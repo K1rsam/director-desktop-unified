@@ -323,6 +323,56 @@ pub(super) fn attach_catalog_scope(target: &mut Value, input: &Value, episode_id
     }
 }
 
+/// A role's input deliberately omits the workflow's internal profile marker.
+/// Re-project a new editor from that frozen workflow, rather than accidentally
+/// treating its already-projected author's packet as a legacy raw catalogue.
+pub(super) fn project_finish_request(
+    legacy: &crate::pipeline::TextRequest,
+    frozen: &Value,
+    assets: &[Value],
+) -> Result<crate::pipeline::TextRequest, String> {
+    validate_profile(frozen)?;
+    if !scoped_profile(frozen) || !crate::pipeline::stage3_pack::uses_profile(frozen)? {
+        return Ok(legacy.clone());
+    }
+    let episode = legacy.input["episodeId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("整编资产投影缺少冻结集身份")?;
+    let sha = frozen["source"]["sha256"]
+        .as_str()
+        .filter(|sha| sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("整编资产投影缺少冻结源摘要")?;
+    if legacy.stage != "storyboardFinish"
+        || legacy.skill != "episode-finishing-editor"
+        || legacy.input["finishMode"] != "delta"
+        || legacy.input["assetCatalogScope"]["version"] != SCOPED_PROFILE
+        || legacy.input["assetCatalogScope"]["episodeId"] != episode
+        || legacy.input["assetCatalogScope"]["sourceSha256"] != sha
+    {
+        return Err("整编资产投影与已冻结主创目录范围不一致；原请求保留".into());
+    }
+    let rows: Vec<crate::pipeline::SourceRow> =
+        serde_json::from_value(legacy.input["sourceRows"].clone()).map_err(|e| e.to_string())?;
+    let context: Vec<crate::pipeline::SourceRow> =
+        serde_json::from_value(legacy.input["contextRows"].clone()).map_err(|e| e.to_string())?;
+    let (cards, selection) = project_for_scope(frozen, assets, episode, &rows, &context)?;
+    let mut projected = legacy.clone();
+    projected.input["assets"] = json!(cards);
+    projected.input["assetSelection"] = selection;
+    projected.input["storyboardAssetInputProfile"] = json!(SCOPED_PROFILE);
+    projected.input["finisherAssetInputProjection"] = json!({
+        "version":"finisher-asset-input-projection/v1",
+        "assetInputProfile":SCOPED_PROFILE,"sourceSha256":sha,"episodeId":episode,
+        "frozenWorkflowInputSha256":crate::pipeline::digest(&frozen.to_string()),
+        "legacyDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(legacy).map_err(|e|e.to_string())?),
+        "projectedAssetsSha256":crate::pipeline::digest(&projected.input["assets"].to_string()),
+        "projectedAssetSelectionSha256":crate::pipeline::digest(&projected.input["assetSelection"].to_string()),
+        "authorInputPreserved":true
+    });
+    Ok(projected)
+}
+
 /// Mechanical projection of the old episode-upstream-material handoff:
 /// canonical prompt bodies, production histories, URLs and local media paths
 /// are not writing inputs. Source-bound visual facts continue through the
@@ -427,6 +477,52 @@ fn adopted_design(input: &Value, asset: &Value) -> Result<Option<Value>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_finisher_binds_parent_v2_cards_without_changing_author_or_legacy_envelopes() {
+        let source = crate::pipeline::prepare_source("第一集\n场景：门口\n△小王推门。\n").unwrap();
+        let episode = &source.episodes[0].id;
+        let row = source.rows.iter().find(|row| row.kind == "body").unwrap();
+        let assets = vec![json!({"id":"person:base","identityId":"person","variantId":"base","version":7,
+            "kind":"CH","name":"小王","sourceAssetId":null,"sourceVariantId":null,
+            "scope":{"kind":"SCENES","reason":"当前原场","scenes":[{"episodeId":episode,"sceneId":row.scene_id}]},
+            "sourceRefs":[row.id],"sourceRefsPurpose":"SOURCE_SCOPE",
+            "design":{"privateHistory":"OLD_RUNTIME_PAYLOAD"},"prompt":"OLD_RUNTIME_PROMPT"})];
+        let mut frozen = json!({"source":source,"assets":assets,"storyboardAssetInputProfile":SCOPED_PROFILE});
+        crate::pipeline::stage3_pack::mark_input(&mut frozen).unwrap();
+        let legacy = crate::pipeline::TextRequest {
+            stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:"offline".into(),reasoning:"medium".into(),
+            input:json!({"episodeId":episode,"finishMode":"delta","sourceRows":[row],"contextRows":[],
+                "assetCatalogScope":{"version":SCOPED_PROFILE,"sourceSha256":source.sha256,"episodeId":episode},
+                "assets":assets,"assetSelection":{"legacy":true},"previousDraft":{"units":[{"id":"unit-1","exact":"已派发前稿"}]}}),
+            schema:json!({"exactSchema":"preserve"}),rule_snapshot:json!({"exactMacRules":"preserve"}),
+        };
+        let original = serde_json::to_string(&legacy).unwrap();
+        let parent = frozen.to_string();
+        let projected = project_finish_request(&legacy,&frozen,&assets).unwrap();
+        let cards = &projected.input["assets"];
+        assert_eq!(cards[0]["id"],"person:base");
+        assert_eq!(cards[0]["variantId"],"base");
+        assert_eq!(cards[0]["version"],7);
+        assert_eq!(cards[0]["scope"],assets[0]["scope"]);
+        assert!(cards[0].get("design").is_none() && cards[0].get("prompt").is_none());
+        assert_eq!(projected.schema,legacy.schema);
+        assert_eq!(projected.rule_snapshot,legacy.rule_snapshot);
+        for field in ["previousDraft","sourceRows","contextRows","assetCatalogScope"] {
+            assert_eq!(projected.input[field],legacy.input[field],"{field}");
+        }
+        assert_eq!(projected.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"],crate::pipeline::digest(&original));
+        assert_eq!(projected.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],crate::pipeline::digest(&parent));
+        assert!(legacy.input.get("storyboardAssetInputProfile").is_none(),"the role packet intentionally omits its parent's internal marker");
+        assert_eq!(serde_json::to_string(&legacy).unwrap(),original);
+        assert_eq!(frozen.to_string(),parent);
+        let mut old_parent = frozen.clone();
+        old_parent.as_object_mut().unwrap().remove("storyboardAssetInputProfile");
+        assert_eq!(serde_json::to_string(&project_finish_request(&legacy,&old_parent,&assets).unwrap()).unwrap(),original);
+        let mut unbound = legacy.clone();
+        unbound.input["assetCatalogScope"]["sourceSha256"] = json!(crate::pipeline::digest("different source"));
+        assert!(project_finish_request(&unbound,&frozen,&assets).is_err());
+    }
+
     #[test]
     fn mac_role_selection_keeps_exact_material_parents_and_excludes_future_appearance() {
         let source = crate::pipeline::prepare_source(

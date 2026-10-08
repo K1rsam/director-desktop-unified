@@ -1,6 +1,7 @@
 //! Native-only capability and text-only supervisor for the genuine pinned SDK.
 //! No IPC setting can register this capability; the desktop entry owns it.
 use super::*;
+use sha2::Digest;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -140,6 +141,111 @@ pub(super) async fn resolve(settings: &Value) -> Result<Value> {
     let mut resolved = settings.clone();
     resolved["textSdkIdentity"] = serde_json::to_value(frozen).map_err(|e| e.to_string())?;
     Ok(resolved)
+}
+
+pub(super) fn supervisor_handoff_identity_bound(old: &Value, new: &Value) -> bool {
+    let (Ok(old_identity), Ok(new_identity)) = (
+        serde_json::from_value::<SdkIdentity>(old.clone()),
+        serde_json::from_value::<SdkIdentity>(new.clone()),
+    ) else {
+        return false;
+    };
+    if old_identity.version != "official-sdk-identity/v2"
+        || old_identity.validate().is_err()
+        || new_identity.validate().is_err()
+    {
+        return false;
+    }
+    let mut allowed = old.clone();
+    for field in ["supervisorExecutable", "supervisorSha256", "resourceDirectory"] {
+        allowed[field] = new[field].clone();
+    }
+    allowed == *new && old != new
+}
+
+fn handoff_resource_hashes(root: &Path) -> Result<Value> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+    if !root.is_absolute() || metadata.is_symlink() || !metadata.is_dir() {
+        return Err("SDK_SUPERVISOR_HANDOFF_RESOURCE_CHANGED: 资源目录不能交接".into());
+    }
+    let mut hashes = serde_json::Map::new();
+    for relative in [
+        "src/health.mjs",
+        "src/main.mjs",
+        "src/bridge.mjs",
+        "src/native-runtime.mjs",
+        "THIRD_PARTY_NOTICES.md",
+        "package-lock.json",
+        "node_modules/@openai/codex-sdk/package.json",
+        "node_modules/@openai/codex-sdk/dist/index.js",
+        "node_modules/@openai/codex-sdk/LICENSE",
+    ] {
+        let mut path = root.to_path_buf();
+        for part in Path::new(relative).components() {
+            path.push(part);
+            if std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?.is_symlink() {
+                return Err("SDK_SUPERVISOR_HANDOFF_RESOURCE_CHANGED: 资源链接不能交接".into());
+            }
+        }
+        let bytes = frozen_file(&path, 16_777_216)?;
+        hashes.insert(relative.into(), json!(format!("{:x}", sha2::Sha256::digest(&bytes))));
+    }
+    Ok(Value::Object(hashes))
+}
+
+pub(super) fn verify_supervisor_handoff_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    if !supervisor_handoff_identity_bound(old, new)
+        || handoff_resource_hashes(Path::new(s(old, "resourceDirectory")))? != *hashes
+        || handoff_resource_hashes(Path::new(s(new, "resourceDirectory")))? != *hashes
+    {
+        return Err("SDK_SUPERVISOR_HANDOFF_BYTES_CHANGED: 旧新资源或冻结身份不同".into());
+    }
+    for (path, sha) in [
+        ("nodeExecutable", "nodeSha256"),
+        ("runtimeExecutable", "runtimeSha256"),
+        ("supervisorExecutable", "supervisorSha256"),
+    ] {
+        if crate::store::hash_file(Path::new(s(new, path)))?.0 != s(new, sha) {
+            return Err("SDK_SUPERVISOR_HANDOFF_BYTES_CHANGED: 核验期间程序字节改变".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn prepare_supervisor_handoff(
+    settings: &Value,
+) -> Result<Option<SupervisorHandoff>> {
+    let native = context()?;
+    let old = identity(settings)?;
+    let current_resources = if native.resources.join("sdk-readiness").is_dir() {
+        native.resources.join("sdk-readiness")
+    } else {
+        native.resources.clone()
+    };
+    let current_resources = node_path_argument(&std::fs::canonicalize(current_resources).map_err(|e| e.to_string())?)?;
+    // Never weaken the frozen guard on an existing dispatch. The executor calls
+    // this only after proving that its later logical node has no task or attempt.
+    if s(&old, "supervisorExecutable") == native.supervisor.to_string_lossy()
+        && s(&old, "supervisorSha256") == native.supervisor_sha
+        && s(&old, "resourceDirectory") == current_resources.to_string_lossy()
+    {
+        return Ok(None);
+    }
+    let resolved = resolve(settings).await?; // account/model probes, zero model calls
+    let new = identity(&resolved)?;
+    if !supervisor_handoff_identity_bound(&old, &new) {
+        return Err("SDK_SUPERVISOR_HANDOFF_IDENTITY_CHANGED: SDK/桥/Node/运行器/账户/权限身份变化；保留原流程，不交接".into());
+    }
+    let old_resources = handoff_resource_hashes(Path::new(s(&old, "resourceDirectory")))?;
+    let new_resources = handoff_resource_hashes(Path::new(s(&new, "resourceDirectory")))?;
+    if old_resources != new_resources {
+        return Err("SDK_SUPERVISOR_HANDOFF_RESOURCE_CHANGED: 旧新资源正文不同，不交接".into());
+    }
+    verify_supervisor_handoff_bytes(&old, &new, &new_resources)?;
+    Ok(Some(SupervisorHandoff {
+        identity: new,
+        resource_hashes: new_resources,
+    }))
 }
 pub(super) async fn add_readiness(settings: &Value, result: &mut Value) {
     let inspected = crate::text_cli::readiness_status(settings).await;

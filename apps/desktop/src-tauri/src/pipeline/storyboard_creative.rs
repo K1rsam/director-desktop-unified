@@ -272,6 +272,11 @@ fn restore_fantasy_schema(schema: &mut Value) {
 pub(in crate::pipeline) fn prepare_request(
     mut request: TextRequest,
 ) -> Result<TextRequest, String> {
+    // Engine-only frozen parent evidence must never be sent as model material.
+    // It contains the full runtime asset/history packet, not this role's scope.
+    if let Some(input) = request.input.as_object_mut() {
+        input.remove("frozenFinisherAssetContext");
+    }
     let mac_pack = super::super::stage3_pack::uses_profile(&request.input)?;
     if request.stage == "storyboardRefine" {
         if !mac_pack || request.skill != "director-refinement" {
@@ -575,6 +580,15 @@ impl TextExecutor for Executor<'_> {
     fn input_transport_characters(&self, request: &TextRequest) -> Result<usize, String> {
         self.0
             .input_transport_characters(&prepare_request(request.clone())?)
+    }
+    async fn prepare_finish_asset_projection(
+        &self,
+        legacy: TextRequest,
+        projected: TextRequest,
+    ) -> Result<TextRequest, String> {
+        self.0
+            .prepare_finish_asset_projection(legacy, projected)
+            .await
     }
     async fn execute(&self, request: TextRequest) -> Result<Value, String> {
         self.0.execute(prepare_request(request)?).await
@@ -1096,6 +1110,22 @@ pub(in crate::pipeline) fn add_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frozen_finisher_asset_context_is_not_model_material_for_any_role() {
+        for (stage, skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),("storyboardFinish","episode-finishing-editor")] {
+            let request = TextRequest {
+                stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),
+                input:json!({"sourceRows":[{"exact":"only scoped source"}],"frozenFinisherAssetContext":{"assets":[{"design":"DO_NOT_DISPATCH_PARENT_RUNTIME"}],"settings":{"private":"not role input"}}}),
+                schema:json!({"exact":"schema"}),rule_snapshot:json!({"exact":"rules"}),
+            };
+            let mut expected = request.clone();
+            expected.input.as_object_mut().unwrap().remove("frozenFinisherAssetContext");
+            let prepared = prepare_request(request).unwrap();
+            assert_eq!(serde_json::to_value(&prepared).unwrap(),serde_json::to_value(&expected).unwrap());
+            assert!(!prepared.input.to_string().contains("DO_NOT_DISPATCH_PARENT_RUNTIME"));
+        }
+    }
+
     #[test]
     fn preset_contains_the_complete_old_physical_visual_voice_basis() {
         let s = visual_style("3D国漫", "16:9");

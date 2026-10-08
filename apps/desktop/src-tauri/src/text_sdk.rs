@@ -153,6 +153,26 @@ pub async fn resolve_for_workflow(settings: &Value) -> Result<Value> {
     native::resolve(settings).await
 }
 
+/// A new, not-yet-created workflow node may bind today's supervisor while all
+/// upstream SDK/runtime/account/model identities remain byte-for-byte frozen.
+/// This never edits workflow settings or an existing attempt.
+#[derive(Debug)]
+pub(crate) struct SupervisorHandoff {
+    pub identity: Value,
+    pub resource_hashes: Value,
+}
+pub(crate) async fn prepare_supervisor_handoff(
+    settings: &Value,
+) -> Result<Option<SupervisorHandoff>> {
+    native::prepare_supervisor_handoff(settings).await
+}
+pub(crate) fn supervisor_handoff_identity_bound(old: &Value, new: &Value) -> bool {
+    native::supervisor_handoff_identity_bound(old, new)
+}
+pub(crate) fn verify_supervisor_handoff_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    native::verify_supervisor_handoff_bytes(old, new, hashes)
+}
+
 pub(crate) async fn add_native_readiness(settings: &Value, value: &mut Value) {
     native::add_readiness(settings, value).await;
 }
@@ -240,6 +260,17 @@ pub(crate) struct Config {
     identity: Value,
 }
 impl Config {
+    pub(crate) fn from_frozen_identity(
+        original_settings: &Value,
+        frozen_identity: &Value,
+        root: &Path,
+    ) -> Result<Self> {
+        // Only a local transport DTO is composed. The parent settings and saved
+        // request are never refreshed or persisted through this method.
+        let mut transport_settings = original_settings.clone();
+        transport_settings["textSdkIdentity"] = frozen_identity.clone();
+        Self::from_settings(&transport_settings, root)
+    }
     pub(crate) fn from_settings(settings: &Value, root: &Path) -> Result<Self> {
         let identity = identity(settings)?;
         #[cfg(test)]

@@ -882,13 +882,7 @@ impl Engine {
             .collect::<std::result::Result<HashMap<_, _>, _>>()
             .map_err(|e| e.to_string())?;
         for j in &mut summaries {
-            let snap = j["snapshot"].clone();
-            let prepared = j["prepared"].clone();
-            j["snapshot"] = json!({"model":snap["model"],"unitVersion":snap["unitVersion"],"problems":snap["problems"],"autoSubmit":auto_submit.get(s(j,"id")).copied().flatten()});
-            j["prepared"] = json!({"estimatedCost":prepared["estimatedCost"]});
-            if let Some(obj) = j.as_object_mut() {
-                obj.remove("receipt");
-            }
+            *j = workspace_job_summary(j.clone(),auto_submit.get(s(j,"id")).copied().flatten());
         }
         let mut providers = Vec::new();
         let mut q = c
@@ -3040,6 +3034,9 @@ impl Engine {
                         rows.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?
                     };
                     input["storyboardHistory"]=json!(history);
+                    // Runtime proof context is the original frozen parent input,
+                    // not the input augmented with decisions or resume history.
+                    input["frozenFinisherAssetContext"]=record["snapshot"]["input"].clone();
                     let mut output=pipeline::run_storyboard(&input,&exec,model,reasoning).await?;
                     output["planningProfile"]=input["capabilities"].clone();output["selection"]=input["selection"].clone();
                     if output["units"].as_array().is_some_and(|u|!u.is_empty()) {
@@ -3288,6 +3285,92 @@ impl Engine {
         self.workspace(&restored, None)
     }
 }
+/// Preserve the compact workflow identity used by Stage1/Stage3 start hints;
+/// never expose frozen bodies, rule texts, settings or transport payloads here.
+fn workspace_job_summary(mut job: Value, auto_submit: Option<bool>) -> Value {
+    let snap = job["snapshot"].clone();
+    let prepared = job["prepared"].clone();
+    job["snapshot"] = if job["kind"] == "workflow" {
+        json!({"runnerVersion":snap["runnerVersion"],"stage":snap["stage"],
+            "sourceVersion":snap["sourceVersion"],"selection":snap["selection"],
+            "input":{"source":{"version":snap["input"]["source"]["version"],"sha256":snap["input"]["source"]["sha256"]}}})
+    } else {
+        json!({"model":snap["model"],"unitVersion":snap["unitVersion"],"problems":snap["problems"],"autoSubmit":auto_submit})
+    };
+    job["prepared"] = json!({"estimatedCost":prepared["estimatedCost"]});
+    if let Some(object) = job.as_object_mut() { object.remove("receipt"); }
+    job
+}
+
+#[cfg(test)]
+mod workspace_job_summary_tests {
+    use super::*;
+
+    #[test]
+    fn actual_store_workflow_summaries_keep_start_hint_binding_through_workspace_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("project")).unwrap();
+        store.create("offline workspace summary","synthetic").unwrap();
+        let source = store.save_source(json!(pipeline::prepare_source("第一集\n场景：门口\n甲：开门。\n第二集\n场景：院内\n乙：回头。\n").unwrap())).unwrap();
+        let selection = json!({"episodeIds":source["episodes"].as_array().unwrap().iter().map(|episode|&episode["id"]).collect::<Vec<_>>()});
+        for stage in ["foundation.run","storyboard.run"] {
+            let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":stage,"sourceVersion":source["version"],"selection":selection,
+                "input":{"source":source,"selection":selection,"settings":{"textApiKey":"SYNTHETIC_PRIVATE_SETTING"}},
+                "rules":[{"content":"SYNTHETIC_PRIVATE_RULE"}]});
+            let key = store.add_job("workflow",stage,"local","local",&snapshot,"failed").unwrap();
+            let stored = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==key).unwrap();
+            let summary = workspace_job_summary(stored,None);
+            assert_eq!(summary["snapshot"],json!({"runnerVersion":"desktop-runner/v1","stage":stage,
+                "sourceVersion":source["version"],"selection":selection,
+                "input":{"source":{"version":source["version"],"sha256":source["sha256"]}}}));
+            assert_eq!(summary["status"],"failed");
+            assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));
+            assert!(summary["snapshot"]["input"]["source"].get("text").is_none());
+            assert!(summary["snapshot"]["input"]["source"].get("rows").is_none());
+            assert!(summary["snapshot"].get("rules").is_none());
+            assert!(summary["snapshot"]["input"].get("settings").is_none());
+            assert_eq!(store.job(&key).unwrap()["snapshot"],snapshot);
+        }
+    }
+
+    #[test]
+    fn actual_child_unknown_survives_workspace_projection_while_known_terminal_children_do_not() {
+        let temp = tempfile::tempdir().unwrap();let store = Store::open(temp.path().join("project")).unwrap();store.create("offline child unknown summary","synthetic").unwrap();store.ensure_workflow_storage().unwrap();
+        for stage in ["foundation.run","storyboard.run"] {
+            let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":stage,"sourceVersion":1,"selection":{"episodeIds":["e1"]},
+                "input":{"source":{"version":1,"sha256":"a".repeat(64),"text":"SYNTHETIC_PRIVATE_SOURCE"},"settings":{"textApiKey":"SYNTHETIC_PRIVATE_SETTING"}}});
+            let parent = store.add_job("workflow",stage,"local","local",&snapshot,"completed").unwrap();
+            let child = store.add_job("text","frozen-node","codex_sdk","local",&json!({}),"submission_unknown").unwrap();
+            store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'frozen-node',?2,'synthetic','failed',?3,?4)",rusqlite::params![parent,stage,child,now()]).unwrap();
+            let before = store.job(&parent).unwrap();
+            let stored = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==parent).unwrap();
+            let summary = workspace_job_summary(stored,None);
+            assert_eq!(summary["status"],"completed");assert_eq!(summary["submissionUnknown"],true);
+            assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));assert_eq!(store.job(&parent).unwrap(),before);
+            for state in ["failed","rejected","completed"] {
+                store.update_job(&child,state,&json!({})).unwrap();
+                let stored = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==parent).unwrap();
+                assert_eq!(workspace_job_summary(stored,None)["submissionUnknown"],false,"known terminal state {state} does not inherit an unknown flag");
+                assert_eq!(store.job(&parent).unwrap(),before);
+            }
+        }
+    }
+
+    #[test]
+    fn non_workflow_summary_keeps_media_metadata_and_omits_transport_and_private_bodies() {
+        let temp = tempfile::tempdir().unwrap();let store = Store::open(temp.path().join("project")).unwrap();store.create("offline media summary","synthetic").unwrap();
+        let key = store.add_job("video","u1","mock","local",&json!({"model":"model","unitVersion":3,"problems":[],"autoSubmit":true,
+            "runnerVersion":"SYNTHETIC_PRIVATE_RUNNER","input":{"source":{"text":"SYNTHETIC_PRIVATE_SOURCE"}},"prompt":"SYNTHETIC_PRIVATE_PROMPT"}),"ready").unwrap();
+        store.update_job(&key,"ready",&json!({"prepared":{"estimatedCost":2,"wire":{"payload":"SYNTHETIC_PRIVATE_WIRE"}},"receipt":{"private":"SYNTHETIC_PRIVATE_RECEIPT"}})).unwrap();
+        let stored = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==key).unwrap();
+        let summary = workspace_job_summary(stored,Some(true));
+        assert_eq!(summary["snapshot"],json!({"model":"model","unitVersion":3,"problems":[],"autoSubmit":true}));
+        assert_eq!(summary["prepared"],json!({"estimatedCost":2}));
+        assert!(summary.get("receipt").is_none());
+        assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));
+    }
+}
+
 struct ActiveGuard {
     engine: Arc<Engine>,
     keys: Vec<String>,

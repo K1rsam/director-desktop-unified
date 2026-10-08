@@ -4467,6 +4467,8 @@ struct FrozenTextReplay {
 mod scoped_shot_replay;
 #[path = "text_executor_sdk_foundation_replay.rs"]
 mod sdk_foundation_replay;
+#[path = "text_executor_sdk_supervisor_handoff.rs"]
+mod sdk_supervisor_handoff;
 pub(crate) use scoped_shot_replay::{
     scoped_author_replay_audit_valid, scoped_author_replay_receipt_bound, scoped_author_replay_stage,
     STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY,
@@ -5025,6 +5027,9 @@ pub(crate) fn spawn_cli_child(
 }
 #[async_trait::async_trait]
 impl TextExecutor for SavedTextExecutor {
+    async fn prepare_finish_asset_projection(&self, legacy: TextRequest, projected: TextRequest) -> Result<TextRequest> {
+        self.saved_finish_asset_projection(legacy, projected)
+    }
     async fn prepare_transport_request(&self, mut request: TextRequest) -> Result<TextRequest> {
         if let Some(original)=self.accepted_author_with_recovered_predecessor(&request)? {
             return Ok(original);
@@ -7366,6 +7371,9 @@ impl SavedTextExecutor {
     fn request_snapshot(&self, request: &TextRequest) -> Result<Value> {
         self.validate_transport_retry(request)?;
         let mut value = self.request_domain_snapshot(request)?;
+        if let Some(saved) = self.sdk_handoff_saved_snapshot(request, &value)? {
+            return Ok(saved);
+        }
         if let Some(saved)=self.legacy_unmanaged_cli_snapshot(request,&value)? { return Ok(saved); }
         if let Some(root) = crate::text_cli::managed_codex_root() {
             if let Some(saved) = self.managed_saved_snapshot_at(request, &value, &root)? {
@@ -11234,6 +11242,7 @@ impl SavedTextExecutor {
     }
     fn sdk_raw(&self, job: &Value, snapshot: &Value) -> Result<Value> {
         use crate::text_transport::{AttemptState, FrozenAttempt};
+        self.sdk_handoff_job_bound(job, snapshot)?;
         let fail = || {
             "SDK_RAW_BINDING_MISMATCH: 原请求、原始文本、事件、回执或执行身份不一致；证据与预算保留"
                 .to_string()
@@ -11286,6 +11295,12 @@ impl SavedTextExecutor {
                         .map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?
+        {
+            return Err(fail());
+        }
+        if snapshot.get("sdkSupervisorHandoff").is_some()
+            && (attempt.workflow_id != self.workflow_id.as_deref().unwrap_or("standalone")
+                || attempt.logical_node_id != step_key(&request))
         {
             return Err(fail());
         }
@@ -11367,7 +11382,9 @@ impl SavedTextExecutor {
             if self.workflow_id.as_deref().unwrap_or("standalone") != original.workflow_id {
                 return Err("SDK_EXISTING_ATTEMPT_UNRESOLVED: 新工作流不能替换原未知执行".into());
             }
-            let config = crate::text_sdk::Config::from_settings(&self.settings, &self.store.root)?;
+            let config = crate::text_sdk::Config::from_frozen_identity(
+                &self.settings, &snapshot["executorIdentity"], &self.store.root,
+            )?;
             let transport = self.sdk_transport(config, s(&job, "id"));
             let observation = transport.reconcile(&original).await;
             transport.close().await?;
@@ -11395,6 +11412,8 @@ impl SavedTextExecutor {
             return self.sdk_receive(request, snapshot, s(&job, "id"), &attempt);
         }
         self.check_sdk_unresolved_hold()?;
+        let new_node_snapshot = self.sdk_new_node_snapshot(request, snapshot).await?;
+        let snapshot = &new_node_snapshot;
         // Reuse the domain-specific global attempt guards before allocating a
         // transport. They key budgets by source/original raw, not workflow IDs.
         let _ = self.visual_fact_replay(request, snapshot)?;
@@ -11402,7 +11421,9 @@ impl SavedTextExecutor {
         let _ = self.carrier_rejected_result(request, snapshot, &hash)?;
         let _ = self.carrier_received_result(request, snapshot, &hash)?;
         self.sdk_revision_budget(request)?;
-        let config = crate::text_sdk::Config::from_settings(&self.settings, &self.store.root)?;
+        let config = crate::text_sdk::Config::from_frozen_identity(
+            &self.settings, &snapshot["executorIdentity"], &self.store.root,
+        )?;
         let compiled = compile_codex_input(request)?;
         let mut transport =
             crate::text_sdk::OfficialSdkTransport::new(config, Arc::new(|_, _| Ok(())));
@@ -11421,14 +11442,19 @@ impl SavedTextExecutor {
             .map_err(|e| e.to_string())?;
         children().check_open()?;
         self.check_sdk_unresolved_hold()?;
-        let job = self.store.add_job(
+        let handed_off = snapshot.get("sdkSupervisorHandoff").is_some();
+        let job = if handed_off {
+            self.store.add_sdk_handoff_node_atomic(request, snapshot, &self.settings)?
+        } else {
+            self.store.add_job(
             "text",
             &format!("{}:{}:{}", request.stage, request.skill, id()),
             "codex_sdk",
             s(&snapshot["executorIdentity"], "accountFingerprint"),
             snapshot,
             "queued",
-        )?;
+            )?
+        };
         let dir = self.store.root.join("text-runs").join(&job);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut attempt = FrozenAttempt::prepare(
@@ -11444,10 +11470,13 @@ impl SavedTextExecutor {
             &dir.join("sdk-compiled.json"),
             &json!({"prompt":compiled.prompt,"schema":compiled.schema,"promptSha256":crate::pipeline::digest(&compiled.prompt),"schemaSha256":crate::pipeline::digest(&compiled.schema)}),
         )?;
-        let prepared = json!({"sdkRequestHash":hash,"sdkAttemptId":job,"sdkDispatchStarted":true,"sdkOriginWorkflowId":self.workflow_id,"compiledPromptSha256":crate::pipeline::digest(&compiled.prompt),"compiledSchemaSha256":crate::pipeline::digest(&compiled.schema)});
+        let mut prepared = json!({"sdkRequestHash":hash,"sdkAttemptId":job,"sdkDispatchStarted":true,"sdkOriginWorkflowId":self.workflow_id,"compiledPromptSha256":crate::pipeline::digest(&compiled.prompt),"compiledSchemaSha256":crate::pipeline::digest(&compiled.schema)});
+        if handed_off {
+            prepared["sdkSupervisorHandoff"] = snapshot["sdkSupervisorHandoff"].clone();
+        }
         self.store
             .update_job(&job, "submitting", &json!({"prepared":prepared}))?;
-        if let Some(run) = &self.workflow_id {
+        if let Some(run) = self.workflow_id.as_ref().filter(|_| !handed_off) {
             self.store.checkpoint(
                 run,
                 &step_key(request),
@@ -12499,3 +12528,6 @@ mod stage2_checkpoint_identity_tests {
 #[cfg(all(test, windows))]
 #[path = "text_executor_frozen_parent_tests.rs"]
 mod frozen_parent_tests;
+
+#[path = "text_executor_finish_assets.rs"]
+mod finish_assets;

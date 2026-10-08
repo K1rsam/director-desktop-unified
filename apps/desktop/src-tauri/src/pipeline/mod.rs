@@ -66,6 +66,15 @@ pub trait TextExecutor: Send + Sync {
             request, input, schema,
         ))
     }
+    /// A new editor may consume the parent's frozen production cards. A saved
+    /// executor must preserve an already-dispatched editor's original request.
+    async fn prepare_finish_asset_projection(
+        &self,
+        _legacy: TextRequest,
+        projected: TextRequest,
+    ) -> Result<TextRequest, String> {
+        Ok(projected)
+    }
     /// Read-only, source-bound evidence for the one legacy A15 attempt whose
     /// accepted result omitted already-adopted production constraints.
     async fn visual_fact_repair_context(

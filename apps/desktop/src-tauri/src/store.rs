@@ -1239,11 +1239,19 @@ impl Store {
     /// Production task history stays independently inspectable; large local workflow history is bounded.
     pub fn job_summaries(&self) -> Result<Vec<Value>> {
         let c = self.conn()?;
-        let query=format!("SELECT {JOB_SUMMARY_COLUMNS} FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
+        // Legacy projects may not have created checkpoint storage yet. Reading
+        // summaries must not create tables or alter an original task record.
+        let has_steps: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let unknown = if has_steps { JOB_SUMMARY_UNKNOWN_COLUMN } else { "j.state='submission_unknown'" };
+        let query=format!("SELECT {JOB_SUMMARY_COLUMNS},{unknown} AS summary_submission_unknown FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR ({unknown}) OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
         let mut q = c.prepare(&query).map_err(|e| e.to_string())?;
-        let rows = q.query_map([], read_job).map_err(|e| e.to_string())?;
-        rows.map(|r| finish_job(r.map_err(|e| e.to_string())?))
-            .collect()
+        let rows = q.query_map([], |row| Ok((read_job(row)?,row.get::<_,bool>(18)?))).map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (raw,unknown) = row.map_err(|e|e.to_string())?;
+            let mut job = finish_job(raw)?;
+            job["submissionUnknown"] = json!(unknown);
+            Ok(job)
+        }).collect()
     }
     /// The scheduler has no history cap; old active cloud identities remain recoverable.
     pub fn pending_jobs(&self) -> Result<Vec<Value>> {
@@ -1746,8 +1754,9 @@ fn source_channel_metadata_only(previous: &Value, current: &Value) -> bool {
 }
 
 const JOB_COLUMNS:&str="j.id,j.kind,j.entity_id,j.provider,j.state,j.task_id,j.account_id,j.snapshot,j.prepared,j.receipt,j.result,j.error,j.created_at,j.updated_at,j.next_attempt_at,j.query_attempts,j.download_attempts,(SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid))";
+const JOB_SUMMARY_UNKNOWN_COLUMN: &str = "j.state='submission_unknown' OR (j.kind='workflow' AND EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs t ON t.id=w.text_job_id WHERE w.workflow_id=j.id AND t.kind='text' AND t.state='submission_unknown'))";
 const JOB_SUMMARY_COLUMNS: &str = r#"j.id,j.kind,j.entity_id,j.provider,j.state,j.task_id,j.account_id,
-CASE WHEN j.kind='workflow' THEN json_object('runnerVersion',json_extract(j.snapshot,'$.runnerVersion'),'stage',json_extract(j.snapshot,'$.stage'),'selection',json_extract(j.snapshot,'$.selection'),'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),'planningProfile',json_extract(j.snapshot,'$.planningProfile'))
+CASE WHEN j.kind='workflow' THEN json_object('runnerVersion',json_extract(j.snapshot,'$.runnerVersion'),'stage',json_extract(j.snapshot,'$.stage'),'selection',json(COALESCE(json_extract(j.snapshot,'$.input.selection'),json_extract(j.snapshot,'$.selection'),'null')),'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),'input',json_object('source',json_object('version',json_extract(j.snapshot,'$.input.source.version'),'sha256',json_extract(j.snapshot,'$.input.source.sha256'))))
 WHEN j.state='ready' THEN json_object('model',json_extract(j.snapshot,'$.model'),'unitVersion',json_extract(j.snapshot,'$.unitVersion'),'problems',json_extract(j.snapshot,'$.problems'),'provider',json_extract(j.snapshot,'$.provider'),'ratio',json_extract(j.snapshot,'$.ratio'),'resolution',json_extract(j.snapshot,'$.resolution'),'duration',json_extract(j.snapshot,'$.duration'),'prompt',json_extract(j.snapshot,'$.prompt'),'references',json_extract(j.snapshot,'$.references'))
 ELSE json_object('model',json_extract(j.snapshot,'$.model'),'unitVersion',json_extract(j.snapshot,'$.unitVersion'),'problems',json_extract(j.snapshot,'$.problems')) END,
 CASE WHEN j.prepared IS NULL THEN NULL ELSE json_object('estimatedCost',json_extract(j.prepared,'$.estimatedCost'),'capabilityVersion',json_extract(j.prepared,'$.capabilityVersion')) END,
@@ -3332,6 +3341,76 @@ mod tests {
             1,
             "successful replacement leaves one complete registry"
         );
+    }
+    #[test]
+    fn workflow_summary_propagates_child_unknown_without_mutating_parent_or_exposing_payloads() {
+        let (_temp,store) = fixture();
+        store.ensure_workflow_storage().unwrap();
+        for stage in ["foundation.run","storyboard.run"] {
+            let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":stage,"sourceVersion":1,
+                "selection":{"episodeIds":["e1"]},"input":{"source":{"version":1,"sha256":"a".repeat(64),"text":"SYNTHETIC_PRIVATE_SOURCE"},
+                    "settings":{"textApiKey":"SYNTHETIC_PRIVATE_SETTING"}},"rules":[{"content":"SYNTHETIC_PRIVATE_RULE"}]});
+            let parent = store.add_job("workflow",stage,"local","local",&snapshot,"failed").unwrap();
+            let child = store.add_job("text","frozen-node","codex_sdk","local",&json!({"private":"SYNTHETIC_PRIVATE_REQUEST"}),"submission_unknown").unwrap();
+            store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'frozen-node',?2,'synthetic','failed',?3,?4)",params![parent,stage,child,now()]).unwrap();
+            let before = store.job(&parent).unwrap();
+            let summary = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==parent).unwrap();
+            assert_eq!(summary["status"],"failed");
+            assert_eq!(summary["submissionUnknown"],true,"child state is authoritative even when the checkpoint still says failed");
+            assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));
+            assert_eq!(store.job(&parent).unwrap(),before,"summary does not change the parent record");
+            assert_eq!(store.job(&child).unwrap()["status"],"submission_unknown");
+            for state in ["failed","rejected","completed"] {
+                store.update_job(&child,state,&json!({})).unwrap();
+                let summary = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==parent).unwrap();
+                assert_eq!(summary["submissionUnknown"],false,"known terminal child {state} is not an unknown submission");
+                assert_eq!(store.job(&parent).unwrap(),before);
+            }
+        }
+    }
+    #[test]
+    fn old_workflow_with_unknown_child_remains_in_bounded_summary_history() {
+        let (_temp,store) = fixture();store.ensure_workflow_storage().unwrap();
+        let parent = store.add_job("workflow","foundation.run","local","local",&json!({"runnerVersion":"desktop-runner/v1","stage":"foundation.run","sourceVersion":1,"selection":{"episodeIds":["e1"]}}),"completed").unwrap();
+        let child = store.add_job("text","frozen-node","codex_sdk","local",&json!({}),"submission_unknown").unwrap();
+        store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'frozen-node','foundation:F2','synthetic','failed',?2,?3)",params![parent,child,now()]).unwrap();
+        for _ in 0..105 {store.add_job("text","unrelated-history","local","local",&json!({}),"completed").unwrap();}
+        let before_parent = store.job(&parent).unwrap();let before_child = store.job(&child).unwrap();
+        let summaries = store.job_summaries().unwrap();
+        let summary = summaries.iter().find(|job|job["id"]==parent).unwrap();
+        assert_eq!(summary["submissionUnknown"],true,"completed parent projection cannot hide an unknown child");
+        assert!(summaries.iter().any(|job|job["id"]==child));
+        assert_eq!(summaries.len(),102,"only the two unresolved identities extend the 100-record text/workflow window");
+        assert!(summaries.iter().filter(|job|job["id"]!=parent && job["id"]!=child).all(|job|job["submissionUnknown"]==false));
+        assert_eq!(store.job(&parent).unwrap(),before_parent);assert_eq!(store.job(&child).unwrap(),before_child);
+    }
+    #[test]
+    fn workflow_summary_keeps_only_frozen_identity_and_effective_scope() {
+        let (_tmp, store) = fixture();
+        for stage in ["foundation.run", "storyboard.run"] {
+            let source_sha = "a".repeat(64);
+            let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":stage,
+                "sourceVersion":9,"selection":{"episodeIds":["old-top-level-scope"]},
+                "planningProfile":{"private":"SYNTHETIC_PRIVATE_PROFILE"},
+                "input":{"source":{"version":9,"sha256":source_sha,"text":"SYNTHETIC_PRIVATE_SOURCE","rows":[{"private":"SYNTHETIC_PRIVATE_ROW"}]},
+                    "selection":{"episodeIds":["e1","e2"],"unitIds":["u1"]},
+                    "settings":{"textApiKey":"SYNTHETIC_PRIVATE_SETTING"}},
+                "rules":[{"content":"SYNTHETIC_PRIVATE_RULE"}]});
+            let key = store.add_job("workflow",stage,"local","local",&snapshot,"failed").unwrap();
+            let summary = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==key).unwrap();
+            assert_eq!(summary["snapshot"],json!({"runnerVersion":"desktop-runner/v1","stage":stage,
+                "sourceVersion":9,"selection":{"episodeIds":["e1","e2"],"unitIds":["u1"]},
+                "input":{"source":{"version":9,"sha256":"a".repeat(64)}}}));
+            assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));
+            assert_eq!(store.job(&key).unwrap()["snapshot"],snapshot,"projection never rewrites the frozen workflow");
+        }
+        let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":"foundation.run","sourceVersion":7,"selection":{"episodeIds":["legacy-e"]}});
+        let key = store.add_job("workflow","foundation.run","local","local",&snapshot,"failed").unwrap();
+        let summary = store.job_summaries().unwrap().into_iter().find(|job|job["id"]==key).unwrap();
+        assert_eq!(summary["snapshot"]["selection"],snapshot["selection"]);
+        assert_eq!(summary["snapshot"]["sourceVersion"],7);
+        assert!(summary["snapshot"]["input"]["source"]["version"].is_null());
+        assert!(summary["snapshot"]["input"]["source"]["sha256"].is_null());
     }
     #[test]
     fn summaries_are_compact_but_old_pending_identities_are_not_capped_by_history() {

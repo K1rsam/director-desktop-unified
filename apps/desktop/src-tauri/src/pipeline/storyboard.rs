@@ -401,6 +401,18 @@ fn finish_request(
         "revisionNotes":[],"unresolved":[]});
     let identity=digest(&json!({"episodeId":episode_id,"authorBatchIds":scopes.iter().map(|scope|&scope.batch.id).collect::<Vec<_>>(),"sourceRefs":refs}).to_string());
     let mut input = scopes[0].input.clone();
+    input.as_object_mut().unwrap().remove("frozenFinisherAssetContext");
+    // A following editor is a new node. Its proof must bind this request, not
+    // the already-dispatched editor whose unmodified input is held in `scope`.
+    if let Some(proof) = input.get("finisherAssetInputProjection") {
+        if proof["version"] != "finisher-asset-input-projection/v1"
+            || input["storyboardAssetInputProfile"] != asset_cards::SCOPED_PROFILE
+        {
+            return Err("上一整编资产投影版本不成立；原请求保留，未派发新节点".into());
+        }
+        input.as_object_mut().unwrap().remove("finisherAssetInputProjection");
+        input.as_object_mut().unwrap().remove("storyboardAssetInputProfile");
+    }
     let mut author_revisions = Vec::new();
     for scope in scopes {
         if let Some(revision) = scope.input.get("authorChainRevision") {
@@ -422,7 +434,7 @@ fn finish_request(
     input["contextRows"] = json!(context_rows);
     if super::stage3_pack::uses_profile(&input)? {
         let (cards, selection) = asset_cards::project_for_scope(
-            &scopes[0].input,
+            &input,
             assets,
             episode_id,
             &source_rows,
@@ -502,6 +514,63 @@ fn finish_request(
         rule_snapshot: snapshot("episode-finishing-editor", &methods)?,
     })?;
     Ok((request, base, refs))
+}
+
+async fn prepare_finish_assets(
+    prepared: (TextRequest, Value, Vec<String>),
+    frozen: &Value,
+    assets: &[Value],
+    executor: &dyn TextExecutor,
+) -> Result<(TextRequest, Value, Vec<String>), String> {
+    let (legacy, base, refs) = prepared;
+    let legacy = creative::prepare_request(legacy)?;
+    let mut projected = asset_cards::project_finish_request(&legacy, frozen, assets)?;
+    if projected.input == legacy.input {
+        return Ok((legacy, base, refs));
+    }
+    projected = creative::prepare_request(projected)?;
+    projected.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+        json!(digest(&serde_json::to_string(&legacy).map_err(|e| e.to_string())?));
+    let actual = executor
+        .prepare_finish_asset_projection(legacy, projected)
+        .await?;
+    Ok((actual, base, refs))
+}
+
+// The live coordinator and the read-only capacity probe use this same builder.
+// It binds the original rejected transport without creating a task or adopting it.
+fn bind_scope_repair_request(
+    prepared: (TextRequest, Value, Vec<String>),
+    source_sha: &str,
+    original_raw: &Value,
+    origin: &TextRequest,
+    scope: &AcceptedAuthorScope,
+    issues: &[Value],
+    attempt: usize,
+) -> Result<(TextRequest, Value, Vec<String>), String> {
+    let (mut request, base, refs) = prepared;
+    let finish_origin = origin.stage == "storyboardFinish";
+    if (!finish_origin && origin.stage != "storyboardCreate")
+        || (finish_origin && origin.input["executionBatch"]["version"] != "related-range-finish/v1")
+    {
+        return Err("适用范围修订原岗或原执行范围不成立；保留原拒绝，未调用模型".into());
+    }
+    let descriptor_field = if finish_origin { "finishRepair" } else { "authorRepair" };
+    let raw_field = if finish_origin { "originalFinishRawSha256" } else { "originalAuthorRawSha256" };
+    let profile = if finish_origin { creative::FINISH_SCOPE_REPAIR_PROFILE } else { creative::AUTHOR_SCOPE_REPAIR_PROFILE };
+    let execution_version = if finish_origin { creative::FINISH_SCOPE_REPAIR_EXECUTION_VERSION } else { creative::AUTHOR_SCOPE_REPAIR_EXECUTION_VERSION };
+    let mut provenance = json!({"version":profile,"attempt":attempt,"maximumAttempts":2,
+        "sourceSha256":source_sha,"originDomainRequestSha256":digest(&serde_json::to_string(origin).map_err(|e|e.to_string())?),
+        "originExecutionBatch":origin.input["executionBatch"],"baseDraftHash":finish_base_hash(&base),
+        "problemSignature":author_scope_problem_signature(issues)});
+    provenance[raw_field] = json!(digest(&original_raw.to_string()));
+    let identity = digest(&provenance.to_string());
+    request.input[descriptor_field] = provenance;
+    request.input["validationIssues"] = json!(issues);
+    request.input["executionBatch"] = json!({"version":execution_version,
+        "id":format!("{}:{identity}",if finish_origin{"finish-domain-repair"}else{"author-domain-repair"}),
+        "sourceRefs":refs,"packageIds":scope.batch.package_ids,"originExecutionBatchId":scope.batch.id});
+    Ok((creative::prepare_request(request)?, base, refs))
 }
 
 fn refs_valid(items: &[String], allowed: &HashSet<&str>, nonempty: bool) -> Result<(), String> {
@@ -1997,6 +2066,9 @@ pub async fn run_storyboard(
     model: &str,
     reasoning: &str,
 ) -> Result<Value, String> {
+    // Runtime decisions/history are not the parent's frozen byte identity.
+    // This complete packet is only a projection/proof argument, never a role input.
+    let frozen_finish_assets = input.get("frozenFinisherAssetContext").unwrap_or(input);
     let creative_enabled = creative::uses_profile(input)?;
     let mac_pack = super::stage3_pack::uses_profile(input)?;
     if mac_pack {
@@ -2334,7 +2406,7 @@ pub async fn run_storyboard(
                         (Err(reason),Some((raw,candidate,issues))) if crate::text_executor::author_repairable_rejection(&reason)=>{
                             let origin=creative::prepare_request(TextRequest{stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),model:model.into(),reasoning:reasoning.into(),input:author_input.clone(),schema,rule_snapshot:snapshot("unit-performance-director",&methods)?})?;
                             let scope=AcceptedAuthorScope{index:batch_index,batch:batch.clone(),input:author_input.clone(),draft:candidate};
-                            repair_author_scope(&source,&raw,&origin,&scope,issues,&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),caps,style,executor).await
+                            repair_author_scope(&source,&raw,&origin,&scope,issues,&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),caps,style,frozen_finish_assets,executor).await
                         }
                         (result,_)=>result,
                     }
@@ -2367,8 +2439,10 @@ pub async fn run_storyboard(
                 let prior=if prior_finish_index.map(|index|index+1==first.index).unwrap_or(false){prior_finish.as_ref()}else{None};
                 let mut end=start+1;
                 let mut prepared=finish_request(&authored_scopes[start..end],&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),prior,authored_scopes.get(end).and_then(|scope|scope.draft["units"].as_array().unwrap().first()))?;
-                if executor.input_transport_characters(&prepared.0)?>FINISH_TRANSPORT_LIMIT {
-                    local_blocked.push(json!({"episodeId":episode.id,"executionBatchId":first.batch.id,"packageIds":first.batch.package_ids,"status":"blocked","code":"FINISH_TRANSPORT_CAPACITY","actualCharacters":executor.input_transport_characters(&prepared.0)?,"limit":FINISH_TRANSPORT_LIMIT,"reason":"不可再分的完整作者范围超过桌面请求容量；已校验主创保留，不截断原文、现稿或规则。"}));
+                let measured=prepare_finish_assets(prepared.clone(),frozen_finish_assets,&current_assets,executor).await?;
+                let actual_characters=executor.input_transport_characters(&measured.0)?;
+                if actual_characters>FINISH_TRANSPORT_LIMIT {
+                    local_blocked.push(json!({"episodeId":episode.id,"executionBatchId":first.batch.id,"packageIds":first.batch.package_ids,"status":"blocked","code":"FINISH_TRANSPORT_CAPACITY","actualCharacters":actual_characters,"limit":FINISH_TRANSPORT_LIMIT,"reason":"不可再分的完整作者范围超过桌面请求容量；已校验主创保留，不截断原文、现稿或规则。"}));
                     failed_finish_owners.extend(first.batch.package_ids.iter().cloned());start+=1;continue;
                 }
                 // Greedily retain the full adjacent range. Neither source video
@@ -2381,7 +2455,13 @@ pub async fn run_storyboard(
                     if finish_grouping_characters(&candidate.0,compact_dependency_exits)?>FINISH_TRANSPORT_LIMIT {break;}
                     prepared=candidate;end+=1;
                 }
-                let (request,base,scope_refs)=prepared;
+                let (request,base,scope_refs)=prepare_finish_assets(prepared,frozen_finish_assets,&current_assets,executor).await?;
+                let actual_characters=executor.input_transport_characters(&request)?;
+                if actual_characters>FINISH_TRANSPORT_LIMIT {
+                    let owners:Vec<_>=authored_scopes[start..end].iter().flat_map(|scope|scope.batch.package_ids.iter().cloned()).collect();
+                    local_blocked.push(json!({"episodeId":episode.id,"executionBatchId":request.input["executionBatch"]["id"],"packageIds":owners,"status":"blocked","code":"FINISH_TRANSPORT_CAPACITY","actualCharacters":actual_characters,"limit":FINISH_TRANSPORT_LIMIT,"reason":"完整关联范围超过实际发送容量；保留原主创、规则与已存在整编，不提交请求。"}));
+                    failed_finish_owners.extend(owners);start=end;continue;
+                }
                 let finish_candidates=request.input["selectedFantasy"].as_array().unwrap().clone();
                 let new_prefix=format!("{}:{}:",episode.id,text(&request.input["executionBatch"],"id"));
                 let finish_result=async {
@@ -2428,7 +2508,7 @@ pub async fn run_storyboard(
                             batch.package_ids=strings(&request.input["executionBatch"],"packageIds")?;
                             batch.source_refs=scope_refs.clone();
                             let scope=AcceptedAuthorScope{index:first.index,batch,input:request.input.clone(),draft:candidate};
-                            repair_author_scope(&source,&original_response,&request,&scope,issues,&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),&validation_caps,style,executor).await
+                            repair_author_scope(&source,&original_response,&request,&scope,issues,&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),&validation_caps,style,frozen_finish_assets,executor).await
                         }
                     }
                 }.await;
@@ -3207,6 +3287,7 @@ async fn repair_author_scope(
     voice_reference: Option<&Value>,
     caps: &Value,
     style: &str,
+    frozen_assets_input: &Value,
     executor: &dyn TextExecutor,
 ) -> Result<Value, String> {
     let finish_origin = origin.stage == "storyboardFinish";
@@ -3224,16 +3305,6 @@ async fn repair_author_scope(
         "originalFinishRawSha256"
     } else {
         "originalAuthorRawSha256"
-    };
-    let profile = if finish_origin {
-        creative::FINISH_SCOPE_REPAIR_PROFILE
-    } else {
-        creative::AUTHOR_SCOPE_REPAIR_PROFILE
-    };
-    let execution_version = if finish_origin {
-        creative::FINISH_SCOPE_REPAIR_EXECUTION_VERSION
-    } else {
-        creative::AUTHOR_SCOPE_REPAIR_EXECUTION_VERSION
     };
     let error_prefix = if finish_origin {
         "FINISH_SCOPE_REPAIR"
@@ -3256,7 +3327,7 @@ async fn repair_author_scope(
     });
     for attempt in 1..=2 {
         let signature = author_scope_problem_signature(&issues);
-        let (mut request, base, refs) = finish_request(
+        let prepared = finish_request(
             &[current.clone()],
             plan,
             rows,
@@ -3277,15 +3348,15 @@ async fn repair_author_scope(
                 None
             },
         )?;
-        let mut provenance = json!({"version":profile,"attempt":attempt,"maximumAttempts":2,"sourceSha256":source.sha256,"originDomainRequestSha256":origin_hash,"originExecutionBatch":origin.input["executionBatch"],"baseDraftHash":finish_base_hash(&base),"problemSignature":signature});
-        provenance[raw_field] = json!(raw_hash);
-        let identity = digest(&provenance.to_string());
-        request.input[descriptor_field] = provenance.clone();
-        request.input["validationIssues"] = json!(issues);
-        request.input["executionBatch"] = json!({"version":execution_version,"id":format!("{}:{identity}",if finish_origin{"finish-domain-repair"}else{"author-domain-repair"}),"sourceRefs":refs,"packageIds":scope.batch.package_ids,"originExecutionBatchId":scope.batch.id});
-        request = creative::prepare_request(request)?;
-        if executor.input_transport_characters(&request)? > FINISH_TRANSPORT_LIMIT {
-            return Err(format!("{error_prefix}_TRANSPORT_CAPACITY：原回包、来源与方法卡完整保留，修订超过实际请求容量；未提交新请求"));
+        let prepared = bind_scope_repair_request(
+            prepared, &source.sha256, original_raw, origin, scope, &issues, attempt,
+        )?;
+        let (request, base, refs) =
+            prepare_finish_assets(prepared, frozen_assets_input, assets, executor).await?;
+        let identity = digest(&request.input[descriptor_field].to_string());
+        let actual_characters = executor.input_transport_characters(&request)?;
+        if actual_characters > FINISH_TRANSPORT_LIMIT {
+            return Err(format!("{error_prefix}_TRANSPORT_CAPACITY：actual={actual_characters} UTF16, limit={FINISH_TRANSPORT_LIMIT}；原回包、来源与方法卡完整保留，未提交新请求"));
         }
         let raw = executor.execute(request.clone()).await?;
         let permitted = author_scope_repair_units(&base, &issues)?;
@@ -5929,6 +6000,52 @@ mod production_contract_tests {
     }
 
     #[tokio::test]
+    async fn projected_finisher_and_its_bounded_repair_reopen_exactly_without_runtime_parent_payload() {
+        let (source, mut frozen) = author_scope_input(1);
+        frozen["assets"] = json!([{"id":"person:base","identityId":"person","variantId":"base","version":2,"name":"甲","kind":"CH",
+            "sourceAssetId":null,"sourceVariantId":null,
+            "applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]},
+            "preparation":{"mode":"REFERENCE"},"design":{"history":"PRIVATE_FULL_PARENT_ASSETS"},"prompt":"PRIVATE_FULL_PARENT_PROMPT"}]);
+        frozen["storyboardAssetInputProfile"] = json!(asset_cards::SCOPED_PROFILE);
+        super::super::stage3_pack::mark_input(&mut frozen).unwrap();
+        let parent_bytes = frozen.to_string();
+        let mut runtime = frozen.clone();
+        runtime["decisions"] = json!([]);
+        runtime["storyboardHistory"] = json!([]);
+        runtime["frozenFinisherAssetContext"] = frozen.clone();
+        let runtime_bytes = runtime.to_string();
+        let exec = Recorded {finish_scope_response:Some("TIMING_FIX"),..Default::default()};
+        let output = run_storyboard(&runtime,&exec,"offline","medium").await.unwrap();
+        assert_eq!(output["status"],"completed","{}",output["blocked"]);
+        let calls = exec.calls.lock().await.clone();
+        assert_eq!(calls.len(),4,"planner, author, original editor, bounded editor repair");
+        for call in &calls {
+            assert!(call.input.get("frozenFinisherAssetContext").is_none(),"{}",call.stage);
+            assert!(!call.input.to_string().contains("PRIVATE_FULL_PARENT"),"{}",call.stage);
+            assert_eq!(serde_json::to_value(creative::prepare_request(call.clone()).unwrap()).unwrap(),serde_json::to_value(call).unwrap(),"final wrapper must preserve domain and proof bytes");
+        }
+        let author = calls.iter().find(|call|call.stage=="storyboardCreate").unwrap();
+        assert!(author.input.get("storyboardAssetInputProfile").is_none());
+        let ordinary = calls.iter().find(|call|call.input["executionBatch"]["version"]=="related-range-finish/v1").unwrap();
+        let repair = calls.iter().find(|call|call.input["executionBatch"]["version"]==creative::FINISH_SCOPE_REPAIR_EXECUTION_VERSION).unwrap();
+        for call in [ordinary,repair] {
+            assert_eq!(call.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],digest(&parent_bytes));
+            assert_eq!(call.input["storyboardAssetInputProfile"],asset_cards::SCOPED_PROFILE);
+            assert!(call.input["assets"][0].get("design").is_none());
+        }
+        assert_eq!(repair.input["finishRepair"]["originDomainRequestSha256"],digest(&serde_json::to_string(ordinary).unwrap()));
+        assert_eq!(repair.input["finishRepair"]["attempt"],1);
+        assert_eq!(repair.input["finishRepair"]["maximumAttempts"],2);
+        assert_ne!(repair.input["finisherAssetInputProjection"],ordinary.input["finisherAssetInputProjection"]);
+        for _ in 0..2 {
+            assert_eq!(run_storyboard(&runtime,&exec,"offline","medium").await.unwrap()["units"],output["units"]);
+            assert_eq!(exec.calls.lock().await.len(),4,"reopening must not refresh the paid editor or repair budget");
+        }
+        assert_eq!(frozen.to_string(),parent_bytes);
+        assert_eq!(runtime.to_string(),runtime_bytes);
+    }
+
+    #[tokio::test]
     async fn ordinary_finisher_scope_repair_has_two_attempts_and_never_adopts_hard_or_unchanged_errors(
     ) {
         for (mode, maximum) in [
@@ -6081,6 +6198,7 @@ mod production_contract_tests {
             None,
             &origin.input["capabilities"],
             "16:9真人",
+            &origin.input,
             &exec,
         )
         .await
@@ -6146,6 +6264,7 @@ mod production_contract_tests {
                 None,
                 &origin.input["capabilities"],
                 "16:9真人",
+                &origin.input,
                 &exec
             )
             .await
@@ -8348,6 +8467,112 @@ mod production_contract_tests {
             "{}",
             json!({"readOnlySavedEvidence":true,"episodes":episode_count,"plannerModelDispatches":0,"authorModelDispatches":0,"reusedPlannerRequests":episode_count,"reusedAuthorRequests":if episode_count==1 {3}else{5},"mockEditorRequests":dispatched.len(),"measurements":measurements,"units":output["units"].as_array().unwrap().len(),"scopeRows":expected.len(),"videoRequests":0})
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit rejected author database COPY; exact Saved hook and CLI capacity, zero model calls or original writes"]
+    async fn readonly_rejected_author_finish_asset_projection_measures_actual_cli_and_saved_parent() {
+        use rusqlite::{Connection, OpenFlags};
+        use std::path::Path;
+        let path = std::env::var("DIRECTOR_FINISH_ASSETS_READONLY_DB").expect("explicit stable DB copy");
+        let workflow = std::env::var("DIRECTOR_FINISH_ASSETS_READONLY_WORKFLOW").expect("explicit parent workflow");
+        let job = std::env::var("DIRECTOR_FINISH_ASSETS_READONLY_JOB").expect("explicit rejected author job");
+        let path = Path::new(&path).canonicalize().unwrap();
+        let evidence_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/live-acceptance-20261008").canonicalize().unwrap();
+        assert!(path.starts_with(&evidence_root),"the probe can only open an isolated local acceptance copy, never the live project");
+        let before = crate::store::hash_file(&path).unwrap();
+        let connection = Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        connection.execute_batch("PRAGMA query_only=ON; BEGIN;").unwrap();
+        let (snapshot,raw,hash,event,parent_text):(String,String,String,String,String)=connection.query_row(
+            "SELECT j.snapshot,j.result,w.request_hash,e.data,parent.snapshot FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id JOIN jobs parent ON parent.id=w.workflow_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE j.id=?1 AND w.workflow_id=?2 AND j.kind='text' AND j.provider='codex' AND j.state='rejected' AND w.state='rejected' AND w.stage='storyboardCreate' AND j.error=w.error AND j.result=w.result AND json_extract(j.receipt,'$.validation')='rejected' AND json_extract(j.receipt,'$.contract')='desktop-runner/v1' AND parent.kind='workflow' AND parent.entity_id='storyboard.run'",
+            rusqlite::params![job,workflow],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(digest(&snapshot),hash);
+        let author:TextRequest=serde_json::from_str(&snapshot).unwrap();
+        let raw_value:Value=serde_json::from_str(&raw).unwrap();
+        let event:Value=serde_json::from_str(&event).unwrap();
+        let parent:Value=serde_json::from_str(&parent_text).unwrap();
+        assert_eq!(event["requestHash"],hash);
+        assert_eq!(event["value"],raw_value);
+        let frozen=&parent["input"];
+        assert_eq!(frozen["storyboardAssetInputProfile"],asset_cards::SCOPED_PROFILE);
+        assert!(author.input.get("storyboardAssetInputProfile").is_none(),"this exact saved role intentionally omits the internal parent marker");
+        let source:LockedSource=serde_json::from_value(frozen["source"].clone()).unwrap();
+        let source=upgrade_source_dialogues(&source).unwrap();
+        validate_source(&source).unwrap();
+        let episode_id=text(&author.input,"episodeId");
+        let episode=source.episodes.iter().find(|episode|episode.id==episode_id).unwrap();
+        let mut assets=episode_assets(frozen["assets"].as_array().unwrap(),episode_id);
+        asset_cards::inherit_identity_aliases(frozen,&mut assets).unwrap();
+        let rows:Vec<_>=source.rows.iter().filter(|row|row.kind=="body" && row.episode_id.as_deref()==Some(episode_id)).cloned().collect();
+        let decisions=scoped_author_decisions(&source,frozen,&rows).unwrap();
+        let context=decision_context(&source,&rows,&relevant_context(&source,episode,&assets,&frozen["foundation"]),decisions.as_ref());
+        let refs=strings(&author.input["executionBatch"],"sourceRefs").unwrap();
+        let style=text(&author.input["settings"],"visualStyle");
+        let prefix=format!("{episode_id}:{}:",text(&author.input["executionBatch"],"id"));
+        let mut checked=raw_value.clone();
+        let reason=validate_authored(&source,&mut checked,&assets,&author.input["capabilities"],&refs,style,&prefix).unwrap_err();
+        assert_eq!(reason,crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION,"revalidation must reach the exact known secondary domain defect without adopting the raw");
+        let plan_text:String=connection.query_row("SELECT w.result FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardPlan' AND w.state='accepted' AND j.state='completed' AND json_extract(j.snapshot,'$.input.episode.id')=?2",rusqlite::params![workflow,episode_id],|row|row.get(0)).unwrap();
+        let plan:Value=serde_json::from_str(&plan_text).unwrap();
+        let selected=author.input["selectedFantasy"].as_array().unwrap();
+        let (draft,issues)=author_validation_candidate(&source,&raw_value,&assets,&author.input["capabilities"],&refs,style,&prefix,&plan,selected,&reason).unwrap();
+        assert!(!issues.is_empty());
+        let execution=&author.input["executionBatch"];
+        let scope=AcceptedAuthorScope {index:0,batch:original::ExecutionBatch {
+            id:text(execution,"id").into(),package_ids:strings(execution,"packageIds").unwrap(),source_refs:refs,
+            provisional_unit_ids:strings(execution,"provisionalUnitIds").unwrap(),estimated_seconds:execution["estimatedSeconds"].as_f64().unwrap(),exceeds_soft_target:execution["exceedsSoftTarget"].as_bool().unwrap(),
+        },input:author.input.clone(),draft};
+        let prepared=bind_scope_repair_request(finish_request(&[scope.clone()],&plan,&rows,&context,&assets,selected,episode_id,&author.model,&author.reasoning,frozen.get("voiceReference"),None,None).unwrap(),&source.sha256,&raw_value,&author,&scope,&issues,1).unwrap();
+        let legacy=prepared.0.clone();
+        // The actual Saved selector runs only against this disposable copy.
+        // All IDs/snapshots/settings remain the saved ones; no mock hash oracle.
+        let isolated=tempfile::tempdir().unwrap();
+        let copied=isolated.path().join("project.sqlite");
+        std::fs::copy(&path,&copied).unwrap();
+        let wal=path.with_file_name("project.sqlite-wal");
+        if wal.exists() {std::fs::copy(&wal,isolated.path().join("project.sqlite-wal")).unwrap();}
+        let saved=crate::text_executor::SavedTextExecutor {store:crate::store::Store {root:isolated.path().to_path_buf()},settings:frozen["settings"].clone(),workflow_id:Some(workflow.clone())};
+        let counts=|c:&Connection|->(i64,i64) {c.query_row("SELECT (SELECT COUNT(*) FROM jobs),(SELECT COUNT(*) FROM events)",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap()};
+        let isolated_counts=counts(&saved.store.conn().unwrap());
+        let projected=prepare_finish_assets(prepared,frozen,&assets,&saved).await.unwrap().0;
+        assert_eq!(counts(&saved.store.conn().unwrap()),isolated_counts,"the real selector cannot insert a task or spend an attempt");
+        assert_eq!(projected.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],digest(&frozen.to_string()));
+        assert_eq!(projected.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"],digest(&serde_json::to_string(&legacy).unwrap()));
+        assert_eq!(serde_json::to_value(creative::prepare_request(projected.clone()).unwrap()).unwrap(),serde_json::to_value(&projected).unwrap());
+        for field in ["previousDraft","sourceRows","contextRows","authorRepair","validationIssues","executionBatch","baseDraftHash"] {
+            assert_eq!(legacy.input[field],projected.input[field],"{field} must remain complete and exact");
+        }
+        assert_eq!(legacy.rule_snapshot,projected.rule_snapshot,"all Mac primary/method/runtime texts are unchanged");
+        assert_eq!(legacy.schema,projected.schema);
+        assert!(projected.input.get("frozenFinisherAssetContext").is_none());
+        let metric=|value:&Value| {let text=value.to_string();json!({"utf16":text.encode_utf16().count(),"bytes":text.len()})};
+        let measure=|request:&TextRequest| {
+            let compiled=crate::text_executor::compile_codex_input(request).unwrap();
+            let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();
+            let fields:serde_json::Map<String,Value>=prompt["input"].as_object().unwrap().iter().map(|(field,value)|(field.clone(),metric(value))).collect();
+            let top:serde_json::Map<String,Value>=prompt.as_object().unwrap().iter().map(|(field,value)|(field.clone(),metric(value))).collect();
+            json!({"actualUtf16":compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),"actualBytes":compiled.prompt.len()+compiled.schema.len(),
+                "promptUtf16":compiled.prompt.encode_utf16().count(),"schemaUtf16":compiled.schema.encode_utf16().count(),"promptBytes":compiled.prompt.len(),"schemaBytes":compiled.schema.len(),"topLevelValues":top,"inputValues":fields,
+                "canonicalAssets":metric(&request.input["assets"]),"assetCount":request.input["assets"].as_array().unwrap().len()})
+        };
+        let old=measure(&legacy); let new=measure(&projected);
+        let report=json!({"readOnlyOriginal":true,"actualSavedHook":true,"newModelCalls":0,"newJobs":0,"newEvents":0,"adopted":0,"videoRequests":0,
+            "sourceSha256":source.sha256,"workflowId":workflow,"authorJobId":job,"authorRequestHash":hash,"originalAuthorRawSha256":digest(&raw),"originalSnapshotSha256":digest(&snapshot),
+            "limitUtf16":FINISH_TRANSPORT_LIMIT,"legacy":old,"projected":new,"issues":issues.iter().map(|issue|json!({"code":issue["code"],"coordinate":issue["coordinate"],"assetId":issue["assetId"],"sourceRefs":issue["sourceRefs"]})).collect::<Vec<_>>(),
+            "unchanged":["sourceRows","contextRows","previousDraft","schema","ruleSnapshot","authorRepair","executionBatch","originalAuthorInput","originalRaw"],"frozenWorkflowInputSha256":digest(&frozen.to_string())});
+        connection.execute_batch("ROLLBACK;").unwrap();
+        let after:(String,String)=connection.query_row("SELECT snapshot,result FROM jobs WHERE id=?1",[&job],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(after,(snapshot,raw));
+        drop(connection);
+        assert_eq!(crate::store::hash_file(&path).unwrap(),before);
+        println!("{}",report);
+        if let Ok(report_path)=std::env::var("DIRECTOR_FINISH_ASSETS_READONLY_REPORT") {
+            let report_path=Path::new(&report_path);
+            assert!(report_path.parent().unwrap().canonicalize().unwrap().starts_with(&evidence_root));
+            std::fs::write(report_path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        assert!(old["actualUtf16"].as_u64().unwrap()>FINISH_TRANSPORT_LIMIT as u64,"saved legacy input must reproduce this actual capacity defect");
+        assert!(new["actualUtf16"].as_u64().unwrap()<=FINISH_TRANSPORT_LIMIT as u64,"the complete source/method/editor packet must fit without truncation");
     }
 
     #[test]
