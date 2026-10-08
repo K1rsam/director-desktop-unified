@@ -12,6 +12,18 @@ pub(super) const AUTHOR_SCOPE_REPAIR_PROFILE: &str = "rejected-author-scope-repa
 pub(super) const AUTHOR_SCOPE_REPAIR_EXECUTION_VERSION: &str = "author-domain-repair/v1";
 pub(super) const FINISH_SCOPE_REPAIR_PROFILE: &str = "rejected-finish-scope-repair/v1";
 pub(super) const FINISH_SCOPE_REPAIR_EXECUTION_VERSION: &str = "finish-domain-repair/v1";
+pub(super) const FINISH_BOUNDARY_PROFILE_FIELD: &str = "finisherBoundaryInputProfile";
+pub(super) const FINISH_BOUNDARY_PROOF_FIELD: &str = "finisherBoundaryInputProjection";
+pub(super) const FINISH_BOUNDARY_PROFILE: &str = "program-export-boundary/v1";
+pub(super) const FINISH_BOUNDARY_PROJECTION_VERSION: &str = "finisher-boundary-input-projection/v1";
+const PROGRAM_EXPORT_FIELDS: [&str; 6] = [
+    "prompt",
+    "channelPromptTemplate",
+    "referenceBindings",
+    "visualStyle",
+    "seedanceExportVersion",
+    PROFILE_FIELD,
+];
 // Execution provenance only: the same original editor and creative standards
 // apply. A rejected author's data is not promoted to a verified/adopted draft.
 const AUTHOR_SCOPE_REPAIR_EXECUTION: &str = "本次是原运行时的未采用主创候选→原整编差量修订。authorRepair与validationIssues是执行核绑定的原主创请求、原回包和正式资产适用范围问题；previousDraft仅通过来源与身份硬校验，尚未通过完整领域验收，不是已采用稿。依原episode-finishing-editor方法修好本次明确问题，交完整差量作品；未涉及单元原样保留，连续原文或幻想关联组须完整处理。资产目录与实际集场真值不变，不修改目录、原文、说者、声道或幻想许可来消除错误；纯VO/OS不证明角色入画，按原规则核对实际声画和参考素材。baseDraftHash逐字回填，修订回包仍须完整通过所有来源、身份、适用范围、原话与创作合同校验后才采用。原主创请求及未采用回包保持原样，不重新主创。";
@@ -131,21 +143,72 @@ pub(super) fn finish_plan_view(plan: &Value, input: &Value, dependency_exits: &V
     view
 }
 
+fn remove_unit_program_exports(unit: &mut Value) -> bool {
+    let Some(map) = unit.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in PROGRAM_EXPORT_FIELDS {
+        changed |= map.remove(key).is_some();
+    }
+    changed
+}
+
 fn remove_program_exports(draft: &mut Value) {
     for unit in draft["units"].as_array_mut().into_iter().flatten() {
-        if let Some(map) = unit.as_object_mut() {
-            for key in [
-                "prompt",
-                "channelPromptTemplate",
-                "referenceBindings",
-                "visualStyle",
-                "seedanceExportVersion",
-                PROFILE_FIELD,
-            ] {
-                map.remove(key);
-            }
-        }
+        remove_unit_program_exports(unit);
     }
+}
+
+/// A new, not-yet-dispatched editor may omit only the reproducible exports of
+/// its next unit. Do not put this in `prepare_request`: old paid domains must
+/// retain their original boundary, and the Saved selector chooses their exact
+/// legacy, asset-only, or boundary-projected request before any dispatch.
+pub(super) fn project_finish_boundary(request: TextRequest) -> Result<TextRequest, String> {
+    if request.input.get(FINISH_BOUNDARY_PROFILE_FIELD).is_some()
+        || request.input.get(FINISH_BOUNDARY_PROOF_FIELD).is_some()
+    {
+        return Err("整编下一边界已持有投影身份；保留原请求，未重新投影".into());
+    }
+    let Some(asset_proof) = request.input.get("finisherAssetInputProjection") else {
+        return Ok(request);
+    };
+    if request.stage != "storyboardFinish"
+        || request.skill != "episode-finishing-editor"
+        || asset_proof["version"] != "finisher-asset-input-projection/v1"
+        || request.input["storyboardAssetInputProfile"] != "asset-production-card/v2"
+    {
+        return Err("整编下一边界缺少准确冻结资产投影；原输入保留".into());
+    }
+    let original_boundary = request.input["nextBoundary"].clone();
+    let mut boundary = original_boundary.clone();
+    if !remove_unit_program_exports(&mut boundary) {
+        return Ok(request);
+    }
+    // Bind only after every creative/runtime/settings transform has finished.
+    // All creative fields, including nested same-named fields, stay untouched.
+    let original_text = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    let proof = json!({
+        "version":FINISH_BOUNDARY_PROJECTION_VERSION,
+        "profile":FINISH_BOUNDARY_PROFILE,
+        "sourceSha256":asset_proof["sourceSha256"],
+        "episodeId":request.input["episodeId"],
+        "frozenWorkflowInputSha256":asset_proof["frozenWorkflowInputSha256"],
+        "assetOnlyDomainRequestSha256":digest(&original_text),
+        "originalBoundarySha256":digest(&original_boundary.to_string()),
+        "projectedBoundarySha256":digest(&boundary.to_string()),
+        "removedFields":PROGRAM_EXPORT_FIELDS,
+        "creativeInputPreserved":true
+    });
+    let mut projected = request.clone();
+    projected.input["nextBoundary"] = boundary;
+    projected.input[FINISH_BOUNDARY_PROFILE_FIELD] = json!(FINISH_BOUNDARY_PROFILE);
+    projected.input[FINISH_BOUNDARY_PROOF_FIELD] = proof;
+    let projected_text = serde_json::to_string(&projected).map_err(|e| e.to_string())?;
+    if projected_text.encode_utf16().count() >= original_text.encode_utf16().count() {
+        return Ok(request);
+    }
+    Ok(projected)
 }
 
 fn old_timing_rounding(brief: &mut Value) {
@@ -1150,6 +1213,70 @@ mod tests {
             "visualStyle"
         )
         .contains("画幅9:16"));
+    }
+
+    fn prepared_boundary_candidate(boundary: Value) -> TextRequest {
+        let sha = "a".repeat(64);
+        prepare_request(TextRequest {
+            stage: "storyboardFinish".into(),
+            skill: "episode-finishing-editor".into(),
+            model: "offline".into(),
+            reasoning: "medium".into(),
+            input: json!({PROFILE_FIELD:PROFILE,"finishMode":"delta","episodeId":"episode",
+                "nextBoundary":boundary,"settings":{"fantasyMode":"off"},
+                "storyboardAssetInputProfile":"asset-production-card/v2",
+                "finisherAssetInputProjection":{"version":"finisher-asset-input-projection/v1",
+                    "sourceSha256":sha,"frozenWorkflowInputSha256":sha}}),
+            schema: json!({}),
+            rule_snapshot: snapshot("episode-finishing-editor", &[]).unwrap(),
+        }).unwrap()
+    }
+
+    #[test]
+    fn new_finish_boundary_omits_only_top_level_program_exports_and_binds_final_domain() {
+        let boundary = json!({"id":"next-unit","sourceRefs":["locked-row"],
+            "initialState":"原初态","exitState":"原末态","assetRefs":[{"assetId":"asset:base"}],
+            "shots":[{"picture":"完整创作镜头","prompt":"nested creative field stays",
+                "dialogueParts":[{"lineId":"line","quoteStart":7,"quoteEnd":13,"delivery":"完整演法"}]}],
+            "soundSources":[{"speaker":"原说者","channel":"VO"}],"prompt":"导出".repeat(2500),
+            "channelPromptTemplate":"导出".repeat(1000),"referenceBindings":[{"compiled":"export"}],
+            "visualStyle":"program style","seedanceExportVersion":"export",PROFILE_FIELD:PROFILE});
+        let original = prepared_boundary_candidate(boundary.clone());
+        let projected = project_finish_boundary(original.clone()).unwrap();
+        assert_eq!(projected.input[FINISH_BOUNDARY_PROFILE_FIELD],FINISH_BOUNDARY_PROFILE);
+        let proof = &projected.input[FINISH_BOUNDARY_PROOF_FIELD];
+        assert_eq!(proof["assetOnlyDomainRequestSha256"],digest(&serde_json::to_string(&original).unwrap()));
+        assert_eq!(proof["originalBoundarySha256"],digest(&boundary.to_string()));
+        assert_eq!(proof["projectedBoundarySha256"],digest(&projected.input["nextBoundary"].to_string()));
+        assert_eq!(proof["removedFields"],json!(PROGRAM_EXPORT_FIELDS));
+        let mut expected_boundary = boundary.clone();
+        for field in PROGRAM_EXPORT_FIELDS {expected_boundary.as_object_mut().unwrap().remove(field);}
+        assert_eq!(projected.input["nextBoundary"],expected_boundary);
+        assert_eq!(projected.input["nextBoundary"]["shots"][0]["prompt"],"nested creative field stays");
+        let mut restored = projected.clone();
+        restored.input["nextBoundary"] = boundary;
+        restored.input.as_object_mut().unwrap().remove(FINISH_BOUNDARY_PROFILE_FIELD);
+        restored.input.as_object_mut().unwrap().remove(FINISH_BOUNDARY_PROOF_FIELD);
+        assert_eq!(serde_json::to_value(restored).unwrap(),serde_json::to_value(&original).unwrap());
+        assert_eq!(serde_json::to_value(prepare_request(projected.clone()).unwrap()).unwrap(),serde_json::to_value(&projected).unwrap(),"the final wrapper cannot shift the proof hash or source domain");
+        assert_eq!(projected.rule_snapshot,original.rule_snapshot);
+        assert_eq!(projected.schema,original.schema);
+        assert!(serde_json::to_string(&projected).unwrap().encode_utf16().count()<serde_json::to_string(&original).unwrap().encode_utf16().count());
+    }
+
+    #[test]
+    fn boundary_projection_keeps_legacy_empty_and_non_beneficial_requests_exact() {
+        for boundary in [Value::Null,json!({"id":"next","shots":[{"picture":"完整"}]}),json!({"prompt":"small"})] {
+            let original = prepared_boundary_candidate(boundary);
+            assert_eq!(serde_json::to_value(project_finish_boundary(original.clone()).unwrap()).unwrap(),serde_json::to_value(&original).unwrap());
+            assert!(original.input.get(FINISH_BOUNDARY_PROOF_FIELD).is_none());
+        }
+        let mut legacy = prepared_boundary_candidate(json!({"prompt":"export".repeat(2000)}));
+        legacy.input.as_object_mut().unwrap().remove("finisherAssetInputProjection");
+        assert_eq!(serde_json::to_value(project_finish_boundary(legacy.clone()).unwrap()).unwrap(),serde_json::to_value(&legacy).unwrap(),"unmarked old workflow retains its boundary and canonical bytes");
+        let mut held = legacy;
+        held.input[FINISH_BOUNDARY_PROFILE_FIELD] = json!(FINISH_BOUNDARY_PROFILE);
+        assert!(project_finish_boundary(held).is_err(),"a dispatched identity cannot be refreshed");
     }
     #[test]
     fn original_creative_runtime_rules_are_trusted_not_source_instructions() {

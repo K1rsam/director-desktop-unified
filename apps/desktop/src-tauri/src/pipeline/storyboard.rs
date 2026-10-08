@@ -404,6 +404,18 @@ fn finish_request(
     input.as_object_mut().unwrap().remove("frozenFinisherAssetContext");
     // A following editor is a new node. Its proof must bind this request, not
     // the already-dispatched editor whose unmodified input is held in `scope`.
+    if input.get(creative::FINISH_BOUNDARY_PROFILE_FIELD).is_some()
+        || input.get(creative::FINISH_BOUNDARY_PROOF_FIELD).is_some()
+    {
+        if input[creative::FINISH_BOUNDARY_PROFILE_FIELD] != creative::FINISH_BOUNDARY_PROFILE
+            || input[creative::FINISH_BOUNDARY_PROOF_FIELD]["version"]
+                != creative::FINISH_BOUNDARY_PROJECTION_VERSION
+        {
+            return Err("上一整编边界投影版本不成立；原请求保留，未派发新节点".into());
+        }
+        input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROFILE_FIELD);
+        input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROOF_FIELD);
+    }
     if let Some(proof) = input.get("finisherAssetInputProjection") {
         if proof["version"] != "finisher-asset-input-projection/v1"
             || input["storyboardAssetInputProfile"] != asset_cards::SCOPED_PROFILE
@@ -531,6 +543,7 @@ async fn prepare_finish_assets(
     projected = creative::prepare_request(projected)?;
     projected.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
         json!(digest(&serde_json::to_string(&legacy).map_err(|e| e.to_string())?));
+    projected = creative::project_finish_boundary(projected)?;
     let actual = executor
         .prepare_finish_asset_projection(legacy, projected)
         .await?;
@@ -6098,6 +6111,71 @@ mod production_contract_tests {
         }
     }
 
+    #[tokio::test]
+    async fn ordinary_and_bounded_finish_boundary_domains_rebuild_exactly_for_legacy_v1_and_new_origins() {
+        let (source, mut author, mut scope, raw, plan, issues) = same_episode_coordinate_fixture();
+        let mut frozen = input(&source);
+        frozen["assets"] = author.input["assets"].clone();
+        frozen["storyboardAssetInputProfile"] = json!(asset_cards::SCOPED_PROFILE);
+        super::super::stage3_pack::mark_input(&mut frozen).unwrap();
+        super::super::stage3_pack::mark_input(&mut author.input).unwrap();
+        author.input["assetCatalogScope"] = json!({"version":asset_cards::SCOPED_PROFILE,
+            "episodeId":source.episodes[0].id,"sourceSha256":source.sha256});
+        author = creative::prepare_request(author).unwrap();
+        scope.input = author.input.clone();
+        let rows: Vec<_> = source.rows.iter().filter(|row|row.kind=="body").cloned().collect();
+        let assets = frozen["assets"].as_array().unwrap();
+        let next = json!({"id":"next-unit","sourceRefs":[rows[1].id],"shots":[{"picture":"完整后稿","sourceRefs":[rows[1].id]}],
+            "initialState":"后稿初态不改","exitState":"后稿末态不改","soundSources":[{"channel":"OS","text":"完整原话"}],
+            "prompt":"程序导出".repeat(3000),"channelPromptTemplate":"程序导出".repeat(1000),
+            "referenceBindings":[],"visualStyle":"program style","seedanceExportVersion":"program export",creative::PROFILE_FIELD:creative::PROFILE});
+        let exec = Recorded::default();
+        let prepared = finish_request(&[scope.clone()],&plan,&rows,&[],assets,&[],&source.episodes[0].id,
+            "offline","medium",None,None,Some(&next)).unwrap();
+        let legacy = prepared.0.clone();
+        let new = prepare_finish_assets(prepared.clone(),&frozen,assets,&exec).await.unwrap().0;
+        assert_eq!(new.input[creative::FINISH_BOUNDARY_PROFILE_FIELD],creative::FINISH_BOUNDARY_PROFILE);
+        let mut asset_v1 = new.clone();
+        asset_v1.input["nextBoundary"] = next.clone();
+        asset_v1.input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROFILE_FIELD);
+        asset_v1.input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROOF_FIELD);
+        assert_eq!(new.input[creative::FINISH_BOUNDARY_PROOF_FIELD]["assetOnlyDomainRequestSha256"],digest(&serde_json::to_string(&asset_v1).unwrap()));
+        // The accepted original Author repair had no next boundary. Keep its
+        // exact asset-only v1 domain instead of adding a new identity marker.
+        let author_prepared = bind_scope_repair_request(finish_request(&[scope.clone()],&plan,&rows,&[],assets,&[],
+            &source.episodes[0].id,"offline","medium",None,None,None).unwrap(),
+            &source.sha256,&raw,&author,&scope,&issues,1).unwrap();
+        let author_repair = prepare_finish_assets(author_prepared.clone(),&frozen,assets,&exec).await.unwrap().0;
+        assert!(author_repair.input.get(creative::FINISH_BOUNDARY_PROOF_FIELD).is_none());
+        assert_eq!(serde_json::to_value(&author_repair).unwrap(),serde_json::to_value(prepare_finish_assets(author_prepared,&frozen,assets,&exec).await.unwrap().0).unwrap());
+        for origin in [legacy,asset_v1,new] {
+            let original_bytes = serde_json::to_string(&origin).unwrap();
+            let mut current = scope.clone();
+            current.input = origin.input.clone();
+            for attempt in 1..=2 {
+                let current_bytes = serde_json::to_string(&current.input).unwrap();
+                let prepared = bind_scope_repair_request(finish_request(&[current.clone()],&plan,&rows,&[],assets,&[],
+                    &source.episodes[0].id,"offline","medium",None,None,origin.input.get("nextBoundary")).unwrap(),
+                    &source.sha256,&raw,&origin,&scope,&issues,attempt).unwrap();
+                let repair = prepare_finish_assets(prepared.clone(),&frozen,assets,&exec).await.unwrap().0;
+                let repeated = prepare_finish_assets(prepared,&frozen,assets,&exec).await.unwrap().0;
+                assert_eq!(serde_json::to_value(&repair).unwrap(),serde_json::to_value(repeated).unwrap(),"same bounded node rebuilds exactly across two reopens");
+                assert_eq!(repair.input["finishRepair"]["originDomainRequestSha256"],digest(&original_bytes));
+                assert_eq!(repair.input["finishRepair"]["attempt"],attempt);
+                assert_eq!(repair.input["finishRepair"]["maximumAttempts"],2);
+                assert_eq!(repair.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],digest(&frozen.to_string()));
+                assert_eq!(serde_json::to_value(creative::prepare_request(repair.clone()).unwrap()).unwrap(),serde_json::to_value(&repair).unwrap());
+                assert_eq!(serde_json::to_string(&current.input).unwrap(),current_bytes,"following-node cleanup cannot rewrite its saved ancestor");
+                assert_eq!(serde_json::to_string(&origin).unwrap(),original_bytes);
+                // Match repair_author_scope: a later attempt uses the same
+                // original scope input, while only its rejected draft changes.
+                // A dispatched repair's provenance is not a new Author input.
+                current.draft["units"][0]["exitState"] = json!(format!("第{attempt}次未采用候选的完整末态"));
+            }
+        }
+        assert!(exec.calls.lock().await.is_empty(),"input rebuilding cannot execute or refresh the two-attempt budget");
+    }
+
     fn same_episode_coordinate_fixture() -> (
         LockedSource,
         TextRequest,
@@ -8573,6 +8651,151 @@ mod production_contract_tests {
         }
         assert!(old["actualUtf16"].as_u64().unwrap()>FINISH_TRANSPORT_LIMIT as u64,"saved legacy input must reproduce this actual capacity defect");
         assert!(new["actualUtf16"].as_u64().unwrap()<=FINISH_TRANSPORT_LIMIT as u64,"the complete source/method/editor packet must fit without truncation");
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit stable B database COPY; accepted repair and next Author, real Saved selector and CLI compiler, zero calls"]
+    async fn readonly_next_boundary_finish_projection_measures_actual_cli_and_preserves_accepted_v1() {
+        use rusqlite::{Connection, OpenFlags};
+        use std::path::Path;
+        let path = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_DB").expect("explicit stable database copy");
+        let workflow = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_WORKFLOW").expect("original workflow");
+        let author_id = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_AUTHOR").expect("original rejected Author");
+        let repair_id = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_REPAIR").expect("accepted asset-v1 Author repair");
+        let next_id = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_NEXT_AUTHOR").expect("accepted next Author");
+        let path = Path::new(&path).canonicalize().unwrap();
+        let evidence_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/live-acceptance-20261008").canonicalize().unwrap();
+        assert!(path.starts_with(&evidence_root),"never open the live project database");
+        let before = crate::store::hash_file(&path).unwrap();
+        let connection = Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        connection.execute_batch("PRAGMA query_only=ON; BEGIN;").unwrap();
+        let load = |id:&str|->Value {
+            connection.query_row(
+                "SELECT w.stage,w.state,w.request_hash,w.result,j.snapshot,j.result,j.receipt,j.state,j.kind,j.provider,e.data FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND j.id=?2",
+                rusqlite::params![workflow,id],|row|Ok(json!({
+                    "stage":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"hash":row.get::<_,String>(2)?,
+                    "adopted":row.get::<_,String>(3)?,"snapshot":row.get::<_,String>(4)?,"raw":row.get::<_,String>(5)?,
+                    "receipt":row.get::<_,String>(6)?,"jobState":row.get::<_,String>(7)?,"kind":row.get::<_,String>(8)?,
+                    "provider":row.get::<_,String>(9)?,"event":row.get::<_,String>(10)?}))).unwrap()
+        };
+        let author_record = load(&author_id);
+        let repair_record = load(&repair_id);
+        let next_record = load(&next_id);
+        for (record,state,stage) in [(&author_record,"rejected","storyboardCreate"),(&repair_record,"accepted","storyboardFinish"),(&next_record,"accepted","storyboardCreate")] {
+            assert_eq!(record["state"],state); assert_eq!(record["stage"],stage);
+            assert_eq!(record["jobState"],if state=="accepted" {"completed"} else {"rejected"});
+            assert_eq!(record["kind"],"text"); assert_eq!(record["provider"],"codex");
+            assert_eq!(digest(text(record,"snapshot")),record["hash"]);
+            let event:Value = serde_json::from_str(text(record,"event")).unwrap();
+            let raw:Value = serde_json::from_str(text(record,"raw")).unwrap();
+            let receipt:Value = serde_json::from_str(text(record,"receipt")).unwrap();
+            assert_eq!(event["requestHash"],record["hash"]);
+            if stage=="storyboardFinish" || state=="rejected" {
+                assert_eq!(event["value"],raw);
+            } else {
+                assert_eq!(record["raw"],record["adopted"],"the accepted Author's materialized cache must agree; its received raw is validated below");
+            }
+            assert_eq!(receipt["contract"],"desktop-runner/v1"); assert_eq!(receipt["validation"],state);
+        }
+        let (parent_text,parent_result):(String,String) = connection.query_row(
+            "SELECT snapshot,result FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run'",[&workflow],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let parent:Value = serde_json::from_str(&parent_text).unwrap();
+        let blocked:Value = serde_json::from_str(&parent_result).unwrap();
+        let frozen = &parent["input"];
+        let source:LockedSource = serde_json::from_value(frozen["source"].clone()).unwrap();
+        let source = upgrade_source_dialogues(&source).unwrap(); validate_source(&source).unwrap();
+        let author:TextRequest = serde_json::from_str(text(&author_record,"snapshot")).unwrap();
+        let repair:TextRequest = serde_json::from_str(text(&repair_record,"snapshot")).unwrap();
+        let next_author:TextRequest = serde_json::from_str(text(&next_record,"snapshot")).unwrap();
+        assert_eq!(repair.input["authorRepair"]["originDomainRequestSha256"],digest(&serde_json::to_string(&author).unwrap()));
+        assert_eq!(repair.input["authorRepair"]["originalAuthorRawSha256"],digest(text(&author_record,"raw")));
+        assert_eq!(repair.input["storyboardAssetInputProfile"],asset_cards::SCOPED_PROFILE);
+        assert!(repair.input.get(creative::FINISH_BOUNDARY_PROOF_FIELD).is_none());
+        assert!(repair.input["nextBoundary"].is_null(),"the accepted asset-v1 node is not eligible for new boundary semantics");
+        let accepted_repair:Value = serde_json::from_str(text(&repair_record,"adopted")).unwrap();
+        let next_draft:Value = serde_json::from_str(text(&next_record,"adopted")).unwrap();
+        assert!(accepted_repair["materializedDraft"]["units"].as_array().is_some_and(|units|!units.is_empty()));
+        let episode_id = text(&author.input,"episodeId");
+        assert_eq!(next_author.input["episodeId"],episode_id);
+        let episode = source.episodes.iter().find(|episode|episode.id==episode_id).unwrap();
+        let rows:Vec<_> = source.rows.iter().filter(|row|row.kind=="body" && row.episode_id.as_deref()==Some(episode_id)).cloned().collect();
+        let mut assets = episode_assets(frozen["assets"].as_array().unwrap(),episode_id);
+        asset_cards::inherit_identity_aliases(frozen,&mut assets).unwrap();
+        let decisions = scoped_author_decisions(&source,frozen,&rows).unwrap();
+        let context = decision_context(&source,&rows,&relevant_context(&source,episode,&assets,&frozen["foundation"]),decisions.as_ref());
+        let plan_text:String = connection.query_row(
+            "SELECT w.result FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardPlan' AND w.state='accepted' AND j.state='completed' AND json_extract(j.snapshot,'$.input.episode.id')=?2",
+            rusqlite::params![workflow,episode_id],|row|row.get(0)).unwrap();
+        let plan:Value = serde_json::from_str(&plan_text).unwrap();
+        let next_event:Value = serde_json::from_str(text(&next_record,"event")).unwrap();
+        let mut next_raw = next_event["value"].clone();
+        let next_refs = strings(&next_author.input["executionBatch"],"sourceRefs").unwrap();
+        let style = text(&next_author.input["settings"],"visualStyle");
+        validate_authored(&source,&mut next_raw,&assets,&next_author.input["capabilities"],&next_refs,style,
+            &format!("{episode_id}:{}:",text(&next_author.input["executionBatch"],"id"))).unwrap();
+        validate_event_bindings(&next_raw,&plan).unwrap();
+        validate_fantasy_profile(&next_raw,next_author.input["selectedFantasy"].as_array().unwrap(),true).unwrap();
+        creative::add_delivery(&mut next_raw,&source,style,&assets,true).unwrap();
+        assert_eq!(next_raw,next_draft,"the complete next boundary must reproduce from the preserved received raw and production validator");
+        let mut scope_input = author.input.clone();
+        assert!(accepted_repair["materializedDraft"]["authorRepairProvenance"].is_object());
+        scope_input["authorRepairProvenance"] = accepted_repair["materializedDraft"]["authorRepairProvenance"].clone();
+        let execution = &author.input["executionBatch"];
+        let scope = AcceptedAuthorScope {index:0,batch:original::ExecutionBatch {
+            id:text(execution,"id").into(),package_ids:strings(execution,"packageIds").unwrap(),source_refs:strings(execution,"sourceRefs").unwrap(),
+            provisional_unit_ids:strings(execution,"provisionalUnitIds").unwrap(),estimated_seconds:execution["estimatedSeconds"].as_f64().unwrap(),exceeds_soft_target:execution["exceedsSoftTarget"].as_bool().unwrap()},
+            input:scope_input,draft:accepted_repair["materializedDraft"].clone()};
+        let next = next_draft["units"].as_array().unwrap().first().unwrap();
+        let prepared = finish_request(&[scope],&plan,&rows,&context,&assets,author.input["selectedFantasy"].as_array().unwrap(),
+            episode_id,&author.model,&author.reasoning,frozen.get("voiceReference"),None,Some(next)).unwrap();
+        let legacy = creative::prepare_request(prepared.0.clone()).unwrap();
+        let mut asset_v1 = creative::prepare_request(asset_cards::project_finish_request(&legacy,frozen,&assets).unwrap()).unwrap();
+        asset_v1.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] = json!(digest(&serde_json::to_string(&legacy).unwrap()));
+        let isolated = tempfile::tempdir().unwrap();
+        std::fs::copy(&path,isolated.path().join("project.sqlite")).unwrap();
+        let wal = path.with_file_name("project.sqlite-wal");
+        if wal.exists() {std::fs::copy(&wal,isolated.path().join("project.sqlite-wal")).unwrap();}
+        let saved = crate::text_executor::SavedTextExecutor {store:crate::store::Store {root:isolated.path().to_path_buf()},settings:frozen["settings"].clone(),workflow_id:Some(workflow.clone())};
+        let counts = |connection:&Connection|->(i64,i64) {connection.query_row("SELECT (SELECT COUNT(*) FROM jobs),(SELECT COUNT(*) FROM events)",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap()};
+        let isolated_counts = counts(&saved.store.conn().unwrap());
+        let projected = prepare_finish_assets(prepared,frozen,&assets,&saved).await.unwrap().0;
+        assert_eq!(counts(&saved.store.conn().unwrap()),isolated_counts);
+        assert_eq!(projected.input[creative::FINISH_BOUNDARY_PROOF_FIELD]["assetOnlyDomainRequestSha256"],digest(&serde_json::to_string(&asset_v1).unwrap()));
+        let mut restored = projected.clone(); restored.input["nextBoundary"] = next.clone();
+        restored.input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROFILE_FIELD);
+        restored.input.as_object_mut().unwrap().remove(creative::FINISH_BOUNDARY_PROOF_FIELD);
+        assert_eq!(serde_json::to_value(restored).unwrap(),serde_json::to_value(&asset_v1).unwrap(),"only the six reproducible exports and bound projection metadata may differ");
+        assert_eq!(serde_json::to_value(creative::prepare_request(projected.clone()).unwrap()).unwrap(),serde_json::to_value(&projected).unwrap());
+        let metric = |value:&Value| {let text=value.to_string(); json!({"utf16":text.encode_utf16().count(),"bytes":text.len()})};
+        let measure = |request:&TextRequest| {
+            let compiled = crate::text_executor::compile_codex_input(request).unwrap();
+            let prompt:Value = serde_json::from_str(&compiled.prompt).unwrap();
+            let input_values:serde_json::Map<String,Value> = prompt["input"].as_object().unwrap().iter().map(|(key,value)|(key.clone(),metric(value))).collect();
+            let top_values:serde_json::Map<String,Value> = prompt.as_object().unwrap().iter().map(|(key,value)|(key.clone(),metric(value))).collect();
+            json!({"actualUtf16":compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),"actualBytes":compiled.prompt.len()+compiled.schema.len(),
+                "promptUtf16":compiled.prompt.encode_utf16().count(),"schemaUtf16":compiled.schema.encode_utf16().count(),"promptBytes":compiled.prompt.len(),"schemaBytes":compiled.schema.len(),"inputValues":input_values,"topLevelValues":top_values})
+        };
+        let old_measure = measure(&asset_v1); let new_measure = measure(&projected);
+        let saved_block = blocked["blocked"].as_array().unwrap().iter().find(|entry|entry["code"]=="FINISH_TRANSPORT_CAPACITY" && entry["episodeId"]==episode_id).unwrap();
+        let report = json!({"readOnlyOriginal":true,"actualSavedHook":true,"newModelCalls":0,"newJobs":0,"newEvents":0,"videoRequests":0,"workflowId":workflow,
+            "sourceSha256":source.sha256,"originalAuthorJobId":author_id,"acceptedAssetV1RepairJobId":repair_id,"nextAcceptedAuthorJobId":next_id,
+            "limitUtf16":FINISH_TRANSPORT_LIMIT,"savedCapacityBlock":saved_block,"assetV1":old_measure,"boundaryProjected":new_measure,
+            "originalBoundary":metric(next),"projectedBoundary":metric(&projected.input["nextBoundary"]),
+            "acceptedAssetV1SnapshotSha256":digest(text(&repair_record,"snapshot")),"acceptedAssetV1AdoptedSha256":digest(text(&repair_record,"adopted")),
+            "unchanged":["sourceRows","contextRows","previousDraft","baseDraftHash","plan","facts","schema","ruleSnapshot","originalAuthorRaw","acceptedRepair","nextAuthorCreativeStructure"]});
+        connection.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(load(&repair_id),repair_record); assert_eq!(load(&author_id),author_record); assert_eq!(load(&next_id),next_record);
+        drop(connection);
+        assert_eq!(crate::store::hash_file(&path).unwrap(),before);
+        println!("{}",report);
+        if let Ok(report_path) = std::env::var("DIRECTOR_FINISH_BOUNDARY_READONLY_REPORT") {
+            let report_path = Path::new(&report_path);
+            assert!(report_path.parent().unwrap().canonicalize().unwrap().starts_with(&evidence_root));
+            std::fs::write(report_path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        assert_eq!(old_measure["actualUtf16"],saved_block["actualCharacters"],"reproduce the exact production compiler and capacity failure");
+        assert!(old_measure["actualUtf16"].as_u64().unwrap()>FINISH_TRANSPORT_LIMIT as u64);
+        assert!(new_measure["actualUtf16"].as_u64().unwrap()<=FINISH_TRANSPORT_LIMIT as u64,"full source, methods and creative boundary must fit without increasing the limit");
     }
 
     #[test]

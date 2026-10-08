@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { choose, request } from './api';
 import { assetGenerationJob, generationBlocksNewJob, generationProgress } from './generationState';
-import { assetImages, assetImageSelection, generationChoices, imageBatchBlocked, imageBatchEstimate, imageDesignBusy, imageDesignJob, initializeImageParameters, ratioLabel, resolutionLabel, workflowResult } from './contracts';
-import { adoptedImage, Badge, Button, Empty, Icon, JsonDetails, jobActive, kindName, MediaPreview, messageOf, Modal, providerId, providerList, providerName } from './components';
+import { assetImages, assetImageSelection, generationChoices, imageBatchBlocked, imageBatchEstimate, imageDesignBusy, initializeImageParameters, ratioLabel, resolutionLabel, workflowResult } from './contracts';
+import { adoptedImage, Badge, Button, Empty, Icon, JsonDetails, kindName, MediaPreview, messageOf, Modal, providerId, providerList, providerName } from './components';
 import type { Asset, JsonObject, Media, Model, Mutation, Workspace } from './types';
 import { AssetDeleteDialog, AssetEditDialog, DeletedAssetsDialog } from './AssetLifecycleDialogs';
 import { foundationCoverage } from './foundationCoverage';
 import { assetMatchesEpisode, deletedAssetsFrom } from './assetManagement';
+import { selectAssetDesignProgress } from './assetDesignProgress';
 
 function ImageCostSummary({ workspace, ids, provider, model, oneClick = false }: { workspace: Workspace; ids: string[]; provider: string; model: Model | string | undefined; oneClick?: boolean }) {
   const estimate = imageBatchEstimate(workspace, ids, provider, model);
@@ -19,15 +20,12 @@ function ImageCostSummary({ workspace, ids, provider, model, oneClick = false }:
 type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; inspect: (media: Media) => void; onNotice: (notice: string) => void; onError: (error: string) => void; onTasks: () => void };
 function needsImage(asset: Asset): boolean { const mode = (asset.preparation as JsonObject | undefined)?.mode; return !['INLINE', 'AUDIO', 'UNRESOLVED'].includes(String(mode || '')); }
 function ImageDesignProgress({ workspace, onTasks }: { workspace: Workspace; onTasks: () => void }) {
-  const job = workspace.jobs.find(item => item.kind === 'workflow' && imageDesignJob(item));
-  const active = job && jobActive(job), step = active ? workspace.jobs.find(item => item.kind === 'text' && imageDesignJob(item) && jobActive(item)) : undefined;
   const [clock, setClock] = useState(Date.now());
-  useEffect(() => { if (!active) return; const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [active]);
-  if (!job || !active && job.status !== 'failed') return null;
-  const seconds = Math.max(0, Math.floor((clock - Date.parse(String(step?.createdAt || job.createdAt || new Date().toISOString()))) / 1000));
-  const entity = String(step?.entityId || '');
-  const phase = entity.startsWith('assetVisualFacts:') ? '提取原文视觉事实' : entity.startsWith('assetDesign:') ? '设计资产提示词' : '准备图片制作';
-  return <section className="surface production-progress" aria-label="图片制作进度"><div className="production-progress-heading"><div><strong>{active ? phase : '图片制作需要处理'}</strong><span>{active ? `本步已运行 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : messageOf(job.error)}</span></div><Button icon="tasks" onClick={onTasks}>查看制作任务</Button></div><p className="muted">已有 {workspace.assets.filter(item => needsImage(item) && item.prompt?.trim()).length} 项提示词。视觉事实按原文范围提取并缓存，资产设计按来源依赖推进。</p></section>;
+  const progress = selectAssetDesignProgress(workspace, clock), ticking = !!progress?.active && !progress.readFailed;
+  useEffect(() => { if (!ticking) return; setClock(Date.now()); const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [progress?.workflowId, ticking]);
+  if (!progress) return null;
+  const { job, elapsedSeconds } = progress;
+  return <section className="surface production-progress" aria-label="图片制作进度"><div className="production-progress-heading"><div><strong>{progress.readFailed ? '上次记录：' : ''}{progress.phase}</strong><span>{elapsedSeconds === null ? '流程用时待刷新' : `整个流程已用时 ${Math.floor(elapsedSeconds / 60)} 分 ${elapsedSeconds % 60} 秒`}</span></div><Button icon="tasks" onClick={onTasks}>查看制作任务</Button></div><p>{progress.designLabel}</p><p className="muted">{progress.factLabel}。资产设计按来源依赖推进；已核验结果保存在本次任务中，完整流程结束后整批保存到资产库。</p>{progress.readFailed && <p className="warning">刷新失败，显示上次记录。</p>}{!progress.active && job.error && <p className="warning">{messageOf(job.error)}</p>}</section>;
 }
 export function AssetPanel({ workspace, writable, mutate, inspect, onNotice, onError, onTasks }: Props) {
   const [selected, setSelected] = useState(workspace.assets[0]?.id || ''), [query, setQuery] = useState(''), [filter, setFilter] = useState('all');

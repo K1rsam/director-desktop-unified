@@ -1,9 +1,69 @@
 use super::*;
 
 const POLICY: &str = "finisher-asset-input-projection/v1";
+const BOUNDARY_POLICY: &str = "finisher-boundary-input-projection/v1";
+const BOUNDARY_PROFILE: &str = "program-export-boundary/v1";
+const BOUNDARY_EXPORT_FIELDS: [&str; 6] = [
+    "prompt",
+    "channelPromptTemplate",
+    "referenceBindings",
+    "visualStyle",
+    "seedanceExportVersion",
+    "storyboardCreativeProfile",
+];
 const API_EXISTING_NODE_HELD: &str = "API_FINISH_EXISTING_NODE_HELD: 原整编API节点尚未处理完，或原采用缓存证据不完整；保留原请求、回包和预算，不创建或重发任务";
 fn held() -> String {
     "FINISH_ASSET_PROJECTION_UNBOUND: 整编资产卡与原流程或已存在请求不一致；保留原任务，未提交新请求".into()
+}
+
+/// Reconstruct the already supported asset-only request, not a replacement for
+/// a persisted request. Every boundary edit must be a proven top-level export
+/// removal; creative material and the asset-v1 proof remain byte-equivalent.
+fn asset_only_finish_request(legacy: &TextRequest, projected: &TextRequest) -> Result<TextRequest> {
+    if legacy.input.get("finisherBoundaryInputProfile").is_some()
+        || legacy.input.get("finisherBoundaryInputProjection").is_some()
+    {
+        return Err(held());
+    }
+    if projected.input.get("finisherBoundaryInputProfile").is_none()
+        && projected.input.get("finisherBoundaryInputProjection").is_none()
+    {
+        return Ok(projected.clone());
+    }
+    let original_boundary = legacy.input.get("nextBoundary").ok_or_else(held)?;
+    let mut stripped_boundary = original_boundary.clone();
+    let boundary = stripped_boundary.as_object_mut().ok_or_else(held)?;
+    let mut removed = false;
+    for field in BOUNDARY_EXPORT_FIELDS {
+        removed |= boundary.remove(field).is_some();
+    }
+    if !removed || projected.input.get("nextBoundary") != Some(&stripped_boundary) {
+        return Err(held());
+    }
+    let mut asset_only = projected.clone();
+    let input = asset_only.input.as_object_mut().ok_or_else(held)?;
+    input.insert("nextBoundary".into(), original_boundary.clone());
+    input.remove("finisherBoundaryInputProfile");
+    input.remove("finisherBoundaryInputProjection");
+    let asset_only_text = serde_json::to_string(&asset_only).map_err(|_| held())?;
+    let expected = json!({
+        "version":BOUNDARY_POLICY,"profile":BOUNDARY_PROFILE,
+        "sourceSha256":asset_only.input["finisherAssetInputProjection"]["sourceSha256"],
+        "episodeId":asset_only.input["episodeId"],
+        "frozenWorkflowInputSha256":asset_only.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],
+        "assetOnlyDomainRequestSha256":crate::pipeline::digest(&asset_only_text),
+        "originalBoundarySha256":crate::pipeline::digest(&original_boundary.to_string()),
+        "projectedBoundarySha256":crate::pipeline::digest(&stripped_boundary.to_string()),
+        "removedFields":BOUNDARY_EXPORT_FIELDS,"creativeInputPreserved":true
+    });
+    if projected.input["finisherBoundaryInputProfile"] != BOUNDARY_PROFILE
+        || projected.input["finisherBoundaryInputProjection"] != expected
+        || serde_json::to_string(projected).map_err(|_| held())?.encode_utf16().count()
+            >= asset_only_text.encode_utf16().count()
+    {
+        return Err(held());
+    }
+    Ok(asset_only)
 }
 
 impl SavedTextExecutor {
@@ -66,7 +126,7 @@ impl SavedTextExecutor {
         Ok(())
     }
 
-    /// Select only the exact old/new domain at the same persisted node. This
+    /// Select only an exact legacy/asset-v1/boundary-v1 domain at the same node. This
     /// never creates a task, spends a repair attempt, or rewrites a frozen input.
     pub(super) fn saved_finish_asset_projection(
         &self,
@@ -85,18 +145,19 @@ impl SavedTextExecutor {
             [run], |r| r.get(0),
         ).map_err(|_| held())?;
         let parent: Value = serde_json::from_str(&parent_text).map_err(|_| held())?;
-        let proof = &projected.input["finisherAssetInputProjection"];
+        let asset_only = asset_only_finish_request(&legacy, &projected)?;
+        let proof = &asset_only.input["finisherAssetInputProjection"];
         let sha = crate::pipeline::digest;
         let original = serde_json::to_value(&legacy).map_err(|_| held())?;
-        let mut restored = serde_json::to_value(&projected).map_err(|_| held())?;
+        let mut restored = serde_json::to_value(&asset_only).map_err(|_| held())?;
         let expected = json!({
             "version":POLICY,"assetInputProfile":"asset-production-card/v2",
             "sourceSha256":legacy.input["assetCatalogScope"]["sourceSha256"],
             "episodeId":legacy.input["episodeId"],
             "frozenWorkflowInputSha256":sha(&parent["input"].to_string()),
             "legacyDomainRequestSha256":sha(&serde_json::to_string(&legacy).map_err(|_| held())?),
-            "projectedAssetsSha256":sha(&projected.input["assets"].to_string()),
-            "projectedAssetSelectionSha256":sha(&projected.input["assetSelection"].to_string()),
+            "projectedAssetsSha256":sha(&asset_only.input["assets"].to_string()),
+            "projectedAssetSelectionSha256":sha(&asset_only.input["assetSelection"].to_string()),
             "authorInputPreserved":true
         });
         if legacy.stage != "storyboardFinish"
@@ -134,6 +195,7 @@ impl SavedTextExecutor {
             return Err(held());
         }
         let old_domain = self.request_domain_snapshot(&legacy)?;
+        let asset_only_domain = self.request_domain_snapshot(&asset_only)?;
         let new_domain = self.request_domain_snapshot(&projected)?;
         let saved: Option<(String, String, String, String, String)> = c.query_row(
             "SELECT w.request_hash,j.snapshot,j.kind,j.provider,w.stage FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",
@@ -166,6 +228,8 @@ impl SavedTextExecutor {
             // request. The ordinary execute/recovery gates own their disposition.
             let selected = if domain == old_domain {
                 legacy
+            } else if domain == asset_only_domain {
+                asset_only
             } else if domain == new_domain {
                 projected
             } else {
@@ -187,7 +251,7 @@ impl SavedTextExecutor {
                 .as_object_mut()
                 .ok_or_else(held)?
                 .remove("executorIdentity");
-            if domain == old_domain || domain == new_domain {
+            if domain == old_domain || domain == asset_only_domain || domain == new_domain {
                 return Err(held());
             }
         }
@@ -257,6 +321,53 @@ mod tests {
         projected.input["finisherAssetInputProjection"] = json!({"version":POLICY,"assetInputProfile":"asset-production-card/v2","sourceSha256":source_sha,"episodeId":"episode-1","frozenWorkflowInputSha256":crate::pipeline::digest(&input.to_string()),"legacyDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(&legacy).unwrap()),"projectedAssetsSha256":crate::pipeline::digest(&projected.input["assets"].to_string()),"projectedAssetSelectionSha256":crate::pipeline::digest(&projected.input["assetSelection"].to_string()),"authorInputPreserved":true});
         (dir, executor, legacy, projected)
     }
+
+    fn boundary_projection(asset_only: &TextRequest) -> TextRequest {
+        let mut projected = asset_only.clone();
+        let boundary = projected.input["nextBoundary"].as_object_mut().unwrap();
+        for field in BOUNDARY_EXPORT_FIELDS {
+            boundary.remove(field);
+        }
+        projected.input["finisherBoundaryInputProfile"] = json!(BOUNDARY_PROFILE);
+        projected.input["finisherBoundaryInputProjection"] = json!({
+            "version":BOUNDARY_POLICY,"profile":BOUNDARY_PROFILE,
+            "sourceSha256":asset_only.input["finisherAssetInputProjection"]["sourceSha256"],
+            "episodeId":asset_only.input["episodeId"],
+            "frozenWorkflowInputSha256":asset_only.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"],
+            "assetOnlyDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(asset_only).unwrap()),
+            "originalBoundarySha256":crate::pipeline::digest(&asset_only.input["nextBoundary"].to_string()),
+            "projectedBoundarySha256":crate::pipeline::digest(&projected.input["nextBoundary"].to_string()),
+            "removedFields":BOUNDARY_EXPORT_FIELDS,"creativeInputPreserved":true
+        });
+        projected
+    }
+
+    fn boundary_fixture_at(endpoint: &str) -> (
+        tempfile::TempDir,
+        SavedTextExecutor,
+        TextRequest,
+        TextRequest,
+        TextRequest,
+    ) {
+        let (dir, executor, mut legacy, mut asset_only) = fixture_at(endpoint);
+        legacy.input["nextBoundary"] = json!({
+            "id":"SYNTHETIC_ACCEPTED_NEXT_UNIT","initialState":"乙仍站在门内。",
+            "shots":[{"id":"next-shot","duration":3,"picture":"乙回应。",
+                "dialogueParts":[{"lineId":"next-line","quoteStart":0,"quoteEnd":3,
+                    "voiceStart":0,"voiceEnd":2}],"prompt":"nested field remains creative material"}],
+            "unknownExtension":{"futureCreativeField":"must remain unchanged"},
+            "prompt":"SYNTHETIC_PROGRAM_EXPORT ".repeat(150),
+            "channelPromptTemplate":{"main":"SYNTHETIC_CHANNEL_EXPORT ".repeat(150)},
+            "referenceBindings":[{"imageId":"synthetic-binding"}],
+            "visualStyle":"SYNTHETIC_STYLE","seedanceExportVersion":"synthetic-export/v1",
+            "storyboardCreativeProfile":"SYNTHETIC_PROFILE"
+        });
+        asset_only.input["nextBoundary"] = legacy.input["nextBoundary"].clone();
+        asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+            json!(crate::pipeline::digest(&serde_json::to_string(&legacy).unwrap()));
+        let projected = boundary_projection(&asset_only);
+        (dir, executor, legacy, asset_only, projected)
+    }
     fn save(
         executor: &SavedTextExecutor,
         request: &TextRequest,
@@ -264,11 +375,12 @@ mod tests {
         step: bool,
     ) -> String {
         let mut snapshot = executor.request_domain_snapshot(request).unwrap();
+        let provider = s(&executor.settings, "textProvider");
         snapshot["executorIdentity"] =
-            json!({"provider":"api","endpoint":s(&executor.settings,"textEndpoint").trim_end_matches('/')});
+            json!({"provider":provider,"endpoint":s(&executor.settings,"textEndpoint").trim_end_matches('/')});
         let job = executor
             .store
-            .add_job("text", "fixture", "api", "local", &snapshot, state)
+            .add_job("text", "fixture", provider, "local", &snapshot, state)
             .unwrap();
         if step {
             executor
@@ -433,13 +545,147 @@ mod tests {
         assert!(e.saved_finish_asset_projection(old, new).is_err());
     }
 
+    #[test]
+    fn new_boundary_projection_reconstructs_final_asset_v1_without_mutation() {
+        let (_dir, e, old, asset_only, new) = boundary_fixture_at("https://invalid.example");
+        let before = evidence(&e);
+        let restored = asset_only_finish_request(&old, &new).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), serde_json::to_string(&asset_only).unwrap());
+        let selected = e.saved_finish_asset_projection(old, new.clone()).unwrap();
+        assert_eq!(serde_json::to_string(&selected).unwrap(), serde_json::to_string(&new).unwrap());
+        assert_eq!(selected.input["nextBoundary"]["shots"], asset_only.input["nextBoundary"]["shots"]);
+        assert_eq!(selected.input["nextBoundary"]["unknownExtension"], asset_only.input["nextBoundary"]["unknownExtension"]);
+        assert!(selected.input["nextBoundary"]["shots"][0].get("prompt").is_some());
+        assert!(serde_json::to_string(&selected).unwrap().encode_utf16().count()
+            < serde_json::to_string(&asset_only).unwrap().encode_utf16().count());
+        assert_eq!(evidence(&e), before);
+    }
+
+    #[test]
+    fn asset_v1_without_boundary_exports_keeps_existing_contract() {
+        for boundary in [None, Some(Value::Null), Some(json!({"initialState":"synthetic continuity"}))] {
+            let (_dir,e,mut old,mut asset_only)=fixture();
+            for request in [&mut old,&mut asset_only] {
+                if let Some(value)=&boundary {request.input["nextBoundary"]=value.clone();}
+                else {request.input.as_object_mut().unwrap().remove("nextBoundary");}
+            }
+            asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+                json!(crate::pipeline::digest(&serde_json::to_string(&old).unwrap()));
+            let before=evidence(&e);
+            assert_eq!(serde_json::to_string(&e.saved_finish_asset_projection(old,asset_only.clone()).unwrap()).unwrap(),serde_json::to_string(&asset_only).unwrap());
+            assert!(asset_only.input.get("finisherBoundaryInputProjection").is_none());
+            assert_eq!(evidence(&e),before);
+        }
+    }
+
+    #[test]
+    fn three_finisher_domains_preserve_exact_cli_sdk_nodes_including_unknown() {
+        for provider in ["codex","codex_sdk"] {
+            for profile in ["legacy","asset-v1","boundary-v1"] {
+                for state in ["submission_unknown","received","interrupted","rejected","completed"] {
+                    let (_dir,mut e,old,mut asset_only,_new)=boundary_fixture_at("https://invalid.example");
+                    e.settings["textProvider"]=json!(provider);
+                    let mut parent=e.store.job(e.workflow_id.as_deref().unwrap()).unwrap()["snapshot"].clone();
+                    parent["input"]["settings"]=e.settings.clone();
+                    e.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",params![parent.to_string(),e.workflow_id.as_deref().unwrap()]).unwrap();
+                    asset_only.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"]=
+                        json!(crate::pipeline::digest(&parent["input"].to_string()));
+                    let new=boundary_projection(&asset_only);
+                    let request=match profile {"legacy"=>old.clone(),"asset-v1"=>asset_only,_=>new.clone()};
+                    save(&e,&request,state,true);
+                    let before=evidence(&e);
+                    let selected=e.saved_finish_asset_projection(old,new).unwrap();
+                    assert_eq!(serde_json::to_string(&selected).unwrap(),serde_json::to_string(&request).unwrap(),"{provider}/{profile}/{state}");
+                    assert_eq!(evidence(&e),before,"{provider}/{profile}/{state}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_projection_tampering_or_non_shrinking_payload_holds() {
+        for field in ["profile","missing-profile","missing-proof","policy","asset-hash","original-hash","projected-hash","removed-fields","preserved","extra-proof","source","parent","episode","next-shot","nested-prompt","extension","new-export","rules","asset-proof","asset-profile","legacy-proof","not-smaller"] {
+            let (_dir,e,mut old,mut asset_only,mut new)=boundary_fixture_at("https://invalid.example");
+            match field {
+                "profile" => new.input["finisherBoundaryInputProfile"]=json!("forged"),
+                "missing-profile" => {new.input.as_object_mut().unwrap().remove("finisherBoundaryInputProfile");}
+                "missing-proof" => {new.input.as_object_mut().unwrap().remove("finisherBoundaryInputProjection");}
+                "policy" => new.input["finisherBoundaryInputProjection"]["version"]=json!("forged"),
+                "asset-hash" => new.input["finisherBoundaryInputProjection"]["assetOnlyDomainRequestSha256"]=json!("forged"),
+                "original-hash" => new.input["finisherBoundaryInputProjection"]["originalBoundarySha256"]=json!("forged"),
+                "projected-hash" => new.input["finisherBoundaryInputProjection"]["projectedBoundarySha256"]=json!("forged"),
+                "removed-fields" => new.input["finisherBoundaryInputProjection"]["removedFields"]=json!(["prompt"]),
+                "preserved" => new.input["finisherBoundaryInputProjection"]["creativeInputPreserved"]=json!(false),
+                "extra-proof" => new.input["finisherBoundaryInputProjection"]["extra"]=json!(true),
+                "source" => new.input["finisherBoundaryInputProjection"]["sourceSha256"]=json!("forged"),
+                "parent" => new.input["finisherBoundaryInputProjection"]["frozenWorkflowInputSha256"]=json!("forged"),
+                "episode" => new.input["finisherBoundaryInputProjection"]["episodeId"]=json!("forged"),
+                "next-shot" => new.input["nextBoundary"]["shots"][0]["duration"]=json!(9),
+                "nested-prompt" => {new.input["nextBoundary"]["shots"][0].as_object_mut().unwrap().remove("prompt");}
+                "extension" => {new.input["nextBoundary"].as_object_mut().unwrap().remove("unknownExtension");}
+                "new-export" => new.input["nextBoundary"]["prompt"]=json!("not stripped"),
+                "rules" => {asset_only.rule_snapshot=json!({"forged":"even when boundary proof is rehashed"});new=boundary_projection(&asset_only);}
+                "asset-proof" => {asset_only.input["finisherAssetInputProjection"]["authorInputPreserved"]=json!(false);new=boundary_projection(&asset_only);}
+                "asset-profile" => {asset_only.input["storyboardAssetInputProfile"]=json!("forged");new=boundary_projection(&asset_only);}
+                "legacy-proof" => old.input["finisherBoundaryInputProjection"]=json!({"forged":true}),
+                _ => {
+                    for request in [&mut old,&mut asset_only] {
+                        for key in BOUNDARY_EXPORT_FIELDS {request.input["nextBoundary"].as_object_mut().unwrap().remove(key);}
+                        request.input["nextBoundary"]["prompt"]=json!("");
+                    }
+                    asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"]=
+                        json!(crate::pipeline::digest(&serde_json::to_string(&old).unwrap()));
+                    new=boundary_projection(&asset_only);
+                }
+            }
+            let before=evidence(&e);
+            assert!(e.saved_finish_asset_projection(old,new).is_err(),"{field}");
+            assert_eq!(evidence(&e),before,"{field}: rejection is read-only");
+        }
+    }
+
+    #[test]
+    fn boundary_projection_orphans_and_unproven_sdk_handoff_hold() {
+        for profile in ["legacy","asset-v1","boundary-v1"] {
+            let (_dir,e,old,asset_only,new)=boundary_fixture_at("https://invalid.example");
+            let request=match profile {"legacy"=>&old,"asset-v1"=>&asset_only,_=>&new};
+            save(&e,request,"submission_unknown",false);
+            let before=evidence(&e);
+            assert!(e.saved_finish_asset_projection(old,new).is_err(),"orphan {profile}");
+            assert_eq!(evidence(&e),before);
+        }
+        // A top-level executor proof is not covered by the creative boundary
+        // proof. It still needs the SDK's persisted predecessor/parent evidence.
+        for profile in ["legacy","asset-v1","boundary-v1"] {
+            let (_dir,mut e,old,mut asset_only,_new)=boundary_fixture_at("https://invalid.example");
+            e.settings["textProvider"]=json!("codex_sdk");
+            let mut parent=e.store.job(e.workflow_id.as_deref().unwrap()).unwrap()["snapshot"].clone();
+            parent["input"]["settings"]=e.settings.clone();
+            e.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",params![parent.to_string(),e.workflow_id.as_deref().unwrap()]).unwrap();
+            asset_only.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"]=
+                json!(crate::pipeline::digest(&parent["input"].to_string()));
+            let new=boundary_projection(&asset_only);
+            let request=match profile {"legacy"=>&old,"asset-v1"=>&asset_only,_=>&new};
+            let job=save(&e,request,"submission_unknown",true);
+            let mut snapshot=e.store.job(&job).unwrap()["snapshot"].clone();
+            snapshot["sdkSupervisorHandoff"]=json!({"version":"forged"});
+            e.store.update_job(&job,"submission_unknown",&json!({"prepared":{"sdkSupervisorHandoff":snapshot["sdkSupervisorHandoff"]}})).unwrap();
+            e.store.event(&job,"sdk_supervisor_handoff_frozen",&snapshot["sdkSupervisorHandoff"]).unwrap();
+            e.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",params![snapshot.to_string(),job]).unwrap();
+            e.store.conn().unwrap().execute("UPDATE workflow_steps SET request_hash=?1 WHERE text_job_id=?2",params![crate::pipeline::digest(&snapshot.to_string()),job]).unwrap();
+            let before=evidence(&e);
+            assert!(e.saved_finish_asset_projection(old,new).is_err(),"unproven SDK handoff {profile}");
+            assert_eq!(evidence(&e),before);
+        }
+    }
+
     #[tokio::test]
     async fn api_existing_unprocessed_finisher_execute_holds_without_dispatch_or_mutation() {
         let server = RefusingApi::start();
-        for projected in [false,true] {
+        for profile in ["legacy","asset-v1","boundary-v1"] {
             for state in ["queued","running","submitting","submission_unknown","received","interrupted","rejected","failed"] {
-                let (_dir,e,old,new)=fixture_at(&server.endpoint);
-                let request=if projected {&new}else{&old};
+                let (_dir,e,old,asset_only,new)=boundary_fixture_at(&server.endpoint);
+                let request=match profile {"legacy"=>&old,"asset-v1"=>&asset_only,_=>&new};
                 let job=save(&e,request,state,true);
                 e.store.update_job(&job,state,&json!({"result":{"originalRaw":"SYNTHETIC_RAW_DO_NOT_REPLACE"},"prepared":{"originalPrepared":"SYNTHETIC_PREPARED_DO_NOT_REPLACE"}})).unwrap();
                 let before=evidence(&e);
@@ -455,9 +701,9 @@ mod tests {
     #[tokio::test]
     async fn api_completed_finisher_reuses_only_original_accepted_cache_without_dispatch() {
         let server=RefusingApi::start();
-        for projected in [false,true] {
-            let (_dir,e,old,new)=fixture_at(&server.endpoint);
-            let request=if projected {&new}else{&old};
+        for profile in ["legacy","asset-v1","boundary-v1"] {
+            let (_dir,e,old,asset_only,new)=boundary_fixture_at(&server.endpoint);
+            let request=match profile {"legacy"=>&old,"asset-v1"=>&asset_only,_=>&new};
             let job=save(&e,request,"received",true);
             let value=complete(&e,request,&job);
             let before=evidence(&e);

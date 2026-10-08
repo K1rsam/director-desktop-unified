@@ -351,6 +351,53 @@ fn workflow_progress_counts_a_migrated_cached_request_once_without_removing_hist
 }
 
 #[test]
+fn workflow_progress_stage2_tracks_frozen_targets_and_accepted_children_without_publishing() {
+    let (_dir, store) = project();
+    store.ensure_workflow_storage().unwrap();
+    let assets = json!([
+        {"id":"base","variantId":"base","prompt":"private old text"},
+        {"id":"suit","variantId":"suit","sourceAssetId":"base"},
+        {"id":"injury","variantId":"injury","sourceAssetId":"suit"},
+        {"id":"cover","variantId":"cover","sourceAssetId":"injury","preparation":{"mode":"INLINE"}},
+        {"id":"unused","variantId":"other"}
+    ]);
+    let context = json!({"assets":assets,"selection":{"assetIds":["cover","base"]}});
+    let run = store.add_job("workflow","images.design:","local","local",&json!({"runnerVersion":"stage2-runner/v1","stage":"images.design","stage2Context":context}),"running").unwrap();
+    let child = store.add_job("text","assetDesign","cli","test",&json!({"input":{"asset":{"id":"base","prompt":"private child"}}}),"completed").unwrap();
+    store.checkpoint(&run,"assetDesign:base","assetDesign","old-hash","rejected",Some(&child),None,Some("old rejection")).unwrap();
+    store.checkpoint(&run,"assetDesign:base:repair","assetDesign","new-hash","accepted",Some(&child),Some(&json!({"prompt":"private result"})),None).unwrap();
+    let before = store.job(&run).unwrap();
+    let p = store.workflow_progress().unwrap();
+    assert_eq!(p[0]["workflowId"],run);
+    assert_eq!(p[0]["stage"],"images.design");
+    assert_eq!(p[0]["assetDesignPlan"],json!({"designAssetIds":["base","suit","injury"],"inlineAssetIds":["cover"]}));
+    assert_eq!(p[0]["nodes"][1]["input"]["assetId"],"base");
+    assert_eq!(p[0]["completedSteps"],1);
+    assert!(!p[0].to_string().contains("private"));
+    assert!(store.values("assets").unwrap().is_empty());
+    assert_eq!(store.job(&run).unwrap(),before);
+    let reopened = Store::open(store.root.clone()).unwrap();
+    assert_eq!(reopened.workflow_progress().unwrap(),p);
+}
+
+#[test]
+fn workflow_progress_stage2_has_no_speculative_plan_for_auto_production_or_invalid_dependencies() {
+    let (_dir, store) = project();
+    store.ensure_workflow_storage().unwrap();
+    for (stage, context) in [
+        ("images.produce",json!({"assets":[{"id":"a","variantId":"a"}],"selection":{"assetIds":["a"]}})),
+        ("images.design",json!({"assets":[{"id":"a","variantId":"a","sourceAssetId":"missing"}],"selection":{"assetIds":["a"]}})),
+        ("images.design",json!({"assets":[{"id":"a","variantId":"a","sourceAssetId":"a"}],"selection":{"assetIds":["a"]}})),
+        ("images.design",json!({"automaticDesign":true,"assets":[{"id":"a","variantId":"a"}],"selection":{"assetIds":["a"]}})),
+        ("images.design",json!({"assets":[{"id":"base","variantId":"base","prompt":"cached design"},{"id":"child","variantId":"child","sourceAssetId":"base"}],"selection":{"assetIds":["child"]}})),
+    ] {
+        let run=store.add_job("workflow",stage,"local","local",&json!({"runnerVersion":"stage2-runner/v1","stage":stage,"stage2Context":context}),"running").unwrap();
+        let p=store.workflow_progress().unwrap();
+        assert!(p.iter().find(|p|p["workflowId"]==run).unwrap()["assetDesignPlan"].is_null());
+    }
+}
+
+#[test]
 fn workflow_progress_reads_only_attached_active_cli_safe_heartbeat_fields() {
     let (_dir, store) = project();
     store.ensure_workflow_storage().unwrap();

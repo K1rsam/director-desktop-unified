@@ -11,6 +11,42 @@ fn has_steps(store: &Store) -> Result<bool> {
     store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')",[],|r|r.get(0)).map_err(|e|e.to_string())
 }
 
+// Display-only plan from the original frozen selection. Do not derive progress
+// from published prompts: the design workflow publishes its results atomically.
+fn asset_design_progress_plan(stage: &str, context: &Value) -> Option<Value> {
+    if stage != "images.design" { return None; }
+    let assets = context["assets"].as_array()?;
+    let selected = context.pointer("/selection/assetIds")?.as_array()?;
+    let mut wanted = selected.iter().map(|id| id.as_str().map(str::to_owned)).collect::<Option<HashSet<_>>>()?;
+    // SQLite json_extract exposes a JSON boolean as SQL integer in this
+    // display-only projection. Either true representation must hide the target.
+    let automatic = context["imageProductionPolicy"] == "automatic"
+        || context["automaticDesign"] == true || context["automaticDesign"] == 1;
+    // Automatic design may legitimately reuse cached work without a node.
+    // Without an exact dispatch plan, expose counts rather than a false target.
+    if automatic { return None; }
+    let explicit = wanted.clone();
+    let mut pending = wanted.iter().cloned().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        let mut matches = assets.iter().filter(|a| s(a, "id") == id);
+        let asset = matches.next()?;
+        if matches.next().is_some() { return None; }
+        if let Some(parent) = crate::pipeline::resolve_asset_dependency(assets, asset).ok()? {
+            if wanted.insert(parent.clone()) { pending.push(parent); }
+        }
+    }
+    let mut design = Vec::new();
+    let mut inline = Vec::new();
+    for asset in assets.iter().filter(|a| wanted.contains(s(a, "id"))) {
+        if asset.pointer("/preparation/mode").and_then(Value::as_str) == Some("INLINE") { inline.push(asset["id"].clone()); }
+        else {
+            if !explicit.contains(s(asset, "id")) && !s(asset, "prompt").trim().is_empty() { return None; }
+            design.push(asset["id"].clone());
+        }
+    }
+    Some(json!({"designAssetIds":design,"inlineAssetIds":inline}))
+}
+
 // Resolution is a read-only projection of durable domain receipts. It never
 // turns an invalid author into an accepted checkpoint or rewrites its error.
 #[derive(Clone)]
@@ -734,7 +770,7 @@ impl Store {
             return Ok(vec![]);
         }
         let c = self.conn()?;
-        let mut q=c.prepare("SELECT id,entity_id,state,result FROM jobs WHERE kind='workflow' AND json_extract(snapshot,'$.runnerVersion')='desktop-runner/v1' ORDER BY created_at DESC,rowid DESC LIMIT 12").map_err(|e|e.to_string())?;
+        let mut q=c.prepare("SELECT id,COALESCE(json_extract(snapshot,'$.stage'),entity_id),state,result,CASE WHEN json_extract(snapshot,'$.stage')='images.design' AND json_extract(snapshot,'$.runnerVersion')='stage2-runner/v1' THEN json_object('assets',json_extract(snapshot,'$.stage2Context.assets'),'selection',json_extract(snapshot,'$.stage2Context.selection'),'imageProductionPolicy',json_extract(snapshot,'$.stage2Context.imageProductionPolicy'),'automaticDesign',json_extract(snapshot,'$.stage2Context.automaticDesign')) END FROM jobs WHERE kind='workflow' AND json_extract(snapshot,'$.runnerVersion') IN ('desktop-runner/v1','stage2-runner/v1') ORDER BY created_at DESC,rowid DESC LIMIT 12").map_err(|e|e.to_string())?;
         let runs = q
             .query_map([], |r| {
                 Ok((
@@ -742,25 +778,26 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(|e| e.to_string())?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         let mut values = vec![];
-        for (id, stage, status, result) in runs {
+        for (id, stage, status, result, design_context) in runs {
             // Read only small progress fields; full input/source/results remain lazy.
             // An older node key can remain after a runner key migration. Its exact
             // cached request is still one step; keep every checkpoint on disk but
             // project only the latest state for each stage/request identity.
-            let mut steps=c.prepare("SELECT w.node_key,w.stage,w.state,w.error,json_extract(j.snapshot,'$.input.delivery'),json_extract(j.snapshot,'$.input.scope'),json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'),CASE WHEN e.rowid IS NOT NULL THEN json_object('phase',json_extract(e.data,'$.phase'),'elapsedSeconds',json_extract(e.data,'$.elapsedSeconds'),'outputQuietSeconds',json_extract(e.data,'$.outputQuietSeconds'),'processAlive',json_extract(e.data,'$.processAlive'),'needsDiagnosis',json_extract(e.data,'$.needsDiagnosis'),'observedAt',e.created_at,'stderrCategory',json_extract(e.data,'$.stderrCategory')) END,w.request_hash,json_extract(j.snapshot,'$.input.executionBatch.version') FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id LEFT JOIN events e ON w.state='running' AND j.state='submitting' AND e.rowid=(SELECT x.rowid FROM events x WHERE x.job_id=w.text_job_id AND x.type='codex_heartbeat' ORDER BY x.rowid DESC LIMIT 1) WHERE w.workflow_id=?1 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid))) ORDER BY w.rowid").map_err(|e|e.to_string())?;
+            let mut steps=c.prepare("SELECT w.node_key,w.stage,w.state,w.error,json_extract(j.snapshot,'$.input.delivery'),json_extract(j.snapshot,'$.input.scope'),json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'),CASE WHEN e.rowid IS NOT NULL THEN json_object('phase',json_extract(e.data,'$.phase'),'elapsedSeconds',json_extract(e.data,'$.elapsedSeconds'),'outputQuietSeconds',json_extract(e.data,'$.outputQuietSeconds'),'processAlive',json_extract(e.data,'$.processAlive'),'needsDiagnosis',json_extract(e.data,'$.needsDiagnosis'),'observedAt',e.created_at,'stderrCategory',json_extract(e.data,'$.stderrCategory')) END,w.request_hash,json_extract(j.snapshot,'$.input.executionBatch.version'),json_extract(j.snapshot,'$.input.asset.id') FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id LEFT JOIN events e ON w.state='running' AND j.state='submitting' AND e.rowid=(SELECT x.rowid FROM events x WHERE x.job_id=w.text_job_id AND x.type='codex_heartbeat' ORDER BY x.rowid DESC LIMIT 1) WHERE w.workflow_id=?1 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid))) ORDER BY w.rowid").map_err(|e|e.to_string())?;
             let mut nodes=steps.query_map([&id],|r| {
                 let stage=r.get::<_,String>(1)?;
                 let delivery=r.get::<_,Option<String>>(4)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
                 let scope=r.get::<_,Option<String>>(5)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
                 let episode=r.get::<_,Option<String>>(6)?.or(r.get::<_,Option<String>>(7)?);
                 let execution=r.get::<_,Option<String>>(8)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
-                Ok(json!({"id":r.get::<_,String>(0)?,"requestHash":r.get::<_,String>(9)?,"title":step_title(&stage),"stage":stage,"status":r.get::<_,String>(2)?,"error":r.get::<_,Option<String>>(3)?,"execution":execution,"input":{"delivery":delivery,"scope":scope,"episodeId":episode,"executionBatchVersion":r.get::<_,Option<String>>(10)?}}))
+                Ok(json!({"id":r.get::<_,String>(0)?,"requestHash":r.get::<_,String>(9)?,"title":step_title(&stage),"stage":stage,"status":r.get::<_,String>(2)?,"error":r.get::<_,Option<String>>(3)?,"execution":execution,"input":{"delivery":delivery,"scope":scope,"episodeId":episode,"executionBatchVersion":r.get::<_,Option<String>>(10)?,"assetId":r.get::<_,Option<String>>(11)?}}))
             }).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
             if stage == "storyboard.run" {
                 project_step_resolutions(self, &c, &id, &mut nodes)?;
@@ -768,7 +805,8 @@ impl Store {
             let result = result
                 .and_then(|v| serde_json::from_str::<Value>(&v).ok())
                 .unwrap_or(Value::Null);
-            values.push(json!({"workflowId":id,"stage":stage,"status":status,"completedSteps":nodes.iter().filter(|n|n["status"]=="accepted").count(),"totalSteps":nodes.len(),"nodes":nodes,"waitingDecision":result["waitingDecision"],"blocked":result["blocked"],"publishedEpisodeIds":result["updatedEpisodeIds"]}));
+            let design_plan = design_context.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|context| asset_design_progress_plan(&stage, &context));
+            values.push(json!({"workflowId":id,"stage":stage,"status":status,"assetDesignPlan":design_plan,"completedSteps":nodes.iter().filter(|n|n["status"]=="accepted").count(),"totalSteps":nodes.len(),"nodes":nodes,"waitingDecision":result["waitingDecision"],"blocked":result["blocked"],"publishedEpisodeIds":result["updatedEpisodeIds"]}));
         }
         Ok(values)
     }
