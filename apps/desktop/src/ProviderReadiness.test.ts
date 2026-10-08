@@ -138,6 +138,8 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         const oauth = nodes.find(node => node.type === 'button' && content(node) === 'OAuth 连接即梦');
         assert.ok(oauth);
         assert.equal(oauth.props['data-execution-action'], 'canvas.login');
+        assert.ok(nodes.some(node => node.type === 'h3' && content(node) === '即梦 Canvas 账户与连接'));
+        assert.ok(nodes.some(node => node.type === 'h3' && content(node) === '即梦生成 CLI'));
       } finally { view.unmount(); }
     });
     await t.test('Jimeng account and provider buttons use readiness with the current unsaved path', async () => {
@@ -146,13 +148,35 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         const element = React.createElement(SettingsPanel, { workspace, writable: true, mutate: async () => { throw new Error('readiness must not call providers.refresh or dreamina.status'); } });
         let nodes = view.render(element); assert.equal(calls.length, 0);
         const input = nodes.find(node => node.type === 'input' && node.props.value === '/saved/dreamina'); assert.ok(input);
+        assert.equal(input.props.placeholder, '填写已安装即梦生成 CLI 的完整路径');
         input.props.onChange({ target: { value: '/unsaved/Jimeng path' } }); nodes = view.render(element);
-        const checks = nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina'); assert.equal(checks.length, 1);
+        const checks = nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina'); assert.equal(checks.length, 2);
         for (const check of checks) assert.equal(check.props.disabled, false);
-        checks[0].props.onClick(); await settle(); nodes = view.render(element);
+        tab(nodes, '检查账户与模型').props.onClick(); tab(nodes, '更新模型目录').props.onClick();
+        nodes = view.render(element);
+        assert.ok(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina').every(node => node.props.disabled), 'both entries share the pending request');
+        await settle(); nodes = view.render(element);
         assert.deepEqual(calls, [{ action: 'readiness.check', projectId: workspace.project.id, provider: 'dreamina', settings: { dreaminaPath: '/unsaved/Jimeng path' } }]);
+        tab(nodes, '更新模型目录').props.onClick(); await settle(); nodes = view.render(element);
+        assert.deepEqual(calls, Array.from({ length: 2 }, () => ({ action: 'readiness.check', projectId: workspace.project.id, provider: 'dreamina', settings: { dreaminaPath: '/unsaved/Jimeng path' } })));
         assert.ok(nodes.map(content).join(' ').includes('图片免费资格尚未核验'));
         for (const action of ['dreamina.login', 'providers.refresh']) for (const node of nodes.filter(node => node.type === 'button' && node.props['data-execution-action'] === action)) assert.equal(node.props.disabled, true);
+      } finally { view.unmount(); }
+    });
+    await t.test('advanced legacy model check uses a draft Windows executable when the saved path is empty', async () => {
+      calls.length = 0; const view = hookRenderer(), initial = { ...workspace, settings: { ...workspace.settings, dreaminaPath: '' } };
+      const before = structuredClone(initial), draftPath = 'D:\\Installed Apps\\即梦\\dreamina.exe';
+      const element = React.createElement(SettingsPanel, { workspace: initial, writable: true, mutate: async () => { throw new Error('draft model check must not save, refresh saved providers or authorize'); } });
+      try {
+        let nodes = view.render(element);
+        const input = nodes.find(node => node.type === 'input' && node.props.placeholder === '填写已安装即梦生成 CLI 的完整路径'); assert.ok(input);
+        assert.equal(input.props.value, '');
+        input.props.onChange({ target: { value: draftPath } }); nodes = view.render(element);
+        assert.ok(nodes.map(content).join(' ').includes('使用当前输入路径检查账户与模型，无需先保存'));
+        tab(nodes, '更新模型目录').props.onClick(); await settle(); nodes = view.render(element);
+        assert.deepEqual(calls, [{ action: 'readiness.check', projectId: initial.project.id, provider: 'dreamina', settings: { dreaminaPath: draftPath } }]);
+        assert.ok(nodes.some(node => node.props['data-readiness-result'] === 'dreamina'));
+        assert.deepEqual(initial, before, 'saved paths, channel selections and history remain unchanged');
       } finally { view.unmount(); }
     });
     await t.test('Canvas uses only its unsaved input and never mutates legacy settings, history, providers or selectors', async () => {
@@ -175,7 +199,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         for (const label of ['schema', 'auth status', 'account', 'image models', 'Synthetic Canvas Image', 'image', '积分 / 额度未知', '没有额度接口', '免费资格未核验', '尚未接入生成桥', '未测试 · 本次检查生成调用 0 次']) assert.ok(text.includes(label), label);
         assert.ok(!nodes.some(node => node.type === 'option' && ['dreamina_canvas', 'synthetic-model'].includes(node.props.value)), 'Canvas catalog never becomes a generation option');
         assert.ok(nodes.some(node => node.type === 'input' && node.props.value === '/saved/dreamina'), 'legacy path is unchanged');
-        assert.equal(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina').length, 1, 'legacy account check remains');
+        assert.equal(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina').length, 2, 'legacy account and advanced entries share one check');
         assert.deepEqual(workspace, before, 'settings, saved account, history and capability cache are untouched');
         tab(nodes, '执行与保存').props.onClick(); nodes = view.render(element);
         assert.ok(!nodes.some(node => node.type === 'option' && ['dreamina_canvas', 'synthetic-model'].includes(node.props.value)));
@@ -204,7 +228,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
           { action: 'readiness.check', projectId: workspace.project.id, provider: 'dreamina_canvas', settings: { dreaminaCanvasPath: '/unsaved/canvas-readiness' } },
         ]);
         for (const provider of ['dreamina', 'dreamina_canvas']) {
-          assert.equal(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === provider).length, 1);
+          assert.equal(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === provider).length, provider === 'dreamina' ? 2 : 1);
           assert.ok(nodes.some(node => node.props['data-readiness-result'] === provider), `${provider} retains its own result`);
         }
         assert.deepEqual(workspace, before, 'saved paths, accounts and generation history are unchanged');
@@ -499,6 +523,27 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         respond = async input => result(input.provider as ProviderReadinessReport['provider']);
       }
     });
+    await t.test('Canvas initial and local-only login records never display a verified login or connection', async () => {
+      const { DreaminaCanvasReadiness } = await server.ssrLoadModule('/src/DreaminaCanvasReadiness.tsx');
+      policy.installExecutionPolicy(policy.validateExecutionPolicy({ ...capability, canvasOAuth: { version: 'canvas-oauth/v1', enabled: true } }));
+      const view = hookRenderer();
+      const element = React.createElement(DreaminaCanvasReadiness, { projectId: 'unverified-account-project', path: '/synthetic/canvas', writable: true, update() {} });
+      const report = { ...result('dreamina_canvas'), authentication: { state: 'authenticated', identityVerified: false }, catalog: { state: 'unavailable', models: [] }, details: { accountQuery: { state: 'unavailable' }, checks: { 'auth account': { state: 'failed', code: 'CANVAS_OAUTH_SCOPE_INSUFFICIENT' } } } };
+      const before = structuredClone(report);
+      respond = async input => input.action === 'canvas.loginStatus' ? { state: 'idle' } : report;
+      try {
+        let nodes = view.render(element), text = nodes.map(content).join(' ');
+        assert.ok(text.includes('尚未核验连接'));
+        assert.ok(!text.includes('已登录') && !text.includes('已连接即梦'), 'initial render has no successful auth evidence');
+        await settle(); view.render(element); await settle(); nodes = view.render(element); text = nodes.map(content).join(' ');
+        assert.ok(text.includes('本机有登录记录 · 身份待核验'));
+        assert.ok(text.includes('本机有登录记录 · 身份未核验'), 'expanded details use the same evidence boundary');
+        assert.ok(text.includes('尚未连接，请检查或重新授权'));
+        assert.ok(!text.includes('已登录') && !text.includes('已连接即梦'), 'local auth status cannot establish verified login');
+        assert.equal(tab(nodes, '退出登录').props.disabled, false, 'an existing local session still supports explicit logout');
+        assert.deepEqual(report, before, 'UI labeling preserves the original account evidence');
+      } finally { view.unmount(); policy.installExecutionPolicy(policy.validateExecutionPolicy(capability)); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
+    });
     await t.test('Canvas account panel shows verified membership, unknown credits and explicit logout confirmation', async () => {
       const { DreaminaCanvasReadiness } = await server.ssrLoadModule('/src/DreaminaCanvasReadiness.tsx');
       policy.installExecutionPolicy(policy.validateExecutionPolicy({ ...capability, canvasOAuth: { version: 'canvas-oauth/v1', enabled: true } }));
@@ -516,6 +561,8 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
       try {
         view.render(element); await settle(); view.render(element); await settle(); let nodes = view.render(element);
         assert.ok(nodes.map(content).join(' ').includes('会员（maestro）'));
+        assert.ok(nodes.map(content).join(' ').includes('已登录 · 身份已核验'));
+        assert.ok(nodes.map(content).join(' ').includes('已连接即梦'));
         assert.ok(nodes.map(content).join(' ').includes('账户额度'));
         assert.ok(nodes.map(content).join(' ').includes('当前接口未提供'));
         assert.ok(nodes.some(node => node.type === 'details' && node.props['data-connection-diagnostics'] && !node.props.open));

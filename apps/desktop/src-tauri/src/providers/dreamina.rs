@@ -1284,6 +1284,28 @@ fn readiness_log_write_restricted(output:&CliOutput)->bool {
     message.contains("initialize logs failed") && message.contains("initialize file logger")
         && (message.contains("operation not permitted") || message.contains("permission denied"))
 }
+fn legacy_readiness_help_supported(command: Option<&str>, bytes: &[u8]) -> bool {
+    let Ok(help) = std::str::from_utf8(bytes) else { return false; };
+    if help.len() > 1024 * 1024 || !help.contains("Usage:") || serde_json::from_str::<Value>(help).is_ok()
+        || help.to_ascii_lowercase().contains("dreamina-canvas") { return false; }
+    let usage = help.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next() == Some("dreamina") && parts.next() == Some(command.unwrap_or("[command]"))
+    });
+    if !usage { return false; }
+    let flags: &[&str] = match command {
+        None => return ["login", "user_credit", "query_result", "text2image", "image2image", "text2video", "multimodal2video"]
+            .iter().all(|name| has_token(help, name)) && has_token(help, "--version"),
+        Some("text2image" | "image2image") => &["--model_version", "--ratio", "--resolution_type", "--prompt"],
+        Some("text2video") => &["--model_version", "--ratio", "--video_resolution", "--duration", "--prompt"],
+        Some("multimodal2video") => &["--model_version", "--ratio", "--video_resolution", "--duration", "--image", "--video", "--audio"],
+        _ => return false,
+    };
+    flags.iter().all(|flag| has_token(help, flag))
+}
+fn legacy_protocol_unsupported() -> ProviderError {
+    ProviderError::new("DREAMINA_PROTOCOL_UNSUPPORTED", "此文件未通过已适配的旧版即梦生成 CLI 版本与命令协议核验。")
+}
 /// No DreaminaSessions polling, account mutation, generation or job-resume hooks.
 pub(super) fn readiness(config: &ProviderConfig) -> Value {
     let mut result=crate::readiness::empty("dreamina");
@@ -1295,16 +1317,23 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
     result["details"]=json!({"binarySha256":identity["sha256"],"freeImageEligibility":"unverified","accountIdentityNotExported":true});
     let mut verified_legacy_version = None;
     let inspected=capabilities_with_runner(config,Instant::now,|config,args,deadline| {
-        let output=execute_until(config,args,false,Some(deadline))?;
-        if readiness_log_write_restricted(&output) {return Err(ProviderError::new("CLI_LOCAL_LOG_WRITE_RESTRICTED","官方 CLI 本地日志初始化受限；未继续账户检查。"));}
-        if !output.success {return Err(output_error(&output,false));}
+        let read = |arguments: &[String]| -> ProviderResult<Vec<u8>> {
+            let output=execute_until(config,arguments,false,Some(deadline))?;
+            if readiness_log_write_restricted(&output) {return Err(ProviderError::new("CLI_LOCAL_LOG_WRITE_RESTRICTED","官方 CLI 本地日志初始化受限；未继续账户检查。"));}
+            if !output.success {return Err(output_error(&output,false));}
+            Ok(output.stdout)
+        };
+        let bytes=read(args)?;
         if args == ["version"] {
-            verified_legacy_version = crate::readiness_canvas::legacy_version_label(&output.stdout);
+            verified_legacy_version = crate::readiness_canvas::legacy_version_label(&bytes);
             if verified_legacy_version.is_none() {
-                return Err(ProviderError::new("DREAMINA_PROTOCOL_UNSUPPORTED", "此文件不是已适配的旧版 Dreamina 1.4.x 协议。"));
+                return Err(legacy_protocol_unsupported());
             }
+            if !legacy_readiness_help_supported(None, &read(&["--help".into()])?) { return Err(legacy_protocol_unsupported()); }
+        } else if args.len() != 2 || args[1] != "-h" || !legacy_readiness_help_supported(Some(&args[0]), &bytes) {
+            return Err(legacy_protocol_unsupported());
         }
-        Ok(output.stdout)
+        Ok(bytes)
     });
     result["installation"]["version"] = json!(verified_legacy_version);
     let mut messages=vec!["只读取官方 CLI 版本/帮助目录与账户积分；没有图片或视频生成。".to_string(),"积分余额和模型目录不能证明当前账户免费资格；免费出图尚未核验。".to_string()];
@@ -1317,9 +1346,9 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
         Err(error)=>{
             result["protocol"]["state"]=json!("failed");result["catalog"]["state"]=json!("unavailable");
             if error.code=="DREAMINA_PROTOCOL_UNSUPPORTED" {
-                result["protocol"]=json!({"state":"unsupported","name":"Legacy Dreamina 1.4.x"});
+                result["protocol"]=json!({"state":"unsupported","name":"Legacy Dreamina generation CLI"});
                 result["details"]["detectedProtocol"]=json!("unsupported_for_legacy");
-                messages.push("所选程序与旧版 Dreamina 1.4.x 不兼容，已停止账户检查；新版 dreamina-canvas 请使用独立 Canvas CLI 路径与检查按钮。旧任务和账户记录保持原样。".into());
+                messages.push("所选程序未通过旧版即梦生成 CLI 的版本与命令协议核验，已停止账户检查；dreamina-canvas 请使用独立 Canvas CLI 路径与检查按钮。旧任务和账户记录保持原样。".into());
                 result["messages"]=json!(messages);return result;
             }
             if error.code=="CLI_LOCAL_LOG_WRITE_RESTRICTED" {
@@ -2919,6 +2948,25 @@ mod tests {
         include_str!("../../../tools/dreamina/1.4.19/text2video-help.txt");
     const IMAGE_HELP: &str = "model_version: 3.0, 3.1, 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro\nratio: 21:9, 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16\n- 3.0/3.1 -> resolution_type 1k or 2k; custom width/height requires resolution_type 2k\n- 4.0/4.1/4.5/4.6/4.7/5.0 -> resolution_type 2k or 4k\n- 5.0Pro -> resolution_type 1.5k, 2k, or 4k\n--width and --height are mutually exclusive with --ratio\n- 2k: each side 768-3072; total pixels <= 4194304";
     const EDIT_HELP: &str = "model_version: 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro\nratio: 21:9, 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16\n- 4.0/4.1/4.5/4.6/4.7/5.0 -> resolution_type 2k or 4k\n- 5.0Pro -> resolution_type 1.5k, 2k, or 4k\n--width and --height are mutually exclusive with --ratio\n- 2k: each side 768-3072; total pixels <= 4194304";
+    #[test]
+    fn legacy_readiness_help_requires_root_commands_and_each_legacy_flag_contract() {
+        let root = "Usage:\n  dreamina [command]\nAvailable Commands:\n login\n user_credit\n query_result\n text2image\n image2image\n text2video\n multimodal2video\nFlags:\n --version";
+        assert!(legacy_readiness_help_supported(None, root.as_bytes()));
+        assert!(!legacy_readiness_help_supported(None, root.replace("user_credit", "account").as_bytes()));
+        assert!(!legacy_readiness_help_supported(None, root.replace("dreamina [command]", "dreamina-canvas [command]").as_bytes()));
+        for (command, help) in [("multimodal2video", VIDEO_HELP), ("text2video", TEXT_VIDEO_HELP)] {
+            assert!(legacy_readiness_help_supported(Some(command), help.as_bytes()));
+            assert!(!legacy_readiness_help_supported(Some(command), help.replace("--model_version", "--model").as_bytes()));
+        }
+        for command in ["text2image", "image2image"] {
+            let help = format!("Usage:\n  dreamina {command} [flags]\nFlags:\n --model_version 5.0 --ratio 16:9 --resolution_type 2k --prompt text");
+            assert!(legacy_readiness_help_supported(Some(command), help.as_bytes()));
+            assert!(!legacy_readiness_help_supported(Some(command), help.replace("--resolution_type", "--resolution").as_bytes()));
+            assert!(!legacy_readiness_help_supported(Some("text2video"), help.as_bytes()));
+        }
+        assert!(!legacy_readiness_help_supported(None, br#"{"schemaVersion":"1","ok":true,"data":{"help":"dreamina [command]"}}"#));
+        assert!(!legacy_readiness_help_supported(Some("text2image"), b"\xff"));
+    }
     fn offline_help(args: &[String]) -> Vec<u8> {
         match args[0].as_str() {
             "version" => b"{}".to_vec(),

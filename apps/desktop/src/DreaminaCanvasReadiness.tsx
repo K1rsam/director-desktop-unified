@@ -121,15 +121,16 @@ export function DreaminaCanvasReadiness({ projectId, path, writable, update }: P
   }
 
   const account = check.result?.details.accountQuery as { state?: string; isVip?: boolean; vipLevel?: string } | undefined;
-  const verified = check.result?.authentication.identityVerified === true && account?.state === 'available';
+  const hasLoginRecord = check.result?.authentication.state === 'authenticated';
+  const identityVerified = hasLoginRecord && check.result?.authentication.identityVerified === true;
+  const verified = identityVerified && account?.state === 'available';
   const membership = !verified || account?.isVip === undefined ? '尚未核验' : account.isVip ? `会员${account.vipLevel ? `（${account.vipLevel}）` : ''}` : '非会员';
-  const loggedIn = check.result?.authentication.state === 'authenticated';
   return <section className="surface dreamina-canvas-readiness" data-readiness-card="dreamina_canvas">
-    <h3>即梦账户与连接</h3>
+    <h3>即梦 Canvas 账户与连接</h3>
     <p className="muted">点击 OAuth，在即梦官方网页确认后自动连接。授权失效时可在这里重新连接。</p>
-    <strong role="status">{login.state === 'logging_out' ? '正在退出登录…' : loginBusy ? '等待官方授权完成' : check.busy ? '正在核验连接…' : check.result?.authentication.identityVerified && check.result.catalog.state === 'available' ? '已连接即梦' : check.result?.authentication.state === 'not_logged_in' ? '未登录' : check.result ? '尚未连接，请检查或重新授权' : '尚未核验连接'}</strong>
+    <strong role="status">{login.state === 'logging_out' ? '正在退出登录…' : loginBusy ? '等待官方授权完成' : check.busy ? '正在核验连接…' : identityVerified && check.result?.catalog.state === 'available' ? '已连接即梦' : check.result?.authentication.state === 'not_logged_in' ? '未登录' : check.result ? '尚未连接，请检查或重新授权' : '尚未核验连接'}</strong>
     <dl className="canvas-account-summary">
-      <div><dt>登录状态</dt><dd>{loginBusy ? login.state === 'logging_out' ? '正在退出' : '等待授权' : check.busy ? '正在刷新' : loggedIn ? check.result?.authentication.identityVerified ? '已登录 · 身份已核验' : '已登录 · 身份待核验' : check.result?.authentication.state === 'not_logged_in' ? '未登录' : '尚未核验'}</dd></div>
+      <div><dt>登录状态</dt><dd>{loginBusy ? login.state === 'logging_out' ? '正在退出' : '等待授权' : check.busy ? '正在刷新' : identityVerified ? '已登录 · 身份已核验' : hasLoginRecord ? '本机有登录记录 · 身份待核验' : check.result?.authentication.state === 'not_logged_in' ? '未登录' : '尚未核验'}</dd></div>
       <div><dt>会员信息</dt><dd>{membership}</dd></div>
       <div><dt>账户额度</dt><dd>当前接口未提供</dd></div>
       <div><dt>可用模型目录</dt><dd>{check.result?.catalog.state === 'available' ? `${check.result.catalog.models.length} 个图片模型` : '尚未读取'}</dd></div>
@@ -140,7 +141,7 @@ export function DreaminaCanvasReadiness({ projectId, path, writable, update }: P
       <ReadinessButton check={check} writable={writable && !selecting && !loginBusy}>检查即梦 CLI、账户与模型</ReadinessButton>
       {loginBusy && login.state !== 'logging_out' && <><Button executionAction="canvas.openAuthorization" disabled={!oauthAllowed || login.state !== 'authorizing'} onClick={() => void sessionAction('canvas.openAuthorization')}>打开授权网页</Button><Button executionAction="canvas.cancelLogin" disabled={!oauthAllowed} onClick={() => void sessionAction('canvas.cancelLogin')}>取消等待</Button></>}
       {!loginBusy && <Button disabled={!oauthAllowed || check.busy} onClick={() => { setConfirmLogout(false); setConfirmForce(true); }}>重新登录</Button>}
-      {!loginBusy && <Button executionAction="canvas.logout" disabled={!oauthAllowed || check.busy || !loggedIn} onClick={() => { setConfirmForce(false); setConfirmLogout(true); }}>退出登录</Button>}
+      {!loginBusy && <Button executionAction="canvas.logout" disabled={!oauthAllowed || check.busy || !hasLoginRecord} onClick={() => { setConfirmForce(false); setConfirmLogout(true); }}>退出登录</Button>}
     </div>
     {confirmLogout && <div role="alert"><p>退出当前 Canvas CLI 的 default 配置登录。使用同一配置的其他程序也会受影响；项目和历史记录保留。</p><Button executionAction="canvas.logout" disabled={loginBusy || check.busy} onClick={() => void logout()}>确认退出登录</Button><Button onClick={() => setConfirmLogout(false)}>返回</Button></div>}
     {login.message && <p className={login.state === 'failed' ? 'warning' : 'control-hint'} role="status">{login.message}</p>}

@@ -362,9 +362,27 @@ fn add_error(report: &mut Value, command: ReadCommand, error: &ProviderError) {
 
 pub(crate) fn legacy_version_label(bytes: &[u8]) -> Option<String> {
     let value = std::str::from_utf8(bytes).ok()?;
-    if value.len() > 4096 || serde_json::from_str::<Value>(value).is_ok() {
+    if value.len() > 4096 {
         return None;
     }
+    if let Ok(build) = serde_json::from_str::<Value>(value) {
+        // The legacy Windows CLI prints a bare Git build object. Canvas uses
+        // a schema/ok/data envelope, which must never enter this adapter.
+        let object = build.as_object()?;
+        if object.len() != 3 { return None; }
+        let version = object.get("version")?.as_str()?;
+        let commit = object.get("commit")?.as_str()?;
+        let built_at = object.get("build_time")?.as_str()?;
+        if !(7..=40).contains(&commit.len()) || !commit.bytes().all(|c| c.is_ascii_hexdigit())
+            || !version.strip_suffix("-dirty").unwrap_or(version).eq_ignore_ascii_case(commit)
+            || chrono::DateTime::parse_from_rfc3339(built_at).is_err() {
+            return None;
+        }
+        // This is build-format evidence only. The readiness adapter separately
+        // checks the old root commands and every adapted command's help flags.
+        return Some(version.to_string());
+    }
+    if value.trim_start().starts_with(['{', '[']) || value.to_ascii_lowercase().contains("dreamina-canvas") { return None; }
     value.split_whitespace().find_map(|part| {
         if part == "1d0bd17-dirty" {
             return Some(part.to_string());
@@ -699,11 +717,33 @@ mod tests {
         for version in [
             b"1.0.2".as_slice(),
             b"dreamina-canvas 1.0.2",
+            b"dreamina-canvas 1.4.19",
             br#"{"schemaVersion":"1","ok":true,"data":{"version":"1.4.19"}}"#,
             b"unknown",
         ] {
             assert!(!legacy_version_supported(version));
         }
+    }
+    #[test]
+    fn legacy_bare_git_build_json_keeps_version_and_requires_consistent_public_metadata() {
+        for (version, commit) in [("1d0bd17-dirty", "1d0bd17"), ("abcdef0", "abcdef0"),
+            ("0123456789abcdef0123456789abcdef01234567-dirty", "0123456789abcdef0123456789abcdef01234567")] {
+            let build = json!({"version":version,"commit":commit,"build_time":"2026-10-03T13:51:54Z"});
+            assert_eq!(legacy_version_label(build.to_string().as_bytes()), Some(version.to_string()));
+        }
+        for build in [
+            json!({"version":"1d0bd17-dirty","commit":"deadbee","build_time":"2026-10-03T13:51:54Z"}),
+            json!({"version":"abcdef-dirty","commit":"abcdef","build_time":"2026-10-03T13:51:54Z"}),
+            json!({"version":"123456g-dirty","commit":"123456g","build_time":"2026-10-03T13:51:54Z"}),
+            json!({"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":"unknown"}),
+            json!({"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":123}),
+            json!({"version":"1d0bd17-dirty","commit":"1d0bd17"}),
+            json!({"schemaVersion":"1","ok":true,"data":{"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":"2026-10-03T13:51:54Z"}}),
+            json!({"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":"2026-10-03T13:51:54Z","schemaVersion":"1"}),
+        ] {
+            assert!(legacy_version_label(build.to_string().as_bytes()).is_none(), "{build}");
+        }
+        assert!(legacy_version_label(b"{\"version\": 1.4.19").is_none());
     }
     #[test]
     fn allowlist_contains_no_mutating_or_generation_commands() {

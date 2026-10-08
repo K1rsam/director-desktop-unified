@@ -129,6 +129,7 @@ export function ProviderReadinessResult({ check }: { check: ReadinessCheck }) {
   const installed = { ready: '已找到', missing: '未找到', invalid: '路径或程序无效', not_checked: '未检查' };
   const protocol = { ready: '握手通过', failed: '握手失败', unsupported: '协议不受支持', not_checked: '未检查' };
   const authentication = { authenticated: '已登录', not_logged_in: '未登录', unknown: '状态未知', not_checked: '未检查' };
+  const authenticationLabel = result.provider === 'dreamina_canvas' && result.authentication.state === 'authenticated' && !result.authentication.identityVerified ? '本机有登录记录' : authentication[result.authentication.state];
   const catalog = { available: '已读取', unavailable: '读取未完成', not_checked: '未检查' };
   const network = { verified_read_only: '只读接口已验证', not_tested: '未测试', failed: '只读接口检查失败' };
   const canvasAccount = result.details.accountQuery;
@@ -138,7 +139,7 @@ export function ProviderReadinessResult({ check }: { check: ReadinessCheck }) {
     <p className="control-hint">最近只读检查：{formatDate(result.checkedAt)}</p>
     <dl><div><dt>程序安装</dt><dd>{installed[result.installation.state]}{result.installation.version ? ` · ${result.installation.version}` : ''}</dd></div>
       <div><dt>协议 / 环境</dt><dd>{protocol[result.protocol.state]}{result.protocol.name ? ` · ${result.protocol.name}` : ''}</dd></div>
-      <div><dt>账户</dt><dd>{authentication[result.authentication.state]} · {result.authentication.identityVerified ? '身份已核验' : '身份未核验'}</dd></div>
+      <div><dt>账户</dt><dd>{authenticationLabel} · {result.authentication.identityVerified ? '身份已核验' : '身份未核验'}</dd></div>
       {result.provider === 'dreamina_canvas' && <div><dt>Canvas account 查询</dt><dd>{canvasAccountLabel}</dd></div>}
       <div><dt>模型目录</dt><dd>{catalog[result.catalog.state]}{result.catalog.state === 'available' ? ` · ${result.catalog.models.length} 个模型` : ''}</dd></div>
       <div><dt>网络</dt><dd>{network[result.network.state]}</dd></div>

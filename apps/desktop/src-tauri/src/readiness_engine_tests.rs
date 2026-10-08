@@ -14,8 +14,9 @@ fn note(value:&str) {std::fs::OpenOptions::new().create(true).append(true).open(
 fn main() {
  let a:Vec<String>=std::env::args().skip(1).collect();
  if __KIND__.starts_with("dreamina") {
-  if a==["version"] {note("version");if __KIND__=="dreamina-version-failure" {std::process::exit(2);}if __KIND__=="dreamina-log-denied" {eprintln!("initialize logs failed: initialize file logger: open /PRIVATE_SENTINEL/.dreamina_cli/logs: operation not permitted");}println!("1.4.19");return;}
-  if a.len()==2 && a[1]=="-h" && ["multimodal2video","text2video","text2image","image2image"].contains(&a[0].as_str()) {note(&format!("{} -h",a[0]));println!("official synthetic help only --model_version 5.0Pro --ratio 16:9 --resolution_type 2k");return;}
+  if a==["version"] {note("version");if __KIND__=="dreamina-version-failure" {std::process::exit(2);}if __KIND__=="dreamina-log-denied" {eprintln!("initialize logs failed: initialize file logger: open /PRIVATE_SENTINEL/.dreamina_cli/logs: operation not permitted");}if __KIND__=="dreamina-build-json-mismatch" {println!("{}",__BAD_BUILD__);}else if __KIND__.starts_with("dreamina-build-json") {println!("{}",__BUILD__);}else{println!("1.4.19");}return;}
+  if a==["--help"] {note("--help");println!("Usage:\n  dreamina [command]\nAvailable Commands:\n login\n user_credit\n query_result\n text2image\n image2image\n text2video\n multimodal2video\nFlags:\n --version");return;}
+  if a.len()==2 && a[1]=="-h" && ["multimodal2video","text2video","text2image","image2image"].contains(&a[0].as_str()) {note(&format!("{} -h",a[0]));if __KIND__=="dreamina-build-json-wrong-help" {println!("Usage:\n  dreamina-canvas [command]\n --model --ratio --resolution");return;}println!("Usage:\n  dreamina {} [flags]\nFlags:\n --model_version 5.0Pro --ratio 16:9 --resolution_type 2k --video_resolution 720p --duration 5 --prompt synthetic --image --video --audio",a[0]);return;}
   if a==["user_credit"] {note("user_credit");println!("{{\"data\":{{\"user_id\":\"PRIVATE_SENTINEL\",\"total_credit\":42,\"gift_credit\":7}}}}");return;}
  } else {
   if a==["--version"] {note("version");if __KIND__=="codex-cold-start" {std::thread::sleep(std::time::Duration::from_millis(3500));}if __KIND__=="codex-output-flood" {for _ in 0..2048 {std::io::stdout().write_all(&[b'x';1024]).unwrap();}return;}println!("codex-cli synthetic-readiness");return;}
@@ -38,7 +39,9 @@ fn main() {
  }
  note("FORBIDDEN_COMMAND");std::process::exit(91);
 }
-"#.replace("__LOG__",&json!(dir.join(format!("{kind}-calls.txt"))).to_string()).replace("__KIND__",&json!(kind).to_string());
+"#.replace("__LOG__",&json!(dir.join(format!("{kind}-calls.txt"))).to_string()).replace("__KIND__",&json!(kind).to_string())
+    .replace("__BUILD__", &json!(json!({"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":"2026-10-03T13:51:54Z"}).to_string()).to_string())
+    .replace("__BAD_BUILD__", &json!(json!({"version":"1d0bd17-dirty","commit":"deadbee","build_time":"2026-10-03T13:51:54Z"}).to_string()).to_string());
     fs::write(&source, code).unwrap();
     let compiler = std::env::var_os("RUSTC")
         .map(PathBuf::from)
@@ -161,6 +164,7 @@ fn dreamina_check_does_not_poll_oauth_resume_tasks_cache_catalogs_or_claim_free_
     assert!(!log.contains("FORBIDDEN"));
     assert!(log.lines().all(|l| [
         "version",
+        "--help",
         "multimodal2video -h",
         "text2video -h",
         "text2image -h",
@@ -168,6 +172,45 @@ fn dreamina_check_does_not_poll_oauth_resume_tasks_cache_catalogs_or_claim_free_
         "user_credit"
     ]
     .contains(&l)));
+}
+#[test]
+fn legacy_build_json_readiness_preserves_original_job_and_settings_and_uses_only_read_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = native_fixture(dir.path(), "dreamina-build-json");
+    let engine = enabled_engine(dir.path().join("home"));
+    let project = engine.dispatch(json!({"action":"projects.create","title":"Synthetic Windows build readiness"})).unwrap();
+    let store = engine.store(s(&project, "id")).unwrap();
+    let job = store.add_job("image", "synthetic", "dreamina", "original-account", &json!({"prompt":"synthetic"}), "auth_required").unwrap();
+    let before_job = store.job(&job).unwrap();
+    let before_settings = store.settings().unwrap();
+    let report = engine.dispatch(json!({"action":"readiness.check","provider":"dreamina","projectId":project["id"],"settings":{"dreaminaPath":path}})).unwrap();
+    assert_eq!(report["installation"]["version"], "1d0bd17-dirty");
+    assert_eq!(report["protocol"]["state"], "ready", "{report}");
+    assert_eq!(report["authentication"]["state"], "authenticated");
+    assert_eq!(report["catalog"]["state"], "available");
+    assert_eq!(report["generation"]["calls"], 0);
+    assert_eq!(report["generation"]["enabled"], false);
+    assert!(!report.to_string().contains("PRIVATE_SENTINEL"));
+    assert_eq!(store.job(&job).unwrap(), before_job);
+    assert_eq!(store.settings().unwrap(), before_settings);
+    assert_eq!(fs::read_to_string(dir.path().join("dreamina-build-json-calls.txt")).unwrap(),
+        "version\n--help\nmultimodal2video -h\ntext2video -h\ntext2image -h\nimage2image -h\nuser_credit\n");
+}
+#[test]
+fn legacy_build_json_requires_matching_commit_and_old_command_help_before_account_probe() {
+    for (kind, expected) in [("dreamina-build-json-mismatch", "version\n"),
+        ("dreamina-build-json-wrong-help", "version\n--help\nmultimodal2video -h\n")] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = native_fixture(dir.path(), kind);
+        let engine = enabled_engine(dir.path().join("home"));
+        let project = engine.dispatch(json!({"action":"projects.create","title":"Synthetic protocol mismatch"})).unwrap();
+        let report = engine.dispatch(json!({"action":"readiness.check","provider":"dreamina","projectId":project["id"],"settings":{"dreaminaPath":path}})).unwrap();
+        assert_eq!(report["protocol"]["state"], "unsupported", "{report}");
+        assert_eq!(report["authentication"]["state"], "not_checked");
+        assert_eq!(report["generation"]["calls"], 0);
+        assert_eq!(fs::read_to_string(dir.path().join(format!("{kind}-calls.txt"))).unwrap(), expected);
+        assert!(engine.store(s(&project, "id")).unwrap().jobs().unwrap().is_empty());
+    }
 }
 #[test]
 fn isolated_startup_and_unsupported_readiness_requests_fail_before_any_probe() {

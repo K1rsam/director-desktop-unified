@@ -37,7 +37,7 @@ npm run desktop:launch
 ```powershell
 # 仓库根目录
 node scripts/verify-integration-lineage.mjs
-cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --tests
+cargo test --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --tests -- --test-threads=1
 # apps/desktop
 npm run test:frontend
 npm run build
