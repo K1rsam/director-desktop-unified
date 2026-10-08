@@ -111,6 +111,7 @@ fn headless_native_async_command_rejects_before_home_or_worker_creation() {
         "foundation.run",
         "images.design",
         "storyboard.run",
+        "storyboard.refine",
         "workflows.resume",
     ] {
         let root = tempfile::tempdir().unwrap();

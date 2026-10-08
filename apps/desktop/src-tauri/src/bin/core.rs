@@ -8,7 +8,11 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let home = PathBuf::from(args.next().unwrap_or_else(|| ".director-next".into()));
     let result = (|| {
-        director_core::windows_runtime::verify_shared_directory(&home)?;
+        // Reject the packaged context without touching the supplied home. The
+        // physical write probe belongs after request and execution-mode gates.
+        if director_core::windows_runtime::is_packaged()? {
+            return Err("项目存储仍在宿主隔离环境，未启动执行器".into());
+        }
         let mut body = String::new();
         io::stdin()
             .read_to_string(&mut body)
@@ -20,6 +24,7 @@ fn main() {
                 "foundation.run",
                 "images.design",
                 "storyboard.run",
+                "storyboard.refine",
                 "workflows.resume",
                 "storyboard.decision.resolve",
                 "images.produce",
@@ -31,13 +36,17 @@ fn main() {
             return Err("HEADLESS_ASYNC_ACCEPTANCE_BLOCKED: 有界真实文本流程须由持续运行的桌面应用派发；一次性核心进程不会启动后立即退出".into());
         }
         let engine = match mode.as_deref() {
-            None => Engine::new(home)?,
+            None => {
+                director_core::windows_runtime::verify_shared_directory(&home)?;
+                Engine::new(home)?
+            }
             Some("--native-cli-acceptance") => {
                 let path = PathBuf::from(args.next().ok_or("缺少验收授权文件绝对路径")?);
                 if args.next().is_some() {
                     return Err("不支持的额外启动参数".into());
                 }
                 let grant = director_core::native_acceptance::AcceptanceGrant::from_file(&path)?;
+                director_core::windows_runtime::verify_shared_directory(&home)?;
                 Engine::with_native_acceptance(home, grant)?
             }
             _ => return Err("未知启动选项；默认仅离线".into()),
