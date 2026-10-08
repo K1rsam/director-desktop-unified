@@ -3130,6 +3130,8 @@ impl Engine {
                 if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
             }
         } else {
+            design_input["selection"]["explicitAssetIds"] = json!(r["assetIds"].as_array().cloned()
+                .unwrap_or_else(|| all_assets.iter().filter(|asset| independent_image(asset)).map(|asset| asset["id"].clone()).collect()));
             pipeline::asset_design_contract::freeze_identity_production_materials(&mut design_input)?;
             pipeline::asset_production_context::freeze(&mut design_input);
             let mut comparisons = json!({});

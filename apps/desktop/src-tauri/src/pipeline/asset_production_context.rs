@@ -4,9 +4,12 @@ use super::{asset_design_contract as contract, assets, digest, LockedSource};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-pub const PROFILE: &str = "asset-production-context/v1";
+pub const LEGACY_PROFILE: &str = "asset-production-context/v1";
+pub const PROFILE: &str = "asset-production-context/v2";
 pub const PROFILE_FIELD: &str = "stage2ProductionContext";
-pub const INSTRUCTIONS: &str = "本附加上下文只指导原C基础/D派生岗位的普通制作判断，不新增模型岗位或事实。applicableScenes是当前形象可复用的准确场次定位，factEvidenceScopes标明每条原facts的证据场次和背景行；原facts/claim/variantId与原已有evidence全部保留，不因属性词或出现次数删改。只有多场共用LOC在evidence额外提供最初适用场的完整原文，其它适用场仅为定位元数据，未声称提供整场文字。核对facts引用行及实际evidence：某一场有状态证据不等于它在所有适用场持续成立，区分身份/空间/物件的稳定设计与现场状态、时段、事件和后续变化。多场共用基础稿以可复用身份/结构为主，明确变化留给对应场次的表演/分镜；初始条件未说明时取最保守且不预支后续剧情的中性可用方案，不补造相反事实，取舍写入freeDesignScope。relatedProps只因已采用A15的SOURCE事实引用了同一非标题原文行而成为候选，不证明持有者、同一物件或长期佩戴；必须核对所给共享原行确认是否当前人物在当前形象使用同一件。只有acceptedDesign非空且关系有原文依据时，复用该道具已接受的形制、材质、颜色和标识，不再次定义同物件美术；这是文字一致性约束，不提升为SOURCE事实。没有有效设计或关系不明确时，只保留原文必要的持有/佩戴关系，不创造独立物件造型，也不推断同场其它主体的物品属于当前人物。候选道具不是parentDesign，不改变直接父形象继承、referenceVariantIds、图片引用或生成数量；差异与不确定性写入freeDesignScope，无需新增确认岗。";
+pub const LEGACY_INSTRUCTIONS: &str = "本附加上下文只指导原C基础/D派生岗位的普通制作判断，不新增模型岗位或事实。applicableScenes是当前形象可复用的准确场次定位，factEvidenceScopes标明每条原facts的证据场次和背景行；原facts/claim/variantId与原已有evidence全部保留，不因属性词或出现次数删改。只有多场共用LOC在evidence额外提供最初适用场的完整原文，其它适用场仅为定位元数据，未声称提供整场文字。核对facts引用行及实际evidence：某一场有状态证据不等于它在所有适用场持续成立，区分身份/空间/物件的稳定设计与现场状态、时段、事件和后续变化。多场共用基础稿以可复用身份/结构为主，明确变化留给对应场次的表演/分镜；初始条件未说明时取最保守且不预支后续剧情的中性可用方案，不补造相反事实，取舍写入freeDesignScope。relatedProps只因已采用A15的SOURCE事实引用了同一非标题原文行而成为候选，不证明持有者、同一物件或长期佩戴；必须核对所给共享原行确认是否当前人物在当前形象使用同一件。只有acceptedDesign非空且关系有原文依据时，复用该道具已接受的形制、材质、颜色和标识，不再次定义同物件美术；这是文字一致性约束，不提升为SOURCE事实。没有有效设计或关系不明确时，只保留原文必要的持有/佩戴关系，不创造独立物件造型，也不推断同场其它主体的物品属于当前人物。候选道具不是parentDesign，不改变直接父形象继承、referenceVariantIds、图片引用或生成数量；差异与不确定性写入freeDesignScope，无需新增确认岗。";
+pub const INSTRUCTIONS: &str = "本附加上下文只指导原C基础/D派生岗位的普通制作判断，不新增模型岗位或事实。applicableScenes是当前形象可复用的准确场次定位，factEvidenceScopes标明每条原facts的证据场次和背景行；原facts/claim/variantId与原已有evidence全部保留，不因属性词或出现次数删改。只有多场共用LOC在evidence额外提供最初适用场的完整原文，其它适用场仅为定位元数据，未声称提供整场文字。核对facts引用行及实际evidence：某一场有状态证据不等于它在所有适用场持续成立，区分身份/空间/物件的稳定设计与现场状态、时段、事件和后续变化。多场共用基础稿以可复用身份/结构为主，明确变化留给对应场次的表演/分镜；初始条件未说明时取最保守且不预支后续剧情的中性可用方案，不补造相反事实，取舍写入freeDesignScope。relatedProps只因已采用A15的SOURCE事实引用了同一非标题原文行而成为候选，不证明持有者、同一物件或长期佩戴；必须核对所给共享原行确认是否当前人物在当前形象使用同一件。只有acceptedDesign非空且关系有原文依据时，复用该道具已接受的形制、材质、颜色和标识，不再次定义同物件美术；这是文字一致性约束，不提升为SOURCE事实。没有有效设计或关系不明确时，只保留原文必要的持有/佩戴关系，不创造独立物件造型，也不推断同场其它主体的物品属于当前人物。候选道具不是parentDesign，不改变直接父形象继承、referenceVariantIds、图片引用或生成数量；差异与不确定性写入freeDesignScope，无需新增确认岗。DERIVED继承父稿的稳定身份、脸型、眉眼鼻唇关系、体态以及适用于当前形象且未被原文明示改变的稳定造型。parentDesign.freeDesignScope逐字来自已接受父稿，designChoices仅证明该美术取舍的来源和版本，不是SOURCE事实。保持未变穿戴只针对当前适用的穿戴，不把父稿限定场次的配饰、携带物、动作或临时状态自动扩展成常驻身份。先对照当前asset.scope、applicableScenes、factEvidenceScopes和实际evidence，判断STATE是否在当前场成立或有原文连续事实支持；父稿明确的场次/用途范围限制须按原范围处理。原文明确在当前场沿用或变更时服从原文并说明取舍；没有连续依据时，不以没有写下摘除/放下为由跨越父稿已明确的范围限制，也不凭换装名称武断删去原文明确仍适用的穿戴。全部原facts仍供核对，不把未适用STATE重写为相反事实。差异或冲突写入当前freeDesignScope，不重设计稳定身份，不扩展直接父引用或图片生成数量。";
+const PARENT_CHOICES_USAGE: &str = "ACCEPTED_PARENT_DESIGN_CHOICES_NOT_SOURCE_FACT";
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
@@ -15,19 +18,143 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 /// Only the engine's new-workflow boundary calls this. No legacy upgrade on replay.
 pub fn freeze(input: &mut Value) {
     input[PROFILE_FIELD] = json!({"version":PROFILE,"instructions":INSTRUCTIONS,"instructionsSha256":digest(INSTRUCTIONS)});
+    if let Some(explicit) = input["selection"].get("explicitAssetIds") {
+        // Copied inside the already-restored profile so GUI dependency closure
+        // cannot turn an implicit v1 source into an explicitly requested design.
+        input[PROFILE_FIELD]["explicitAssetIds"] = explicit.clone();
+    }
 }
 
 fn profile(input: &Value) -> Result<Option<&Value>, String> {
     let Some(value) = input.get(PROFILE_FIELD).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
-    if value["version"] != PROFILE
-        || value["instructions"] != INSTRUCTIONS
-        || value["instructionsSha256"] != digest(INSTRUCTIONS)
-    {
+    if !valid_profile(value) {
         return Err("第二阶段原制作上下文版本/指令摘要无效；未重建旧请求".into());
     }
     Ok(Some(value))
+}
+
+fn valid_profile(value: &Value) -> bool {
+    let instructions = match value["version"].as_str() {
+        Some(LEGACY_PROFILE) => LEGACY_INSTRUCTIONS,
+        Some(PROFILE) => INSTRUCTIONS,
+        _ => return false,
+    };
+    let exact_instructions = value["instructions"] == instructions
+        && value["instructionsSha256"] == digest(instructions);
+    if value["version"] == PROFILE {
+        if let Some(explicit) = value.get("explicitAssetIds") {
+            let Some(ids) = explicit.as_array() else { return false; };
+            let mut seen = HashSet::new();
+            if ids.iter().any(|id| id.as_str().is_none_or(|id| id.is_empty() || !seen.insert(id))) {
+                return false;
+            }
+        }
+    }
+    exact_instructions
+}
+
+pub(crate) fn frozen_version(input: &Value) -> Result<Option<&str>, String> {
+    profile(input).map(|value| value.map(|value| text(value, "version")))
+}
+
+pub(crate) fn explicit_design_asset_ids(input: &Value) -> Result<Option<&[Value]>, String> {
+    let Some(frozen) = profile(input)? else { return Ok(None); };
+    if frozen["version"] != PROFILE { return Ok(None); }
+    Ok(frozen.get("explicitAssetIds").and_then(Value::as_array).map(Vec::as_slice))
+}
+
+/// New v2 children may read an implicit accepted v1 parent under its original
+/// contract. Explicit design targets still receive the new v2 instructions.
+pub(super) fn accepted_parent_input(input: &Value, asset: &Value) -> Result<Option<Value>, String> {
+    let explicit = explicit_design_asset_ids(input)?
+        .or_else(|| input["selection"]["assetIds"].as_array().map(Vec::as_slice));
+    if frozen_version(input)? != Some(PROFILE)
+        || explicit.is_none_or(|ids| ids.contains(&asset["id"]))
+        || asset["design"]["designReceipt"]["basis"]["assetProductionContext"]["version"] != LEGACY_PROFILE
+    {
+        return Ok(None);
+    }
+    let original = &asset["design"]["frozenContext"]["assetProductionContext"];
+    let original_basis = &asset["design"]["designReceipt"]["basis"];
+    if !valid_profile(original) || original["version"] != LEGACY_PROFILE
+        || binding(original) != original_basis["assetProductionContext"]
+    {
+        return Err("父稿原冻结v1制作合同或收据不匹配，未升级或重发".into());
+    }
+    let mut basis = input.clone();
+    basis[PROFILE_FIELD] = json!({"version":original["version"],"instructions":original["instructions"],"instructionsSha256":original["instructionsSha256"]});
+    if original_basis.get("identityProductionMaterialsSha256").is_none()
+        && original_basis.get("assetScopeProductionMaterialsSha256").is_none()
+    {
+        for key in [contract::IDENTITY_MATERIAL_PROFILE_FIELD,contract::IDENTITY_MATERIALS_FIELD,contract::SCOPE_MATERIALS_FIELD] {
+            basis.as_object_mut().unwrap().remove(key);
+        }
+    }
+    Ok(Some(basis))
+}
+
+fn parent_design_choice_proof(asset: &Value, design: &Value) -> Option<Value> {
+    if asset["promptOrigin"] == "MANUAL"
+        || design["schemaVersion"] != "asset-design/v1"
+        || design["assetId"] != asset["id"]
+        || design["variantId"] != asset["variantId"]
+        || text(asset, "prompt").trim().is_empty()
+        || design["prompt"] != asset["prompt"]
+        || text(design, "sourceSha256").is_empty()
+        || text(&design["designReceipt"], "sha256").is_empty()
+    {
+        return None;
+    }
+    let scope = design["freeDesignScope"].as_str()?;
+    Some(json!({
+        "assetId":asset["id"],"identityId":contract::identity(asset),"variantId":asset["variantId"],
+        "assetSemanticVersion":digest(&contract::asset_semantics(asset).to_string()),
+        "sourceSha256":design["sourceSha256"],"designReceiptSha256":design["designReceipt"]["sha256"],
+        "designVersion":digest(&json!({"prompt":asset["prompt"],"receipt":design["designReceipt"]}).to_string()),
+        "freeDesignScopeSha256":digest(scope),"usage":PARENT_CHOICES_USAGE
+    }))
+}
+
+/// Called only with an accepted/current parent design, never a manual or stale
+/// candidate. v1 keeps its exact seven-field parent card.
+pub(super) fn reference_design_choices(
+    input: &Value,
+    asset: &Value,
+    design: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    if frozen_version(input)? != Some(PROFILE) || asset["promptOrigin"] == "MANUAL" {
+        return Ok(None);
+    }
+    design.map(|design| {
+        let proof = parent_design_choice_proof(asset, design)
+            .ok_or("已接受父设计的制作取舍证据不完整，原稿保留")?;
+        if proof["sourceSha256"] != input["source"]["sha256"] {
+            return Err("父设计制作取舍不属于当前锁定来源，原稿保留".into());
+        }
+        Ok(proof)
+    }).transpose()
+}
+
+fn parent_design_choices(input: &Value, asset: &Value) -> Result<Option<Value>, String> {
+    let catalogue = input["assets"].as_array().ok_or("制作上下文缺少资产目录")?;
+    let Some(parent) = assets::resolve_asset_dependency(catalogue, asset)? else {
+        return Ok(None);
+    };
+    let by_id = catalogue.iter().map(|row| (text(row,"id"), row)).collect();
+    let parents = catalogue.iter().filter_map(|row| {
+        assets::resolve_asset_dependency(catalogue, row).ok()
+            .map(|parent|(text(row,"id").to_owned(),parent))
+    }).collect();
+    let target = assets::inline_reference_target(&parent, &by_id, &parents)?;
+    let saved = catalogue.iter().find(|row| text(row,"id") == target)
+        .ok_or("已接受父设计身份缺失")?;
+    let original = accepted_parent_input(input, saved)?;
+    if !contract::design_receipt_current(original.as_ref().unwrap_or(input), saved) {
+        return Ok(None);
+    }
+    reference_design_choices(input, saved, saved.get("design"))
 }
 
 fn selected_facts(
@@ -269,6 +396,18 @@ fn prop_design(input: &Value, prop: &Value, source: &LockedSource) -> Option<Val
     let original_basis = &design["designReceipt"]["basis"];
     if original_basis.get("assetProductionContext").is_none() {
         basis.as_object_mut()?.remove(PROFILE_FIELD);
+    } else if frozen_version(input).ok()? == Some(PROFILE)
+        && original_basis["assetProductionContext"]["version"] != PROFILE
+    {
+        // A new v2 character may consume a valid v1 prop, but its accepted
+        // receipt must be evaluated under the exact original v1 instructions.
+        let original = &design["frozenContext"]["assetProductionContext"];
+        if !valid_profile(original)
+            || original["version"] != original_basis["assetProductionContext"]["version"]
+        {
+            return None;
+        }
+        basis[PROFILE_FIELD] = json!({"version":original["version"],"instructions":original["instructions"],"instructionsSha256":original["instructionsSha256"]});
     }
     if original_basis
         .get("identityProductionMaterialsSha256")
@@ -423,9 +562,13 @@ pub(crate) fn context(input: &Value, asset: &Value) -> Result<Option<Value>, Str
             "VERIFY_SAME_OBJECT_IN_SOURCE_THEN_REUSE"
         });
     }
-    Ok(Some(
-        json!({"version":PROFILE,"sourceSha256":source.sha256,"instructions":frozen["instructions"],"instructionsSha256":frozen["instructionsSha256"],"applicableScenes":source.scenes.iter().filter(|scene| applicable.contains(&scene.id)).map(scene_card).collect::<Vec<_>>(),"factEvidenceScenes":source.scenes.iter().filter(|scene| evidence_scenes.contains(&scene.id)).map(scene_card).collect::<Vec<_>>(),"factEvidenceScopes":fact_scopes,"readSceneIds":source.scenes.iter().filter(|scene|read_scenes.contains(&scene.id)).map(|scene|scene.id.clone()).collect::<Vec<_>>(),"relatedProps":related}),
-    ))
+    let mut context = json!({"version":frozen["version"],"sourceSha256":source.sha256,"instructions":frozen["instructions"],"instructionsSha256":frozen["instructionsSha256"],"applicableScenes":source.scenes.iter().filter(|scene| applicable.contains(&scene.id)).map(scene_card).collect::<Vec<_>>(),"factEvidenceScenes":source.scenes.iter().filter(|scene| evidence_scenes.contains(&scene.id)).map(scene_card).collect::<Vec<_>>(),"factEvidenceScopes":fact_scopes,"readSceneIds":source.scenes.iter().filter(|scene|read_scenes.contains(&scene.id)).map(|scene|scene.id.clone()).collect::<Vec<_>>(),"relatedProps":related});
+    if frozen["version"] == PROFILE {
+        if let Some(proof) = parent_design_choices(input, asset)? {
+            context["parentDesignChoices"] = proof;
+        }
+    }
+    Ok(Some(context))
 }
 
 /// Source text is still materialized once, in C/D evidence. Scene mapping is
@@ -466,23 +609,64 @@ pub(crate) fn evidence_rows(context: &Value, source: &LockedSource) -> BTreeSet<
 pub(crate) fn binding(context: &Value) -> Value {
     let consumed: Vec<_> = context["relatedProps"].as_array().into_iter().flatten().filter(|prop| !prop["acceptedDesign"].is_null())
         .map(|prop| json!({"assetId":prop["assetId"],"identityId":prop["identityId"],"variantId":prop["variantId"],"assetSemanticVersion":prop["assetSemanticVersion"],"sourceSha256":context["sourceSha256"],"sharedSourceRefs":prop["sharedSourceRefs"],"designVersion":prop["acceptedDesign"]["designVersion"],"designReceiptSha256":prop["acceptedDesign"]["designReceiptSha256"]})).collect();
-    json!({"version":PROFILE,"instructionsSha256":context["instructionsSha256"],"sceneContextSha256":digest(&json!({"applicableScenes":context["applicableScenes"],"factEvidenceScenes":context["factEvidenceScenes"],"factEvidenceScopes":context["factEvidenceScopes"],"readSceneIds":context["readSceneIds"]}).to_string()),"relatedPropsSha256":digest(&context["relatedProps"].to_string()),"consumedPropDesigns":consumed})
+    let mut binding = json!({"version":context["version"],"instructionsSha256":context["instructionsSha256"],"sceneContextSha256":digest(&json!({"applicableScenes":context["applicableScenes"],"factEvidenceScenes":context["factEvidenceScenes"],"factEvidenceScopes":context["factEvidenceScopes"],"readSceneIds":context["readSceneIds"]}).to_string()),"relatedPropsSha256":digest(&context["relatedProps"].to_string()),"consumedPropDesigns":consumed});
+    if context["version"] == PROFILE {
+        if let Some(proof) = context.get("parentDesignChoices") {
+            binding["parentDesignChoices"] = proof.clone();
+        }
+    }
+    binding
 }
 
 /// Atomic publication and resume guard for relevant props outside proposals.
 /// Counters/media do not invalidate a design; a user edit to prose or semantic
 /// identity does. Missing profile keeps the exact legacy publication contract.
 pub fn validate_consumed_prop_designs(design: &Value, catalogue: &[Value]) -> Result<(), String> {
+    validate_consumed_designs(design, catalogue, &mut HashSet::new())
+}
+
+fn validate_consumed_dependency(
+    asset: &Value,
+    catalogue: &[Value],
+    visiting: &mut HashSet<String>,
+) -> Result<(), String> {
+    let id = text(asset,"id").to_owned();
+    if !visiting.insert(id.clone()) || visiting.len() > catalogue.len() {
+        return Err("已接受制作取舍依赖循环或超出冻结目录，原稿保留".into());
+    }
+    let result = validate_consumed_designs(&asset["design"], catalogue, visiting);
+    visiting.remove(&id);
+    result
+}
+
+fn validate_consumed_designs(
+    design: &Value,
+    catalogue: &[Value],
+    visiting: &mut HashSet<String>,
+) -> Result<(), String> {
     let Some(expected) = design["designReceipt"]["basis"].get("assetProductionContext") else {
         return Ok(());
     };
     let context = &design["frozenContext"]["assetProductionContext"];
-    if context["version"] != PROFILE
-        || context["instructions"] != INSTRUCTIONS
-        || context["instructionsSha256"] != digest(INSTRUCTIONS)
+    if !valid_profile(context)
         || *expected != binding(context)
     {
         return Err("已冻结制作上下文与设计收据不一致，原稿保留".into());
+    }
+    if let Some(proof) = expected.get("parentDesignChoices") {
+        let matches: Vec<_> = catalogue.iter().filter(|parent| {
+            parent["id"] == proof["assetId"] && !crate::store::asset_deleted(parent)
+        }).collect();
+        let [parent] = matches.as_slice() else {
+            return Err("已使用的父设计制作取舍身份缺失或重复，原稿保留".into());
+        };
+        if context["version"] != PROFILE
+            || proof["sourceSha256"] != context["sourceSha256"]
+            || parent_design_choice_proof(parent, &parent["design"]).as_ref() != Some(proof)
+        {
+            return Err("已使用的父设计制作取舍/范围或设计版本已变化，原请求与稿件保留".into());
+        }
+        validate_consumed_dependency(parent, catalogue, visiting)?;
     }
     for proof in expected["consumedPropDesigns"]
         .as_array()
@@ -512,6 +696,9 @@ pub fn validate_consumed_prop_designs(design: &Value, catalogue: &[Value]) -> Re
             != json!(contract::source_chain(catalogue, prop)?)
         {
             return Err("已使用的相关道具祖先设计版本已变化；原请求与稿件保留".into());
+        }
+        if context["version"] == PROFILE {
+            validate_consumed_dependency(prop, catalogue, visiting)?;
         }
     }
     Ok(())
@@ -559,6 +746,13 @@ pub(crate) fn validate_resume(
                 .as_array_mut()
                 .unwrap()
                 .retain(|prop| !original_targets.contains(text(prop, "assetId")));
+            if context.get("parentDesignChoices").is_some_and(|proof| {
+                original_targets.contains(text(proof, "assetId"))
+            }) {
+                // Accepted in-flow parents are guarded by each frozen child
+                // request/result; original preflight still contains old parents.
+                context.as_object_mut().unwrap().remove("parentDesignChoices");
+            }
             let design = json!({"designReceipt":{"basis":{"assetProductionContext":binding(&context)}},"frozenContext":{"assetProductionContext":context}});
             validate_consumed_prop_designs(&design, catalogue)?;
         }
@@ -569,6 +763,46 @@ pub(crate) fn validate_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parent_design_choices_v1_instruction_and_binding_bytes_remain_exact() {
+        assert_eq!(digest(LEGACY_INSTRUCTIONS), "918274f96c798388a74c1f022d34146a885ae2134fd469f12b8e1955c6c443e1");
+        let frozen = json!({"version":LEGACY_PROFILE,"instructions":LEGACY_INSTRUCTIONS,"instructionsSha256":digest(LEGACY_INSTRUCTIONS)});
+        let input = json!({PROFILE_FIELD:frozen});
+        assert_eq!(frozen_version(&input).unwrap(),Some(LEGACY_PROFILE));
+        let context = json!({"version":LEGACY_PROFILE,"sourceSha256":"source","instructions":LEGACY_INSTRUCTIONS,"instructionsSha256":digest(LEGACY_INSTRUCTIONS),"applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[],"relatedProps":[]});
+        assert_eq!(binding(&context),json!({"version":LEGACY_PROFILE,"instructionsSha256":digest(LEGACY_INSTRUCTIONS),"sceneContextSha256":digest(&json!({"applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[]}).to_string()),"relatedPropsSha256":digest("[]"),"consumedPropDesigns":[]}));
+        let design = json!({"designReceipt":{"basis":{"assetProductionContext":binding(&context)}},"frozenContext":{"assetProductionContext":context}});
+        validate_consumed_prop_designs(&design,&[]).unwrap();
+    }
+
+    #[test]
+    fn parent_design_choices_versions_and_exact_instruction_hash_fail_closed() {
+        let mut input = json!({});
+        freeze(&mut input);
+        assert_eq!(frozen_version(&input).unwrap(),Some(PROFILE));
+        for (version,instructions) in [(LEGACY_PROFILE,INSTRUCTIONS),(PROFILE,LEGACY_INSTRUCTIONS),("asset-production-context/v3",INSTRUCTIONS)] {
+            let changed = json!({PROFILE_FIELD:{"version":version,"instructions":instructions,"instructionsSha256":digest(instructions)}});
+            assert!(frozen_version(&changed).is_err());
+        }
+        input[PROFILE_FIELD]["instructionsSha256"] = json!(digest(LEGACY_INSTRUCTIONS));
+        assert!(frozen_version(&input).is_err());
+        for ids in [json!(null),json!(["child","child"]),json!([3]),json!([""])] {
+            let changed = json!({PROFILE_FIELD:{"version":PROFILE,"instructions":INSTRUCTIONS,"instructionsSha256":digest(INSTRUCTIONS),"explicitAssetIds":ids}});
+            assert!(frozen_version(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn parent_design_choices_missing_accepted_scope_rejects_v2_and_keeps_v1_card_contract() {
+        let asset = json!({"id":"parent","baseAssetId":"subject","variantId":"base","prompt":"已接受的父稿","promptOrigin":"AI"});
+        let design = json!({"schemaVersion":"asset-design/v1","assetId":"parent","variantId":"base","prompt":"已接受的父稿","sourceSha256":"source","designReceipt":{"sha256":"receipt"}});
+        let mut input = json!({"source":{"sha256":"source"}});
+        freeze(&mut input);
+        assert!(reference_design_choices(&input,&asset,Some(&design)).is_err());
+        input[PROFILE_FIELD] = json!({"version":LEGACY_PROFILE,"instructions":LEGACY_INSTRUCTIONS,"instructionsSha256":digest(LEGACY_INSTRUCTIONS)});
+        assert_eq!(reference_design_choices(&input,&asset,Some(&design)).unwrap(),None);
+    }
+
     #[test]
     fn unreceipted_shared_facts_never_create_prop_candidates() {
         let source =

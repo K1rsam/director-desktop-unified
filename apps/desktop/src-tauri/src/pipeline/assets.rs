@@ -43,7 +43,7 @@ fn inline_asset(asset: &Value) -> bool {
     asset.pointer("/preparation/mode").and_then(Value::as_str) == Some("INLINE")
 }
 
-fn inline_reference_target(
+pub(super) fn inline_reference_target(
     parent: &str,
     by_id: &BTreeMap<&str, &Value>,
     parents: &BTreeMap<String, Option<String>>,
@@ -324,14 +324,19 @@ fn asset_design_card(input: &Value, asset: &Value) -> Result<Value, String> {
     Ok(card)
 }
 
-fn reference_design_card(asset: &Value, design: Option<&Value>) -> Value {
-    json!({
+fn reference_design_card(input: &Value, asset: &Value, design: Option<&Value>) -> Result<Value, String> {
+    let mut card = json!({
         "assetId":asset["id"],"variantId":asset["variantId"],"assetVersion":asset["version"],
         "prompt":asset["prompt"],
         "origin":if text(asset,"promptOrigin")=="MANUAL" {"MANUAL"} else if design.is_some() {"AI"} else {"UNVERIFIED"},
         "sourceRefs":design.and_then(|value|value.get("sourceRefs")),
         "evidencePolicy":"已保存来源设计是外观一致性约束，不是新的原文事实；未提供图片像素。"
-    })
+    });
+    if let Some(proof) = super::asset_production_context::reference_design_choices(input, asset, design)? {
+        card["freeDesignScope"] = design.unwrap()["freeDesignScope"].clone();
+        card["designChoices"] = proof;
+    }
+    Ok(card)
 }
 
 pub(super) fn reusable_parent_design<'a>(
@@ -344,7 +349,8 @@ pub(super) fn reusable_parent_design<'a>(
     parent: Option<&str>,
 ) -> Option<&'a Value> {
     let design = asset.get("design")?;
-    if !super::asset_design_contract::design_receipt_current(input, asset)
+    let original = super::asset_production_context::accepted_parent_input(input, asset).ok()?;
+    if !super::asset_design_contract::design_receipt_current(original.as_ref().unwrap_or(input), asset)
         || text(design, "schemaVersion") != "asset-design/v1"
         || text(design, "sourceSha256") != source_sha
         || text(design, "assetId") != text(asset, "id")
@@ -423,9 +429,14 @@ pub(super) fn automatic_design_stale(input: &Value, asset: &Value) -> bool {
     {
         return false;
     }
-    if input.get(super::asset_production_context::PROFILE_FIELD).is_some_and(|value| !value.is_null())
-        && asset["design"]["designReceipt"]["basis"]["assetProductionContext"]["version"] != super::asset_production_context::PROFILE {
-        return true; // New requests do not silently relabel old accepted receipts.
+    match super::asset_production_context::frozen_version(input) {
+        Ok(Some(version)) if asset["design"]["designReceipt"]["basis"]["assetProductionContext"]["version"] != version => {
+            if super::asset_production_context::accepted_parent_input(input,asset).ok().flatten().is_none() {
+                return true; // Only an implicit, exactly revalidated v1 source can cross profiles.
+            }
+        }
+        Err(_) => return true,
+        _ => {}
     }
     let Some(assets) = input["assets"].as_array() else {
         return true;
@@ -548,7 +559,9 @@ pub async fn run_asset_design(
         })
         .map(|a| text(a, "id").to_string())
         .collect();
-    let explicitly_selected = wanted.clone();
+    let explicitly_selected = if let Some(explicit) = super::asset_production_context::explicit_design_asset_ids(input)? {
+        wanted.iter().filter(|id| explicit.iter().any(|value| value.as_str() == Some(id.as_str()))).cloned().collect()
+    } else { wanted.clone() };
     let mut parents = BTreeMap::new();
     let mut parent_errors = BTreeMap::new();
     for asset in assets {
@@ -688,7 +701,7 @@ pub async fn run_asset_design(
         {
             available_designs.insert(
                 text(asset, "id").to_owned(),
-                reference_design_card(asset, None),
+                reference_design_card(&design_basis, asset, None)?,
             );
         }
     }
@@ -721,11 +734,12 @@ pub async fn run_asset_design(
                     available_designs.insert(
                         id.clone(),
                         reference_design_card(
+                            &design_basis,
                             asset,
                             asset.get("design").filter(|design| {
                                 text(design, "schemaVersion") == "asset-design/v1"
                             }),
-                        ),
+                        )?,
                     );
                 }
                 pending.remove(&id);
@@ -788,7 +802,7 @@ pub async fn run_asset_design(
                 if manual || no_ai_design {
                     // A direct saved reference is usable without pretending it is
                     // an accepted AI result. Never rewrite an implicit dependency.
-                    available_designs.insert(id.clone(), reference_design_card(asset, None));
+                    available_designs.insert(id.clone(), reference_design_card(&design_basis, asset, None)?);
                     pending.remove(&id);
                     progress = true;
                     continue;
@@ -865,7 +879,7 @@ pub async fn run_asset_design(
                 .filter(|_| !automatic || !parent_redesigned)
                 {
                     available_designs
-                        .insert(id.clone(), reference_design_card(asset, Some(design)));
+                        .insert(id.clone(), reference_design_card(&design_basis, asset, Some(design))?);
                     pending.remove(&id);
                     progress = true;
                     continue;
@@ -1057,7 +1071,7 @@ pub async fn run_asset_design(
                     }
                     available_designs.insert(
                         id.clone(),
-                        reference_design_card(&updated_asset, Some(&output)),
+                        reference_design_card(&design_basis, &updated_asset, Some(&output))?,
                     );
                     designs.push(output);
                 }
