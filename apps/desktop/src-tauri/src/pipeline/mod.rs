@@ -29,7 +29,7 @@ pub(crate) fn scope_repair_delta_schema_for_test(full: &Value, base: &Value) -> 
     storyboard::finish_delta_schema(full, base)
 }
 pub use storyboard::{
-    compile_reference_template, render_legacy_unit, run_storyboard, validate_storyboard,
+    compile_reference_template, freeze_scene_input_profile, render_legacy_unit, run_storyboard, validate_storyboard,
 };
 pub(crate) use storyboard_transport::{
     compile_legacy_finish_grouping_transport, compile_storyboard_dispatch_transport,

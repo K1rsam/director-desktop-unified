@@ -22,17 +22,26 @@ $stagedPath = Join-Path $releaseRoot 'director-desktop-next.update.tmp'
 $preparedCandidatePath = Join-Path $releaseRoot 'director-desktop-next-candidate.exe'
 $preparedCandidateReceiptPath = Join-Path $releaseRoot '.prepared-candidate.json'
 
+function Get-NativeIoPath([string]$Path) {
+    # Keep all containment checks on ordinary canonical paths. Only .NET I/O
+    # receives a verbatim path: Windows PowerShell 5.1's provider rejects
+    # existing SDK files beyond MAX_PATH, even when native I/O can read them.
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    if ($absolute.StartsWith('\\?\')) { return $absolute }
+    if ($absolute.StartsWith('\\')) { return '\\?\UNC\' + $absolute.Substring(2) }
+    return '\\?\' + $absolute
+}
 function Get-ClientHash([string]$Path) {
-    $stream = [System.IO.File]::OpenRead($Path)
+    $stream = [System.IO.File]::OpenRead((Get-NativeIoPath $Path))
     $hasher = [System.Security.Cryptography.SHA256]::Create()
     try { return [System.BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 function Get-VerifiedSdkManifest([string]$Directory) {
     $root = [System.IO.Path]::GetFullPath($Directory)
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw '缺少已准备的 SDK 只读资源。' }
+    if (-not [System.IO.Directory]::Exists((Get-NativeIoPath $root))) { throw '缺少已准备的 SDK 只读资源。' }
     $manifestPath = Join-Path $root 'manifest.json'
-    $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+    $manifest = [System.IO.File]::ReadAllText((Get-NativeIoPath $manifestPath)) | ConvertFrom-Json
     $allowed = @('src/health.mjs','src/bridge.mjs','src/main.mjs','src/native-runtime.mjs','THIRD_PARTY_NOTICES.md','package-lock.json','node_modules/@openai/codex-sdk/package.json','node_modules/@openai/codex-sdk/dist/index.js','node_modules/@openai/codex-sdk/LICENSE')
     if ($manifest.schemaVersion -ne 'sdk-readiness-resources/v1' -or $manifest.sdkPackage -ne '@openai/codex-sdk' -or $manifest.sdkVersion -ne '0.160.1' -or $manifest.officialRuntimeIncluded -ne $false -or $manifest.modelCalls -ne 0 -or $manifest.files.Count -ne $allowed.Count) {
         throw 'SDK 资源清单身份无效；未轮换客户端。'
@@ -43,10 +52,10 @@ function Get-VerifiedSdkManifest([string]$Directory) {
         $seen[$file.path] = $true
         $itemPath = [System.IO.Path]::GetFullPath((Join-Path $root $file.path))
         if (-not $itemPath.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'SDK 资源路径越界。' }
-        $item = Get-Item -LiteralPath $itemPath
-        if ($item.PSIsContainer -or $item.Length -gt 2097152 -or $item.Length -ne $file.bytes -or (Get-ClientHash $itemPath) -ne $file.sha256) { throw 'SDK 资源字节验证失败。' }
+        $item = [System.IO.FileInfo]::new((Get-NativeIoPath $itemPath))
+        if (-not $item.Exists -or ($item.Attributes -band [System.IO.FileAttributes]::Directory) -or $item.Length -gt 2097152 -or $item.Length -ne $file.bytes -or (Get-ClientHash $itemPath) -ne $file.sha256) { throw 'SDK 资源字节验证失败。' }
         for ($ancestor = $itemPath; $ancestor -and $ancestor.Length -ge $root.Length; $ancestor = Split-Path -Parent $ancestor) {
-            if ((Get-Item -LiteralPath $ancestor).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'SDK 资源不得通过符号链接发布。' }
+            if ([System.IO.File]::GetAttributes((Get-NativeIoPath $ancestor)) -band [System.IO.FileAttributes]::ReparsePoint) { throw 'SDK 资源不得通过符号链接发布。' }
             if ($ancestor -eq $root) { break }
         }
     }
@@ -135,10 +144,10 @@ try {
             New-Item -ItemType Directory -Path $stageSdk -Force | Out-Null
             foreach ($file in $manifest.files) {
                 $destination = Join-Path $stageSdk $file.path
-                New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-                Copy-Item -LiteralPath (Join-Path $SdkResourceDirectory $file.path) -Destination $destination
+                $null = [System.IO.Directory]::CreateDirectory((Get-NativeIoPath (Split-Path -Parent $destination)))
+                [System.IO.File]::Copy((Get-NativeIoPath (Join-Path $SdkResourceDirectory $file.path)), (Get-NativeIoPath $destination))
             }
-            Copy-Item -LiteralPath (Join-Path $SdkResourceDirectory 'manifest.json') -Destination (Join-Path $stageSdk 'manifest.json')
+            [System.IO.File]::Copy((Get-NativeIoPath (Join-Path $SdkResourceDirectory 'manifest.json')), (Get-NativeIoPath (Join-Path $stageSdk 'manifest.json')))
             $null = Get-VerifiedSdkManifest $stageSdk
             [System.IO.Directory]::Move($resourceStage, $resourceRoot)
         } finally {

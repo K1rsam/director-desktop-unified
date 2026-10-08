@@ -2819,6 +2819,11 @@ impl Engine {
                 StoryboardStartBoundary::Hold(reason) => return Err(reason),
             }
         }
+        // Only a genuinely new writer/refinement gets the scene contract. The
+        // resume returns above and saved-snapshot recovery keep their exact input.
+        if matches!(stage, "storyboard.run" | "storyboard.refine") {
+            pipeline::freeze_scene_input_profile(&mut input)?;
+        }
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
             |settings| runtime.block_on(resolve_text_execution_settings(settings)))?;

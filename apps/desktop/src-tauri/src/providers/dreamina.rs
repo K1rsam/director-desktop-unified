@@ -4213,7 +4213,10 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(4);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((s, _)) => break s,
+                    Ok((s, peer)) => {
+                        assert!(peer.ip().is_loopback());
+                        break s;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && Instant::now() < deadline =>
@@ -4223,13 +4226,35 @@ mod tests {
                     Err(_) => return false,
                 }
             };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut bytes = [0; 2048];
-            let count = socket.read(&mut bytes).unwrap();
-            let requested = String::from_utf8_lossy(&bytes[..count])
+            // Winsock inherits the listener's nonblocking mode on accept. A
+            // read timeout does not clear it, and TCP may split the headers.
+            socket.set_nonblocking(false).unwrap();
+            let read_deadline = Instant::now() + Duration::from_secs(2);
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 512];
+            loop {
+                let remaining = read_deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .expect("loopback proxy request headers exceeded the existing two-second limit");
+                socket.set_read_timeout(Some(remaining)).unwrap();
+                let capacity = (8192 - bytes.len()).min(chunk.len());
+                assert!(capacity > 0, "loopback proxy request headers exceeded 8 KiB");
+                let count = match socket.read(&mut chunk[..capacity]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result.expect("read the bounded loopback proxy request headers"),
+                };
+                assert!(count > 0, "loopback proxy request headers ended before CRLFCRLF");
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.windows(4).any(|ending| ending == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let requested = String::from_utf8_lossy(&bytes)
                 .starts_with("GET http://fixture.invalid/result ");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .unwrap();
@@ -4240,7 +4265,11 @@ mod tests {
             Some(&windows_static(&address.to_string(), "")),
         );
         let client = result_proxies_from_environment(
-            reqwest::blocking::Client::builder().timeout(Duration::from_secs(3)),
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                // A broken proxy selection must still stay on loopback. The
+                // absolute request URI above distinguishes proxy from direct.
+                .resolve("fixture.invalid", address),
             &env,
         )
         .unwrap()

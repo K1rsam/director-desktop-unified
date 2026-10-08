@@ -7,6 +7,19 @@ pub(super) mod creative;
 #[path = "storyboard_original.rs"]
 pub(super) mod original;
 
+/// Explicit new-workflow opt-in. Recovery reads the existing frozen marker;
+/// this helper is never called while reconstructing a saved role request.
+pub fn freeze_scene_input_profile(input: &mut Value) -> Result<(), String> {
+    creative::uses_scene_profile(input)?;
+    if !input.is_object()
+        || !(creative::uses_profile(input)? || super::stage3_pack::uses_profile(input)?)
+    {
+        return Err("单元场景合同须绑定第三阶段冻结创作合同".into());
+    }
+    input[creative::SCENE_PROFILE_FIELD] = json!(creative::SCENE_PROFILE);
+    Ok(())
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -1209,6 +1222,7 @@ fn validate_storyboard_scope_with_issues(
         scope_issues,
         false,
         false,
+        false,
     )
 }
 
@@ -1224,6 +1238,7 @@ fn validate_storyboard_repair_scope(
     mut scope_issues: Option<&mut Vec<Value>>,
     defer_scene_coordinate: bool,
     defer_zero_duration: bool,
+    defer_shot_source: bool,
 ) -> Result<(), String> {
     validate_source(source)?;
     let (min, max, image_limit) = capabilities(&json!({"capabilities":caps}))?;
@@ -1238,6 +1253,15 @@ fn validate_storyboard_repair_scope(
     let mut shot_ids = HashSet::new();
     let mut covered = Vec::new();
     let all: HashSet<_> = source.rows.iter().map(|r| r.id.as_str()).collect();
+    // This is only the original Author execution package. A known row from
+    // context, another package or another episode never enters this repair.
+    let shot_repair_scope = if defer_shot_source {
+        let refs = expected_refs.ok_or("镜头来源修订缺少冻结执行包")?;
+        refs_valid(refs, &all, true)?;
+        Some(refs.iter().map(String::as_str).collect::<HashSet<_>>())
+    } else {
+        None
+    };
     let quotes: HashMap<_, _> = source
         .rows
         .iter()
@@ -1285,6 +1309,9 @@ fn validate_storyboard_repair_scope(
         }
         let source_refs = strings(unit, "sourceRefs")?;
         refs_valid(&source_refs, &all, true)?;
+        if let Some(allowed) = &shot_repair_scope {
+            refs_valid(&source_refs, allowed, true)?;
+        }
         if source_refs.iter().any(|id| {
             source
                 .rows
@@ -1408,8 +1435,40 @@ fn validate_storyboard_repair_scope(
             }
             let rs = strings(reference, "sourceRefs")?;
             refs_valid(&rs, &all, true)?;
+            if let Some(allowed) = &shot_repair_scope {
+                refs_valid(&rs, allowed, true)?;
+            }
             if rs.iter().any(|r| !source_refs.contains(r)) {
-                return Err("单元资产引用越出本单元来源".into());
+                let Some(issues) = scope_issues.as_deref_mut().filter(|_| defer_shot_source) else {
+                    return Err(crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION.into());
+                };
+                let outside: Vec<_> = rs.iter().filter(|id| !source_refs.contains(id)).cloned().collect();
+                let mut owner_ids = Vec::new();
+                for row_id in &outside {
+                    let row = source.rows.iter().find(|row| &row.id == row_id).unwrap();
+                    if row.kind != "body" || row.episode_id.as_deref() != Some(eid) {
+                        return Err("资产来源越出冻结制作正文，未扩大修订".into());
+                    }
+                    let mut owned = false;
+                    for owner in units {
+                        if text(owner, "id") != uid && text(owner, "episodeId") == eid
+                            && strings(owner, "sourceRefs")?.contains(row_id)
+                        {
+                            owned = true;
+                            let owner_id = text(owner, "id").to_owned();
+                            if !owner_ids.contains(&owner_id) { owner_ids.push(owner_id); }
+                        }
+                    }
+                    if !owned {
+                        return Err("越界资产源行没有同执行包的实际归属单元，未扩大修订".into());
+                    }
+                }
+                issues.push(json!({"code":"ASSET_SOURCE_SCOPE","unitId":uid,
+                    "coordinate":format!("{uid}.assetRefs[{}].sourceRefs",order-1),
+                    "assetId":aid,"variantId":vid,"episodeId":eid,"sceneId":sid,
+                    "sourceRefs":rs,"unitSourceRefs":source_refs,
+                    "outsideSourceRefs":outside,"ownerUnitIds":owner_ids,
+                    "problem":crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION}));
             }
         }
         if image_identities.len() > image_limit {
@@ -1455,9 +1514,40 @@ fn validate_storyboard_repair_scope(
             }
             let rs = strings(shot, "sourceRefs")?;
             refs_valid(&rs, &all, true)?;
+            if let Some(allowed) = &shot_repair_scope {
+                refs_valid(&rs, allowed, true)?;
+            }
             covered.extend(rs.iter().cloned());
             if rs.iter().any(|r| !source_refs.contains(r)) {
-                return Err("镜头引用越出本单元来源".into());
+                let Some(issues) = scope_issues.as_deref_mut().filter(|_| defer_shot_source) else {
+                    return Err(crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION.into());
+                };
+                let outside: Vec<_> = rs.iter().filter(|id| !source_refs.contains(id)).cloned().collect();
+                let mut owner_ids = Vec::new();
+                for row_id in &outside {
+                    let row = source.rows.iter().find(|row| &row.id == row_id).unwrap();
+                    if row.kind != "body" || row.episode_id.as_deref() != Some(eid) {
+                        return Err("镜头来源越出冻结制作正文，未扩大修订".into());
+                    }
+                    let mut owned = false;
+                    for owner in units {
+                        if text(owner, "id") != uid && text(owner, "episodeId") == eid
+                            && strings(owner, "sourceRefs")?.contains(row_id)
+                        {
+                            owned = true;
+                            let owner_id = text(owner, "id").to_owned();
+                            if !owner_ids.contains(&owner_id) { owner_ids.push(owner_id); }
+                        }
+                    }
+                    if !owned {
+                        return Err("越界镜头源行没有同执行包的实际归属单元，未扩大修订".into());
+                    }
+                }
+                issues.push(json!({"code":"SHOT_SOURCE_SCOPE","unitId":uid,"shotId":id,
+                    "coordinate":format!("{uid}.shots[{shot_index}].sourceRefs"),
+                    "episodeId":eid,"sourceRefs":rs,"unitSourceRefs":source_refs,
+                    "outsideSourceRefs":outside,"ownerUnitIds":owner_ids,
+                    "problem":crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION}));
             }
             refs_valid(&strings(shot, "contextRefs")?, &all, false)?;
             for part in shot
@@ -2083,6 +2173,9 @@ pub async fn run_storyboard(
     // This complete packet is only a projection/proof argument, never a role input.
     let frozen_finish_assets = input.get("frozenFinisherAssetContext").unwrap_or(input);
     let creative_enabled = creative::uses_profile(input)?;
+    if creative::uses_scene_profile(input)? && !creative_enabled {
+        return Err("单元场景合同须与原三岗创作合同共同使用".into());
+    }
     let mac_pack = super::stage3_pack::uses_profile(input)?;
     if mac_pack {
         if !creative_enabled {
@@ -2276,6 +2369,7 @@ pub async fn run_storyboard(
             asset_cards::attach_catalog_scope(&mut plan_input, input, &episode.id);
             creative::mark_input(&mut plan_input, creative_enabled);
             creative::attach_carrier_profile(&mut plan_input, input)?;
+            creative::attach_scene_profile(&mut plan_input, input)?;
             super::stage3_pack::attach_profile(&mut plan_input, input)?;
             if !continuity_revision.is_null(){plan_input["continuityRevision"]=continuity_revision.clone();}
             attach_author_decisions(&mut plan_input, scoped_decisions.as_ref());
@@ -2383,6 +2477,7 @@ pub async fn run_storyboard(
                 asset_cards::attach_catalog_scope(&mut author_input, input, &episode.id);
                 creative::mark_input(&mut author_input, creative_enabled);
                 creative::attach_carrier_profile(&mut author_input, input)?;
+                creative::attach_scene_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
                 if !continuity_revision.is_null(){author_input["continuityRevision"]=continuity_revision.clone();}
                 if creative_enabled { author_input["settings"]["fantasyEnabled"] = json!(!candidates.is_empty()); }
@@ -2944,6 +3039,9 @@ fn author_validation_candidate(
             source, raw, assets, caps, refs, style, prefix, plan, selected,
         );
     }
+    if reason == crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION {
+        return author_shot_source_candidate(source, raw, assets, caps, refs, style, prefix, plan, selected);
+    }
     if reason == crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION {
         return author_scope_candidate(
             source, raw, assets, caps, refs, style, prefix, plan, selected, true,
@@ -3146,12 +3244,87 @@ fn scope_repair_candidate(
         Some(&mut issues),
         defer_scene_coordinate,
         false,
+        false,
     )?;
     validate_event_bindings_for_repair(&draft, plan, Some(&issues))?;
     validate_fantasy_profile(&draft, selected, creative_enabled)?;
     materialize_unit_coverage(source, &mut draft)?;
     // These exports are data only. This candidate is never an adopted author.
     creative::add_delivery(&mut draft, source, style, assets, creative_enabled)?;
+    Ok((draft, issues))
+}
+
+fn package_source_issue(issue: &Value) -> bool {
+    issue["code"] == "SHOT_SOURCE_SCOPE"
+        || issue["code"] == "ASSET_SOURCE_SCOPE" && issue.get("ownerUnitIds").is_some()
+}
+
+fn author_shot_source_candidate(
+    source: &LockedSource,
+    raw: &Value,
+    assets: &[Value],
+    caps: &Value,
+    refs: &[String],
+    style: &str,
+    prefix: &str,
+    plan: &Value,
+    selected: &[Value],
+) -> Result<(Value, Vec<Value>), String> {
+    author_package_source_candidate(source, raw, assets, caps, refs, style, prefix, plan, selected, true)
+}
+
+/// Only this unaccepted package candidate can carry both shot and asset source
+/// diagnostics. An asset-only remainder is allowed solely in the same bounded
+/// repair lineage; the legacy pure-asset route and strict adoption stay intact.
+fn author_package_source_candidate(
+    source: &LockedSource,
+    raw: &Value,
+    assets: &[Value],
+    caps: &Value,
+    refs: &[String],
+    style: &str,
+    prefix: &str,
+    plan: &Value,
+    selected: &[Value],
+    require_shot_issue: bool,
+) -> Result<(Value, Vec<Value>), String> {
+    if raw["schemaVersion"] != "storyboard-draft/v2" {
+        return Err("镜头来源修订缺少冻结原话区间协议".into());
+    }
+    let mut draft = raw.clone();
+    materialize_dialogue(source, &mut draft, false)?;
+    materialize_asset_references(&mut draft, assets)?;
+    prefix_ids(&mut draft, prefix)?;
+    add_delivery_fields(&mut draft, style)?;
+    let mut issues = Vec::new();
+    validate_storyboard_repair_scope(source, &draft, assets, caps, Some(refs),
+        Some(&mut issues), false, false, true)?;
+    if !issues.iter().any(package_source_issue)
+        || require_shot_issue && !issues.iter().any(|issue| issue["code"] == "SHOT_SOURCE_SCOPE")
+    {
+        return Err("原镜头来源拒绝没有同执行包内的可定位问题，未扩大修订".into());
+    }
+    validate_event_bindings(&draft, plan)?;
+    validate_fantasy_profile(&draft, selected, true)?;
+
+    // Diagnostic copy only: prove that the units' own shots already contain
+    // the complete ordered source/voice backbone without the foreign cites.
+    // Never send or adopt this filtered copy as a program-written correction.
+    let mut coverage_probe = draft.clone();
+    let mut owned_refs = Vec::new();
+    for unit in coverage_probe["units"].as_array_mut().unwrap() {
+        let unit_refs = strings(unit, "sourceRefs")?;
+        for shot in unit["shots"].as_array_mut().unwrap() {
+            let refs = shot["sourceRefs"].as_array_mut().unwrap();
+            refs.retain(|value| value.as_str().is_some_and(|id| unit_refs.iter().any(|row| row == id)));
+            owned_refs.extend(refs.iter().map(|value| value.as_str().unwrap().to_owned()));
+        }
+    }
+    if normalize_coverage(source, &owned_refs)? != refs {
+        return Err("镜头跨单元候选的本单元镜表没有完整冻结正文，未扩大修订".into());
+    }
+    materialize_unit_coverage(source, &mut coverage_probe)?;
+    creative::add_delivery(&mut draft, source, style, assets, true)?;
     Ok((draft, issues))
 }
 
@@ -3184,6 +3357,7 @@ fn author_duration_candidate(
         Some(&mut issues),
         false,
         true,
+        false,
     )?;
     if !issues.iter().any(|issue| issue["code"] == "SHOT_DURATION") {
         return Err("原镜长拒绝没有可定位的零秒无对白镜；未扩大修订".into());
@@ -3201,8 +3375,11 @@ fn author_scope_problem_signature(issues: &[Value]) -> String {
         refs.sort_by_key(Value::to_string);refs.dedup();
         let mut identity=json!({"code":issue["code"],"assetId":issue["assetId"],"variantId":issue["variantId"],"episodeId":issue["episodeId"],"sceneId":issue["sceneId"],"sourceRefs":refs});
         if issue["code"]=="UNIT_SCENE_COORDINATE" {identity["expectedSceneId"]=issue["expectedSceneId"].clone();}
-        if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE","SHOT_DURATION"].contains(&text(issue,"code")) {
+        if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE","SHOT_SOURCE_SCOPE","SHOT_DURATION"].contains(&text(issue,"code")) {
             for field in ["coordinate","lineId","quoteStart","quoteEnd","allowedSpokenRanges","requiredSourceRefs","shotId","originalDuration"] {identity[field]=issue[field].clone();}
+            if package_source_issue(issue) {
+                for field in ["unitSourceRefs","outsideSourceRefs","ownerUnitIds"] {identity[field]=issue[field].clone();}
+            }
         }
         identity.to_string()
     }).collect::<HashSet<_>>().into_iter().collect();
@@ -3224,6 +3401,22 @@ fn author_scope_repair_units(base: &Value, issues: &[Value]) -> Result<HashSet<S
             .any(|id| !units.iter().any(|unit| text(unit, "id") == id))
     {
         return Err("主创适用范围修订没有可定位的原单元".into());
+    }
+    // The editor may need the row's existing owner to resolve premature action
+    // or repartitioning. Authorize only that source-linked contiguous group,
+    // not every unit sharing an event or the entire episode.
+    for issue in issues.iter().filter(|issue| package_source_issue(issue)) {
+        let mut linked = strings(issue, "ownerUnitIds")?;
+        linked.push(text(issue, "unitId").into());
+        if linked.iter().any(|id| !units.iter().any(|unit| text(unit,"id") == id)) {
+            return Err("镜头来源修订关联单元不属于原执行包".into());
+        }
+        let positions: Vec<_> = units.iter().enumerate()
+            .filter(|(_,unit)| linked.iter().any(|id| id == text(unit,"id")))
+            .map(|(index,_)| index).collect();
+        if let (Some(first),Some(last)) = (positions.first(),positions.last()) {
+            permitted.extend(units[*first..=*last].iter().map(|unit| text(unit,"id").to_owned()));
+        }
     }
     loop {
         let before = permitted.len();
@@ -3328,12 +3521,14 @@ async fn repair_author_scope(
     let raw_hash = digest(&original_raw.to_string());
     let mut current = scope.clone();
     let mut lineage = Vec::new();
+    let package_source_repair = issues.iter().any(package_source_issue);
     let source_repair = issues.iter().any(|issue| {
         [
             "DIALOGUE_SOURCE_INTERVAL",
             "DIALOGUE_SOURCE_COVERAGE",
             "UNIT_SOURCE_COVERAGE",
             "ASSET_SOURCE_SCOPE",
+            "SHOT_SOURCE_SCOPE",
             "SHOT_DURATION",
         ]
         .contains(&text(issue, "code"))
@@ -3431,7 +3626,11 @@ async fn repair_author_scope(
                         (checked, Vec::new())
                     }
                     Err(reason) if crate::text_executor::author_repairable_rejection(&reason) => {
-                        author_validation_candidate(
+                        if package_source_repair && [crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION,
+                            crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION].contains(&reason.as_str()) {
+                            author_package_source_candidate(source, &draft, assets, caps, &refs, style,
+                                &format!("{episode_id}:"), plan, selected, false)?
+                        } else { author_validation_candidate(
                             source,
                             &draft,
                             assets,
@@ -3442,7 +3641,7 @@ async fn repair_author_scope(
                             plan,
                             selected,
                             &reason,
-                        )?
+                        )? }
                     }
                     Err(reason) => return Err(reason),
                 }
@@ -4459,6 +4658,7 @@ async fn run_storyboard_revision(
             asset_cards::attach_catalog_scope(&mut author_input, input, &episode.id);
             creative::mark_input(&mut author_input, creative_enabled);
             creative::attach_carrier_profile(&mut author_input, input)?;
+            creative::attach_scene_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
             if let Some(context) = &accepted_context {
                 author_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
@@ -4484,6 +4684,7 @@ async fn run_storyboard_revision(
             asset_cards::attach_catalog_scope(&mut finish_input, input, &episode.id);
             creative::mark_input(&mut finish_input, creative_enabled);
             creative::attach_carrier_profile(&mut finish_input, input)?;
+            creative::attach_scene_profile(&mut finish_input, input)?;
             super::stage3_pack::attach_profile(&mut finish_input, input)?;
             if accepted_context.is_some() {
                 finish_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
@@ -5230,6 +5431,8 @@ mod production_contract_tests {
         author_chain_branch: bool,
         author_source_error: Option<&'static str>,
         source_repair_no_progress: bool,
+        mixed_source_partial: bool,
+        mixed_source_exhaust_budget: bool,
         finish_scope_response: Option<&'static str>,
         rejected_raw: Mutex<HashMap<String, Value>>,
         rejected_values: Mutex<Vec<(TextRequest, Value)>>,
@@ -5364,6 +5567,31 @@ mod production_contract_tests {
                         .collect();
                     let mut groups = Vec::new();
                     if mode == "SOURCE_FIX" {
+                        if self.mixed_source_partial || self.mixed_source_exhaust_budget {
+                            // Synthetic editor delta: the first turn fixes the
+                            // shot while preserving the known asset defect.
+                            // The second either fixes it or makes bounded but
+                            // still invalid progress. No production raw edits.
+                            for old in &selected {
+                                let mut next = (*old).clone();
+                                let owned = strings(&next, "sourceRefs").unwrap();
+                                for shot in next["shots"].as_array_mut().unwrap() {
+                                    shot["sourceRefs"].as_array_mut().unwrap().retain(|row| {
+                                        owned.iter().any(|id| row.as_str() == Some(id.as_str()))
+                                    });
+                                }
+                                if attempt == 2 {
+                                    for reference in next["assetRefs"].as_array_mut().unwrap() {
+                                        reference["sourceRefs"] = if self.mixed_source_exhaust_budget {
+                                            json!([owned[0], request.input["sourceRows"][0]["id"]])
+                                        } else { json!(owned) };
+                                    }
+                                }
+                                retained.retain(|id| id != &old["id"]);
+                                groups.push(json!({"replaces":[old["id"]],"units":[next],"fantasyRealization":[]}));
+                            }
+                            return Ok(json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":request.input["baseDraftHash"],"retainedUnitIds":retained,"replacements":groups,"revisionNotes":[],"unresolved":[]}));
+                        }
                         let mut writer = request.clone();
                         writer.input["workPackage"] = request.input["workPackages"][0].clone();
                         if self.author_source_error == Some("COVERAGE") {
@@ -5602,6 +5830,15 @@ mod production_contract_tests {
                         "ASSET_SOURCE" => {
                             draft["units"][0]["assetRefs"] = json!([{"assetId":request.input["assets"][0]["id"],"variantId":request.input["assets"][0]["variantId"],"use":"character","order":1,"sourceRefs":[request.input["sourceRows"][1]["id"]]}]);
                         }
+                        "SHOT_SOURCE" => {
+                            draft["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap()
+                                .push(request.input["sourceRows"][1]["id"].clone());
+                        }
+                        "MIXED_SOURCE" => {
+                            draft["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap()
+                                .push(request.input["sourceRows"][1]["id"].clone());
+                            draft["units"][1]["assetRefs"] = json!([{"assetId":request.input["assets"][0]["id"],"variantId":request.input["assets"][0]["variantId"],"use":"character","order":1,"sourceRefs":[request.input["sourceRows"][1]["id"],request.input["sourceRows"][2]["id"]]}]);
+                        }
                         "MISSING_DIALOGUE" => {
                             draft["units"][0]["shots"][0]["dialogueParts"] = json!([]);
                         }
@@ -5757,6 +5994,143 @@ mod production_contract_tests {
     }
 
     #[test]
+    fn shot_source_candidate_is_package_bound_and_never_program_corrected_or_accepted() {
+        let source = prepare_source("第一集\n场景：门口\n甲：第一句。\n甲：第二句。\n甲：第三句。\n场景：远处\n△远处船只驶过。\n第二集\n场景：别处\n乙：另一集。\n").unwrap();
+        let rows: Vec<_> = source.rows.iter().filter(|row| row.kind=="body")
+            .take(3).cloned().collect();
+        let refs: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+        let request = TextRequest {stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),
+            model:"offline".into(),reasoning:"medium".into(),input:json!({"sourceRows":rows,"workPackage":{"eventId":"E1"}}),
+            schema:json!({}),rule_snapshot:json!({})};
+        let plan = mock_plan(&request, false);
+        let mut raw = mock_draft(&request, false);
+        raw["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap().push(json!(refs[1]));
+        let original = raw.clone();
+        let caps = json!({"minDuration":0,"maxDuration":15,"imageLimit":0});
+        let check = |value:&Value| author_validation_candidate(&source,value,&[],&caps,&refs,"原画风","P:",&plan,&[],crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION);
+        let (candidate,issues) = check(&raw).unwrap();
+        assert_eq!(raw,original,"the original rejected raw is immutable");
+        assert_eq!(issues.len(),1);
+        assert_eq!(issues[0]["code"],"SHOT_SOURCE_SCOPE");
+        assert_eq!(issues[0]["outsideSourceRefs"],json!([refs[1]]));
+        assert_eq!(issues[0]["ownerUnitIds"],json!(["P:U1"]));
+        assert_eq!(candidate["units"][0]["shots"][0]["sourceRefs"],raw["units"][0]["shots"][0]["sourceRefs"],"no automatic cite removal or promotion to context");
+        assert_eq!(author_scope_repair_units(&candidate,&issues).unwrap(),HashSet::from(["P:U0".into(),"P:U1".into()]));
+        assert_eq!(validate_authored(&source,&mut candidate.clone(),&[],&caps,&refs,"原画风","P:").unwrap_err(),crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION,"candidate still cannot be accepted");
+        let foreign: Vec<_> = source.rows.iter().filter(|row| row.kind=="body" && !refs.contains(&row.id)).map(|row|row.id.clone()).collect();
+        for row in foreign.into_iter().chain(std::iter::once("unknown-source".to_owned())) {
+            let mut bad = raw.clone();
+            bad["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap().push(json!(row));
+            assert!(check(&bad).is_err(),"known context/other episode/unknown production is not repairable");
+        }
+        let mut unowned = raw.clone();
+        unowned["units"].as_array_mut().unwrap().remove(1);
+        assert!(check(&unowned).is_err(),"cross cite must have an actual original owner in this execution package");
+        let mut changed_words = raw.clone();
+        changed_words["units"][0]["shots"][0]["dialogueParts"][0]["text"] = json!("擅改原话");
+        assert!(check(&changed_words).is_err());
+        let mut bad_voice = raw.clone();
+        bad_voice["units"][0]["shots"][0]["dialogueParts"][0]["voiceEnd"] = json!(9);
+        assert!(check(&bad_voice).is_err(),"voice windows stay hard");
+        let mut missing = raw.clone();
+        missing["units"][1]["shots"][0]["dialogueParts"] = json!([]);
+        assert!(check(&missing).is_err(),"all original words still have to appear exactly once");
+        let mut reordered = raw.clone();
+        reordered["units"].as_array_mut().unwrap().swap(1,2);
+        assert!(check(&reordered).is_err(),"source speech order stays hard");
+    }
+
+    #[test]
+    fn mixed_shot_asset_source_candidate_preserves_exact_package_assets_and_all_hard_gates() {
+        let source = prepare_source("第一集\n场景：门口\n甲：第一句。\n甲：第二句。\n甲：第三句。\n甲：第四句。\n场景：远处\n△另一场的船驶过。\n第二集\n场景：别处\n乙：另一集。\n").unwrap();
+        let rows: Vec<_> = source.rows.iter().filter(|row| row.kind == "body").take(4).cloned().collect();
+        let refs: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+        let request = TextRequest {stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),
+            model:"offline".into(),reasoning:"medium".into(),input:json!({"sourceRows":rows,"workPackage":{"eventId":"E1"}}),schema:json!({}),rule_snapshot:json!({})};
+        let plan = mock_plan(&request, false);
+        let assets = vec![json!({"id":"tool:base","variantId":"base","name":"独立器具","kind":"PROP","preparation":{"mode":"REFERENCE"},"applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]}})];
+        let caps = json!({"minDuration":0,"maxDuration":15,"imageLimit":1});
+        let mut raw = mock_draft(&request, false);
+        raw["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap().push(json!(refs[1]));
+        raw["units"][1]["assetRefs"] = json!([{"assetId":"tool:base","variantId":"base","use":"prop","order":1,"sourceRefs":[refs[1],refs[2]]}]);
+        let original = raw.clone();
+        let check = |value:&Value, reason:&str| author_validation_candidate(&source,value,&assets,&caps,&refs,"原画风","P:",&plan,&[],reason);
+        let (candidate,issues) = check(&raw,crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION).unwrap();
+        assert_eq!(raw,original);
+        assert_eq!(issues.len(),2);
+        assert_eq!(issues[0]["code"],"SHOT_SOURCE_SCOPE");
+        assert_eq!(issues[1]["code"],"ASSET_SOURCE_SCOPE");
+        assert_eq!(issues[1]["assetId"],"tool:base");
+        assert_eq!(issues[1]["variantId"],"base");
+        assert_eq!(issues[1]["outsideSourceRefs"],json!([refs[2]]));
+        assert_eq!(issues[1]["ownerUnitIds"],json!(["P:U2"]));
+        assert_eq!(candidate["units"][1]["assetRefs"][0]["sourceRefs"],raw["units"][1]["assetRefs"][0]["sourceRefs"],"the diagnostic never repairs the original asset cite");
+        assert_eq!(author_scope_repair_units(&candidate,&issues).unwrap(),HashSet::from(["P:U0".into(),"P:U1".into(),"P:U2".into()]));
+        assert_eq!(validate_authored(&source,&mut candidate.clone(),&assets,&caps,&refs,"原画风","P:").unwrap_err(),crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION);
+
+        // A remaining asset issue keeps its original owner and source limits
+        // only inside the existing shot-origin repair; legacy pure asset
+        // inputs keep their old diagnostics and frozen request identity.
+        let mut asset_only = raw.clone();
+        asset_only["units"][0]["shots"][0]["sourceRefs"] = json!([refs[0]]);
+        assert_eq!(validate_authored(&source,&mut asset_only.clone(),&assets,&caps,&refs,"原画风","P:").unwrap_err(),crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION);
+        let (_,legacy_issues) = check(&asset_only,crate::text_executor::AUTHOR_ASSET_SOURCE_REJECTION).unwrap();
+        assert!(legacy_issues[0].get("ownerUnitIds").is_none());
+        let (remaining,remaining_issues) = author_package_source_candidate(&source,&asset_only,&assets,&caps,&refs,"原画风","P:",&plan,&[],false).unwrap();
+        assert_eq!(remaining_issues.len(),1);
+        assert_eq!(remaining_issues[0]["ownerUnitIds"],json!(["P:U2"]));
+        assert_eq!(author_scope_repair_units(&remaining,&remaining_issues).unwrap(),HashSet::from(["P:U1".into(),"P:U2".into()]));
+        assert!(author_shot_source_candidate(&source,&asset_only,&assets,&caps,&refs,"原画风","P:",&plan,&[]).is_err(),"asset-only raw cannot newly acquire a shot-origin repair");
+
+        for gate in ["unknownAsset","unknownVariant","foreignPackage","unknownRow","duplicateIdentity","missingOwner","changedWords","voiceWindow"] {
+            let mut invalid = raw.clone();
+            match gate {
+                "unknownAsset" => invalid["units"][1]["assetRefs"][0]["assetId"] = json!("unknown"),
+                "unknownVariant" => invalid["units"][1]["assetRefs"][0]["variantId"] = json!("unknown"),
+                "foreignPackage" => invalid["units"][1]["assetRefs"][0]["sourceRefs"].as_array_mut().unwrap().push(json!(source.rows.iter().find(|row| row.kind == "body" && !refs.contains(&row.id)).unwrap().id)),
+                "unknownRow" => invalid["units"][1]["assetRefs"][0]["sourceRefs"].as_array_mut().unwrap().push(json!("unknown-row")),
+                "duplicateIdentity" => { let same = invalid["units"][1]["assetRefs"][0].clone(); invalid["units"][1]["assetRefs"].as_array_mut().unwrap().push(same); },
+                "missingOwner" => { invalid["units"].as_array_mut().unwrap().remove(2); },
+                "changedWords" => invalid["units"][0]["shots"][0]["dialogueParts"][0]["text"] = json!("改词"),
+                _ => invalid["units"][0]["shots"][0]["dialogueParts"][0]["voiceEnd"] = json!(9),
+            }
+            assert!(check(&invalid,crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION).is_err(),"{gate} remains hard even behind an earlier repairable shot issue");
+        }
+        let legacy_signature = json!({"code":"ASSET_SOURCE_SCOPE","unitId":"P:U1","coordinate":"P:U1.assetRefs","sourceRefs":["r2"]});
+        assert_eq!(author_scope_problem_signature(&[legacy_signature]),"3c7cc5da32e640b481c6ff6684fbb2c52dcf74bc5d22fdaa2f159727a6e2b513","the pre-existing pure-asset issue identity is byte stable");
+    }
+
+    #[tokio::test]
+    async fn frozen_unit_scene_profile_reaches_three_roles_without_changing_old_replay() {
+        let source = prepare_source("第一集\n场景：门口\n甲：原话完整保留。\n").unwrap();
+        let mut old = input(&source);
+        creative::mark_input(&mut old,true);
+        let executor = Recorded::default();
+        run_storyboard(&old,&executor,"offline","medium").await.unwrap();
+        let old_calls = executor.calls.lock().await.clone();
+        assert_eq!(old_calls.len(),3);
+        let mut new = old.clone();
+        freeze_scene_input_profile(&mut new).unwrap();
+        run_storyboard(&new,&executor,"offline","medium").await.unwrap();
+        let calls = executor.calls.lock().await.clone();
+        assert_eq!(calls.len(),6);
+        for request in &calls[3..] {
+            assert_eq!(request.input[creative::SCENE_PROFILE_FIELD],creative::SCENE_PROFILE);
+            assert_eq!(request.rule_snapshot["runtimeContract"]["sceneProfile"],creative::SCENE_PROFILE);
+            assert_eq!(serde_json::to_value(creative::prepare_request(request.clone()).unwrap()).unwrap(),serde_json::to_value(request).unwrap());
+        }
+        run_storyboard(&old,&executor,"offline","medium").await.unwrap();
+        assert_eq!(executor.calls.lock().await.len(),6,"old request hashes remain reusable");
+        for request in &old_calls {
+            assert!(request.input.get(creative::SCENE_PROFILE_FIELD).is_none());
+            assert!(request.rule_snapshot["runtimeContract"].get("sceneProfile").is_none());
+        }
+        new[creative::SCENE_PROFILE_FIELD] = json!("unknown");
+        assert!(run_storyboard(&new,&executor,"offline","medium").await.is_err());
+        assert_eq!(executor.calls.lock().await.len(),6,"unknown marker rejects before dispatch");
+    }
+
+    #[test]
     fn original_editor_repair_history_is_not_an_old_author_batch_finish() {
         let source = prepare_source("第一集\n场景：门口\n甲：原话。\n").unwrap();
         let mut request = input(&source);
@@ -5791,17 +6165,19 @@ mod production_contract_tests {
             "DIALOGUE",
             "COVERAGE",
             "ASSET_SOURCE",
+            "SHOT_SOURCE",
+            "MIXED_SOURCE",
             "MISSING_DIALOGUE",
             "PARTIAL_DIALOGUE",
             "ZERO_DURATION",
         ] {
-            let source = prepare_source(
-                "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n",
-            )
-            .unwrap();
+            let source = prepare_source(if mode == "MIXED_SOURCE" {
+                "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n甲：第三句完整保留。\n"
+            } else { "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n" }).unwrap();
             let mut request = input(&source);
             request[creative::PROFILE_FIELD] = json!(creative::PROFILE);
             request["assets"] = json!([{"id":"person-base","variantId":"base","name":"甲","kind":"CH","applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]},"preparation":{"mode":"REFERENCE"}}]);
+            if ["SHOT_SOURCE","MIXED_SOURCE"].contains(&mode) { freeze_scene_input_profile(&mut request).unwrap(); }
             let frozen = request.clone();
             let exec = Recorded {
                 author_source_error: Some(mode),
@@ -5836,6 +6212,12 @@ mod production_contract_tests {
                 1
             );
             let repair = calls.iter().find(|r| is_author_repair_request(r)).unwrap();
+            if ["SHOT_SOURCE","MIXED_SOURCE"].contains(&mode) {
+                assert!(repair.rule_snapshot["runtimeContract"]["content"].as_str().unwrap().contains("不能机械删引用"));
+                for request in &calls {
+                    assert_eq!(request.input[creative::SCENE_PROFILE_FIELD],creative::SCENE_PROFILE,"bounded editor inherits the exact frozen scene profile");
+                }
+            }
             assert_eq!(repair.skill, "episode-finishing-editor");
             assert_eq!(repair.input["authorRepair"]["maximumAttempts"], 2);
             assert!(repair.rule_snapshot["runtimeContract"]["content"]
@@ -5889,14 +6271,15 @@ mod production_contract_tests {
             "DIALOGUE",
             "COVERAGE",
             "ASSET_SOURCE",
+            "SHOT_SOURCE",
+            "MIXED_SOURCE",
             "MISSING_DIALOGUE",
             "PARTIAL_DIALOGUE",
             "ZERO_DURATION",
         ] {
-            let source = prepare_source(
-                "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n",
-            )
-            .unwrap();
+            let source = prepare_source(if mode == "MIXED_SOURCE" {
+                "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n甲：第三句完整保留。\n"
+            } else { "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n" }).unwrap();
             let mut request = input(&source);
             request[creative::PROFILE_FIELD] = json!(creative::PROFILE);
             request["assets"] = json!([{"id":"person-base","variantId":"base","name":"甲","kind":"CH","applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]},"preparation":{"mode":"REFERENCE"}}]);
@@ -5932,6 +6315,54 @@ mod production_contract_tests {
                 calls.len(),
                 "no unchanged repair or author dispatch on resume"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_source_partial_repair_keeps_asset_owners_and_original_two_attempt_budget_on_resume() {
+        for exhaust in [false,true] {
+            let source = prepare_source("第一集\n场景：门口\n甲：第一句完整保留。\n甲：第二句完整保留。\n甲：第三句完整保留。\n甲：无关末句完整保留。\n").unwrap();
+            let mut request = input(&source);
+            request[creative::PROFILE_FIELD] = json!(creative::PROFILE);
+            request["assets"] = json!([{"id":"person-base","variantId":"base","name":"甲","kind":"CH","applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]},"preparation":{"mode":"REFERENCE"}}]);
+            let exec = Recorded {author_source_error:Some("MIXED_SOURCE"),mixed_source_partial:true,
+                mixed_source_exhaust_budget:exhaust,..Default::default()};
+            let output = run_storyboard(&request,&exec,"offline","medium").await.unwrap();
+            let calls = exec.calls.lock().await.clone();
+            let repairs: Vec<_> = calls.iter().filter(|r| is_author_repair_request(r)).collect();
+            assert_eq!(calls.iter().filter(|r| r.stage == "storyboardCreate").count(),1,"never reauthor the rejected package");
+            assert_eq!(repairs.len(),2);
+            assert_eq!(repairs[0].input["validationIssues"].as_array().unwrap().iter().filter(|issue| issue["code"] == "SHOT_SOURCE_SCOPE").count(),1);
+            assert_eq!(repairs[0].input["validationIssues"].as_array().unwrap().iter().filter(|issue| issue["code"] == "ASSET_SOURCE_SCOPE").count(),1);
+            let remaining = repairs[1].input["validationIssues"].as_array().unwrap();
+            assert_eq!(remaining.len(),1);
+            assert_eq!(remaining[0]["code"],"ASSET_SOURCE_SCOPE");
+            assert_eq!(remaining[0]["ownerUnitIds"],json!([repairs[1].input["previousDraft"]["units"][2]["id"]]));
+            assert_eq!(repairs[0].input["previousDraft"]["units"][3],repairs[1].input["previousDraft"]["units"][3],"unrelated unit remains byte exact between bounded turns");
+            let rejected = exec.rejected_values.lock().await.clone();
+            let original = rejected.iter().find(|(r,_)| r.stage == "storyboardCreate").unwrap();
+            for (index,repair) in repairs.iter().enumerate() {
+                assert_eq!(repair.input["authorRepair"]["attempt"],index+1);
+                assert_eq!(repair.input["authorRepair"]["maximumAttempts"],2);
+                assert_eq!(repair.input["authorRepair"]["originalAuthorRawSha256"],digest(&original.1.to_string()));
+                assert!(repair.rule_snapshot["runtimeContract"]["content"].as_str().unwrap().contains("当前原整编的剩余有界轮次"));
+            }
+            assert!(!exec.accepted.lock().await.contains_key(&serde_json::to_string(&original.0).unwrap()));
+            if exhaust {
+                assert_eq!(output["status"],"partially_blocked");
+                assert!(output["blocked"].to_string().contains("AUTHOR_SCOPE_REPAIR_LIMIT"),"second changed defect still cannot create a third attempt: {}",output["blocked"]);
+                assert!(output["units"].as_array().unwrap().is_empty());
+            } else {
+                assert_eq!(output["status"],"completed","{}",output["blocked"]);
+                validate_storyboard_scope(&source,&output,request["assets"].as_array().unwrap(),&request["capabilities"],None).unwrap();
+                let accepted = exec.accepted.lock().await;
+                let repaired = accepted.get(&serde_json::to_string(repairs[1]).unwrap()).unwrap();
+                assert_eq!(repaired["materializedDraft"]["authorRepairProvenance"]["originalAuthorAccepted"],false);
+            }
+            let again = run_storyboard(&request,&exec,"offline","medium").await.unwrap();
+            assert_eq!(again,output);
+            assert_eq!(exec.calls.lock().await.len(),calls.len(),"reopen replays original requests and cannot reset the two-turn budget");
+            assert_eq!(exec.rejected_raw.lock().await.get(&serde_json::to_string(&original.0).unwrap()).unwrap(),&original.1,"original rejected raw is unchanged");
         }
     }
 
@@ -6546,6 +6977,7 @@ mod production_contract_tests {
                 Some(&refs),
                 Some(&mut issues),
                 true,
+                false,
                 false,
             )
             .unwrap();
@@ -9825,14 +10257,21 @@ mod production_contract_tests {
             .expect("explicit original workflow");
         let job =
             std::env::var("DIRECTOR_SHOT_ID_READONLY_JOB").expect("explicit original author job");
+        let path = std::path::Path::new(&path).canonicalize().unwrap();
+        let evidence_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../.local/live-acceptance-20261008").canonicalize().unwrap();
+        assert!(path.starts_with(evidence_root),"only a stable private DB copy may be opened");
+        let before = crate::store::hash_file(&path).unwrap();
         let connection =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
         connection
             .execute_batch("PRAGMA query_only=ON; BEGIN;")
             .unwrap();
-        let (snapshot, raw, hash, event, workflow_snapshot): (String, String, String, String, String) = connection.query_row("SELECT j.snapshot,j.result,w.request_hash,e.data,parent.snapshot FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id JOIN jobs parent ON parent.id=w.workflow_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE j.id=?1 AND w.workflow_id=?2 AND j.kind='text' AND j.state='rejected' AND j.error='模型镜号重复' AND w.state='rejected' AND w.stage='storyboardCreate' AND w.error=j.error AND w.result=j.result AND json_extract(j.receipt,'$.validation')='rejected' AND json_extract(j.receipt,'$.contract')='desktop-runner/v1' AND parent.kind='workflow' AND parent.entity_id='storyboard.run'", rusqlite::params![job, workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        let (snapshot, raw, hash, event, workflow_snapshot): (String, String, String, String, String) = connection.query_row("SELECT j.snapshot,j.result,w.request_hash,e.data,parent.snapshot FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id JOIN jobs parent ON parent.id=w.workflow_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE j.id=?1 AND w.workflow_id=?2 AND j.kind='text' AND j.state='rejected' AND j.error IN('模型镜号重复','镜头引用越出本单元来源') AND w.state='rejected' AND w.stage='storyboardCreate' AND w.error=j.error AND w.result=j.result AND json_extract(j.receipt,'$.validation')='rejected' AND json_extract(j.receipt,'$.contract')='desktop-runner/v1' AND parent.kind='workflow' AND parent.entity_id='storyboard.run'", rusqlite::params![job, workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
         connection.execute_batch("ROLLBACK;").unwrap();
+        drop(connection);
+        assert_eq!(crate::store::hash_file(&path).unwrap(),before,"private evidence bytes remain unchanged");
         assert_eq!(digest(&snapshot), hash);
         let request: TextRequest = serde_json::from_str(&snapshot).unwrap();
         let raw: Value = serde_json::from_str(&raw).unwrap();
@@ -9916,7 +10355,27 @@ mod production_contract_tests {
         } else {
             expected_known_rejection
         };
-        let evidence = json!({"version":"scoped-shot-id-revalidation/v1","readOnly":true,"workflowId":workflow,"originalJobId":job,"requestHash":hash,"sourceSha256":source.sha256,"units":unit_count,"shots":shot_count,"normalizationIdempotent":normalized==once,"allAuthorGatesPassed":result.is_ok(),"expectedKnownRejection":expected_known_rejection,"expectedRejection":if expected_rejection.is_empty(){Value::Null}else{json!(expected_rejection)},"diagnosisMatchesExpectation":diagnosis_matches,"firstRejectedGate":if result.is_ok(){Value::Null}else{json!(gate)},"error":result.as_ref().err(),"originalRawUnchanged":raw==original,"accepted":false,"modelCalls":0,"videoSubmissions":0});
+        let repair_eligibility = if result.as_ref().err().map(String::as_str) == Some(crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION) {
+            let (rejected,issues) = author_validation_candidate(&source,&raw,&assets,&request.input["capabilities"],&refs,
+                text(&request.input["settings"],"visualStyle"),&prefix,&request.input["plan"],request.input["selectedFantasy"].as_array().unwrap(),crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION).unwrap();
+            let mut permitted: Vec<_> = author_scope_repair_units(&rejected,&issues).unwrap().into_iter().collect();
+            permitted.sort();
+            let mut issue_counts = serde_json::Map::new();
+            for issue in &issues {
+                let count = issue_counts.entry(text(issue,"code").to_owned()).or_insert(json!(0));
+                *count = json!(count.as_u64().unwrap()+1);
+                if package_source_issue(issue) {
+                    assert!(!strings(issue,"ownerUnitIds").unwrap().is_empty());
+                    assert!(strings(issue,"outsideSourceRefs").unwrap().iter().all(|id| refs.contains(id)),"diagnostics cannot expand the frozen package");
+                }
+                if issue["code"] == "ASSET_SOURCE_SCOPE" {
+                    assert!(assets.iter().any(|asset| asset["id"] == issue["assetId"] && asset["variantId"] == issue["variantId"]),"repair keeps exact frozen asset identity");
+                }
+            }
+            assert_eq!(raw,original);
+            json!({"eligible":true,"issues":issues,"issueCounts":issue_counts,"permittedUnitIds":permitted,"candidateAccepted":false,"sameFrozenPackage":true,"modelCalls":0})
+        } else { Value::Null };
+        let evidence = json!({"version":"scoped-shot-id-revalidation/v1","readOnly":true,"workflowId":workflow,"originalJobId":job,"requestHash":hash,"sourceSha256":source.sha256,"units":unit_count,"shots":shot_count,"normalizationIdempotent":normalized==once,"allAuthorGatesPassed":result.is_ok(),"expectedKnownRejection":expected_known_rejection,"expectedRejection":if expected_rejection.is_empty(){Value::Null}else{json!(expected_rejection)},"diagnosisMatchesExpectation":diagnosis_matches,"firstRejectedGate":if result.is_ok(){Value::Null}else{json!(gate)},"error":result.as_ref().err(),"repairEligibility":repair_eligibility,"originalRawUnchanged":raw==original,"accepted":false,"modelCalls":0,"videoSubmissions":0});
         if let Ok(report) = std::env::var("DIRECTOR_SHOT_ID_READONLY_REPORT") {
             std::fs::write(report, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         }

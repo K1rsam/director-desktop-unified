@@ -20,10 +20,16 @@ $candidate3 = Join-Path $testRoot 'candidate three.exe'
 [System.IO.File]::WriteAllBytes($candidate2, [System.Text.Encoding]::UTF8.GetBytes('synthetic executable two; never launched'))
 [System.IO.File]::WriteAllBytes($candidate3, [System.Text.Encoding]::UTF8.GetBytes('synthetic executable three; never launched'))
 function Hash([string]$Path) {
-    $stream = [System.IO.File]::OpenRead($Path)
+    $stream = [System.IO.File]::OpenRead((NativeIoPath $Path))
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try { return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
     finally { $sha256.Dispose(); $stream.Dispose() }
+}
+function NativeIoPath([string]$Path) {
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    if ($absolute.StartsWith('\\?\')) { return $absolute }
+    if ($absolute.StartsWith('\\')) { return '\\?\UNC\' + $absolute.Substring(2) }
+    return '\\?\' + $absolute
 }
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 $checks = [System.Collections.Generic.List[string]]::new()
@@ -114,6 +120,42 @@ try { & $isolatedScript -PublishOnly -CandidatePath $candidate2 -ReleaseDirector
 Assert ($blocked -and (Hash $targetArtifact) -eq $targetHash -and (Hash $defaultCurrent) -eq (Hash $candidate1)) '错误的 Cargo 发布目录未被阻断。'
 $checks.Add('cargo_target_is_never_a_publish_directory')
 
+# Force the real SDK reader/copy path beyond MAX_PATH on every checkout. Each
+# component stays below the per-component limit; no fixture root is shortened.
+$longSdk = Join-Path (Join-Path (Join-Path $testRoot ('sdk-long-' + ('a' * 80))) ('nested-' + ('b' * 80))) ('nested-' + ('c' * 80))
+$null = [System.IO.Directory]::CreateDirectory((NativeIoPath $longSdk))
+foreach ($file in $sourceManifest.files) {
+    $destination = Join-Path $longSdk $file.path
+    $null = [System.IO.Directory]::CreateDirectory((NativeIoPath (Split-Path -Parent $destination)))
+    [System.IO.File]::Copy((NativeIoPath (Join-Path $SdkResourceDirectory $file.path)), (NativeIoPath $destination))
+}
+[System.IO.File]::Copy((NativeIoPath (Join-Path $SdkResourceDirectory 'manifest.json')), (NativeIoPath (Join-Path $longSdk 'manifest.json')))
+$longestSdkPath = ($sourceManifest.files | ForEach-Object { (Join-Path $longSdk $_.path).Length } | Measure-Object -Maximum).Maximum
+Assert ($longSdk.Length -gt 260 -and $longestSdkPath -gt 260) '长路径回归未真正越过 MAX_PATH。'
+$longRelease = Join-Path $testRoot 'long-sdk-client'
+$longCurrent = Join-Path $longRelease 'director-desktop-next.exe'
+$longPrevious = Join-Path $longRelease 'director-desktop-next-previous.exe'
+foreach ($candidate in @($candidate1,$candidate2)) {
+    & $scriptPath -PublishOnly -CandidatePath $candidate -ReleaseDirectory $longRelease -SdkResourceDirectory $longSdk | Out-Null
+}
+Assert ((Hash $longCurrent) -eq (Hash $candidate2) -and (Hash $longPrevious) -eq (Hash $candidate1)) '长 SDK 路径改变了当前版/上一版轮换。'
+foreach ($file in $sourceManifest.files) {
+    $published = Join-Path (Join-Path (Join-Path $longRelease '.client-resources') (Hash $candidate2)) ('sdk-readiness\' + $file.path)
+    Assert ((Hash $published) -eq $file.sha256) '长路径 SDK 未逐字发布。'
+}
+$checks.Add('long_sdk_native_read_copy_and_atomic_rotation')
+[System.IO.File]::AppendAllText((NativeIoPath (Join-Path $longSdk 'src\health.mjs')), '// deliberate long-path tamper')
+$blocked = $false
+try { & $scriptPath -PublishOnly -CandidatePath $candidate3 -ReleaseDirectory $longRelease -SdkResourceDirectory $longSdk | Out-Null } catch { $blocked = $true }
+Assert ($blocked -and (Hash $longCurrent) -eq (Hash $candidate2) -and (Hash $longPrevious) -eq (Hash $candidate1)) '长路径资源篡改没有保留当前版和上一版。'
+$checks.Add('long_sdk_tamper_preserves_current_and_previous')
+$sdkJunction = Join-Path $testRoot 'sdk-junction'
+New-Item -ItemType Junction -Path $sdkJunction -Target $SdkResourceDirectory | Out-Null
+$blocked = $false
+try { & $scriptPath -PublishOnly -CandidatePath $candidate3 -ReleaseDirectory $longRelease -SdkResourceDirectory $sdkJunction | Out-Null } catch { $blocked = $true }
+Assert ($blocked -and (Hash $longCurrent) -eq (Hash $candidate2) -and (Hash $longPrevious) -eq (Hash $candidate1)) 'extended I/O 放宽了 SDK 重解析点保护。'
+$checks.Add('native_io_preserves_sdk_reparse_point_rejection')
+
 $receipt = [ordered]@{
     schemaVersion='windows-client-update-synthetic/v1'
     platform=[System.Environment]::OSVersion.VersionString
@@ -122,6 +164,9 @@ $receipt = [ordered]@{
     checks=$checks
     updateScriptSha256=(Hash $scriptPath)
     sourceResourceManifestSha256=(Hash (Join-Path $SdkResourceDirectory 'manifest.json'))
+    originalChecks=11
+    longSdkRootCharacters=$longSdk.Length
+    longestSdkResourcePathCharacters=$longestSdkPath
     syntheticExecutablesLaunched=0
     realGenerationCalls=0
     productionProjectsAccessed=$false

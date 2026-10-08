@@ -8,6 +8,8 @@ pub(super) const REVISION_PROFILE_FIELD: &str = "storyboardRevisionProfile";
 pub(super) const REVISION_PROFILE: &str = "accepted-plan-revision/v1";
 pub(super) const CARRIER_PROFILE_FIELD: &str = "storyboardCarrierProfile";
 pub(super) const CARRIER_PROFILE: &str = "integer-video-units/v1";
+pub(in crate::pipeline) const SCENE_PROFILE_FIELD: &str = "storyboardSceneInputProfile";
+pub(in crate::pipeline) const SCENE_PROFILE: &str = "unit-local-scene/v1";
 pub(super) const AUTHOR_SCOPE_REPAIR_PROFILE: &str = "rejected-author-scope-repair/v1";
 pub(super) const AUTHOR_SCOPE_REPAIR_EXECUTION_VERSION: &str = "author-domain-repair/v1";
 pub(super) const FINISH_SCOPE_REPAIR_PROFILE: &str = "rejected-finish-scope-repair/v1";
@@ -30,6 +32,33 @@ const AUTHOR_SCOPE_REPAIR_EXECUTION: &str = "本次是原运行时的未采用�
 const FINISH_SCOPE_REPAIR_EXECUTION: &str = "本次是原运行时的未采用整编候选→原整编差量修订。finishRepair与validationIssues绑定原整编请求、原回包、正式资产及其适用范围；previousDraft是未采用候选，不是已验收稿。仍由episode-finishing-editor按原方法修好准确问题，未涉及单元原样保留，连续原文与幻想关联组完整处理。资产目录、原文、说者、声道、事件和已选幻想不变；纯VO/OS不证明人物入画，不为声音角色强加不适用角色图片。保留原已校验作者和原整编请求，不重新主创或规划。baseDraftHash逐字回填，差量作品仍须完整通过全部领域校验后才采用。";
 const SCENE_COORDINATE_REPAIR_EXECUTION: &str = "UNIT_SCENE_COORDINATE只说明本次未采用修订的同集已知sceneId字段，与该单元全部制作来源唯一场及原event场坐标不一致。expectedSceneId是锁定制作来源坐标，不是程序新判剧情；不改源行、事件、资产适用范围或文本事实，不把它当新增或重演场景授权。由原整编协调单元字段、真实声画与参考素材，必要拆合仍在本问题及必要关联组内，修后必须重过最终强校验；不能仅换场号却保留不适用素材。";
 const SOURCE_COORDINATE_REPAIR_EXECUTION: &str = "本次原整编处理程序定位的未采用主创来源坐标问题。DIALOGUE_SOURCE_INTERVAL须依allowedSpokenRanges选择原文绝对UTF16半开区间，括号演法不发声；若跨演法，应拆为连续原话片段并重算声窗，不能改字、删句或裁窗。UNIT_SOURCE_COVERAGE须使本范围requiredSourceRefs顺序完整覆盖，单元拆合与必要关联组由原整编决定，不添剧情、不重演前稿；ASSET_SOURCE_SCOPE须协调实际入画素材与本单元真实来源。previousDraft仍是未采用候选，其错误对白区间尚未物化，不能把其中派生prompt当台词真值；锁定sourceRows的dialogue和spokenSegments为准。只替换问题单元及必要原文/幻想关联组；其余单元原样保留。修后仍完整验证原文、台词、身份、事件、时长和声窗，原主创原包不改、不再次调用主创。";
+const SHOT_SOURCE_REPAIR_EXECUTION: &str = "SHOT_SOURCE_SCOPE定位同一冻结执行包内的镜头来源与其所属单元来源不一致。outsideSourceRefs及ownerUnitIds只标明原包中已有源行与单元归属，不授权新增、预演或重放下一单元动作。依原文、实际镜表和前后声画判断是否修正镜头引用、改写越界演法或在问题单元及其来源关联单元内重组；不能机械删引用、改作contextRefs或仅扩大单元sourceRefs来掩盖提前兑现。必要关联组由原整编完整处理，其余单元原样保留；全包正文、原话逐字恰好一次，时序、身份、幻想和声窗仍须通过最终强校验。";
+const PACKAGE_ASSET_SOURCE_REPAIR_EXECUTION: &str = "带outsideSourceRefs及ownerUnitIds的ASSET_SOURCE_SCOPE与同包镜头来源问题一并处理：assetId/variantId是冻结正式素材身份，越界源行属于原包已定位的另一单元，不授权添加素材或扩展原文范围。请依据实际入画、持物交接和原动作顺序协调素材来源与镜表，避免引用正确但画面仍提前挥铲、抓物或兑现；不能机械删引用、按名称换资产或扩大本单元sourceRefs掩盖问题。即使镜头问题已修而仅余素材问题，也仅继续当前原整编的剩余有界轮次；其余单元原样保留，最终仍须通过全部来源、身份、原话、时序与声窗校验。";
+const UNIT_LOCAL_SCENE_REQUIREMENTS: &str = "单元场景合同 unit-local-scene/v1：scene只描述本单元实际镜表发生的时空、声画与有依据的内部跳转。同一物理场的基础表述保持一致，但不要把工作包、事件或前一单元的完整scene头复制到所有单元；未在本单元实际出现的酒店、闪回、幻想或天气不写入本单元scene。sceneId仍是锁定制作来源坐标，不能以其简短标题覆盖合法的单元内部闪回或多空间。规划在自然事件与单元范围中区分这些内容；主创依据本单元sourceRefs、逐镜声画及已选幻想写完整场景。整编与独立精修在keep/retained前逐单元核对scene和真实镜表；若元数据污染则正式差量替换该单元及必要关联组，不能保留错误头或由程序猜改。保留原文、完整表演、原话与有依据的跨空间镜头，不通过删除源内容或一律改成单场来过关。";
+
+pub(in crate::pipeline) fn uses_scene_profile(input: &Value) -> Result<bool, String> {
+    match input.get(SCENE_PROFILE_FIELD) {
+        None => Ok(false),
+        Some(Value::String(value)) if value == SCENE_PROFILE => Ok(true),
+        _ => Err("单元场景合同版本未知，保留冻结请求，未调用模型".into()),
+    }
+}
+
+pub(in crate::pipeline) fn attach_scene_profile(input: &mut Value, frozen: &Value) -> Result<(), String> {
+    if uses_scene_profile(frozen)? {
+        input[SCENE_PROFILE_FIELD] = json!(SCENE_PROFILE);
+    }
+    Ok(())
+}
+
+fn attach_scene_contract(contract: &mut Value, enabled: bool) {
+    if enabled {
+        let content = format!("{}\n\n{UNIT_LOCAL_SCENE_REQUIREMENTS}", text(contract, "content"));
+        contract["sceneProfile"] = json!(SCENE_PROFILE);
+        contract["content"] = json!(content);
+        contract["sha256"] = json!(digest(text(contract, "content")));
+    }
+}
 
 fn source_coordinate_issue(issue: &Value) -> bool {
     [
@@ -37,6 +66,7 @@ fn source_coordinate_issue(issue: &Value) -> bool {
         "DIALOGUE_SOURCE_COVERAGE",
         "UNIT_SOURCE_COVERAGE",
         "ASSET_SOURCE_SCOPE",
+        "SHOT_SOURCE_SCOPE",
     ]
     .contains(&text(issue, "code"))
 }
@@ -341,12 +371,14 @@ pub(in crate::pipeline) fn prepare_request(
         input.remove("frozenFinisherAssetContext");
     }
     let mac_pack = super::super::stage3_pack::uses_profile(&request.input)?;
+    let unit_scene = uses_scene_profile(&request.input)?;
     if request.stage == "storyboardRefine" {
         if !mac_pack || request.skill != "director-refinement" {
             return Err("导演精修必须绑定冻结生产规则的独立兼容适配".into());
         }
         request.rule_snapshot["runtimeContract"] =
             super::super::stage3_pack::runtime_contract("storyboardRefine", true)?;
+        attach_scene_contract(&mut request.rule_snapshot["runtimeContract"], unit_scene);
         request
             .input
             .as_object_mut()
@@ -475,7 +507,7 @@ pub(in crate::pipeline) fn prepare_request(
         false
     };
     if !uses_profile(&request.input)? {
-        if carrier || author_repair || finish_repair || mac_pack {
+        if carrier || author_repair || finish_repair || mac_pack || unit_scene {
             return Err("视频载体合同须与原三岗制作合同共同使用".into());
         }
         return Ok(request);
@@ -541,6 +573,7 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
+    attach_scene_contract(&mut runtime_contract, unit_scene);
     if planner_repair {
         let content=format!("{}\n\n本次是原情绪统筹岗位的定向规划修复。previousPlan为完整未采用原回包，validationIssues由程序校验给出。保留正确的情绪、事件、来源归属、入口事实、选择及初排；只修复明确问题及其必要关联。真实集场以sourceRows和episode为准，continuous只适用于同一真实场景；跨场的时空或事件边界由本岗依据原文判断，程序不代写剧情。交完整规划并再次经过覆盖、顺序、身份及场景校验。不得重抄原文或改写源事实。最多两次定向修订，同样问题不循环。",text(&runtime_contract,"content"));
         runtime_contract["planRepairProfile"] = json!("rejected-plan-repair/v1");
@@ -599,6 +632,20 @@ pub(in crate::pipeline) fn prepare_request(
             "{}\n\n{SOURCE_COORDINATE_REPAIR_EXECUTION}",
             text(&runtime_contract, "content")
         );
+        runtime_contract["content"] = json!(content);
+        runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
+    }
+    if author_repair && request.input["validationIssues"].as_array().is_some_and(|issues| {
+        issues.iter().any(|issue| issue["code"] == "SHOT_SOURCE_SCOPE")
+    }) {
+        let content = format!("{}\n\n{SHOT_SOURCE_REPAIR_EXECUTION}", text(&runtime_contract, "content"));
+        runtime_contract["content"] = json!(content);
+        runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
+    }
+    if author_repair && request.input["validationIssues"].as_array().is_some_and(|issues| {
+        issues.iter().any(|issue| issue["code"] == "ASSET_SOURCE_SCOPE" && issue.get("ownerUnitIds").is_some())
+    }) {
+        let content = format!("{}\n\n{PACKAGE_ASSET_SOURCE_REPAIR_EXECUTION}", text(&runtime_contract, "content"));
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
@@ -1173,6 +1220,45 @@ pub(in crate::pipeline) fn add_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unit_scene_profile_is_opt_in_and_all_role_wrappers_preserve_scene_data() {
+        for (stage,skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),
+            ("storyboardFinish","episode-finishing-editor"),("storyboardRefine","director-refinement")] {
+            let mut input = json!({PROFILE_FIELD:PROFILE,"settings":{"fantasyMode":"off"},"sourceRows":[],"contextRows":[],
+                "capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":0},
+                "previousDraft":{"units":[{"id":"single","scene":"家屋，日间","shots":[{"picture":"家屋中回应"}]},
+                    {"id":"multiple","scene":"家屋；内部有源依据的酒店闪回","shots":[{"picture":"合法内部闪回"}]}]}});
+            // Every actual role builder supplies this frozen brief before the
+            // creative/rhythm wrappers. Test the real builder boundary, rather
+            // than an incomplete fixture that first synthesizes it downstream.
+            input["capacityBrief"] = super::super::original::capacity_brief(
+                &input["capabilities"],Some(&input["previousDraft"]),None,&[]);
+            super::super::super::stage3_pack::mark_input(&mut input).unwrap();
+            let request = TextRequest {stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),
+                input,schema:json!({}),rule_snapshot:super::super::super::stage3_pack::snapshot(skill,&[]).unwrap()};
+            let old = prepare_request(request.clone()).unwrap();
+            assert!(old.input.get(SCENE_PROFILE_FIELD).is_none());
+            assert!(old.rule_snapshot["runtimeContract"].get("sceneProfile").is_none());
+            assert!(!text(&old.rule_snapshot["runtimeContract"],"content").contains(UNIT_LOCAL_SCENE_REQUIREMENTS));
+            let mut marked = request.clone();
+            marked.input[SCENE_PROFILE_FIELD] = json!(SCENE_PROFILE);
+            let prepared = prepare_request(marked).unwrap();
+            let runtime = &prepared.rule_snapshot["runtimeContract"];
+            assert_eq!(runtime["sceneProfile"],SCENE_PROFILE);
+            assert_eq!(runtime["sha256"],digest(text(runtime,"content")));
+            assert_eq!(text(runtime,"content").matches(UNIT_LOCAL_SCENE_REQUIREMENTS).count(),1);
+            assert!(text(runtime,"content").contains("在keep/retained前逐单元核对"));
+            assert_eq!(prepared.input["previousDraft"],old.input["previousDraft"],"guidance never program-overwrites legal single/multi-space metadata or body");
+            assert_eq!(prepared.rule_snapshot["primary"],old.rule_snapshot["primary"],"frozen production skill bytes stay exact");
+            assert_eq!(prepared.rule_snapshot["methods"],old.rule_snapshot["methods"]);
+            assert_eq!(serde_json::to_vec(&prepare_request(prepared.clone()).unwrap()).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            assert_eq!(serde_json::to_vec(&prepare_request(request.clone()).unwrap()).unwrap(),serde_json::to_vec(&old).unwrap(),"old frozen request remains byte exact");
+            let mut unknown = request;
+            unknown.input[SCENE_PROFILE_FIELD] = json!("unknown");
+            assert!(prepare_request(unknown).is_err());
+        }
+    }
+
     #[test]
     fn frozen_finisher_asset_context_is_not_model_material_for_any_role() {
         for (stage, skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),("storyboardFinish","episode-finishing-editor")] {

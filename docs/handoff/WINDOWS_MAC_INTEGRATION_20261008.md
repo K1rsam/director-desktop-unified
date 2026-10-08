@@ -254,4 +254,28 @@ Stage2 新 `asset-production-context/v2` 传入直接父稿逐字的 `freeDesign
 
 Windows 定向回归：新父设计继承 7、原制作上下文 6、资产原子发布 4、版本与旧合同库测试 3，共 20 项通过；controller 309.545 秒、exit0、未超时且 Job 子树为空。覆盖 v1 零新派发恢复、三层父链、显式/隐式父稿、手写父稿、相关道具及修改父取舍后的原子拒绝。此项尚未成为新桌面候选，也尚未真实重新设计睡衣子稿；最终全库和实际复验另录。
 
+第二集后续主创第三包实际 388.526 秒完成，单 thread/turn、stdout 48453 字节、stderr 0、无网络重试；其后两份整编均采用。整集发布仍被第一包三处同执行包跨单元镜头引用阻断，后续八集按前集连续性等待，没有另开重发或死循环。现在增加精确 `SHOT_SOURCE_SCOPE` 诊断，要求源行在原包白名单、正文、同集且有实际归属单元，接入现有最多两轮原整编。诊断覆盖副本不改送模型的原候选，最终仍完整校验来源、台词、时序、素材与声窗；原回包和其它已完成包继续复用。
+
+新流程可冻结 `unit-local-scene/v1`，三岗、局部重做和精修都要求场景头限定于本单元实际内容，整编 keep 前核对，不用程序强改合法内部闪回；缺少标记的旧流程请求、规则和候选绑定保持不变。当前第一集 unit03 仍须正式局部精修，不能因适配上线而直接改写已采用稿。
+
+父设计修复后的完整预编译 library 执行为 856 通过、24 失败、37 忽略，controller 203.444 秒、exit101、未超时且进程树为空，二进制 SHA256 `cc1a0553876812a43778cb70ac61b375f079efaacda933f8112a42df1012c33a`。其中 16 个 readiness fixture 因直接测试进程没有 `RUSTC` 而找不到编译器；明确指定本机 rustc 后该模块 18 项全部通过，controller 23.208 秒、exit0、进程树为空。其余八项揭示早期 API 防重发总门禁误拦严格原回包恢复。修复只允许原只读 sealed-raw 证明及精确原采用审计通过，保留领域校验/CAS/修订预算；在新任务分配前再次拒绝已有节点或原孤儿请求。新增回归及原八项须实际重测，不降低未知提交保护。
+
+### 2026-10-09 Windows 来源和完整回归复核（进行中）
+
+Windows 精确源码工作树是 `_task-backups/github-desktop-20261005`，不是无独立 Git 元数据的 `director-desktop` 目录。以实际工作树重跑现有来源校验器，`windowsHistory.sourceGitVerified=true`；从实际迁入提交到 `1e2bf93553c1235ba56fddc2141058e719393d1c` 的 19 个后续提交逐项匹配，保护 bundle 的对象链一致，远端 `director-web` 的 `handoff/director-desktop-20261005` 回读亦为同一 SHA。原工作树和集成库 refs 未改，来源核对不是代码覆盖。
+
+非 Rust 九入口完整执行：SDK 合成验证 61/61、前端 148/148、TypeScript 通过，额外工作台 UI 38/38、资产生命周期 10/10、任务准备 6/6、视频准备 34/34。两个失败经独立修复重验：基础范围测试旧 hook 转换未适配 useRef，现精确替换一次并在未知 hook 或未命中时失败，7/7；Windows PowerShell 5.1 对实际存在的 265 字符资源路径读取失败，现仅 SDK 的 .NET I/O 使用规范化 extended path，原目录边界、九文件白名单、SHA、重解析点、锁和版本轮换保持。更新器原 11 项加新增三项共 14/14，最长资源叶路径 411 字符，篡改和 junction 均拒绝，SDK 九文件加 manifest 的哈希前后相同。此次零实际模型、媒体、账户或客户端发布调用。
+
+全 Rust 首轮编译发现新 scene helper 的模块可见性缺失，修正后第二轮 library 885 通过、2 失败、37 忽略，controller 534.823 秒、exit101、未超时、Job 子树为空。两个新增测试错误分别为未按真实岗位预填 capacityBrief，以及把 Store::job 附带 mediaIds 的 UI 投影当作模型原包；仅修夹具和改为读取原始 jobs.result，生产验收不放宽。第三轮完整 library 与 integration 正在执行。
+
+真实 B 第二集旧拒绝稿的零派发只读探针进一步揭示同包镜头来源和资产来源的混合问题；只接入镜头诊断仍被资产来源严格拒绝，因此目前尚不能进入候选实跑。探针原库零连接、私有副本无修改，controller 776 毫秒、exit101、进程树为空。后续只允许在同一冻结包与原素材白名单内收集这两类诊断，交由原最多两轮整编；不删除原引用来伪造通过。
+
+第三轮 library 886 通过、1 失败、37 忽略，controller 532.990 秒、exit101、未超时、Job 子树为空；前述新 scene/API 回归通过。剩余为原 loopback 代理 fixture 在 Windows accept 后继承 nonblocking，单次 read 遇到 Winsock 10035。测试现显式切回 blocking，在原两秒总预算和 8 KiB 上限内读取完整 HTTP 头，保留代理目标和响应断言，并限制失败路径也只能访问 loopback；不改生产代理逻辑。第四轮使用 no-fail-fast 验证完整 library 和 integration。
+
+混合来源窄修后的真实 B2 只读探针通过：原 3 单元、22 镜，准确发现 3 处 SHOT_SOURCE_SCOPE 和 1 处 ASSET_SOURCE_SCOPE，关联原包内三个单元。原稿仍为 rejected、accepted=false，源和原 raw 未改，只证明可进入原两轮整编；零模型/视频派发。controller 741 毫秒、exit0、Job 子树为空，测试二进制 SHA256 `e1f59ae87c0aae8e79f408eca1c8dfc7e467c8b012dd277b329d4ed222ac4e11`。新的纯源码副本校验 144 个迁入对象、22 个原规则以及来源锁 11 项通过。
+
+22:54:42–22:54:45 UTC 新执行的本机 Windows Canvas 只读检查：1.0.2 / 09e50ac，本地 default/cn 已登录；auth account 退出 11，reason=oauth_scope_insufficient；图片目录退出 12、access_denied，未取得 canonical 5.0 模型。六条只读命令均独立 30 秒 Job 保护，未超时、进程树清空；零登录/授权变更/生成/上传/创建，不保存原始账户输出。该结果独立于 Mac 历史收据。Canvas 显式零积分 ceiling 协议存在，但当前账户及模型前提不满足；旧生成 CLI 未核验本次零费报价，所以免费实图仍未验收，视频继续禁止。
+
+第四轮 Windows Rust 全量完成：`cargo test --release --locked --no-default-features --no-fail-fast --tests -- --test-threads=1`，library **889/889**、28 个 integration target 合计 **212/212**，总计 **1101 通过、0 失败、41 忽略**（library 37、integration 4），另一个 core binary target 为零测试。controller 604.067 秒、exit0、未超时、Job 子树清空；包含混合来源两轮及零重派恢复、API 原回包保护和修复后的 Windows loopback 代理测试。忽略项没有批量执行，真实 B2 只读探针以独立精确过滤器另列。此结果不替代新版原生客户端实跑或免费成图验收。
+
 主控补录：最终集成提交 SHA 与新仓库远端 SHA、最终 manifest/profile、完整 Rust/前端/SDK/适用平台策略结果、成品 EXE 与资源 SHA256、独立原生启动及隔离保存重开结果、实际渠道检查与未测范围。上述字段补齐后再移除本文草稿标记。

@@ -4579,6 +4579,7 @@ pub(crate) const AUTHOR_DIALOGUE_INTERVAL_REJECTION: &str =
 pub(crate) const AUTHOR_SOURCE_COVERAGE_REJECTION: &str =
     "单元须依源顺序完整覆盖制作正文；跨单元同句仅允许连续原片段且全句恰好一次";
 pub(crate) const AUTHOR_ASSET_SOURCE_REJECTION: &str = "单元资产引用越出本单元来源";
+pub(crate) const AUTHOR_SHOT_SOURCE_REJECTION: &str = "镜头引用越出本单元来源";
 pub(crate) const AUTHOR_SHOT_DURATION_REJECTION: &str = "镜长须为正数";
 
 pub(crate) fn author_missing_dialogue(reason: &str) -> Option<&str> {
@@ -4592,6 +4593,7 @@ pub(crate) fn author_repairable_rejection(reason: &str) -> bool {
         AUTHOR_DIALOGUE_INTERVAL_REJECTION,
         AUTHOR_SOURCE_COVERAGE_REJECTION,
         AUTHOR_ASSET_SOURCE_REJECTION,
+        AUTHOR_SHOT_SOURCE_REJECTION,
         AUTHOR_SHOT_DURATION_REJECTION,
     ]
     .contains(&reason) || author_missing_dialogue(reason).is_some()
@@ -5342,6 +5344,7 @@ impl TextExecutor for SavedTextExecutor {
             }
             self.check_managed_node_resume_boundary(&request)?;
         }
+        self.check_api_finish_submission_boundary(&request)?;
         let job = self.store.add_job(
             "text",
             &format!("{}:{}:{}", request.stage, request.skill, id()),
@@ -6145,6 +6148,7 @@ impl SavedTextExecutor {
             AUTHOR_DIALOGUE_INTERVAL_REJECTION,
             AUTHOR_SOURCE_COVERAGE_REJECTION,
             AUTHOR_ASSET_SOURCE_REJECTION,
+            AUTHOR_SHOT_SOURCE_REJECTION,
             AUTHOR_SHOT_DURATION_REJECTION
         ].into_iter().map(str::to_string).collect::<Vec<_>>();
         // Enumerate only this immutable request's own source dialogue IDs.
@@ -9790,6 +9794,7 @@ mod carrier_continuity_key_tests {
             AUTHOR_DIALOGUE_INTERVAL_REJECTION,
             AUTHOR_SOURCE_COVERAGE_REJECTION,
             AUTHOR_ASSET_SOURCE_REJECTION,
+            AUTHOR_SHOT_SOURCE_REJECTION,
             "对白 dialogue:row:source:0:8 未完整出现一次",
         ] {
             let (_temp, exec, request, job, raw) = rejected_author_fixture();

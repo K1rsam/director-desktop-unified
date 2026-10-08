@@ -67,8 +67,9 @@ fn asset_only_finish_request(legacy: &TextRequest, projected: &TextRequest) -> R
 }
 
 impl SavedTextExecutor {
-    /// API has no passive reconciliation for an interrupted request. An existing
-    /// editor can only replay its proven adopted cache, never allocate a replacement.
+    /// API has no passive reconciliation for an interrupted request. Existing
+    /// nodes may only use a proven cache or the original sealed raw recovery;
+    /// neither permission authorizes a replacement API task.
     pub(super) fn check_existing_api_finish_node(&self, request: &TextRequest) -> Result<()> {
         if s(&self.settings, "textProvider") != "api" || request.stage != "storyboardFinish" {
             return Ok(());
@@ -93,6 +94,49 @@ impl SavedTextExecutor {
             return Ok(());
         };
         let held = || API_EXISTING_NODE_HELD.to_owned();
+        let expected = self.request_snapshot(request).map_err(|_|held())?;
+        let expected_hash = crate::pipeline::digest(&expected.to_string());
+        if saved["stepState"] != "accepted" || saved["jobState"] != "completed" {
+            // These read-only predicates own the original raw, domain and
+            // persistent attempt budget. In particular, an unresolved bounded
+            // attempt must retain its precise no-resend diagnosis.
+            let raw = if let Some((_, value)) =
+                self.scope_rejected_author_result(request, &expected, &expected_hash)?
+            {
+                Some(value)
+            } else if let Some(replay) =
+                self.scope_group_validator_replay(request, &expected, &expected_hash)?
+            {
+                Some(replay.value)
+            } else if let Some((_, value, _)) =
+                self.carrier_rejected_result(request, &expected, &expected_hash)?
+            {
+                Some(value)
+            } else {
+                self.carrier_received_result(request, &expected, &expected_hash)?
+                    .map(|replay| replay.value)
+            };
+            let Some(raw) = raw else { return Err(held()); };
+            let event: Option<String> = c.query_row(
+                "SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",
+                [s(&saved,"jobId")],|row|row.get(0),
+            ).optional().map_err(|e|e.to_string())?;
+            let event: Value = serde_json::from_str(event.as_deref().ok_or_else(held)?).map_err(|_|held())?;
+            let parent_bound: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run')",
+                [run], |row|row.get(0),
+            ).map_err(|e|e.to_string())?;
+            if saved["stage"] != request.stage || saved["kind"] != "text"
+                || saved["provider"] != "api" || !parent_bound
+                || s(&saved,"snapshot") != expected.to_string()
+                || saved["requestHash"] != expected_hash
+                || serde_json::from_str::<Value>(s(&saved,"result")).map_err(|_|held())? != raw
+                || event["requestHash"] != expected_hash || event["value"] != raw
+            {
+                return Err(held());
+            }
+            return Ok(());
+        }
         if saved["stepState"] != "accepted" || saved["jobState"] != "completed"
             || saved["stage"] != request.stage || saved["kind"] != "text"
             || saved["provider"] != "api" || !saved["stepError"].is_null()
@@ -102,27 +146,73 @@ impl SavedTextExecutor {
         }
         let snapshot_text = saved["snapshot"].as_str().ok_or_else(held)?;
         let snapshot: Value = serde_json::from_str(snapshot_text).map_err(|_|held())?;
-        let expected = self.request_snapshot(request).map_err(|_|held())?;
         let hash = crate::pipeline::digest(snapshot_text);
         let receipt: Value = serde_json::from_str(s(&saved,"receipt")).map_err(|_|held())?;
         let accepted: Value = serde_json::from_str(s(&saved,"accepted")).map_err(|_|held())?;
         let result: Value = serde_json::from_str(s(&saved,"result")).map_err(|_|held())?;
-        let event: Option<String> = c.query_row(
-            "SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",
-            [s(&saved,"jobId")],|row|row.get(0),
+        let event: Option<(i64,String)> = c.query_row(
+            "SELECT id,data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",
+            [s(&saved,"jobId")],|row|Ok((row.get(0)?,row.get(1)?)),
         ).optional().map_err(|e|e.to_string())?;
-        let event: Value = serde_json::from_str(event.as_deref().ok_or_else(held)?).map_err(|_|held())?;
+        let (event_id,event_text) = event.ok_or_else(held)?;
+        let event: Value = serde_json::from_str(&event_text).map_err(|_|held())?;
         if snapshot.to_string() != snapshot_text || snapshot != expected
             || saved["requestHash"] != hash
             || receipt["contract"] != "desktop-runner/v1" || receipt["validation"] != "accepted"
-            || !receipt["migrationPolicy"].is_null()
             || receipt.get("acceptedRequestHash").is_some_and(|value|value != &json!(hash))
             || event["requestHash"] != hash || event["value"].is_null()
-            || accepted.is_null() || accepted != result
+            || accepted.is_null()
             || self.store.accepted_step(run,&hash)?.as_ref() != Some(&accepted)
         {
             return Err(held());
         }
+        if receipt["migrationPolicy"].is_null() {
+            if accepted != result { return Err(held()); }
+        } else {
+            // A replay's normalized adopted value belongs only to this exact
+            // workflow node. The original raw remains in jobs.result and must
+            // never become a generic API result cache.
+            let policy = s(&receipt,"migrationPolicy");
+            let audit = match policy {
+                "carrier-received-validation/v1" if is_carrier_repair(request) =>
+                    &receipt["carrierReceivedValidation"],
+                "author-scope-received-validation/v1" if is_scope_finisher_repair(request) =>
+                    &receipt["authorScopeReceivedValidation"],
+                _ => return Err(held()),
+            };
+            let parent_bound: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run')",
+                [run], |row|row.get(0),
+            ).map_err(|e|e.to_string())?;
+            if !parent_bound || receipt["acceptedRequestHash"] != hash
+                || audit["version"] != policy || audit["workflowId"] != run
+                || audit["nodeKey"] != step_key(request) || audit["requestHash"] != hash
+                || audit["originalSnapshotSha256"] != hash
+                || audit["originalResultSha256"] != crate::pipeline::digest(s(&saved,"result"))
+                || audit["originalRawEventId"] != event_id
+                || audit["generationRequestsSent"] != 0 || audit["acceptedAutomatically"] != false
+                || event["value"] != result
+            {
+                return Err(held());
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check after asynchronous slot/readiness waits. Even a node which was
+    /// replayable at entry may not fall through to allocation if its evidence
+    /// changes before the original recovery predicate runs.
+    pub(super) fn check_api_finish_submission_boundary(&self, request: &TextRequest) -> Result<()> {
+        if s(&self.settings,"textProvider") != "api" || request.stage != "storyboardFinish" {
+            return Ok(());
+        }
+        let Some(run) = self.workflow_id.as_deref() else { return Ok(()); };
+        let blocked: bool = self.store.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2) OR EXISTS(SELECT 1 FROM jobs j WHERE j.kind='text' AND j.provider='api' AND j.snapshot=?3 AND NOT EXISTS(SELECT 1 FROM workflow_steps w WHERE w.text_job_id=j.id))",
+            params![run,step_key(request),self.request_snapshot(request)?.to_string()],
+            |row|row.get(0),
+        ).map_err(|e|e.to_string())?;
+        if blocked { return Err(API_EXISTING_NODE_HELD.to_owned()); }
         Ok(())
     }
 
@@ -410,6 +500,38 @@ mod tests {
             &request.stage,&hash,"accepted",Some(job),Some(&value),None).unwrap();
         executor.store.event(job,"text_received_raw",&json!({"requestHash":hash,"value":value})).unwrap();
         value
+    }
+
+    fn recovery_fixture_at(endpoint: &str, family: &str) -> (
+        tempfile::TempDir, SavedTextExecutor, TextRequest, TextRequest, TextRequest,
+    ) {
+        let (dir,e,mut old,mut asset_only,_) = boundary_fixture_at(endpoint);
+        for request in [&mut old,&mut asset_only] {
+            request.rule_snapshot = crate::pipeline::snapshot("episode-finishing-editor",&[]).unwrap();
+            let (batch,field,version) = match family {
+                "carrier" => ("carrier-repair/v1","carrierRepair","accepted-finisher-carrier-repair/v1"),
+                "author" => ("author-domain-repair/v1","authorRepair","rejected-author-scope-repair/v1"),
+                "finish" => ("finish-domain-repair/v1","finishRepair","rejected-finish-scope-repair/v1"),
+                _ => ("related-range-finish/v1","",""),
+            };
+            request.input["storyboardCreativeProfile"] = json!("original-production-contract/v1");
+            request.input["executionBatch"] = json!({"version":batch,"id":"sealed-original-attempt"});
+            if !field.is_empty() {
+                request.input[field] = json!({"version":version,"attempt":1,"maximumAttempts":2});
+            }
+        }
+        asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+            json!(crate::pipeline::digest(&serde_json::to_string(&old).unwrap()));
+        let new = boundary_projection(&asset_only);
+        (dir,e,old,asset_only,new)
+    }
+
+    fn receive(executor: &SavedTextExecutor, request: &TextRequest, job: &str) -> Value {
+        let raw = json!({"sealedRaw":"SYNTHETIC_ORIGINAL_UNADOPTED_FINISHER"});
+        let hash = crate::pipeline::digest(&executor.request_snapshot(request).unwrap().to_string());
+        executor.store.update_job(job,"received",&json!({"result":raw})).unwrap();
+        executor.store.event(job,"text_received_raw",&json!({"requestHash":hash,"value":raw})).unwrap();
+        raw
     }
 
     fn evidence(executor: &SavedTextExecutor) -> Value {
@@ -738,6 +860,131 @@ mod tests {
             assert_eq!(e.execute(request).await.unwrap_err(),API_EXISTING_NODE_HELD,"{changed}");
             assert_eq!(evidence(&e),before,"{changed}: no mutation");
             assert_eq!(server.requests.load(Ordering::SeqCst),0,"{changed}: no dispatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_sealed_received_finishers_require_domain_validation_and_keep_zero_dispatch() {
+        let server = RefusingApi::start();
+        for family in ["carrier","author","finish"] {
+            for profile in ["legacy","asset-v1","boundary-v1"] {
+                for valid in [false,true] {
+                    let (_dir,e,old,asset_only,new) = recovery_fixture_at(&server.endpoint,family);
+                    let request = match profile { "legacy"=>old.clone(), "asset-v1"=>asset_only, _=>new.clone() };
+                    let job = save(&e,&request,"received",true);
+                    let raw = receive(&e,&request,&job);
+                    let before = evidence(&e);
+                    let selected = e.saved_finish_asset_projection(old,new).unwrap();
+                    assert_eq!(serde_json::to_value(&selected).unwrap(),serde_json::to_value(&request).unwrap());
+                    assert_eq!(evidence(&e),before,"selection is read-only");
+                    assert_eq!(e.check_api_finish_submission_boundary(&selected).unwrap_err(),API_EXISTING_NODE_HELD);
+                    let original_job = e.store.job(&job).unwrap();
+                    let mut checked = false;
+                    let result = crate::pipeline::call_validated(
+                        &e,&selected.stage,&selected.skill,&selected.model,&selected.reasoning,
+                        selected.input.clone(),selected.schema.clone(),&[],|value| {
+                            checked = true;
+                            assert_eq!(*value,raw);
+                            assert_eq!(e.store.job(&job).unwrap(),original_job,"raw is not adopted by execute");
+                            if valid { value["validatedDomain"]=json!(true); Ok(()) }
+                            else { Err("strict original-domain rejection".into()) }
+                        },
+                    ).await;
+                    assert!(checked,"{family}/{profile}: original validator runs");
+                    if valid {
+                        let domain = result.unwrap();
+                        let adopted = evidence(&e);
+                        for _ in 0..2 {
+                            assert_eq!(e.execute(selected.clone()).await.unwrap(),domain);
+                            e.accept(&selected,&domain).await.unwrap();
+                        }
+                        assert_eq!(evidence(&e),adopted,"exact normalized cache is read-only");
+                    } else {
+                        assert_eq!(result.unwrap_err(),"strict original-domain rejection");
+                        let rejected_job = e.store.job(&job).unwrap();
+                        assert_eq!(e.execute(selected.clone()).await.unwrap(),raw);
+                        e.reject(&selected,&raw,"strict original-domain rejection").await.unwrap();
+                        assert!(e.accept(&selected,&raw).await.is_err());
+                        assert_eq!(e.store.job(&job).unwrap(),rejected_job);
+                    }
+                    assert_eq!(e.store.job(&job).unwrap()["snapshot"],original_job["snapshot"]);
+                    // Store::job decorates the UI result with mediaIds; compare
+                    // sealed model bytes in storage, not that compatibility view.
+                    let stored_raw: String = e.store.conn().unwrap().query_row(
+                        "SELECT result FROM jobs WHERE id=?1", [&job], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(&stored_raw).unwrap(),raw);
+                    assert_eq!(e.store.jobs().unwrap().len(),2,"persistent attempt never resets");
+                    assert_eq!(server.requests.load(Ordering::SeqCst),0,"{family}/{profile}: no API dispatch");
+                    assert!(!e.store.root.join("text-runs").exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_sealed_rejected_finishers_keep_original_error_and_budget_without_dispatch() {
+        let server = RefusingApi::start();
+        for family in ["carrier","author","finish","ordinary"] {
+            for profile in ["legacy","asset-v1","boundary-v1"] {
+                let (_dir,e,old,asset_only,new) = recovery_fixture_at(&server.endpoint,family);
+                let request = match profile { "legacy"=>old.clone(), "asset-v1"=>asset_only, _=>new.clone() };
+                let job = save(&e,&request,"received",true);
+                let raw = receive(&e,&request,&job);
+                let hash = crate::pipeline::digest(&e.request_snapshot(&request).unwrap().to_string());
+                e.store.update_job(&job,"rejected",&json!({"error":AUTHOR_ASSET_SCOPE_REJECTION,
+                    "receipt":{"contract":"desktop-runner/v1","validation":"rejected"}})).unwrap();
+                e.store.checkpoint(e.workflow_id.as_deref().unwrap(),&step_key(&request),&request.stage,
+                    &hash,"rejected",Some(&job),Some(&raw),Some(AUTHOR_ASSET_SCOPE_REJECTION)).unwrap();
+                let before = evidence(&e);
+                let selected = e.saved_finish_asset_projection(old,new).unwrap();
+                assert_eq!(serde_json::to_value(&selected).unwrap(),serde_json::to_value(&request).unwrap());
+                assert_eq!(evidence(&e),before);
+                for _ in 0..2 {
+                    assert_eq!(e.execute(selected.clone()).await.unwrap(),raw);
+                    e.reject(&selected,&raw,AUTHOR_ASSET_SCOPE_REJECTION).await.unwrap();
+                    assert!(e.accept(&selected,&raw).await.is_err());
+                }
+                let after = evidence(&e);
+                assert_eq!(after["jobs"],before["jobs"]);
+                assert_eq!(after["steps"],before["steps"]);
+                assert_eq!(server.requests.load(Ordering::SeqCst),0);
+                assert_eq!(e.store.jobs().unwrap().len(),2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_normalized_replay_proof_pollution_cannot_dispatch_or_reset_the_node() {
+        let server = RefusingApi::start();
+        for changed in ["policy","request-hash","event-id","raw-hash","snapshot-hash",
+            "workflow","node","calls","automatic","received-event","receipt-hash","parent"] {
+            let (_dir,e,_,_,request) = recovery_fixture_at(&server.endpoint,"carrier");
+            let job = save(&e,&request,"received",true);
+            let raw = receive(&e,&request,&job);
+            let mut domain = raw.clone(); domain["validatedDomain"]=json!(true);
+            e.accept(&request,&domain).await.unwrap();
+            let mut receipt = e.store.job(&job).unwrap()["receipt"].clone();
+            let audit = &mut receipt["carrierReceivedValidation"];
+            match changed {
+                "policy" => receipt["migrationPolicy"]=json!("unproven-policy"),
+                "request-hash" => audit["requestHash"]=json!("changed"),
+                "event-id" => audit["originalRawEventId"]=json!(-1),
+                "raw-hash" => audit["originalResultSha256"]=json!("changed"),
+                "snapshot-hash" => audit["originalSnapshotSha256"]=json!("changed"),
+                "workflow" => audit["workflowId"]=json!("changed"),
+                "node" => audit["nodeKey"]=json!("changed"),
+                "calls" => audit["generationRequestsSent"]=json!(1),
+                "automatic" => audit["acceptedAutomatically"]=json!(true),
+                "received-event" => {e.store.event(&job,"text_received_raw",&json!({"requestHash":"changed","value":raw})).unwrap();}
+                "receipt-hash" => receipt["acceptedRequestHash"]=json!("changed"),
+                _ => {e.store.conn().unwrap().execute("UPDATE jobs SET entity_id='other-workflow' WHERE id=?1",[e.workflow_id.as_deref().unwrap()]).unwrap();}
+            }
+            e.store.update_job(&job,"completed",&json!({"receipt":receipt})).unwrap();
+            let before = evidence(&e);
+            assert_eq!(e.execute(request).await.unwrap_err(),API_EXISTING_NODE_HELD,"{changed}");
+            assert_eq!(evidence(&e),before,"{changed}: no state mutation");
+            assert_eq!(server.requests.load(Ordering::SeqCst),0);
         }
     }
 

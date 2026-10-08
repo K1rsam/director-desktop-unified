@@ -161,10 +161,14 @@ fn basis(input: &Value) -> Result<Basis, String> {
     let mut events: Vec<_> = events.into_iter().collect();
     events.sort();
     let scope = json!({"version":"director-refinement-scope/v1","reviewScope":"complete_adopted_episode","unitIds":ordered,"eventIds":events});
-    let input_binding=digest(&json!({"sourceSha256":source.sha256,"episodeId":episode,"baseDraftHash":storyboard::finish_base_hash(&draft),
+    let mut binding = json!({"sourceSha256":source.sha256,"episodeId":episode,"baseDraftHash":storyboard::finish_base_hash(&draft),
         "acceptedContext":context,"assets":input["assets"],"settings":input["settings"],"capabilities":input["capabilities"],
         "productionDirection":input["productionDirection"],"refinementScope":scope,"reviewNotes":input["reviewNotes"],"preserveNotes":input["preserveNotes"],
-        "rulePackSha256":stage3_pack::pack_sha256()?}).to_string());
+        "rulePackSha256":stage3_pack::pack_sha256()?});
+    if creative::uses_scene_profile(input)? {
+        binding[creative::SCENE_PROFILE_FIELD] = input[creative::SCENE_PROFILE_FIELD].clone();
+    }
+    let input_binding = digest(&binding.to_string());
     Ok(Basis {
         source,
         rows,
@@ -401,6 +405,7 @@ pub async fn run_storyboard_refinement(
         "productionDirection":input["productionDirection"],"refinementFeedbackVersion":FEEDBACK_VERSION,
         "acceptedProvenance":basis.context["unitBindings"],"capacityBrief":storyboard::original::capacity_brief(&input["capabilities"],Some(&basis.draft),input.get("voiceReference"),&basis.rows)});
     stage3_pack::attach_profile(&mut payload, input)?;
+    creative::attach_scene_profile(&mut payload, input)?;
     payload["assetSelection"] = asset_selection;
     let request = creative::prepare_request(TextRequest {
         stage: "storyboardRefine".into(),
@@ -897,6 +902,34 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(executor.calls.lock().await.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn refinement_scene_profile_is_frozen_and_candidate_adoption_binding_cannot_drift() {
+        let (_directory,_store,old,_origin) = fixture().await;
+        let executor = Model {mode:"changed",..Default::default()};
+        let old_basis = basis(&old).unwrap();
+        let old_candidate = run_storyboard_refinement(&old,&executor,"offline","medium").await.unwrap();
+        let first = executor.calls.lock().await[0].clone();
+        assert!(first.input.get(creative::SCENE_PROFILE_FIELD).is_none());
+        let mut current = old.clone();
+        storyboard::freeze_scene_input_profile(&mut current).unwrap();
+        let new_basis = basis(&current).unwrap();
+        assert_ne!(old_basis.input_binding,new_basis.input_binding,"candidate freeze includes new scene guidance");
+        let new_candidate = run_storyboard_refinement(&current,&executor,"offline","medium").await.unwrap();
+        assert!(adopt_storyboard_refinement(&current,&old_candidate).is_err(),"a candidate cannot silently switch profile");
+        assert!(adopt_storyboard_refinement(&old,&new_candidate).is_err());
+        adopt_storyboard_refinement(&current,&new_candidate).unwrap();
+        let calls = executor.calls.lock().await.clone();
+        assert_eq!(calls.len(),2);
+        assert_eq!(calls[1].input[creative::SCENE_PROFILE_FIELD],creative::SCENE_PROFILE);
+        assert_eq!(calls[1].rule_snapshot["runtimeContract"]["sceneProfile"],creative::SCENE_PROFILE);
+        assert_eq!(calls[1].input["previousDraft"],first.input["previousDraft"],"full adopted draft stays identical model material");
+        run_storyboard_refinement(&old,&executor,"offline","medium").await.unwrap();
+        assert_eq!(executor.calls.lock().await.len(),2,"old frozen refinement remains cache-compatible");
+        current[creative::SCENE_PROFILE_FIELD] = json!("unknown");
+        assert!(run_storyboard_refinement(&current,&executor,"offline","medium").await.is_err());
+        assert_eq!(executor.calls.lock().await.len(),2);
     }
 
     #[tokio::test]
