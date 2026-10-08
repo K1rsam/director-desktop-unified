@@ -1,11 +1,71 @@
 use super::*;
 
 const POLICY: &str = "finisher-asset-input-projection/v1";
+const API_EXISTING_NODE_HELD: &str = "API_FINISH_EXISTING_NODE_HELD: 原整编API节点尚未处理完，或原采用缓存证据不完整；保留原请求、回包和预算，不创建或重发任务";
 fn held() -> String {
     "FINISH_ASSET_PROJECTION_UNBOUND: 整编资产卡与原流程或已存在请求不一致；保留原任务，未提交新请求".into()
 }
 
 impl SavedTextExecutor {
+    /// API has no passive reconciliation for an interrupted request. An existing
+    /// editor can only replay its proven adopted cache, never allocate a replacement.
+    pub(super) fn check_existing_api_finish_node(&self, request: &TextRequest) -> Result<()> {
+        if s(&self.settings, "textProvider") != "api" || request.stage != "storyboardFinish" {
+            return Ok(());
+        }
+        let Some(run) = self.workflow_id.as_deref() else {
+            return Ok(());
+        };
+        let c = self.store.conn()?;
+        let saved: Option<Value> = c.query_row(
+            "SELECT w.stage,w.request_hash,w.state,w.result,w.error,j.id,j.kind,j.provider,j.state,j.snapshot,j.result,j.receipt,j.error FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",
+            params![run,step_key(request)], |row| Ok(json!({
+                "stage":row.get::<_,String>(0)?,"requestHash":row.get::<_,String>(1)?,
+                "stepState":row.get::<_,String>(2)?,"accepted":row.get::<_,Option<String>>(3)?,
+                "stepError":row.get::<_,Option<String>>(4)?,"jobId":row.get::<_,Option<String>>(5)?,
+                "kind":row.get::<_,Option<String>>(6)?,"provider":row.get::<_,Option<String>>(7)?,
+                "jobState":row.get::<_,Option<String>>(8)?,"snapshot":row.get::<_,Option<String>>(9)?,
+                "result":row.get::<_,Option<String>>(10)?,"receipt":row.get::<_,Option<String>>(11)?,
+                "jobError":row.get::<_,Option<String>>(12)?
+            })),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some(saved) = saved else {
+            return Ok(());
+        };
+        let held = || API_EXISTING_NODE_HELD.to_owned();
+        if saved["stepState"] != "accepted" || saved["jobState"] != "completed"
+            || saved["stage"] != request.stage || saved["kind"] != "text"
+            || saved["provider"] != "api" || !saved["stepError"].is_null()
+            || !saved["jobError"].is_null()
+        {
+            return Err(held());
+        }
+        let snapshot_text = saved["snapshot"].as_str().ok_or_else(held)?;
+        let snapshot: Value = serde_json::from_str(snapshot_text).map_err(|_|held())?;
+        let expected = self.request_snapshot(request).map_err(|_|held())?;
+        let hash = crate::pipeline::digest(snapshot_text);
+        let receipt: Value = serde_json::from_str(s(&saved,"receipt")).map_err(|_|held())?;
+        let accepted: Value = serde_json::from_str(s(&saved,"accepted")).map_err(|_|held())?;
+        let result: Value = serde_json::from_str(s(&saved,"result")).map_err(|_|held())?;
+        let event: Option<String> = c.query_row(
+            "SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",
+            [s(&saved,"jobId")],|row|row.get(0),
+        ).optional().map_err(|e|e.to_string())?;
+        let event: Value = serde_json::from_str(event.as_deref().ok_or_else(held)?).map_err(|_|held())?;
+        if snapshot.to_string() != snapshot_text || snapshot != expected
+            || saved["requestHash"] != hash
+            || receipt["contract"] != "desktop-runner/v1" || receipt["validation"] != "accepted"
+            || !receipt["migrationPolicy"].is_null()
+            || receipt.get("acceptedRequestHash").is_some_and(|value|value != &json!(hash))
+            || event["requestHash"] != hash || event["value"].is_null()
+            || accepted.is_null() || accepted != result
+            || self.store.accepted_step(run,&hash)?.as_ref() != Some(&accepted)
+        {
+            return Err(held());
+        }
+        Ok(())
+    }
+
     /// Select only the exact old/new domain at the same persisted node. This
     /// never creates a task, spends a repair attempt, or rewrites a frozen input.
     pub(super) fn saved_finish_asset_projection(
@@ -104,13 +164,15 @@ impl SavedTextExecutor {
             }
             // Unknown/received/rejected/accepted states all retain the original
             // request. The ordinary execute/recovery gates own their disposition.
-            return if domain == old_domain {
-                Ok(legacy)
+            let selected = if domain == old_domain {
+                legacy
             } else if domain == new_domain {
-                Ok(projected)
+                projected
             } else {
-                Err(held())
+                return Err(held());
             };
+            self.check_existing_api_finish_node(&selected)?;
+            return Ok(selected);
         }
         // An interrupted local insertion must not become a new request simply
         // because its workflow step is missing. Match full domains, not names.
@@ -136,8 +198,18 @@ impl SavedTextExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn fixture() -> (
+        tempfile::TempDir,
+        SavedTextExecutor,
+        TextRequest,
+        TextRequest,
+    ) {
+        fixture_at("https://invalid.example")
+    }
+    fn fixture_at(endpoint: &str) -> (
         tempfile::TempDir,
         SavedTextExecutor,
         TextRequest,
@@ -149,7 +221,7 @@ mod tests {
             .create("offline finisher projection", "fixture")
             .unwrap();
         store.ensure_workflow_storage().unwrap();
-        let settings = json!({"textProvider":"api","textEndpoint":"https://invalid.example"});
+        let settings = json!({"textProvider":"api","textEndpoint":endpoint,"textApiKey":"SYNTHETIC_TEST_KEY_NOT_A_CREDENTIAL"});
         let source_sha = crate::pipeline::digest("甲。乙。");
         let input = json!({"storyboardAssetInputProfile":"asset-production-card/v2","settings":settings,"source":{"sha256":source_sha}});
         let run = store
@@ -193,7 +265,7 @@ mod tests {
     ) -> String {
         let mut snapshot = executor.request_domain_snapshot(request).unwrap();
         snapshot["executorIdentity"] =
-            json!({"provider":"api","endpoint":"https://invalid.example"});
+            json!({"provider":"api","endpoint":s(&executor.settings,"textEndpoint").trim_end_matches('/')});
         let job = executor
             .store
             .add_job("text", "fixture", "api", "local", &snapshot, state)
@@ -214,6 +286,76 @@ mod tests {
                 .unwrap();
         }
         job
+    }
+
+    fn complete(executor: &SavedTextExecutor, request: &TextRequest, job: &str) -> Value {
+        let value = json!({"savedAcceptedValue":"SYNTHETIC_ORIGINAL_EDITOR_RESULT"});
+        let snapshot = executor.request_snapshot(request).unwrap();
+        let hash = crate::pipeline::digest(&snapshot.to_string());
+        executor.store.update_job(job,"completed",&json!({"result":value,
+            "receipt":{"contract":"desktop-runner/v1","validation":"accepted"},"error":null})).unwrap();
+        executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(),&step_key(request),
+            &request.stage,&hash,"accepted",Some(job),Some(&value),None).unwrap();
+        executor.store.event(job,"text_received_raw",&json!({"requestHash":hash,"value":value})).unwrap();
+        value
+    }
+
+    fn evidence(executor: &SavedTextExecutor) -> Value {
+        let c = executor.store.conn().unwrap();
+        let mut steps = c.prepare("SELECT workflow_id,node_key,stage,request_hash,state,text_job_id,result,error,updated_at FROM workflow_steps ORDER BY rowid").unwrap();
+        let steps: Vec<_> = steps.query_map([],|row|Ok(json!([
+            row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,
+            row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,
+            row.get::<_,Option<String>>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,String>(8)?
+        ]))).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+        let mut events = c.prepare("SELECT id,job_id,type,data,created_at FROM events ORDER BY id").unwrap();
+        let events: Vec<_> = events.query_map([],|row|Ok(json!([
+            row.get::<_,i64>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?,
+            row.get::<_,String>(3)?,row.get::<_,String>(4)?
+        ]))).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+        json!({"jobs":executor.store.jobs().unwrap(),"steps":steps,"events":events})
+    }
+
+    /// Loopback only; every attempted request is counted and rejected. The guard
+    /// must return before even this synthetic API transport is contacted.
+    struct RefusingApi {
+        endpoint: String,
+        requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl RefusingApi {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}",listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let counted = requests.clone();let stopping = stop.clone();
+            let worker = std::thread::spawn(move|| {
+                while !stopping.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream,_)) => {
+                            counted.fetch_add(1,Ordering::SeqCst);
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                            let mut buffer = [0u8;4096];let _ = stream.read(&mut buffer);
+                            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                        }
+                        Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self{endpoint,requests,stop,worker:Some(worker)}
+        }
+    }
+    impl Drop for RefusingApi {
+        fn drop(&mut self) {
+            self.stop.store(true,Ordering::SeqCst);
+            if let Some(worker)=self.worker.take(){let _=worker.join();}
+        }
     }
     #[test]
     fn new_finisher_uses_bound_cards_without_creating_jobs_or_changing_parent() {
@@ -244,14 +386,14 @@ mod tests {
                 let (_dir, e, old, new) = fixture();
                 let expected = if projected { &new } else { &old };
                 let job = save(&e, expected, state, true);
+                if state == "completed" { complete(&e,expected,&job); }
                 let before = e.store.job(&job).unwrap();
-                let selected = e
-                    .saved_finish_asset_projection(old.clone(), new.clone())
-                    .unwrap();
-                assert_eq!(
-                    serde_json::to_value(selected).unwrap(),
-                    serde_json::to_value(expected).unwrap()
-                );
+                let selected = e.saved_finish_asset_projection(old.clone(), new.clone());
+                if state == "completed" {
+                    assert_eq!(serde_json::to_value(selected.unwrap()).unwrap(),serde_json::to_value(expected).unwrap());
+                } else {
+                    assert_eq!(selected.unwrap_err(),API_EXISTING_NODE_HELD,"{state} remains a held original API node");
+                }
                 assert_eq!(e.store.job(&job).unwrap(), before);
             }
         }
@@ -289,5 +431,81 @@ mod tests {
         changed.model = "changed".into();
         save(&e, &changed, "failed", true);
         assert!(e.saved_finish_asset_projection(old, new).is_err());
+    }
+
+    #[tokio::test]
+    async fn api_existing_unprocessed_finisher_execute_holds_without_dispatch_or_mutation() {
+        let server = RefusingApi::start();
+        for projected in [false,true] {
+            for state in ["queued","running","submitting","submission_unknown","received","interrupted","rejected","failed"] {
+                let (_dir,e,old,new)=fixture_at(&server.endpoint);
+                let request=if projected {&new}else{&old};
+                let job=save(&e,request,state,true);
+                e.store.update_job(&job,state,&json!({"result":{"originalRaw":"SYNTHETIC_RAW_DO_NOT_REPLACE"},"prepared":{"originalPrepared":"SYNTHETIC_PREPARED_DO_NOT_REPLACE"}})).unwrap();
+                let before=evidence(&e);
+                assert_eq!(e.saved_finish_asset_projection(old.clone(),new.clone()).unwrap_err(),API_EXISTING_NODE_HELD,"selector {state}");
+                assert_eq!(e.execute(request.clone()).await.unwrap_err(),API_EXISTING_NODE_HELD,"execute {state}");
+                assert_eq!(evidence(&e),before,"{state}: jobs/checkpoint/prepared/raw/events unchanged");
+                assert_eq!(server.requests.load(Ordering::SeqCst),0,"{state}: no loopback API dispatch");
+                assert!(!e.store.root.join("text-runs").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_completed_finisher_reuses_only_original_accepted_cache_without_dispatch() {
+        let server=RefusingApi::start();
+        for projected in [false,true] {
+            let (_dir,e,old,new)=fixture_at(&server.endpoint);
+            let request=if projected {&new}else{&old};
+            let job=save(&e,request,"received",true);
+            let value=complete(&e,request,&job);
+            let before=evidence(&e);
+            let selected=e.saved_finish_asset_projection(old.clone(),new.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&selected).unwrap(),serde_json::to_value(request).unwrap());
+            for _ in 0..2 {assert_eq!(e.execute(selected.clone()).await.unwrap(),value);}
+            assert_eq!(evidence(&e),before);
+            assert_eq!(server.requests.load(Ordering::SeqCst),0);
+            assert!(!e.store.root.join("text-runs").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn api_completed_finisher_unproven_cache_holds_without_dispatch_or_mutation() {
+        let server=RefusingApi::start();
+        for changed in ["missing-receipt","missing-event","changed-event-hash","changed-checkpoint-hash","changed-result","changed-identity","unaccepted-step","changed-domain"] {
+            let (_dir,e,mut request,_new)=fixture_at(&server.endpoint);
+            let job=save(&e,&request,"received",true);complete(&e,&request,&job);
+            let c=e.store.conn().unwrap();
+            match changed {
+                "missing-receipt" => {c.execute("UPDATE jobs SET receipt=NULL WHERE id=?1",[&job]).unwrap();}
+                "missing-event" => {c.execute("DELETE FROM events WHERE job_id=?1 AND type='text_received_raw'",[&job]).unwrap();}
+                "changed-event-hash" => {c.execute("UPDATE events SET data=json_set(data,'$.requestHash','changed') WHERE job_id=?1 AND type='text_received_raw'",[&job]).unwrap();}
+                "changed-checkpoint-hash" => {c.execute("UPDATE workflow_steps SET request_hash='changed' WHERE text_job_id=?1",[&job]).unwrap();}
+                "changed-result" => {c.execute("UPDATE jobs SET result='{}' WHERE id=?1",[&job]).unwrap();}
+                "changed-identity" => {c.execute("UPDATE jobs SET snapshot=json_set(snapshot,'$.executorIdentity.endpoint','http://invalid.example') WHERE id=?1",[&job]).unwrap();}
+                "unaccepted-step" => {c.execute("UPDATE workflow_steps SET state='running' WHERE text_job_id=?1",[&job]).unwrap();}
+                _ => {request.input["previousDraft"]=json!({"changed":"not original accepted draft"});}
+            }
+            drop(c);
+            let before=evidence(&e);
+            assert_eq!(e.execute(request).await.unwrap_err(),API_EXISTING_NODE_HELD,"{changed}");
+            assert_eq!(evidence(&e),before,"{changed}: no mutation");
+            assert_eq!(server.requests.load(Ordering::SeqCst),0,"{changed}: no dispatch");
+        }
+    }
+
+    #[test]
+    fn api_finisher_hold_does_not_apply_to_other_backends_or_stages() {
+        let (_dir,mut e,mut request,_new)=fixture();
+        save(&e,&request,"submission_unknown",true);
+        for provider in ["codex","codex_sdk"] {
+            e.settings["textProvider"]=json!(provider);
+            assert!(e.check_existing_api_finish_node(&request).is_ok());
+        }
+        e.settings["textProvider"]=json!("api");request.stage="storyboardCreate".into();
+        assert!(e.check_existing_api_finish_node(&request).is_ok());
+        request.stage="storyboardFinish".into();e.workflow_id=None;
+        assert!(e.check_existing_api_finish_node(&request).is_ok());
     }
 }

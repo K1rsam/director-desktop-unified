@@ -5125,6 +5125,7 @@ impl TextExecutor for SavedTextExecutor {
             },
             _ => return Err("UNKNOWN_TEXT_BACKEND: 未知文本入口，不回退 CLI".into()),
         }
+        self.check_existing_api_finish_node(&request)?;
         children().check_open()?;
         crate::pipeline::asset_visual_facts::validate_visual_fact_repair_request(&request)?;
         let mut snapshot = self.request_snapshot(&request)?;
