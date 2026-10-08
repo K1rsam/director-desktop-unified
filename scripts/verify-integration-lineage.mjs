@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { FOUNDATION_RULE_UPDATES, verifyActiveFoundationRules } from './verify_source_lock.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const refs = {
@@ -102,7 +103,18 @@ function tree(directory) {
 
 const index = json('reference-skills/index.json');
 const macIndex = JSON.parse(gitBytes(refs.mac, 'reference-skills/index.json').toString('utf8'));
-assert.deepEqual(index, macIndex, 'Historical Mac index must remain unchanged');
+const activeFoundationRules = verifyActiveFoundationRules(repo, index);
+const historicalIndex = structuredClone(index);
+for (const update of FOUNDATION_RULE_UPDATES) {
+  const at = historicalIndex.registeredFiles.findIndex(row => row.id === update.id);
+  const original = macIndex.registeredFiles.find(row => row.id === update.id);
+  assert.ok(at >= 0 && original, 'Foundation amendment has no historical registration');
+  const { sha256, bytes, version, ...unchanged } = index.registeredFiles[at];
+  const { sha256: sourceSha, bytes: sourceBytes, ...historical } = original;
+  assert.deepEqual(unchanged, historical, 'Foundation amendment changed historical registration identity');
+  historicalIndex.registeredFiles[at] = original;
+}
+assert.deepEqual(historicalIndex, macIndex, 'Mac snapshot index changed outside two explicit current foundation amendments');
 const snapshots = verifyRows(index.snapshots, 72, 'Reference snapshots');
 assert.equal(snapshots.bytes, index.referenceSnapshotBytes);
 const expectedGroups = { 'desktop-original-2ac7c216': 29, 'mac-3008-git-2511c56': 21, 'mac-3008-production-20261005': 22 };
@@ -146,7 +158,8 @@ const registryEnd = registrySource.indexOf('.into_iter()', registryStart);
 assert.ok(registryStart >= 0 && registryEnd > registryStart, 'Rust registration table not found');
 const registration = [...registrySource.slice(registryStart, registryEnd).matchAll(/\(\s*"([^"]+)"\s*,\s*include_str!\("([^"]+)"\)\s*,?\s*\)/g)];
 assert.equal(registration.length, 29, 'Desktop compiled registration count');
-const known = new Map(index.registeredFiles.map(row => [row.id, row]));
+const known = new Map(macIndex.registeredFiles.map(row => [row.id, row]));
+const foundationUpdates = new Map(activeFoundationRules.map(row => [row.id, row]));
 const actual = [], rawMacUnchanged = [], newlineOnly = [];
 for (const [, id, include] of registration) {
   const file = path.relative(repo, path.resolve(repo, 'apps/desktop/src-tauri/src/pipeline', include)).split(path.sep).join('/');
@@ -157,7 +170,7 @@ for (const [, id, include] of registration) {
   actual.push({ id, path: file, version, sha256: digest(bytes), bytes: bytes.length });
   if (bytes.equals(macBytes)) rawMacUnchanged.push(id);
   else if (lf(bytes) === lf(macBytes)) newlineOnly.push(id);
-  else assert.equal(id, 'asset-image-production', 'Unrecorded semantic rule change');
+  else assert.ok(id === 'asset-image-production' || foundationUpdates.has(id), 'Unrecorded semantic rule change');
 }
 assert.equal(new Set(actual.map(row => row.id)).size, 29);
 const art = actual.find(row => row.id === 'asset-art-director');
@@ -193,7 +206,9 @@ const receipt = {
   referenceSnapshots: { count: 72, bytes: snapshots.bytes, groups: expectedGroups, loadedByFolderScan: false },
   candidateOriginals: { count: 22, productionReferenceMatches: 22, originalBytesVerified: true },
   siblingHistory: { changedFiles: 65, originalArchivesVerified: 60, documentationAndIndexes: 5 },
-  desktopRegistry: { count: 29, digest: digest(JSON.stringify(actual)), macRawUnchangedCount: rawMacUnchanged.length, macNewlineOnlyCount: newlineOnly.length, semanticChanges: [production.id], art, production },
+  desktopRegistry: { count: 29, digest: digest(JSON.stringify(actual)), macRawUnchangedCount: rawMacUnchanged.length, macNewlineOnlyCount: newlineOnly.length,
+    semanticChanges: [production.id, ...activeFoundationRules.map(row => row.id)],
+    activeFoundationRules, historicalReferenceSnapshotsUnchanged: true, art, production },
   stage3: { manifestActive: candidate.active, manifestStatus: candidate.status, activePackId: candidate.activePackId, compiledAdapterEntries: adapterEntries, runtimeAcceptanceProven: false },
   generationCalls: 0, accountCalls: 0, productionProjectsOpened: false,
 };

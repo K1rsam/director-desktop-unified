@@ -30,6 +30,7 @@ pub fn export(store: &Store, path: &Path) -> Result<Value> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    crate::executable_paths::remove_project_settings(&snap)?;
     let mut q = snap
         .prepare("SELECT data FROM media")
         .map_err(|e| e.to_string())?;
@@ -165,6 +166,9 @@ pub fn import(path: &Path, target: &Path) -> Result<Store> {
         if integrity != "ok" {
             return Err("项目数据库完整性校验失败".into());
         }
+        // Packages from older versions may contain another machine's active paths.
+        // Do not adopt them as local defaults or rewrite historical task snapshots.
+        crate::executable_paths::remove_project_settings(&store.conn()?)?;
         for m in store.values("media")? {
             store.verify_media(&m)?;
         }

@@ -11,6 +11,8 @@ pub const ADAPTER_VERSION: &str = "mac-3008-rust-adapter/v1";
 pub const SELECTOR_VERSION: &str = "source-bound-rust-selector/v1";
 pub const DIALOGUE_PROFILE: &str = "locked-utf16-reference/v1";
 pub const ORIGINAL_VERSION: &str = "production-byte-lock/20261005";
+pub const RHYTHM_PROFILE_FIELD: &str = "storyboardRhythmProfile";
+pub const RHYTHM_PROFILE: &str = "source-bound-rhythm-locator/v1";
 const MANIFEST: &str = include_str!("../../../../../rules/stage3/manifest.json");
 
 struct FrozenFile {
@@ -157,6 +159,16 @@ pub fn uses_profile(input: &Value) -> Result<bool, String> {
     }
 }
 
+pub fn uses_rhythm_profile(input: &Value) -> Result<bool, String> {
+    match input.get(RHYTHM_PROFILE_FIELD) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(profile)) if profile == RHYTHM_PROFILE && uses_profile(input)? => {
+            Ok(true)
+        }
+        _ => Err("第三阶段声画定位版本未知或缺少冻结生产包；原请求未重发".into()),
+    }
+}
+
 fn verified_files() -> Result<Vec<FrozenFile>, String> {
     let manifest: Value = serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
     let entries = manifest["files"].as_array().ok_or("生产规则清单缺少原件")?;
@@ -211,6 +223,7 @@ pub fn pack_sha256() -> Result<String, String> {
 }
 
 pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> {
+    let rhythm = uses_rhythm_profile(frozen)?;
     if uses_profile(frozen)? {
         let hash = pack_sha256()?;
         if frozen
@@ -221,6 +234,9 @@ pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> 
         }
         target[PROFILE_FIELD] = json!(PROFILE);
         target["storyboardRulePackSha256"] = json!(hash);
+        if rhythm {
+            target[RHYTHM_PROFILE_FIELD] = json!(RHYTHM_PROFILE);
+        }
     }
     Ok(())
 }
@@ -235,6 +251,9 @@ pub fn mark_input(input: &mut Value) -> Result<(), String> {
     input["storyboardCreativeProfile"] = json!("original-production-contract/v1");
     input[PROFILE_FIELD] = json!(PROFILE);
     input["storyboardRulePackSha256"] = json!(pack_sha256()?);
+    // Only newly constructed workflows opt into the mechanical locator. Saved
+    // runs without this marker retain their exact old requests and caches.
+    input[RHYTHM_PROFILE_FIELD] = json!(RHYTHM_PROFILE);
     Ok(())
 }
 
@@ -312,6 +331,7 @@ pub(super) fn runtime_contract(stage: &str, delta: bool) -> Result<Value, String
 }
 
 pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, String> {
+    let rhythm = uses_rhythm_profile(&request.input)?;
     if !uses_profile(&request.input)? {
         return Ok(request);
     }
@@ -342,6 +362,9 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
     )?;
     if let Some(runtime) = runtime {
         request.rule_snapshot["runtimeContract"] = runtime;
+    }
+    if rhythm {
+        super::storyboard::original::rhythm::attach(&mut request)?;
     }
     Ok(request)
 }
@@ -385,5 +408,84 @@ mod tests {
         mark_input(&mut marked).unwrap();
         marked["storyboardRulePackSha256"] = json!("different");
         assert!(attach_profile(&mut json!({}), &marked).is_err());
+    }
+
+    #[test]
+    fn rhythm_opt_in_is_frozen_and_unknown_versions_fail_before_dispatch() {
+        let old = json!({PROFILE_FIELD:PROFILE,"storyboardRulePackSha256":pack_sha256().unwrap()});
+        let mut restored = json!({});
+        attach_profile(&mut restored, &old).unwrap();
+        assert!(!uses_rhythm_profile(&restored).unwrap());
+        assert!(restored.get(RHYTHM_PROFILE_FIELD).is_none());
+        let mut fresh = old.clone();
+        mark_input(&mut fresh).unwrap();
+        attach_profile(&mut restored, &fresh).unwrap();
+        assert!(uses_rhythm_profile(&restored).unwrap());
+        assert_eq!(restored[RHYTHM_PROFILE_FIELD], RHYTHM_PROFILE);
+        assert_eq!(
+            fresh["storyboardRulePackSha256"],
+            old["storyboardRulePackSha256"]
+        );
+        fresh[RHYTHM_PROFILE_FIELD] = json!("unknown");
+        assert!(attach_profile(&mut json!({}), &fresh).is_err());
+        assert!(uses_rhythm_profile(&json!({RHYTHM_PROFILE_FIELD:RHYTHM_PROFILE})).is_err());
+    }
+
+    #[test]
+    fn all_four_role_requests_receive_locator_without_rewriting_older_requests() {
+        for (stage, skill) in [
+            ("storyboardPlan", "episode-emotion-planner"),
+            ("storyboardCreate", "unit-performance-director"),
+            ("storyboardFinish", "episode-finishing-editor"),
+            ("storyboardRefine", "director-refinement"),
+        ] {
+            let mut input = json!({PROFILE_FIELD:PROFILE,"storyboardRulePackSha256":pack_sha256().unwrap(),
+                "sourceRows":[],"capabilities":{"maxDuration":15},"capacityBrief":{"preferredRange":[13,15]}});
+            let mut rules = snapshot(skill, &["storyboard-common"]).unwrap();
+            rules["runtimeContract"] =
+                runtime_contract(stage, stage == "storyboardRefine").unwrap();
+            let request = TextRequest {
+                stage: stage.into(),
+                skill: skill.into(),
+                model: "offline-fixture".into(),
+                reasoning: "medium".into(),
+                input: input.clone(),
+                schema: json!({"type":"object","properties":{"shots":{"type":"array","items":{"type":"object","properties":{
+                    "duration":{"type":"number"},"camera":{"type":"string"},"picture":{"type":"string"}}}}}}),
+                rule_snapshot: rules,
+            };
+            let old = prepare_request(request.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&old).unwrap(),
+                serde_json::to_value(&request).unwrap(),
+                "old frozen Mac {stage} request is unchanged"
+            );
+            input[RHYTHM_PROFILE_FIELD] = json!(RHYTHM_PROFILE);
+            let mut fresh = request;
+            fresh.input = input;
+            let prepared = prepare_request(fresh).unwrap();
+            assert_eq!(
+                prepared.input["capacityBrief"]["preferredRange"],
+                Value::Null
+            );
+            assert_eq!(
+                prepared.input["capacityBrief"]["rhythm"]["reference"]["commonShotSecondsRange"],
+                json!([2, 5])
+            );
+            assert_eq!(
+                prepared.rule_snapshot["runtimeContract"]["rhythmProfile"],
+                RHYTHM_PROFILE
+            );
+            assert!(
+                prepared.schema["properties"]["shots"]["items"]["properties"]["duration"]
+                    .get("maximum")
+                    .is_none()
+            );
+            assert_eq!(
+                serde_json::to_value(prepare_request(prepared.clone()).unwrap()).unwrap(),
+                serde_json::to_value(prepared).unwrap(),
+                "prepared {stage} request is idempotent"
+            );
+        }
     }
 }

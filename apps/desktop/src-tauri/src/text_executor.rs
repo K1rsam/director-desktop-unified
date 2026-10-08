@@ -648,7 +648,7 @@ pub(crate) fn source_coverage_replay_receipt_valid(receipt:&Value,snapshot:&str,
 const EXECUTION_ROOT_MARKER: &str = ".director-text-root";
 // Preserve the CLI's existing authentication, but do not inherit host workflows or tools.
 // A custom provider must use the explicit text API settings, not arbitrary user config layers.
-const CLI_CONFIG: &[&str] = &[
+pub(crate) const CLI_CONFIG: &[&str] = &[
     "project_doc_max_bytes=0",
     "project_root_markers=[\".director-text-root\"]",
     "features.shell_tool=false",
@@ -665,7 +665,9 @@ const CLI_CONFIG: &[&str] = &[
     "features.browser_use=false",
     "features.computer_use=false",
     "features.image_generation=false",
-    "tools.view_image=false",
+    // Actual codex-cli 0.162.0-alpha.2 reports tools.view_image as ignored.
+    // Omit that ineffective key; keep image generation and all execution,
+    // browser, web, app/plugin and host-skill capabilities disabled below.
     "features.code_mode=false",
     "features.code_mode_host=false",
     "features.skill_search=false",
@@ -11378,8 +11380,9 @@ impl SavedTextExecutor {
         let mut transport =
             crate::text_sdk::OfficialSdkTransport::new(config, Arc::new(|_, _| Ok(())));
         let inspect = transport.inspect().await?;
-        if inspect["offlineFixtureAvailable"] != true
-            || inspect["capabilities"]["execute"] != "offline_fixture_only"
+        let offline = snapshot["executorIdentity"]["permissionProfile"] == crate::text_sdk::POLICY;
+        if (offline && (inspect["offlineFixtureAvailable"] != true || inspect["capabilities"]["execute"] != "offline_fixture_only"))
+            || (!offline && (inspect["liveCallsAllowed"] != true || inspect["capabilities"]["execute"] != "verified_native_text_only"))
         {
             return Err("SDK_LIVE_DISABLED".into());
         }
@@ -11395,7 +11398,7 @@ impl SavedTextExecutor {
             "text",
             &format!("{}:{}:{}", request.stage, request.skill, id()),
             "codex_sdk",
-            "synthetic-no-account",
+            s(&snapshot["executorIdentity"], "accountFingerprint"),
             snapshot,
             "queued",
         )?;
@@ -11434,7 +11437,10 @@ impl SavedTextExecutor {
         attempt.persist(&dir.join("sdk-attempt.json"))?;
         transport.set_observer(self.sdk_observer(&job));
         let result = transport.execute(&frozen).await;
-        transport.close().await?;
+        if let Err(error) = transport.close().await {
+            self.sdk_unknown(&job, request, &hash, &error)?;
+            return Err(error);
+        }
         attempt = FrozenAttempt::load(&dir.join("sdk-attempt.json"))?;
         match result {
             Ok(mut observation) => {

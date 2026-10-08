@@ -30,21 +30,26 @@ pub fn request_settings(request: &Value, saved: &Value) -> Result<(String, Value
             settings[name] = value.clone();
         }
     }
+    if provider == "codex_sdk" {
+        if let Some(path) = saved.get("codexPath") {
+            settings["codexPath"] = path.clone();
+        }
+    }
     if let Some(overrides) = request.get("settings").filter(|v| !v.is_null()) {
         let overrides = overrides
             .as_object()
             .ok_or("READINESS_SETTINGS_INVALID: 检查设置必须为对象")?;
-        if overrides.keys().any(|k| k != key) {
+        if overrides.keys().any(|k| k != key && !(provider == "codex_sdk" && k == "codexPath")) {
             return Err("READINESS_SETTINGS_INVALID: 检查只接受本渠道的可执行文件路径，不接受执行、登录或凭据参数".into());
         }
-        if let Some(value) = overrides.get(key) {
+        for (name, value) in overrides {
             let path = value
                 .as_str()
                 .ok_or("READINESS_PATH_INVALID: 路径必须为文本")?;
             if path.len() > 4096 || path.chars().any(char::is_control) {
                 return Err("READINESS_PATH_INVALID: 路径无效".into());
             }
-            settings[key] = json!(path.trim());
+            settings[name] = json!(path.trim());
         }
     }
     Ok((provider.into(), settings))

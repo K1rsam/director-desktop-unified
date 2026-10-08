@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { request } from './api';
-import { actionBlockReason, currentExecutionPolicy, subscribeExecutionPolicy } from './executionPolicy';
-import type { ReadinessProvider } from './executionPolicy';
+import { actionBlockReason, currentExecutionPolicy, hasSdkExecutionCapability, subscribeExecutionPolicy } from './executionPolicy';
+import type { ExecutionPolicy, ReadinessProvider } from './executionPolicy';
 import { Button, formatDate, messageOf } from './components';
 import type { ProviderReadinessReport } from './types';
 
 const pathKeys = { codex_cli: 'codexPath', dreamina: 'dreaminaPath', dreamina_canvas: 'dreaminaCanvasPath', codex_sdk: 'textSdkNodePath' } as const;
+
+export function sdkReadinessAllowsExecution(report: ProviderReadinessReport | null, policy: ExecutionPolicy = currentExecutionPolicy()): boolean {
+  return hasSdkExecutionCapability(policy) && report?.provider === 'codex_sdk'
+    && report.installation.state === 'ready' && report.protocol.state === 'ready'
+    && report.authentication.state === 'authenticated' && report.authentication.identityVerified
+    && report.catalog.state === 'available' && report.catalog.models.length > 0
+    && report.details.officialRuntimeChecked === true && report.details.accountChecked === true
+    && typeof report.details.runtimeExecutable === 'string' && report.details.runtimeExecutable.length > 0
+    && report.generation.enabled === true && report.generation.testPerformed === false && report.generation.calls === 0;
+}
 
 /** Reject mismatched or contradictory results instead of displaying an execution claim. */
 export function validateProviderReadiness(value: unknown, provider: ReadinessProvider): ProviderReadinessReport {
@@ -22,18 +32,22 @@ export function validateProviderReadiness(value: unknown, provider: ReadinessPro
       || !Array.isArray(report.catalog.models) || !report.catalog.models.every(model => model && typeof model.id === 'string'
         && (model.name === undefined || typeof model.name === 'string')
         && (model.kind === undefined || typeof model.kind === 'string')
+        && (model.defaultReasoningEffort === undefined || typeof model.defaultReasoningEffort === 'string')
+        && (model.isDefault === undefined || typeof model.isDefault === 'boolean')
         && (model.supportedReasoningEfforts === undefined || Array.isArray(model.supportedReasoningEfforts) && model.supportedReasoningEfforts.every(effort => typeof effort === 'string')))
       || !['verified_read_only', 'not_tested', 'failed'].includes(report.network?.state) || !Array.isArray(report.network.proof)
-      || report.generation?.enabled !== false || report.generation?.testPerformed !== false || report.generation?.calls !== 0
+      || typeof report.generation?.enabled !== 'boolean' || report.generation?.testPerformed !== false || report.generation?.calls !== 0
       || !Array.isArray(report.messages) || !report.messages.every(message => typeof message === 'string')
-      || !report.details || typeof report.details !== 'object') throw new Error('本地核心返回的只读检查结果无效，请重新检查。');
+      || !report.details || typeof report.details !== 'object' || Array.isArray(report.details)
+      || report.generation.enabled && !sdkReadinessAllowsExecution(report)) throw new Error('本地核心返回的只读检查结果无效，请重新检查。');
   return report;
 }
 
 type CheckState = { scope: string; attempt: number; busy: boolean; result: ProviderReadinessReport | null; error: string };
-export function useProviderReadiness(projectId: string, provider: ReadinessProvider, path: string, enabled = true) {
+export function useProviderReadiness(projectId: string, provider: ReadinessProvider, path: string, enabled = true, sdkSettings?: { codexPath: string }) {
   useSyncExternalStore(subscribeExecutionPolicy, currentExecutionPolicy, currentExecutionPolicy);
-  const scope = JSON.stringify([projectId, provider, path, enabled]);
+  const codexPath = provider === 'codex_sdk' ? sdkSettings?.codexPath : undefined;
+  const scope = JSON.stringify([projectId, provider, path, enabled, codexPath]);
   const currentScope = useRef(scope), sequence = useRef(0), inFlight = useRef<string | null>(null), mounted = useRef(true);
   if (currentScope.current !== scope) { currentScope.current = scope; sequence.current++; inFlight.current = null; }
   const [state, setState] = useState<CheckState>({ scope, attempt: sequence.current, busy: false, result: null, error: '' });
@@ -46,7 +60,7 @@ export function useProviderReadiness(projectId: string, provider: ReadinessProvi
     inFlight.current = scope;
     setState({ scope, attempt, busy: true, result: null, error: '' });
     try {
-      const response = await request<unknown>({ action: 'readiness.check', projectId, provider, settings: { [pathKeys[provider]]: path } });
+      const response = await request<unknown>({ action: 'readiness.check', projectId, provider, settings: { [pathKeys[provider]]: path, ...(codexPath !== undefined ? { codexPath } : {}) } });
       if (!mounted.current || attempt !== sequence.current || currentScope.current !== scope) return;
       setState({ scope, attempt, busy: false, result: validateProviderReadiness(response, provider), error: '' });
     } catch (reason) {
@@ -54,7 +68,7 @@ export function useProviderReadiness(projectId: string, provider: ReadinessProvi
     } finally {
       if (attempt === sequence.current) inFlight.current = null;
     }
-  }, [enabled, scope, projectId, provider, path]);
+  }, [enabled, scope, projectId, provider, path, codexPath]);
   const current = state.scope === scope && state.attempt === sequence.current ? state : { busy: false, result: null, error: '' };
   const reset = useCallback(() => {
     const attempt = ++sequence.current; inFlight.current = null;
@@ -146,7 +160,7 @@ export function ProviderReadinessResult({ check }: { check: ReadinessCheck }) {
       <div><dt>真实模型生成</dt><dd>未测试 · 本次检查生成调用 0 次</dd></div></dl>
     {result.installation.executable && <p className="control-hint path-value">{result.installation.executable}</p>}
     {result.messages.map((message, index) => <p className="control-hint" key={index}>{message}</p>)}
-    {result.provider === 'codex_sdk' && <p className="control-hint">SDK 包导入和 worker 握手仅证明环境与协议；真实模型未测试，SDK 真实生成保持关闭。</p>}
+    {result.provider === 'codex_sdk' && <p className="control-hint">{sdkReadinessAllowsExecution(result) ? '已核验 SDK 原生环境、账户与模型目录，可显式选择 SDK 发起文字流程；本次检查没有模型生成，成稿质量尚未验收。' : 'SDK 包导入和 worker 握手仅证明环境与协议；真实模型未测试，SDK 真实生成保持关闭。'}</p>}
     {result.provider === 'dreamina' && <p className="control-hint">图片免费资格尚未核验；积分余额和模型目录不能证明本次生成免费。</p>}
     {result.provider === 'dreamina_canvas' && <p className="control-hint">Canvas CLI 仅核验版本、schema、auth status、account 与 image models。积分 / 额度未知：当前适配的只读协议没有额度接口；免费资格未核验。尚未接入生成桥，模型目录不会写入图片或视频生成选项。</p>}
     {result.provider === 'codex_cli' && <p className="control-hint">账户与模型目录读取不代表真实模型生成已通过。</p>}

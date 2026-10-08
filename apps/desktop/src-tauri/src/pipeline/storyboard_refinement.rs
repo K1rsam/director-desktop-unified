@@ -826,6 +826,9 @@ pub(crate) mod tests {
             .unwrap();
         let old_calls = executor.calls.lock().await.clone();
         assert_eq!(old_calls.len(), 3);
+        for request in &old_calls {
+            assert!(request.input["capacityBrief"].get("rhythm").is_none());
+        }
         let mut current = legacy.clone();
         stage3_pack::mark_input(&mut current).unwrap();
         let fresh = storyboard::run_storyboard(&current, &executor, "offline", "medium")
@@ -835,6 +838,22 @@ pub(crate) mod tests {
         let calls = executor.calls.lock().await.clone();
         assert_eq!(calls.len(), 6);
         for request in &calls[3..] {
+            assert_eq!(
+                request.input[stage3_pack::RHYTHM_PROFILE_FIELD],
+                stage3_pack::RHYTHM_PROFILE
+            );
+            assert_eq!(
+                request.input["capacityBrief"]["preferredRange"],
+                Value::Null
+            );
+            assert_eq!(
+                request.input["capacityBrief"]["rhythm"]["reference"]["commonShotSecondsRange"],
+                json!([2, 5])
+            );
+            assert_eq!(
+                request.input["capacityBrief"]["rhythm"]["audit"]["available"],
+                request.stage == "storyboardFinish"
+            );
             assert_eq!(
                 request.rule_snapshot["creativePack"]["packId"],
                 stage3_pack::PACK_ID
@@ -901,6 +920,18 @@ pub(crate) mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].stage, "storyboardRefine");
         assert_eq!(calls[0].skill, "director-refinement");
+        assert_eq!(
+            calls[0].input["capacityBrief"]["rhythm"]["audit"]["available"],
+            true
+        );
+        assert_eq!(
+            calls[0].input["capacityBrief"]["rhythm"]["audit"]["providedUnitCount"],
+            3
+        );
+        assert_eq!(
+            calls[0].input["capacityBrief"]["rhythm"]["reference"]["hardShotDurationBounds"],
+            false
+        );
         assert_eq!(
             calls[0].input["previousDraft"]["units"]
                 .as_array()

@@ -29,7 +29,10 @@ function fixture(t) {
   const migration = JSON.parse(readFileSync(path.join(ROOT, MIGRATION), 'utf8'));
   for (const entry of migration.files) write(entry.destinationPath, 'synthetic adapted destination\n');
   for (const relative of [MANIFEST, MIGRATION, INDEX, CONFIG, RUNTIME,
-    'docs/handoff/MAC_RUNTIME_TRANSFER_REQUIREMENTS.json']) {
+    'docs/handoff/MAC_RUNTIME_TRANSFER_REQUIREMENTS.json', 'reference-skills/index.json',
+    'apps/desktop/src-tauri/src/pipeline/mod.rs',
+    'apps/desktop/rules/foundation-asset-catalog/SKILL.md',
+    'apps/desktop/rules/foundation-finishing-editor/SKILL.md']) {
     write(relative, readFileSync(path.join(ROOT, relative)));
   }
   const manifest = json(MANIFEST);
@@ -60,6 +63,45 @@ test('active compatible adapter passes without claiming original Mac runtime or 
   assert.equal(report.originalMacRuntimePorted, false);
   assert.equal(report.liveGenerationVerified, false);
   assert.equal(report.episode1And2QualityCompared, false);
+  assert.deepEqual(report.activeFoundationRules.map(row => [row.id, row.version]), [
+    ['foundation-asset-catalog', '2.0.1'], ['foundation-finishing-editor', '2.0.1'],
+  ]);
+});
+
+test('current foundation rule tampering is rejected without changing historical source locks', t => {
+  const f = fixture(t);
+  for (const id of ['foundation-asset-catalog', 'foundation-finishing-editor']) {
+    const relative = `apps/desktop/rules/${id}/SKILL.md`;
+    const bytes = readFileSync(path.join(f.root, relative));
+    const corrupt = Buffer.from(bytes); corrupt[corrupt.length - 2] ^= 1;
+    f.write(relative, corrupt);
+    assert.throws(f.verify, /Current foundation rule hash differs/);
+    f.write(relative, bytes);
+  }
+  assert.equal(f.verify().status, 'passed');
+});
+
+test('current foundation registration cannot use its old source hash or a different version', t => {
+  const f = fixture(t);
+  const relative = 'reference-skills/index.json', original = f.json(relative);
+  f.mutate(relative, value => {
+    value.registeredFiles.find(row => row.id === 'foundation-asset-catalog').version = '2.0.0';
+  });
+  assert.throws(f.verify, /Current foundation rule version differs/);
+  f.write(relative, JSON.stringify(original));
+  f.mutate(relative, value => {
+    value.registeredFiles.find(row => row.id === 'foundation-finishing-editor').sha256 =
+      '5f28919467dd4ea25bb84eac60d42aa8d314f750e97af28ca1557d85b14866e9';
+  });
+  assert.throws(f.verify, /Current foundation rule sha256 differs/);
+});
+
+test('current foundation rules must still be compiled under their registered paths', t => {
+  const f = fixture(t), relative = 'apps/desktop/src-tauri/src/pipeline/mod.rs';
+  const registry = readFileSync(path.join(f.root, relative), 'utf8');
+  f.write(relative, registry.replace('include_str!("../../../rules/foundation-asset-catalog/SKILL.md")',
+    'include_str!("../../../rules/unregistered-foundation/SKILL.md")'));
+  assert.throws(f.verify, /Current foundation rule is not compiled/);
 });
 
 test('old inactive switch and unknown runtime profile cannot pass the new source lock', t => {

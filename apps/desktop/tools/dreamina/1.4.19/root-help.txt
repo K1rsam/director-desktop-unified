@@ -1,0 +1,54 @@
+Usage:
+  dreamina [flags]
+
+即梦 official AIGC CLI tool for login, account, and generation workflows
+
+About:
+  dreamina is the 即梦 official AIGC CLI tool.
+
+Quick start:
+  1. Run "dreamina login" to complete OAuth device login.
+  2. For headless login, run "dreamina login --headless", then "dreamina login checklogin --device_code=<device_code>".
+  3. Run a generator command such as "dreamina text2image --prompt='a cat portrait' --resolution_type=2k".
+  4. Use "dreamina query_result --submit_id=<id>" for async tasks, or "dreamina list_task" to review saved tasks.
+  5. Use "dreamina user_credit" to check the current account credit balance.
+
+Tips:
+  Run "dreamina <subcommand> -h" to view detailed help for any subcommand.
+  Login now uses OAuth Device Flow and prints verification_uri, user_code, and device_code in the terminal.
+  All generation operations consume credits.
+  The Seedance family provides flagship video generation models, including Seedance 2.5 for VIP users.
+
+Built-in Commands:
+  help                 Help about any command
+  list_task            List saved tasks with status and result summary
+  login                Log in locally with OAuth Device Flow before using task and account commands
+  logout               Clear the local OAuth login state
+  query_result         Query the current result of an async generation task
+  relogin              Clear the local OAuth login state and force a fresh OAuth login
+  session              Manage sessions (create/list/search/rename/delete)
+  user_credit          Show the current user's remaining credit balance
+  version              Print build version and commit information
+
+
+Generator Commands:
+  frames2video         Submit a Dreamina first-last-frames video task
+  image2image          Submit a Dreamina image-to-image task
+  image2video          Animate one image into video; use multiframe2video for multi-image stories
+  image_upscale        Submit a Dreamina image upscale task
+  multiframe2video     Create a coherent video story from multiple images
+  multimodal2video     Dreamina flagship video mode (全能参考 / formerly ref2video) with all-around references and Seedance
+  text2image           Submit a Dreamina text-to-image task
+  text2video           Submit a Dreamina text-to-video task
+
+
+Examples:
+  dreamina login
+  dreamina login --headless
+  dreamina login checklogin --device_code=<device_code> --poll=30
+  dreamina logout
+  dreamina relogin
+  dreamina user_credit
+  dreamina list_task --gen_status=success
+  dreamina query_result --submit_id=550e8400-e29b-41d4-a716-446655440000
+  dreamina text2image --prompt="a cat portrait" --ratio=1:1 --resolution_type=2k

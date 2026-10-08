@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const source = fileURLToPath(new URL('./fixtures/fake-codex.mjs', import.meta.url));
-export const SCENARIOS = Object.freeze(['rust-domain', 'happy', 'duplicates', 'out-of-order', 'malformed-json', 'early-complete', 'changed-thread', 'policy-violation', 'failed-after-text', 'hang', 'ignore-abort', 'invalid-text-json', 'oversized-event', 'same-item-mutated']);
+export const SCENARIOS = Object.freeze(['rust-domain', 'happy', 'duplicates', 'out-of-order', 'malformed-json', 'early-complete', 'changed-thread', 'policy-violation', 'failed-after-text', 'hang', 'ignore-abort', 'invalid-text-json', 'oversized-event', 'same-item-mutated', 'configuration-notice', 'configuration-notice-only', 'configuration-notice-before-thread', 'configuration-notice-malformed', 'configuration-notice-after-turn', 'agent-before-turn']);
 export function offlineFixture(scenario) {
   if (!SCENARIOS.includes(scenario)) throw new Error('Unknown offline fixture scenario');
   return Object.freeze({

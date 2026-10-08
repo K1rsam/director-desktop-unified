@@ -71,7 +71,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
   let respond = async (input: PolicyRequest): Promise<unknown> => result(input.provider as ProviderReadinessReport['provider']);
   let pick = async (): Promise<string[]> => [];
   Object.assign(globalThis, { isTauri: true, location: { search: '' }, window: { __TAURI_INTERNALS__: { invoke: async (_command: string, args: { request: PolicyRequest }) => { calls.push(args.request); return args.request.action === 'getExecutionPolicy' ? capability : args.request.action === 'files.choose' ? pick() : respond(args.request); } } } });
-  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false }, appType: 'custom' });
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom' });
   try {
     const api = await server.ssrLoadModule('/src/api.ts');
     const policy = await server.ssrLoadModule('/src/executionPolicy.ts');
@@ -113,7 +113,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
           const before = calls.length; await settle(); assert.equal(calls.length, before, 'mount and switch have no IPC');
           check.props.onClick(); check.props.onClick();
           assert.equal(calls.length, before + 1, 'duplicate clicks while pending are ignored');
-          assert.deepEqual(calls.at(-1), { action: 'readiness.check', projectId: workspace.project.id, provider: name, settings: { [key]: path } });
+          assert.deepEqual(calls.at(-1), { action: 'readiness.check', projectId: workspace.project.id, provider: name, settings: { [key]: path, ...(name === 'codex_sdk' ? { codexPath: props.settings.codexPath } : {}) } });
           nodes = view.render(element); assert.equal(button(nodes, name).props.disabled, true);
           await settle(); nodes = view.render(element);
           assert.equal(button(nodes, name).props.disabled, false);
@@ -575,6 +575,79 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         assert.ok(nodes.map(content).join(' ').includes('未登录'));
         assert.ok(!nodes.map(content).join(' ').includes('已连接即梦'));
       } finally { view.unmount(); policy.installExecutionPolicy(policy.validateExecutionPolicy(capability)); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
+    });
+    await t.test('standard SDK selection uses its verified catalog and both unsaved paths without a model call', async () => {
+      const standard = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], readiness,
+        allowedActions: ['getExecutionPolicy', 'readiness.check', 'files.choose', 'settings.save', 'foundation.run', 'images.design'],
+        textBackends: [{ id: 'codex_cli', status: 'enabled' }, { id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
+      policy.installExecutionPolicy(policy.validateExecutionPolicy(standard));
+      const sdkReport: ProviderReadinessReport = { ...result('codex_sdk'), authentication: { state: 'authenticated', identityVerified: true },
+        catalog: { state: 'available', models: [{ id: 'sdk-verified-model', name: 'SDK verified model', supportedReasoningEfforts: ['high'], defaultReasoningEffort: 'high', isDefault: true }] },
+        generation: { enabled: true, testPerformed: false, calls: 0 }, details: { officialRuntimeChecked: true, accountChecked: true, runtimeExecutable: '/verified/native/codex', runtimeVersion: 'synthetic-runtime' } };
+      const originalReport = structuredClone(sdkReport), view = hookRenderer(); calls.length = 0;
+      let settings: Record<string, string> = { textProvider: 'codex', textSdkNodePath: '/draft/node', codexPath: '/draft/codex', textModel: 'cli-only-model', reasoning: 'low' };
+      const element = () => React.createElement(TextExecutionSettings as React.ComponentType<Record<string, unknown>>, { ...props, settings, update(key: string, value: string) { settings = { ...settings, [key]: value }; } });
+      const state = (nodes: Host[]) => nodes.find(node => node.props['data-sdk-execution-state'])?.props['data-sdk-execution-state'];
+      respond = async input => input.provider === 'codex_sdk' ? sdkReport : result('codex_cli', 'cli-only-model');
+      try {
+        let nodes = view.render(element()); await settle(); assert.equal(calls.length, 0);
+        button(nodes, 'codex_cli').props.onClick(); await settle(); nodes = view.render(element());
+        assert.ok(nodes.some(node => node.type === 'option' && content(node) === 'cli-only-model'));
+        settings = { ...settings, textProvider: 'codex_sdk' }; const before = calls.length;
+        nodes = view.render(element()); await settle(); assert.equal(calls.length, before, 'switching to SDK cannot check or execute automatically');
+        assert.equal(state(nodes), 'unverified');
+        assert.ok(nodes.map(content).join(' ').includes('cli-only-model · 尚未核实'), 'saved CLI preference is retained without reusing the CLI catalog');
+        button(nodes, 'codex_sdk').props.onClick(); await settle(); nodes = view.render(element());
+        assert.deepEqual(calls.at(-1), { action: 'readiness.check', projectId: workspace.project.id, provider: 'codex_sdk', settings: { textSdkNodePath: '/draft/node', codexPath: '/draft/codex' } });
+        assert.equal(state(nodes), 'ready');
+        assert.ok(nodes.map(content).join(' ').includes('本次检查没有模型生成'));
+        const models = nodes.find(node => node.type === 'select' && node.props['data-text-model']); assert.ok(models);
+        models.props.onChange({ target: { value: 'sdk-verified-model' } });
+        assert.equal(settings.textModel, 'sdk-verified-model'); assert.equal(settings.reasoning, 'high', 'default effort comes from the same SDK directory');
+        nodes = view.render(element());
+        assert.ok(nodes.some(node => node.type === 'option' && content(node) === 'high'));
+        assert.ok(!nodes.some(node => node.type === 'option' && node.props.value === 'cli-only-model'));
+        const beforeEdit = calls.length; settings = { ...settings, codexPath: '/new/draft/codex' };
+        nodes = view.render(element()); assert.equal(state(nodes), 'unverified');
+        assert.ok(nodes.map(content).join(' ').includes('sdk-verified-model · 尚未核实'));
+        assert.equal(calls.length, beforeEdit, 'editing the Codex path clears proof without IPC or saving');
+        let resolve!: (value: unknown) => void; respond = () => new Promise(done => { resolve = done; });
+        button(nodes, 'codex_sdk').props.onClick();
+        settings = { ...settings, textSdkNodePath: '/new/draft/node' }; nodes = view.render(element());
+        assert.equal(state(nodes), 'unverified'); resolve(sdkReport); await settle(); nodes = view.render(element());
+        assert.equal(state(nodes), 'unverified', 'late results for old Node or Codex paths never restore readiness');
+        assert.deepEqual(sdkReport, originalReport);
+        assert.ok(calls.every(call => call.action === 'readiness.check'), 'selection, path changes and model choices perform no workflow or save calls');
+      } finally { view.unmount(); policy.installExecutionPolicy(policy.validateExecutionPolicy(capability)); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
+    });
+    await t.test('SDK live readiness requires explicit standard capability and complete native evidence; image checks remain generation-off', async () => {
+      const standard = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], readiness,
+        allowedActions: ['readiness.check'], textBackends: [{ id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
+      const ready = { ...result('codex_sdk'), authentication: { state: 'authenticated', identityVerified: true }, catalog: { state: 'available', models: [{ id: 'sdk-model', supportedReasoningEfforts: ['medium'] }] },
+        generation: { enabled: true, testPerformed: false, calls: 0 }, details: { officialRuntimeChecked: true, accountChecked: true, runtimeExecutable: '/native/codex' } };
+      try {
+        policy.installExecutionPolicy(policy.validateExecutionPolicy(standard));
+        assert.equal(validateProviderReadiness(ready, 'codex_sdk'), ready);
+        for (const invalid of [
+          { ...ready, authentication: { state: 'authenticated', identityVerified: false } },
+          { ...ready, authentication: { state: 'unknown', identityVerified: true } },
+          { ...ready, catalog: { state: 'available', models: [] } },
+          { ...ready, details: { ...ready.details, officialRuntimeChecked: false } },
+          { ...ready, details: { ...ready.details, accountChecked: false } },
+          { ...ready, details: { ...ready.details, runtimeExecutable: '' } },
+          { ...ready, installation: { ...ready.installation, state: 'invalid' } },
+          { ...ready, generation: { enabled: true, testPerformed: true, calls: 1 } },
+        ]) assert.throws(() => validateProviderReadiness(invalid, 'codex_sdk'));
+        for (const provider of ['codex_cli', 'dreamina', 'dreamina_canvas'] as const) {
+          assert.throws(() => validateProviderReadiness({ ...ready, provider }, provider), `${provider} must stay generation-off`);
+          assert.doesNotThrow(() => validateProviderReadiness(result(provider), provider));
+        }
+        for (const closed of [policy.OFFLINE_EXECUTION_POLICY, { ...standard, textBackends: undefined }, { ...standard, textBackends: [{ id: 'codex_sdk', status: 'offline_contract_only' }] },
+          { mode: 'native_cli_acceptance', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['foundation.run'] }]) {
+          policy.installExecutionPolicy(closed);
+          assert.throws(() => validateProviderReadiness(ready, 'codex_sdk'), 'selected SDK and reported readiness alone cannot override backend mode');
+        }
+      } finally { policy.installExecutionPolicy(policy.validateExecutionPolicy(capability)); }
     });
     await t.test('invalid readiness and model-generation claims are rejected; other live actions remain closed', async () => {
       for (const invalid of [null, {}, { ...result('codex_cli'), provider: 'dreamina' }, { ...result('codex_cli'), schemaVersion: 'other' }, { ...result('codex_cli'), generation: { enabled: true, testPerformed: false, calls: 0 } }, { ...result('codex_cli'), generation: { enabled: false, testPerformed: true, calls: 1 } }]) assert.throws(() => validateProviderReadiness(invalid, 'codex_cli'));

@@ -31,9 +31,9 @@ export type ProviderReadinessReport = {
   installation: { state: 'ready' | 'missing' | 'invalid' | 'not_checked'; version: string | null; executable: string | null };
   protocol: { state: 'ready' | 'failed' | 'unsupported' | 'not_checked'; name: string | null };
   authentication: { state: 'authenticated' | 'not_logged_in' | 'unknown' | 'not_checked'; identityVerified: boolean };
-  catalog: { state: 'available' | 'unavailable' | 'not_checked'; models: { id: string; name?: string; kind?: string; supportedReasoningEfforts?: string[] }[] };
+  catalog: { state: 'available' | 'unavailable' | 'not_checked'; models: { id: string; name?: string; kind?: string; supportedReasoningEfforts?: string[]; defaultReasoningEffort?: string; isDefault?: boolean }[] };
   network: { state: 'verified_read_only' | 'not_tested' | 'failed'; proof: unknown[] };
-  generation: { enabled: false; testPerformed: false; calls: 0 };
+  generation: { enabled: boolean; testPerformed: false; calls: 0 };
   messages: string[];
   details: Record<string, unknown> & { cliStatus?: TextCliStatus };
 };

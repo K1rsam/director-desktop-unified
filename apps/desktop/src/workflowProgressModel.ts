@@ -85,13 +85,26 @@ export function executionSummary(node: Node, now = Date.now(), readFailed = fals
   const stamp = Date.parse(words(execution.observedAt)), age = Number.isFinite(stamp) ? Math.max(0, (now - stamp) / 1000) : Infinity;
   const alive = execution.processAlive === true || execution.processAlive === 1;
   const phase = words(execution.phase), fresh = !readFailed && age <= 90;
-  if (!fresh) return '执行状态暂未更新 · 最后记录用时 ' + secondsLabel(elapsed);
-  const label = phase === 'writing_stdin' ? '正在发送制作资料' : phase === 'output_received' || !alive ? '已收到结果，正在核对' : '等待 CLI 返回';
+  const event = words(execution.lastEventType), turnCompleted = event === 'turn.completed', turnFailed = event === 'turn.failed';
+  const failure = turnFailed ? 'CLI 本轮执行失败，请查看任务错误记录' : phase === 'failed' ? 'CLI 本地执行失败，请查看任务错误记录' : '';
+  if (!fresh) return '执行状态暂未更新' + (failure ? ' · 最后记录：' + failure : '') + ' · 最后记录用时 ' + secondsLabel(elapsed);
+  // A terminal turn event is stronger evidence than a historical stderr label.
+  // Process exit alone does not prove that a usable result was received.
+  const label = failure || (phase === 'cleanup' ? '正在结束本地 CLI，结果尚待确认'
+    : phase === 'output_received' ? '已收到结果，正在核对'
+      : turnCompleted ? 'CLI 本轮已完成，正在核对结果'
+        : phase === 'writing_stdin' ? '正在发送制作资料'
+          : phase === 'read_result' ? '正在读取 CLI 结果'
+            : phase === 'draining' || !alive ? 'CLI 已退出，结果尚待核对' : '等待 CLI 返回');
   const liveAge = alive ? age : 0;
-  const diagnosis = alive && phase === 'executing' && (execution.needsDiagnosis === true || execution.needsDiagnosis === 1 || Number.isFinite(quiet) && quiet + liveAge >= 120);
-  const diagnosticLabels: Record<string, string> = { NETWORK_RETRY: 'CLI 报告网络重连', NETWORK_TRANSPORT: 'CLI 报告网络连接异常', TIMEOUT: 'CLI 报告连接超时', RATE_LIMIT: 'CLI 报告请求限流', AUTHENTICATION: 'CLI 报告鉴权异常', CLI_ERROR: 'CLI 有运行错误记录' };
-  const diagnostic = alive && phase === 'executing' ? diagnosticLabels[words(execution.stderrCategory)] : '';
-  return label + ' · 已用时 ' + secondsLabel(elapsed + liveAge) + (diagnostic ? ' · ' + diagnostic : '') + (diagnosis ? ' · 较长时间未收到新输出，执行监控持续跟踪' : '');
+  const waiting = alive && phase === 'executing' && !turnCompleted && !turnFailed;
+  const eventAge = execution.lastEventAgeSeconds, hasEventAge = typeof eventAge === 'number' && Number.isFinite(eventAge) && eventAge >= 0;
+  // Diagnostic stderr activity is not a new semantic execution event.
+  const quietAge = hasEventAge ? eventAge : quiet;
+  const diagnosis = waiting && (execution.needsDiagnosis === true || execution.needsDiagnosis === 1 || Number.isFinite(quietAge) && quietAge + liveAge >= 120);
+  const diagnosticLabels: Record<string, string> = { NETWORK_RETRY: 'CLI 报告网络重连', NETWORK_TRANSPORT: 'CLI 报告网络连接异常', TIMEOUT: 'CLI 日志含超时提示（来源待核对）', RATE_LIMIT: 'CLI 报告请求限流', AUTHENTICATION: 'CLI 报告鉴权异常', CLI_ERROR: 'CLI 有运行错误记录' };
+  const diagnostic = waiting ? diagnosticLabels[words(execution.stderrCategory)] : '';
+  return label + ' · 已用时 ' + secondsLabel(elapsed + liveAge) + (diagnostic ? ' · ' + diagnostic : '') + (diagnosis ? ` · 较长时间未收到新${hasEventAge ? '执行事件' : '输出'}，执行监控持续跟踪` : '');
 }
 
 export function hasActiveWorkspaceTasks(workspace: Workspace): boolean {

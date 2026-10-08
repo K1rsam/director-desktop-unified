@@ -1,0 +1,49 @@
+Usage:
+  dreamina image2image [flags]
+
+Upload 1 to 10 local images, then submit a Dreamina image-to-image task. The task is asynchronous, but --poll can wait briefly before falling back to query_result.
+
+Supported combinations:
+- model_version: 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro
+- ratio: 21:9, 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16
+- generate_num: 1-10
+- 4.0/4.1/4.5/4.6/4.7/5.0 -> resolution_type 2k or 4k
+- 5.0Pro -> resolution_type 1.5k, 2k, or 4k
+
+Custom width/height:
+- --width and --height must be provided together as positive integers and are mutually exclusive with --ratio
+- --resolution_type is required; limits are checked against the selected resolution
+- 1k: each side 512-2016; total pixels <= 1763584
+- 1.5k: each side 972-2268; total pixels <= 2359296
+- 2k: each side 768-3072; total pixels <= 4194304
+- 4k: each side 1536-6240; total pixels <= 16777216
+- each-side and total-pixel limits must both be satisfied; backend configuration is the final authority
+- width/height are target dimensions; the backend/model may align final output dimensions, so query_result is authoritative
+
+Notes:
+- --resolution_type is required
+- default model_version: 5.0
+- omit --ratio to use 16:9 unless custom width/height is provided
+- omit --generate_num to generate 1 image
+- resolution_type and any explicitly supplied ratio are strictly validated; unsupported or legacy values are rejected instead of silently adjusted
+- 一次最多上传十张图片，否则可能导致生图失败
+
+
+Flags:
+      --images strings           local input image paths
+      --prompt string            edit prompt
+      --session int              session id (default 0 "默认对话") 
+      --ratio string             supported values: 21:9, 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16; default: 16:9
+      --resolution_type string   required; supported values by model: 4.0/4.1/4.5/4.6/4.7/5.0 -> 2k or 4k; 5.0Pro -> 1.5k, 2k, or 4k
+      --width int                custom output width in pixels; requires --height; mutually exclusive with --ratio
+      --height int               custom output height in pixels; requires --width; mutually exclusive with --ratio
+      --model_version string     supported values: 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro; default: 5.0
+      --generate_num int         number of images to generate; supported range: 1-10 (default 1)
+      --poll int                 submit then poll query_result for up to N seconds at 1s intervals (0 disables polling)
+  -h, --help                     help for image2image
+
+Global Flags:
+      --version   print build version information
+
+Examples:
+  dreamina image2image --images ./input.png --prompt="turn into watercolor" --resolution_type=2k

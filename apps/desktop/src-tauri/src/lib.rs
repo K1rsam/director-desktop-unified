@@ -1,5 +1,6 @@
 pub mod binding;
 pub mod engine;
+pub mod executable_paths;
 pub mod importer;
 pub mod media_probe;
 pub mod pipeline;

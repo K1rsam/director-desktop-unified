@@ -775,19 +775,21 @@
     },
     {
       "path": "apps/desktop/rules/foundation-asset-catalog/SKILL.md",
-      "sha256": "569af266afa5197f6b219d356c87b0f3a04288fd8b986a3f87a37e287c0dd87b",
-      "bytes": 9107,
+      "sha256": "4f7730877b5ffa6a664b655a81a7a5b40b0f13c396eebfa1d37b245064a9497c",
+      "bytes": 11227,
       "id": "foundation-asset-catalog",
       "runtimeRole": "compiled_registry",
-      "dispatchStatus": "stage1_rule_available_subject_to_domain_and_source_checks"
+      "dispatchStatus": "stage1_rule_available_subject_to_domain_and_source_checks",
+      "version": "2.0.1"
     },
     {
       "path": "apps/desktop/rules/foundation-finishing-editor/SKILL.md",
-      "sha256": "5f28919467dd4ea25bb84eac60d42aa8d314f750e97af28ca1557d85b14866e9",
-      "bytes": 9769,
+      "sha256": "ab9b92a69698d9a0e4df5804c88f51e819b3e2d29bcc0b9884c8eea7b4fb85b8",
+      "bytes": 11777,
       "id": "foundation-finishing-editor",
       "runtimeRole": "compiled_registry",
-      "dispatchStatus": "stage1_rule_available_subject_to_domain_and_source_checks"
+      "dispatchStatus": "stage1_rule_available_subject_to_domain_and_source_checks",
+      "version": "2.0.1"
     },
     {
       "path": "apps/desktop/rules/methods/acting-blocking.md",

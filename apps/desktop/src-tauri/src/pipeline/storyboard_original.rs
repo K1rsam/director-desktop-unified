@@ -4,6 +4,9 @@
 //! mechanical ownership, transport and timing work, never creative judgement.
 use super::*;
 
+#[path = "storyboard_rhythm.rs"]
+pub(in crate::pipeline) mod rhythm;
+
 pub(super) const SCENARIO_KEYS: &[&str] = &[
     "camera-path-repair",
     "comic-contrast",

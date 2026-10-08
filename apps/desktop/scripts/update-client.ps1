@@ -33,7 +33,7 @@ function Get-VerifiedSdkManifest([string]$Directory) {
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw '缺少已准备的 SDK 只读资源。' }
     $manifestPath = Join-Path $root 'manifest.json'
     $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-    $allowed = @('src/health.mjs','src/bridge.mjs','THIRD_PARTY_NOTICES.md','package-lock.json','node_modules/@openai/codex-sdk/package.json','node_modules/@openai/codex-sdk/dist/index.js','node_modules/@openai/codex-sdk/LICENSE')
+    $allowed = @('src/health.mjs','src/bridge.mjs','src/main.mjs','src/native-runtime.mjs','THIRD_PARTY_NOTICES.md','package-lock.json','node_modules/@openai/codex-sdk/package.json','node_modules/@openai/codex-sdk/dist/index.js','node_modules/@openai/codex-sdk/LICENSE')
     if ($manifest.schemaVersion -ne 'sdk-readiness-resources/v1' -or $manifest.sdkPackage -ne '@openai/codex-sdk' -or $manifest.sdkVersion -ne '0.160.1' -or $manifest.officialRuntimeIncluded -ne $false -or $manifest.modelCalls -ne 0 -or $manifest.files.Count -ne $allowed.Count) {
         throw 'SDK 资源清单身份无效；未轮换客户端。'
     }

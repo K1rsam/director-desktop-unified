@@ -4,6 +4,9 @@
 export const READINESS_PROVIDERS = ['codex_cli', 'dreamina', 'dreamina_canvas', 'codex_sdk'] as const;
 export type ReadinessProvider = typeof READINESS_PROVIDERS[number];
 export type ReadinessCapability = { version: 'provider-readiness/v1'; enabled: boolean; providers: ReadinessProvider[]; generationAllowed: false };
+export type TextBackendCapability =
+  | { id: 'codex_cli'; status: 'enabled' | 'preserved_not_enabled' }
+  | { id: 'codex_sdk'; status: 'explicit_selection_when_ready' | 'offline_contract_only' };
 
 export type ExecutionPolicy = {
   mode: 'offline_prepare_only' | 'native_cli_acceptance' | 'standard_native';
@@ -14,6 +17,7 @@ export type ExecutionPolicy = {
   reasons: string[];
   readiness?: ReadinessCapability;
   canvasOAuth?: { version: 'canvas-oauth/v1'; enabled: boolean };
+  textBackends?: TextBackendCapability[];
 };
 export type PolicyRequest = { action: string; [key: string]: unknown };
 export type ActionCategory = 'local_read' | 'local_write' | 'generation' | 'readiness' | 'provider' | 'credentials' | 'unknown';
@@ -36,7 +40,7 @@ export function subscribeExecutionPolicy(listener: () => void): () => void {
   policyListeners.add(listener); return () => { policyListeners.delete(listener); };
 }
 export function installExecutionPolicy(policy: ExecutionPolicy): void {
-  activePolicy = { ...policy, readiness: validateReadinessCapability(policy.readiness), reasons: [...policy.reasons], allowedActions: policy.allowedActions ? [...policy.allowedActions] : undefined };
+  activePolicy = { ...policy, readiness: validateReadinessCapability(policy.readiness), textBackends: validateTextBackends(policy.textBackends, policy.mode), reasons: [...policy.reasons], allowedActions: policy.allowedActions ? [...policy.allowedActions] : undefined };
   for (const listener of policyListeners) listener();
 }
 const NATIVE_EXTRA_ACTIONS = new Set(['foundation.run', 'images.design', 'workflows.resume', 'textCli.status', 'storyboard.run', 'storyboard.decision.resolve']);
@@ -128,11 +132,30 @@ function validateReadinessCapability(value: unknown): ReadinessCapability | unde
   return { version: 'provider-readiness/v1', enabled: capability.enabled, providers: [...capability.providers] as ReadinessProvider[], generationAllowed: false };
 }
 
+function validateTextBackends(value: unknown, mode: unknown): TextBackendCapability[] | undefined {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > 2 || new Set(value.map(item => item?.id)).size !== value.length
+      || !value.every(item => item && typeof item === 'object'
+        && (item.id === 'codex_cli' && ['enabled', 'preserved_not_enabled'].includes(item.status)
+          || item.id === 'codex_sdk' && ['explicit_selection_when_ready', 'offline_contract_only'].includes(item.status))
+        && (mode === 'standard_native' || item.id === 'codex_cli' && mode === 'native_cli_acceptance'
+          || !['enabled', 'explicit_selection_when_ready'].includes(item.status)))) {
+    throw new Error('文本入口能力无效，真实 SDK 执行保持关闭。');
+  }
+  return value.map(item => ({ id: item.id, status: item.status })) as TextBackendCapability[];
+}
+
+export function hasSdkExecutionCapability(policy: ExecutionPolicy = currentExecutionPolicy()): boolean {
+  return policy.mode === 'standard_native' && policy.liveExecutionAllowed
+    && policy.textBackends?.some(backend => backend.id === 'codex_sdk' && backend.status === 'explicit_selection_when_ready') === true;
+}
+
 export function validateExecutionPolicy(value: unknown): ExecutionPolicy {
   if (!value || typeof value !== 'object') throw new Error('本地核心未返回有效的执行策略。');
   const policy = value as Record<string, unknown>;
   if (!Array.isArray(policy.reasons) || !policy.reasons.every(reason => typeof reason === 'string')) throw new Error('执行策略缺少说明，外部执行保持关闭。');
   const readiness = validateReadinessCapability(policy.readiness);
+  const textBackends = validateTextBackends(policy.textBackends, policy.mode);
   const auth = policy.canvasOAuth as ExecutionPolicy['canvasOAuth'];
   if (auth !== undefined && (!auth || auth.version !== 'canvas-oauth/v1' || typeof auth.enabled !== 'boolean')) throw new Error('即梦授权能力无效。');
   const canvasOAuth = auth ? { version: 'canvas-oauth/v1' as const, enabled: auth.enabled } : undefined;
@@ -147,10 +170,10 @@ export function validateExecutionPolicy(value: unknown): ExecutionPolicy {
       throw new Error('标准版功能策略无效，未开放外部执行。');
     }
     return { mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: stage3 ? 'verified_active' : 'inactive',
-      reasons: [...policy.reasons], allowedActions: [...actions], ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}) };
+      reasons: [...policy.reasons], allowedActions: [...actions], ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}), ...(textBackends ? { textBackends } : {}) };
   }
   if (policy.mode === 'offline_prepare_only' && policy.liveExecutionAllowed === false && policy.stage3CreativePackStatus === 'inactive') {
-    return { mode: 'offline_prepare_only', liveExecutionAllowed: false, stage3CreativePackStatus: 'inactive', reasons: [...policy.reasons], ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}) };
+    return { mode: 'offline_prepare_only', liveExecutionAllowed: false, stage3CreativePackStatus: 'inactive', reasons: [...policy.reasons], ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}), ...(textBackends ? { textBackends } : {}) };
   }
   const scope = policy.acceptance && typeof policy.acceptance === 'object' ? policy.acceptance as Record<string, unknown> : {};
   const safeActions = new Set([...LOCAL_READ_ACTIONS, ...LOCAL_WRITE_ACTIONS, ...NATIVE_EXTRA_ACTIONS, 'readiness.check']);
@@ -166,7 +189,7 @@ export function validateExecutionPolicy(value: unknown): ExecutionPolicy {
       || (!stage3 && actions.some(action => ['storyboard.run', 'storyboard.decision.resolve'].includes(action)))) {
     throw new Error('本地核心执行策略与有界验收合同不一致；外部执行保持关闭。');
   }
-  return { mode: 'native_cli_acceptance', liveExecutionAllowed: true, stage3CreativePackStatus: stage3 ? 'verified_active' : 'inactive', reasons: [...policy.reasons], allowedActions: [...actions], acceptance: { ...scope }, ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}) };
+  return { mode: 'native_cli_acceptance', liveExecutionAllowed: true, stage3CreativePackStatus: stage3 ? 'verified_active' : 'inactive', reasons: [...policy.reasons], allowedActions: [...actions], acceptance: { ...scope }, ...(readiness ? { readiness } : {}), ...(canvasOAuth ? { canvasOAuth } : {}), ...(textBackends ? { textBackends } : {}) };
 }
 
 /** Keep the guard ahead of IPC, including direct callers that bypass a disabled button. */

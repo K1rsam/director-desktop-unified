@@ -49,6 +49,24 @@ test('hello/inspect/execute default stays disabled and starts zero runtime proce
   assert.deepEqual(await fs.readdir(dir), ['worker.lock']);
 });
 
+test('genuine SDK native mode creates schema inside the dedicated attempt temp and restores parent env', async t => {
+  const previous = Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]]));
+  let temporaryDirectory;
+  const nativeRuntime = { identity: { runtimePackageVersion: 'offline-schema-contract-only' }, async create(directory) {
+    const fixture = await offlineFixture('happy').create(directory);
+    temporaryDirectory = path.join(directory, 'dedicated-sdk-schema'); await fs.mkdir(temporaryDirectory);
+    return { ...fixture, temporaryDirectory };
+  } };
+  const { bridge, dir } = await fixture(t, null, { nativeRuntime });
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'transport_completed');
+  const captured = JSON.parse(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'));
+  const schemaPath = captured.args[captured.args.indexOf('--output-schema') + 1];
+  assert(path.resolve(schemaPath).startsWith(path.resolve(temporaryDirectory) + path.sep));
+  assert.deepEqual(Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]])), previous);
+  assert.deepEqual(await fs.readdir(temporaryDirectory), []);
+});
+
 test('actual SDK preserves frozen model/reasoning/prompt/schema and uses no inherited credentials', async t => {
   const { bridge, dir, events } = await fixture(t);
   process.env.DIRECTOR_SYNTHETIC_SECRET_MUST_NOT_INHERIT = 'not-a-real-secret';
@@ -105,10 +123,30 @@ test('identical duplicates are durable and do not overwrite or double-complete',
   assert.equal(events.filter(e => e.type === 'observation').length, 1);
 });
 
+test('observed pre-turn configuration notice is durable, never model text, and still requires a complete turn', async t => {
+  const { bridge, dir, events } = await fixture(t, 'configuration-notice');
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'transport_completed');
+  assert.equal(receipt.rawResult.rawText, '{"ok":true,"text":"合成测试"}');
+  const warning = events.filter(event => event.rawEvent?.item?.type === 'error');
+  assert.equal(warning.length, 1);
+  assert.equal(warning[0].sequence, 2);
+  assert.match(warning[0].rawEvent.item.message, /tools\.view_image/);
+  const restarted = new OfficialSdkBridge({ stateDirectory: dir });
+  await bridge.disconnect(); await restarted.initialize();
+  try {
+    assert.equal(restarted.observe('attempt_1').rawResult.rawText, receipt.rawResult.rawText);
+    assert.equal(restarted.inspect().liveCallsAllowed, false);
+  } finally { await restarted.disconnect(); }
+});
+
 for (const [scenario, expected] of [
   ['out-of-order', 'OUT_OF_ORDER'], ['early-complete', 'OUT_OF_ORDER'], ['changed-thread', 'THREAD_IDENTITY'],
   ['policy-violation', 'POLICY_VIOLATION'], ['failed-after-text', 'SDK_TURN_FAILED'],
   ['same-item-mutated', 'ITEM_IDENTITY'], ['oversized-event', 'EVENT_LIMIT'],
+  ['configuration-notice-only', 'INCOMPLETE_STREAM'], ['configuration-notice-before-thread', 'OUT_OF_ORDER'],
+  ['configuration-notice-malformed', 'OUT_OF_ORDER'], ['configuration-notice-after-turn', 'POLICY_VIOLATION'],
+  ['agent-before-turn', 'OUT_OF_ORDER'],
 ]) test(`${scenario} fails closed, persists evidence, blocks retry/fallback and reserves unknown capacity`, async t => {
   const { bridge, dir } = await fixture(t, scenario);
   const { receipt } = await completed(bridge);

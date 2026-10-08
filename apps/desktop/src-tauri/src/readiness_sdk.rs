@@ -101,6 +101,14 @@ fn verify_resources(root: &Path) -> CheckResult<()> {
             include_bytes!("../../../../sdk-bridge/src/bridge.mjs").as_slice(),
         ),
         (
+            "src/main.mjs",
+            include_bytes!("../../../../sdk-bridge/src/main.mjs").as_slice(),
+        ),
+        (
+            "src/native-runtime.mjs",
+            include_bytes!("../../../../sdk-bridge/src/native-runtime.mjs").as_slice(),
+        ),
+        (
             "THIRD_PARTY_NOTICES.md",
             include_bytes!("../../../../sdk-bridge/THIRD_PARTY_NOTICES.md").as_slice(),
         ),
@@ -197,6 +205,24 @@ fn node_candidates(settings: &Value) -> CheckResult<Vec<PathBuf>> {
         PathBuf::from("/usr/bin/node"),
     ];
     Ok(candidates)
+}
+
+pub(crate) async fn native_components(
+    settings: &Value,
+    resource_root: &Path,
+) -> crate::store::Result<(PathBuf, String, String, PathBuf)> {
+    let (root, _) = resource_location(Some(resource_root)).map_err(str::to_owned)?;
+    verify_resources(&root).map_err(str::to_owned)?;
+    let paths = node_candidates(settings).map_err(str::to_owned)?;
+    let node = paths
+        .iter()
+        .find(|p| p.exists())
+        .ok_or("SDK_NODE_MISSING")?;
+    let (node, sha) = verify_node(node).map_err(str::to_owned)?;
+    let version = run_health(&node, &root, None)
+        .await
+        .map_err(str::to_owned)?;
+    Ok((node, sha, version, root))
 }
 
 fn verify_node(path: &Path) -> CheckResult<(PathBuf, String)> {
@@ -548,6 +574,9 @@ pub async fn check(settings: &Value, resource_root: Option<&Path>) -> Value {
             value["messages"] = json!([error, "未检查账号或模型，SDK 真实生成仍关闭"]);
         }
     }
+    if value["protocol"]["state"] == "ready" && crate::text_sdk::native_execution_enabled() {
+        crate::text_sdk::add_native_readiness(settings, &mut value).await;
+    }
     value
 }
 
@@ -572,6 +601,8 @@ mod tests {
         for relative in [
             "src/health.mjs",
             "src/bridge.mjs",
+            "src/main.mjs",
+            "src/native-runtime.mjs",
             "THIRD_PARTY_NOTICES.md",
             "package-lock.json",
             "node_modules/@openai/codex-sdk/package.json",

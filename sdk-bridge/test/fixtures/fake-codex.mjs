@@ -25,7 +25,14 @@ if (scenario === 'rust-domain') {
 }
 const text = { type: 'item.completed', item: { id: 'synthetic-item-1', type: 'agent_message', text: scenario === 'invalid-text-json' ? '{not repaired' : fixtureText } };
 const complete = { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 1 } };
-if (scenario === 'out-of-order') { event(start); event(thread); event(text); event(complete); }
+const configurationNotice = { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `tools.view_image` is ignored.' } };
+if (scenario === 'configuration-notice') { event(thread); event(configurationNotice); event(start); event(text); event(complete); }
+else if (scenario === 'configuration-notice-only') { event(thread); event(configurationNotice); }
+else if (scenario === 'configuration-notice-before-thread') { event(configurationNotice); event(thread); event(start); event(text); event(complete); }
+else if (scenario === 'configuration-notice-malformed') { event(thread); event({ ...configurationNotice, item: { ...configurationNotice.item, text: 'must not be treated as agent text' } }); event(start); event(text); event(complete); }
+else if (scenario === 'configuration-notice-after-turn') { event(thread); event(start); event(configurationNotice); event(text); event(complete); }
+else if (scenario === 'agent-before-turn') { event(thread); event(text); event(start); event(complete); }
+else if (scenario === 'out-of-order') { event(start); event(thread); event(text); event(complete); }
 else if (scenario === 'malformed-json') { event(thread); event(start); process.stdout.write('{this is not runtime JSON}\n'); }
 else if (scenario === 'early-complete') { event(thread); event(start); event(complete); event(text); }
 else if (scenario === 'changed-thread') { event(thread); event({ ...thread, thread_id: 'unexpected-thread' }); }

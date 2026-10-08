@@ -55,7 +55,9 @@ Mac 对应版本的 10 月 7 日 837 core 通过、24 忽略，109 前端和 121
 
 第二阶段采用 Mac `asset-art-director` 2.0.0，保持原字节：SHA256 `9193cd59b44bdc77fb413fb8c40bb6531c2cfb9377ca17fafc0749808ba6cd82`。规则依据剧本和来源视觉事实做美术设计，人物默认包含肖像及正、侧、背三视图，非人物不强行套用人物排版。集成对象包括输入、有效性检查、最终提示词编译、UI 展示、冻结队列和恢复，而不是单独复制 `SKILL.md`。直接父资产关系、素材哈希和生成顺序由 Windows 实现继续约束。
 
-生图生产规则采用 Windows `asset-image-production` 1.2.0，SHA256 `7d4d32682a6261bbcff3a7f5cbffc3a34a6c313068fa0f39a3f34b454935194d`，来源提交 `1e2bf93`；它与 Mac 原 1.1.0 的差异是实际采用的策略变化。其余 28 份桌面注册规则保持 Mac 原字节，包含上述 2.0.0。原 CRLF 仅归一为 LF 的问题已在集成区修正，未修改正文。
+生图生产规则采用 Windows `asset-image-production` 1.2.0，SHA256 `7d4d32682a6261bbcff3a7f5cbffc3a34a6c313068fa0f39a3f34b454935194d`，来源提交 `1e2bf93`；它与 Mac 原 1.1.0 的差异是实际采用的策略变化。随后真实第一阶段测试发现模型将同批新建基础形象误当成不存在的来源，故 F2/Q1 更新为 2.0.1：同一人的连续换装、伤势及同一非人主体的连续进化须引用实际上一形态；独立个体及原文明确独立的形象不强连。新增对象可用本批 localKey/fromKey 绑定；明确独立的空来源不被程序猜改。其余 26 份注册规则保持 Mac 原字节，包含上述美术 2.0.0。72 份历史参考快照不变。
+
+F2 2.0.1：11,227 bytes，SHA256 `4f7730877b5ffa6a664b655a81a7a5b40b0f13c396eebfa1d37b245064a9497c`；Q1 2.0.1：11,777 bytes，SHA256 `ab9b92a69698d9a0e4df5804c88f51e819b3e2d29bcc0b9884c8eea7b4fb85b8`。
 
 第三阶段来源仍是 Mac 最新 3008 生产规则。交接提交的清单是 `active=false`、`production_rules_verified_runtime_adapter_pending`；本轮完成兼容 Rust 适配器和离线回归后将其启用，profile 为 `mac-3008-compatible-rust/v1`。执行顺序是情绪统筹、完整主创、统一整编；另接整集上下文的导演精修、候选预览、显式原子采用和恢复。22 份原规则正文和哈希保持不变。精修取料与采用均核验源文、资产、当前单元、执行设置和原回包；任何漂移会阻止覆盖，旧候选和原稿继续保留。兼容适配器是重建实现，不等于迁入未交付正文的 42 个 Mac 原运行文件，也不自动证明生产稿质量提升。详见 [第三阶段适配记录](STAGE3_COMPATIBLE_RUST_ADAPTER_20261008.md)。
 
@@ -67,7 +69,7 @@ Mac 对应版本的 10 月 7 日 837 core 通过、24 忽略，109 前端和 121
 | 桌面原有注册表 | `pipeline::rule_snapshots()` 显式 29 项 | 按当前源码实际路径、版本、哈希核对；历史 index 的注册列表不自动成为当前运行注册 |
 | 本轮第三阶段适配器 | `pipeline::stage3_pack` 显式 22 个冻结来源条目 | 规则加载、调用顺序、采用和恢复已通过离线回归；真实文本成稿质量尚未验收 |
 
-`node scripts/verify-integration-lineage.mjs` 无生成、账户或项目操作，核对上述原字节、Git 父提交与两个归档口径，并输出紧凑 JSON。最终 desktop registry digest 为 `e742b3e1e7837ea2e4530f130460afa1508cd1c4b9545cc5dc6201e212a07e86`，29 项中 28 项与 Mac 原字节一致，语义改变只有 Windows 生图生产规则。在业务提交的独立干净 clone 中重跑通过，manifest 为 `production_rules_active_on_reconstructed_compatible_rust_adapter`。来源锁同时核对 22 个原件、144 个迁入对象和 46 个重叠历史哈希通过。
+`node scripts/verify-integration-lineage.mjs` 无生成、账户或项目操作，核对上述原字节、Git 父提交与两个归档口径，并输出紧凑 JSON。当前 desktop registry digest 为 `ea4ff62fba77510e9619018a38c541cbfe94d0d2d7f0eaf957a72a4f49659a0b`，29 项中 26 项与 Mac 原字节一致，3 项变化为 Windows 生图生产规则及 F2/Q1 2.0.1。manifest 为 `production_rules_active_on_reconstructed_compatible_rust_adapter`。来源锁还核对 22 个原件、144 个迁入对象和 46 个重叠历史哈希；清洁源码副本的最新验证单独留回执。
 
 新仓库无需携带整个旧 Web 仓库祖先图。脚本始终核对 Windows 1.2.0 固定原 blob SHA256/版本并记录来源提交；本地有 Windows Git 对象时再核对 19 提交和原 blob，并显示 `sourceGitVerified=true`。普通新仓库 clone 缺少这些 Windows Git 对象时不阻止同一来源锁校验，回执显示 `sourceGitVerified=false`。
 
@@ -80,9 +82,9 @@ Mac 对应版本的 10 月 7 日 837 core 通过、24 忽略，109 前端和 121
 | 旧 Dreamina CLI | 保留有效生成链、匿名账户识别、官方重新授权、会话修订和排队保护 | 不与 Canvas 账户、可用性或生成能力串用；本轮未真实重新登录或付费生成 |
 | Canvas OAuth | 保留 Mac OAuth 与账户卡、独立 readiness | Mac 最近实际检查仍 `oauth_scope_insufficient`；本轮不宣称 scope 或生图桥已解决 |
 | Codex CLI | 保留 Mac 10 秒版本/帮助冷启动预算及 Windows 额度、原 turn 恢复 | 冷检查预算不改变生成 deadline；未知结果与原回包不能自动重试覆盖 |
-| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1、真实包导入健康检查、仅测试用合成执行 | `SDK_LIVE_DISABLED` 保留；没有真实 SDK 模型调用或生产账户读取 |
+| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1；标准 Windows GUI 可显式选择并核验运行器、Node、模型、推理强度及账户身份 | 离线/健康检查保持关闭；真实调用需要冻结执行身份，未知提交不自动重发。首个真实合成请求状态未知，不能称已验收 |
 | Windows SDK 路径 | 校验仍使用规范路径，Node argv 将 verbatim DOS/UNC 转为等价普通路径；`--import` 使用 file URL | 设备命名空间、相对路径和 `..` 拒绝；含中文、空格、`#`、`%` 路径有独立原生 Node 回归 |
-| Windows SDK 环境 | 清空继承环境，仅加入经校验的 `SystemRoot`/`WINDIR` 供 Node 随机数服务初始化 | 不继承凭据、用户 HOME、代理、PATH 或外部 NODE_OPTIONS；健康检查继续零副作用审计 |
+| Windows SDK 环境 | Node worker 清空继承环境；经审计的 native wrapper 单独启动官方 Codex runtime，使用已核验的既有 credentialHome | 不复制登录凭据，不混用 worker 环境与官方 runtime 登录路径；运行器、桥接、资源、模型、账户指纹绑定在冻结请求中。健康检查保持零生成 |
 | 新程序更新 | 独立同名 EXE 的 current/previous、按 EXE SHA256 配对资源、持锁发布、在用拒绝、原子替换 | BuildOnly 不发布；资源不与另一个版本错配；旧应用原 EXE 路径不替换 |
 
 SDK 首轮 Windows 全库测试暴露三个真实差异：Node 主入口无法消费 `\\?\` 脚本参数；Windows `--import D:\...` 不是可用模块 URL；Rust `env_clear` 的 Node worker 缺少 Windows 系统目录，触发 `ncrypto::CSPRNG` 断言。修复限定在路径和系统环境适配，没有跳过测试或放宽来源哈希、输出上限、生产执行开关。
@@ -114,9 +116,25 @@ SDK 首轮 Windows 全库测试暴露三个真实差异：Node 主入口无法�
 | 最后一轮渠道修复回归 | `cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib readiness -- --test-threads=1`，同命令 filter 换 `providers::dreamina::tests` | readiness 49 通过；provider 76 通过、2 原有忽略，均 exit 0。二组有 1 个重叠项，未简单相加，也未重跑全库冒充新全量结果 |
 | Windows 测试进程回收 | `node scripts/test-windows-native-runner.mjs`，`native-runner-job-regression-02` | 2/2 原生子树测试通过，正常退出及 2 秒超时后 Job 活动进程均为 0 |
 
-native runner 由 MSIX 外的真实 Windows 进程执行，并记录 `unpackagedRunner=true`、`sharedWriteProbeVerified=true`；不能把初始宿主退出码当成测试结果，须读取独立 `receipt.json`。打包后的新应用启动、保存重开、渠道真实账户检查和最终全库测试待主控收口。
+native runner 由 MSIX 外的真实 Windows 进程执行，并记录 `unpackagedRunner=true`、`sharedWriteProbeVerified=true`；不能把初始宿主退出码当成测试结果，须读取独立 `receipt.json`。上表为此前检查点，新增源码的最终回归及生产验收另记，不以旧数值代替。
 
-本轮没有真实图片/视频生成，没有 SDK live 模型调用，没有 Canvas 生图桥验收，没有账户退出或重新授权，没有打开旧生产项目库。第一、二集在固定原文、资产、模型、成本范围下的新旧成稿质量比较仍未做。需要真实账户、输入或费用的工作应核对已有授权后另行完成；发布源码不等于完成这些验收。
+## 真实运行发现与修复中的验收
+
+用户已授权 SDK 使用现有额度、仅免费图片，禁止视频。所有私人剧本、数据库、请求和原回包只留本机；没有退出账户、重新授权或打开旧生产项目库。
+
+第一轮新建项目的十集原文一键整理完成，用时 442.8 秒；F2 369.5 秒、Q1 67.5 秒。得到 50 个基础身份、59 个形象，源文 SHA256 保持一致。只读审稿发现 3 个连续换装被错误声明为独立来源，已修订 F2/Q1；不手工补这三个结果冒充工作流通过，将用另一新建项目重新验收。
+
+同时发现跨行 `【情报…价值:一星】` 界面板的字段被错误标成现场对白。source parser v7 只识别完整界面区间，保留原文、UTF-16 坐标和精确覆盖；畸形或未闭合区间不能吞对白。既有 v1–v6 来源身份不静默重写，只有投影实际变化的新解析采用 v7。
+
+SDK 第一次真实合成请求产生 1 次 dispatch，确认模型调用次数未知。官方运行器的非致命配置警告出现在 turn.started 前，旧桥接误判 OUT_OF_ORDER。原事件和 `submission_unknown` 收据已保全，未重试。修复只接受已观察到的配置警告语法，不将其当成生成结果；桥接仍拒绝过早的模型内容、工具调用、畸形事件和没有完成事件的输出。第二次使用独立新 case 验证，结果另录。
+
+第三阶段新增有界来源坐标提示，给情绪、主创、整编和精修共同定位镜头时长问题，去掉要求单元凑满 13–15 秒的适配偏好；22 份 3008 原规则不变。程序不将真实长镜头数字强行截成 5 秒，实际十集成稿仍须审查。
+
+当前新增回归：前端 136/136 通过，SDK JS 54/54 通过，来源锁篡改 11/11 通过，本机可执行路径默认值 8/8 通过；SDK 资源增至 9 个后的更新脚本 11/11 通过。最新隔离源码副本的来源锁和 lineage 均通过，72/22/60 三组历史原字节保持。
+
+最终完整 Rust 命令为 `cargo test --release --locked --lib --tests -- --test-threads=1`（工作目录 `apps/desktop/src-tauri`），native receipt `sdk-native-rust-final-02`：library 785 通过、0 失败、33 忽略；24 组 integration 184 通过、0 失败、4 忽略；合计 **969 通过、0 失败、37 忽略**。整次 exit 0，用时 521.013 秒，未超时，Job 进程树已确认清空。包含 SDK 31、source display 8、父链 13 及版本锁测试，不重复相加。成品构建和后续生产验收继续补录。
+
+历史即梦图片任务的 `credit_count=0` 只能证明历史免费，账户总积分不证明下一次请求免费。当前 CLI 未提供可核验的本次免费资格或费用上限，因此尚未提交真实图片；Canvas scope 不足和 Canvas 生图桥仍是缺口，不能用付费图片或视频绕过。第一、二集同源新旧成稿质量比较也尚未完成。发布源码不等于完成这些验收。
 
 ## 最终收口项
 

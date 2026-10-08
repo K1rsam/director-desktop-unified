@@ -15,6 +15,21 @@ export class BridgeError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
 function requireThat(value, code, message) { if (!value) throw new BridgeError(code, message); }
+// Codex 0.162 emits these SDK ErrorItem diagnostics after thread.started but
+// before a model turn. They are neither agent text nor a fatal stream error.
+// Accept only the observed configuration-warning grammar; preserve the raw
+// event, without granting a turn, final text, tool permission or completion.
+function preTurnConfigurationNotice(event) {
+  const item = event.item;
+  if (event.type !== 'item.completed' || !object(item) || item.type !== 'error'
+    || !validId(item.id) || typeof item.message !== 'string'
+    || Object.keys(item).sort().join(',') !== 'id,message,type') return false;
+  const match = /^Codex is ignoring ([1-9]\d{0,2}) unrecognized configuration settings?\. Check for typos or deprecated settings\.\n([\s\S]+)$/.exec(item.message);
+  if (!match || Number(match[1]) > 64) return false;
+  const lines = match[2].replace(/\n$/, '').split('\n');
+  return lines.length === Number(match[1])
+    && lines.every(line => /^  session-flags: `[A-Za-z][A-Za-z0-9_.-]{0,127}` is ignored\.$/.test(line));
+}
 function receiptPayload(value) { const { receiptEnvelopeSha256, ...payload } = value; return payload; }
 async function atomicJson(file, value) {
   const payload = receiptPayload(value);
@@ -30,11 +45,13 @@ async function atomicJson(file, value) {
 
 /** Real official SDK adapter. No mock SDK object, resume, alternate model or provider. */
 export class OfficialSdkBridge {
-  constructor({ stateDirectory, emit = () => {}, offlineFixture = null, limits = {} }) {
+  constructor({ stateDirectory, emit = () => {}, offlineFixture = null, nativeRuntime = null, limits = {} }) {
     requireThat(path.isAbsolute(stateDirectory), 'INVALID_DIRECTORY', 'stateDirectory must be absolute and dedicated to this worker');
     this.root = stateDirectory;
     this.emit = emit;
     this.fixture = offlineFixture;
+    requireThat(!(offlineFixture && nativeRuntime), 'RUNTIME_MODE_CONFLICT', 'Live execution cannot use an offline fixture');
+    this.nativeRuntime = nativeRuntime;
     this.limits = { ...LIMITS, ...limits };
     this.records = new Map();
     this.active = null;
@@ -130,10 +147,10 @@ export class OfficialSdkBridge {
     return {
       backend: 'codex_sdk', bridgeVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION,
       sdk: { package: '@openai/codex-sdk', version: SDK_VERSION, transport: 'exec --experimental-json' },
-      runtime: { version: this.fixture ? 'synthetic-fixture' : null, verified: false },
-      available: false, liveCallsAllowed: false, offlineFixtureAvailable: !!this.fixture,
-      capabilities: { execute: this.fixture ? 'offline_fixture_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
-      blockers: ['SDK live execution has not been authorized', 'Native runtime isolation, process-tree ownership and packaged distribution are unverified', 'Pinned SDK buffers runtime stderr and lines without bounds; real-runtime resource containment is unverified'],
+      runtime: { version: this.fixture ? 'synthetic-fixture' : this.nativeRuntime?.identity.runtimePackageVersion ?? null, verified: !!this.nativeRuntime },
+      available: !!this.nativeRuntime, liveCallsAllowed: !!this.nativeRuntime, offlineFixtureAvailable: !!this.fixture,
+      capabilities: { execute: this.fixture ? 'offline_fixture_only' : this.nativeRuntime ? 'verified_native_text_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: this.nativeRuntime ? 'AbortSignal_with_native_supervisor' : 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
+      blockers: this.nativeRuntime ? ['Pinned SDK has no passive remote observation or turn ID; interrupted submission remains unknown'] : ['SDK live execution needs verified native supervision', 'Native runtime isolation and process-tree ownership are required'],
       limits: this.limits,
     };
   }
@@ -164,7 +181,7 @@ export class OfficialSdkBridge {
     return { attemptId: record.attempt.attemptId, semanticRequestHash: record.attempt.semanticRequestHash, executionFingerprint: record.attempt.executionFingerprint, attemptEnvelopeHash: record.attempt.attemptEnvelopeHash ?? null, compiledPromptSha256: record.compiledPromptSha256, compiledSchemaSha256: record.compiledSchemaSha256, state: record.state, backend: 'codex_sdk', threadId: record.threadId, turnId: null, lastSequence: record.lastSequence, rawResult: record.rawResult, error: record.error, usage: record.usage, domainAccepted: false, processTreeStopProven: false, remoteObservationSupported: false, receiptRelativePath: `${record.attempt.attemptId}/receipt.json` };
   }
   async execute(message) {
-    requireThat(this.fixture, 'SDK_LIVE_DISABLED', 'Live SDK execution is disabled; no fallback or runtime was started');
+    requireThat(this.fixture || this.nativeRuntime, 'SDK_LIVE_DISABLED', 'Live SDK execution is disabled; no fallback or runtime was started');
     requireThat(!this.active && ![...this.records.values()].some(r => UNRESOLVED.has(r.state)), 'WORKER_OCCUPIED', 'An active or unknown attempt still owns this worker budget');
     const { attempt, compiledPrompt, compiledSchema, compiledPromptSha256, compiledSchemaSha256 } = message.params ?? {};
     requireThat(object(attempt) && attempt.version === 'text-attempt/v2' && attempt.backend === 'codex_sdk' && attempt.state === 'prepared' && attempt.threadId === null && attempt.turnId === null && attempt.lastSequence === 0 && attempt.rawResult === null, 'FROZEN_ATTEMPT', 'Expected a prepared text-attempt/v2 frozen to codex_sdk');
@@ -215,12 +232,23 @@ export class OfficialSdkBridge {
   }
   async run(active, schema) {
     const record = active.record;
+    let temporaryEnvironment = null;
     const timeout = setTimeout(() => { active.canceled = true; if (active.abortable) active.controller.abort(); }, this.limits.executionMs);
     try {
-      // Factory is internal offline-fixture code, never a user-selected runtime or SDK mock.
-      const fixture = await this.fixture.create(path.join(this.root, record.attempt.attemptId));
+      // Both modes construct the genuine pinned SDK. Production uses only the
+      // native supervisor frozen by Rust, never a fixture or provider fallback.
+      const fixture = this.fixture
+        ? await this.fixture.create(path.join(this.root, record.attempt.attemptId))
+        : await this.nativeRuntime.create(path.join(this.root, record.attempt.attemptId), record);
       requireThat(!active.canceled, 'CANCEL_UNCONFIRMED', 'Canceled before SDK dispatch');
-      const sdk = new Codex({ codexPathOverride: fixture.executable, env: fixture.env, config: { tools: { shell: false }, features: { web_search_request: false }, model_provider: 'openai' } });
+      if (this.nativeRuntime) {
+        // The official SDK creates output-schema files in this Node process,
+        // not in its runtime child's env. This worker permits one active turn.
+        requireThat(path.isAbsolute(fixture.temporaryDirectory ?? ''), 'SDK_NATIVE_TEMP', 'Dedicated schema directory required');
+        temporaryEnvironment = ['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]]);
+        for (const [key] of temporaryEnvironment) process.env[key] = fixture.temporaryDirectory;
+      }
+      const sdk = new Codex({ codexPathOverride: fixture.executable, env: fixture.env, ...(this.fixture ? { config: { tools: { shell: false }, features: { web_search_request: false }, model_provider: 'openai' } } : {}) });
       const thread = sdk.startThread({ model: record.attempt.request.model, modelReasoningEffort: record.attempt.request.reasoning, workingDirectory: fixture.workingDirectory, sandboxMode: 'read-only', approvalPolicy: 'never', networkAccessEnabled: false, webSearchMode: 'disabled', skipGitRepoCheck: true });
       const { events } = await thread.runStreamed(record.compiledPrompt, { outputSchema: schema, signal: active.controller.signal });
       active.abortable = true;
@@ -240,6 +268,9 @@ export class OfficialSdkBridge {
           active.threadStarted = true; record.state = active.canceled ? 'cancel_requested' : 'running';
         } else if (event.type === 'turn.started') {
           requireThat(active.threadStarted && !active.turnStarted, 'OUT_OF_ORDER', 'Turn started without exactly one thread'); active.turnStarted = true;
+        } else if (active.threadStarted && !active.turnStarted && preTurnConfigurationNotice(event)) {
+          // The notice is already durably recorded. A real turn and final
+          // agent_message are still mandatory before transport completion.
         } else if (['item.started', 'item.updated', 'item.completed'].includes(event.type)) {
           requireThat(active.turnStarted && object(event.item), 'OUT_OF_ORDER', 'Item arrived before turn start');
           requireThat(['agent_message', 'reasoning'].includes(event.item.type), 'POLICY_VIOLATION', 'Text-only bridge received a tool, file, search, or unsupported item');
@@ -274,6 +305,9 @@ export class OfficialSdkBridge {
       record.error = { code: active.canceled ? 'CANCEL_UNCONFIRMED' : (error.code ?? 'SDK_STREAM_ERROR'), message: String(error.message).slice(0, this.limits.eventBytes / 2) };
     } finally {
       clearTimeout(timeout);
+      for (const [key, value] of temporaryEnvironment ?? []) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
       await atomicJson(path.join(this.root, record.attempt.attemptId, 'receipt.json'), record);
       this.emit({ protocolVersion: PROTOCOL_VERSION, requestId: active.requestId, attemptId: record.attempt.attemptId, type: 'observation', ...this.publicReceipt(record) });
     }

@@ -73,8 +73,8 @@ pub fn standard_report() -> Value {
         "allowedActions":actions,"credentialBackend":crate::platform::credential_backend_status(),
         "reasons":["第一阶段制作和第二阶段提示词设计使用所选真实文字渠道。",
             "图片及视频沿用已实现渠道的账户、模型、费用确认和未知提交保护；即梦画布生成桥尚未接入。",
-            if creative_runtime_ready() { "第三阶段使用已验证接线的 3008 规则与 Rust 兼容适配；真实成稿质量仍待同源比较。官方 SDK 真实执行尚未开放。" } else { "最新 3008 第三阶段尚待运行适配；官方 SDK 真实执行尚未开放。" }],
-        "textBackends":[{"id":"codex_cli","status":"enabled"},{"id":"codex_sdk","status":"offline_contract_only"}],
+            if creative_runtime_ready() { "第三阶段使用已验证接线的 3008 规则与 Rust 兼容适配；真实成稿质量以项目验收为准。" } else { "最新 3008 第三阶段尚待运行适配。" }],
+        "textBackends":[{"id":"codex_cli","status":"enabled"},{"id":"codex_sdk","status":if crate::text_sdk::native_execution_enabled(){"explicit_selection_when_ready"}else{"offline_contract_only"}}],
         "localAcceptance":{"backend":"codex_cli","model":"gpt-6.1-sol","reasoning":"medium"}})
 }
 pub fn report() -> Value {

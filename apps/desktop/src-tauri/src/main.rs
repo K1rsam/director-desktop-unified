@@ -346,6 +346,9 @@ async fn desktop_request(
     result
 }
 fn main() {
+    if director_core::text_sdk::run_runtime_wrapper().expect("SDK 执行子进程校验失败") {
+        return;
+    }
     // Leave packaged-host file redirection before opening application state or CLI workers.
     if director_core::windows_runtime::ensure_unvirtualized().expect("无法切换到共享桌面项目环境") {
         return;
@@ -389,6 +392,7 @@ fn main() {
             if let Some(v) = &setup_verification { v.diagnostics.mark(DiagnosticStage::SetupEntered); }
             let home = match &setup_verification { Some(v) => v.home.clone(), None => app.path().app_data_dir()? };
             director_core::windows_runtime::verify_shared_directory(&home).map_err(std::io::Error::other)?;
+            let saved_acceptance_grant = home.join("native-cli-acceptance.json").try_exists()?;
             // Diagnostic projects have no channel account configured. Disable live-account
             // lookup so automatic Stage 4 preflight fails locally without touching a user session.
             let engine = match &acceptance_grant {
@@ -397,6 +401,9 @@ fn main() {
                 None => Engine::new_standard(home),
             }.map_err(std::io::Error::other)?;
             let resource_root=director_core::platform::native_resource_root(app.path().resource_dir()?).map_err(std::io::Error::other)?;
+            if cfg!(windows) && setup_verification.is_none() && acceptance_grant.is_none() && !saved_acceptance_grant {
+                director_core::text_sdk::enable_native_execution(resource_root.clone()).map_err(std::io::Error::other)?;
+            }
             let engine=engine.with_native_resource_root(resource_root).map_err(std::io::Error::other)?;
             if let Some(v) = &setup_verification {
                 v.diagnostics.mark(DiagnosticStage::EngineReady);

@@ -20,6 +20,15 @@ const IMPLEMENTATION = 'reconstructed_compatible_rust_not_original_mac_runtime';
 const SHA256 = /^[a-f0-9]{64}$/;
 const SHA1 = /^[a-f0-9]{40}$/;
 
+// Current tested rule amendments are separate from the immutable Mac/source
+// records. Updating these locks never rewrites a historical source SHA.
+export const FOUNDATION_RULE_UPDATES = Object.freeze([
+  Object.freeze({ id: 'foundation-asset-catalog', path: 'apps/desktop/rules/foundation-asset-catalog/SKILL.md',
+    version: '2.0.1', bytes: 11227, sha256: '4f7730877b5ffa6a664b655a81a7a5b40b0f13c396eebfa1d37b245064a9497c' }),
+  Object.freeze({ id: 'foundation-finishing-editor', path: 'apps/desktop/rules/foundation-finishing-editor/SKILL.md',
+    version: '2.0.1', bytes: 11777, sha256: 'ab9b92a69698d9a0e4df5804c88f51e819b3e2d29bcc0b9884c8eea7b4fb85b8' }),
+]);
+
 function withinRoot(root, relative) {
   assert.equal(typeof relative, 'string', 'Source path must be a string');
   assert(relative && !relative.includes('\\') && !path.win32.parse(relative).root
@@ -54,6 +63,30 @@ function* filesIn(directory) {
     if (entry.isDirectory()) yield* filesIn(full);
     else yield full;
   }
+}
+
+export function verifyActiveFoundationRules(root, index) {
+  const registered = uniqueRows(index.registeredFiles, 'id', 29, 'Desktop rule registration');
+  const registry = readFileSync(withinRoot(root, 'apps/desktop/src-tauri/src/pipeline/mod.rs'), 'utf8');
+  for (const expected of FOUNDATION_RULE_UPDATES) {
+    const row = registered.get(expected.id);
+    assert(row, `Current foundation rule missing: ${expected.id}`);
+    for (const key of ['path', 'version', 'bytes', 'sha256']) {
+      assert.equal(row[key], expected[key], `Current foundation rule ${key} differs: ${expected.id}`);
+    }
+    assert.equal(row.runtimeRole, 'compiled_registry');
+    assert.equal(row.dispatchStatus, 'stage1_rule_available_subject_to_domain_and_source_checks');
+    const bytes = readFileSync(withinRoot(root, expected.path));
+    assert.equal(bytes.length, expected.bytes, `Current foundation rule byte count differs: ${expected.id}`);
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), expected.sha256,
+      `Current foundation rule hash differs: ${expected.id}`);
+    const version = bytes.toString('utf8').split(/\r?\n/).map(line => line.trim())
+      .find(line => line.startsWith('version:'))?.slice(8).trim();
+    assert.equal(version, expected.version, `Current foundation rule body version differs: ${expected.id}`);
+    assert(registry.includes(`include_str!("../../../rules/${expected.id}/SKILL.md")`),
+      `Current foundation rule is not compiled: ${expected.id}`);
+  }
+  return FOUNDATION_RULE_UPDATES.map(row => ({ ...row }));
 }
 
 export function verifySourceLock(repository = DEFAULT_ROOT) {
@@ -92,6 +125,7 @@ export function verifySourceLock(repository = DEFAULT_ROOT) {
   assert.equal(index.desktopSource.ref, DESKTOP_COMMIT);
   assert.equal(index.creativeSource.ref, CREATIVE_COMMIT);
   assert.equal(index.creativeSource.path, CREATIVE_PREFIX);
+  const activeFoundationRules = verifyActiveFoundationRules(root, jsonFile(root, 'reference-skills/index.json'));
   assert.equal(new Set(index.readSources.map(row => `${row.source}\0${row.path}`)).size,
     index.readSources.length, 'Independent source index contains ambiguous records');
   const originalFiles = uniqueRows(index.creativeFiles, 'sourceRelativePath', 22, 'Original creative index');
@@ -191,8 +225,10 @@ export function verifySourceLock(repository = DEFAULT_ROOT) {
     overlappingHistoricalHashes, candidateRuntimeActive: manifest.active,
     runtimeProfile: PROFILE, runtimeImplementation: IMPLEMENTATION, originalMacRuntimePorted: false,
     liveGenerationVerified: false, episode1And2QualityCompared: false,
+    activeFoundationRules,
     checks: ['candidate bytes and SHA-256', 'original Git blob and independent source index',
-      'exact runtime profile and frozen registry', 'pinned migration index', 'private fixture exclusion',
+      'exact runtime profile and frozen registry', 'current foundation 2.0.1 registration and bytes',
+      'pinned migration index', 'private fixture exclusion',
       'new app identity', 'empty default asset scope'],
   };
 }

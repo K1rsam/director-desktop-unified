@@ -24,6 +24,22 @@ test('standard native capabilities enable existing flows and keep unported Stage
 });
 import type { PolicyRequest } from './executionPolicy.ts';
 
+test('text backend selection retains exact core capability and cannot open SDK in isolated or CLI acceptance modes', async () => {
+  const { hasSdkExecutionCapability } = await import('./executionPolicy.ts');
+  const input = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['foundation.run'],
+    textBackends: [{ id: 'codex_cli', status: 'enabled' }, { id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
+  const checked = validateExecutionPolicy(input);
+  assert.equal(hasSdkExecutionCapability(checked), true);
+  assert.deepEqual(checked.textBackends, input.textBackends); assert.notEqual(checked.textBackends, input.textBackends);
+  assert.equal(hasSdkExecutionCapability(validateExecutionPolicy({ ...input, textBackends: undefined })), false);
+  assert.equal(hasSdkExecutionCapability(validateExecutionPolicy({ ...input, textBackends: [{ id: 'codex_sdk', status: 'offline_contract_only' }] })), false);
+  for (const textBackends of [[{ id: 'codex_sdk', status: 'enabled' }], [{ id: 'codex_api', status: 'explicit_selection_when_ready' }], [input.textBackends[1], input.textBackends[1]], 'codex_sdk']) {
+    assert.throws(() => validateExecutionPolicy({ ...input, textBackends }), /文本入口能力/);
+  }
+  assert.throws(() => validateExecutionPolicy({ ...OFFLINE_EXECUTION_POLICY, textBackends: input.textBackends }), /文本入口能力/);
+  assert.throws(() => validateExecutionPolicy({ ...input, mode: 'native_cli_acceptance', textBackends: [input.textBackends[1]] }), /文本入口能力/);
+});
+
 test('director refinement requires the verified pack and cannot unlock video generation', async () => {
   const { installExecutionPolicy } = await import('./executionPolicy.ts');
   const actions = ['storyboard.refine', 'storyboard.refinement.adopt'];

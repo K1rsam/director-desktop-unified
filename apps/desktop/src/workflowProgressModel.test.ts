@@ -49,6 +49,71 @@ test('CLI诊断只使用固定分类，旧心跳和不可信分类不作为当�
   assert.doesNotMatch(executionSummary(current, stamp + 5000), /PRIVATE/);
 });
 
+test('通用TIMEOUT只显示来源待核对日志，不推断模型连接失败且不改原记录', () => {
+  const current = node('storyboardCreate', 'running', 'B02');
+  const execution = current.execution as Record<string, unknown>;
+  Object.assign(execution, { stderrCategory: 'TIMEOUT', lastEventType: 'turn.started', lastEventAgeSeconds: 358, outputQuietSeconds: 79, needsDiagnosis: false });
+  const before = JSON.stringify(current), summary = executionSummary(current, stamp + 5000);
+  assert.match(summary, /等待 CLI 返回/);
+  assert.match(summary, /CLI 日志含超时提示（来源待核对）/);
+  assert.match(summary, /较长时间未收到新执行事件/);
+  assert.doesNotMatch(summary, /连接超时|连接失败|执行失败/);
+  assert.equal(JSON.stringify(current), before);
+});
+
+test('stderr活跃不能重置明确的执行事件静默，旧格式仍用输出静默', () => {
+  const current = node('storyboardCreate', 'running', 'B02');
+  const execution = current.execution as Record<string, unknown>;
+  Object.assign(execution, { outputQuietSeconds: 0, lastEventType: 'turn.started', lastEventAgeSeconds: 140, needsDiagnosis: false });
+  assert.match(executionSummary(current, stamp + 5000), /较长时间未收到新执行事件/);
+  execution.lastEventAgeSeconds = 10;
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /较长时间/);
+  delete execution.lastEventAgeSeconds;
+  execution.outputQuietSeconds = 140;
+  assert.match(executionSummary(current, stamp + 5000), /较长时间未收到新输出/);
+});
+
+test('turn.completed与已接收结果优先显示核对状态，不把历史TIMEOUT当成当前故障', () => {
+  const current = node('storyboardCreate', 'running', 'B02');
+  const execution = current.execution as Record<string, unknown>;
+  Object.assign(execution, { lastEventType: 'turn.completed', stderrCategory: 'TIMEOUT', needsDiagnosis: true, lastEventAgeSeconds: 140 });
+  assert.match(executionSummary(current, stamp + 5000), /CLI 本轮已完成，正在核对结果/);
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /等待 CLI 返回|超时|较长时间/);
+  Object.assign(execution, { phase: 'output_received', processAlive: false });
+  assert.match(executionSummary(current, stamp + 5000), /已收到结果，正在核对/);
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /超时|较长时间/);
+  for (const status of ['accepted', 'completed']) assert.equal(executionSummary({ ...current, status }, stamp + 5000), '');
+});
+
+test('明确turn.failed或本地failed不因进程退出或先前turn.completed而误显示成功', () => {
+  const current = node('storyboardCreate', 'running', 'B02');
+  const execution = current.execution as Record<string, unknown>;
+  Object.assign(execution, { processAlive: false, lastEventType: 'turn.failed', stderrCategory: 'TIMEOUT' });
+  assert.match(executionSummary(current, stamp + 5000), /CLI 本轮执行失败/);
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /已收到结果|本轮已完成/);
+  Object.assign(execution, { lastEventType: 'turn.completed', phase: 'failed' });
+  assert.match(executionSummary(current, stamp + 5000), /CLI 本地执行失败/);
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /已收到结果|本轮已完成/);
+  assert.match(executionSummary(current, stamp + 180000), /执行状态暂未更新.*最后记录：CLI 本地执行失败/);
+  assert.match(executionSummary(current, stamp + 5000, true), /最后记录：CLI 本地执行失败/);
+});
+
+test('无完成事件的退出和cleanup不宣称已收到结果，正式失败节点仍留在当前失败范围', () => {
+  const current = node('storyboardCreate', 'running', 'B02');
+  const execution = current.execution as Record<string, unknown>;
+  Object.assign(execution, { processAlive: false, lastEventType: 'turn.started' });
+  assert.match(executionSummary(current, stamp + 5000), /CLI 已退出，结果尚待核对/);
+  assert.doesNotMatch(executionSummary(current, stamp + 5000), /已收到结果|本轮已完成/);
+  execution.phase = 'cleanup';
+  assert.match(executionSummary(current, stamp + 5000), /正在结束本地 CLI，结果尚待确认/);
+  const workspace = fixture(), failed = { ...current, status: 'failed', error: '合成明确传输失败' };
+  workspace.workflowProgress![0].nodes = [failed];
+  const selected = selectWorkflowProgress(workspace, 'storyboard');
+  assert.equal(selected.completed, 0);
+  assert.equal(selected.currentNodes[0].status, 'failed');
+  assert.equal(selected.currentNodes[0].error, '合成明确传输失败');
+});
+
 test('文本恢复仅凭核心的完整绑定证明移出当前失败，不能掩盖未采用或跨岗结果', () => {
   const origin = { id: 'original', stage: 'storyboardCreate', status: 'failed', requestHash: 'a'.repeat(64), resolution: { version: 'workflow-step-resolution/v1', kind: 'text-transport-recovered', verified: true, workflowId: 'run', originNodeId: 'original', originRequestHash: 'a'.repeat(64), resolverNodeId: 'retry', resolverRequestHash: 'b'.repeat(64) } };
   const resolver = { id: 'retry', stage: 'storyboardCreate', status: 'accepted', requestHash: 'b'.repeat(64) };

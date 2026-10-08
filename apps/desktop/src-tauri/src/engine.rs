@@ -976,6 +976,7 @@ impl Engine {
                     if force && request["confirmedForce"]!=true {return Err("重新授权会清除本配置登录态，请先确认。".into());}
                     store.save_settings(&json!({"dreaminaCanvasPath":path}))?;
                     atomic_json(&self.home.join("canvas-cli-path.json"),&json!({"path":path}))?;
+                    crate::executable_paths::remember(&self.home,&json!({"dreaminaCanvasPath":path}))?;
                     self.canvas_sessions.begin(project,path,force)
                 },
                 "canvas.logout" => {
@@ -1021,12 +1022,14 @@ impl Engine {
                 };
                 let store = Store::open(root)?;
                 store.create(s(&request, "title"), &key)?;
+                crate::executable_paths::apply(&self.home, &store)?;
                 self.register(&store)?;
                 return store.project();
             }
             "project.import" => {
                 let target = self.home.join("projects").join(id());
                 let store = portable::import(Path::new(s(&request, "path")), &target)?;
+                crate::executable_paths::apply(&self.home, &store)?;
                 self.register(&store)?;
                 store.ensure_current_images()?;
                 return self.workspace(&store, None);
@@ -1268,6 +1271,7 @@ impl Engine {
                 {
                     store.invalidate_unsubmitted_settings("生成设置已变化，请重新准备")?;
                 }
+                crate::executable_paths::remember(&self.home, data)?;
             }
             "readiness.check" => {
                 let (provider,mut settings)=crate::readiness::request_settings(&request,&store.settings()?)?;

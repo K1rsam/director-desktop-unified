@@ -6997,6 +6997,170 @@ mod tests {
     }
 
     #[test]
+    fn f2_local_parent_nonhuman_evolution_keeps_each_previous_form_and_an_independent_peer() {
+        let s = prepare_source(concat!(
+            "第1集\n场景：山洞\n△青鳞幼龙爬出洞口。\n",
+            "第2集\n场景：山洞\n△同一条青鳞幼龙展开新生翼膜，青色鳞片仍在。\n",
+            "第3集\n场景：山洞\n△刚才那条龙再长出赤角，翼膜仍在。\n",
+            "△另一条同物种幼龙经过，不是此前进化的那一条。\n"
+        ))
+        .unwrap();
+        let scope: Vec<_> = s.episodes.iter().map(|e| e.id.clone()).collect();
+        let scenes: Vec<_> = s.scenes.iter().map(|v| json!([v.episode_id, v.id])).collect();
+        let batch = Batch { pieces: whole_rows(&s, &scope), scope, fragment: None };
+        let prior = empty_foundation(&s);
+        let mut raw = empty_catalogue(&s, &batch);
+        raw["assets"] = json!([
+            {"name": "青鳞龙", "type": "BEAST", "role": "主角",
+             "episodes": [batch.scope[0]], "sceneRefs": [scenes[0]],
+             "preparation": {"mode": "REFERENCE"}, "variants": [
+                {"localKey": "horned", "name": "赤角翼膜形态",
+                 "episodes": [batch.scope[2]], "sceneRefs": [scenes[2]],
+                 "preparation": {"mode": "DERIVE", "fromKey": "winged"}},
+                {"localKey": "winged", "name": "翼膜形态",
+                 "episodes": [batch.scope[1]], "sceneRefs": [scenes[1]],
+                 "preparation": {"mode": "DERIVE"}}
+             ]},
+            {"name": "另一条青鳞幼龙", "type": "BEAST",
+             "episodes": [batch.scope[2]], "sceneRefs": [scenes[2]],
+             "preparation": {"mode": "REFERENCE"}}
+        ]);
+        let context = json!({"foundationModelInputProfile": super::super::foundation_wire::PROFILE});
+        let input = input_for("F2", &s, &batch, &prior, &context, 0, 1, false, &[]);
+        let transport = super::super::foundation_wire::compile(
+            "foundation:F2", &input, &delivery_schema("F2", &input)
+        ).unwrap();
+        transport.restore(&mut raw).unwrap();
+        let next = apply_catalogue(
+            &raw, &s, &batch, &input, &prior, None, &HashSet::new()
+        ).unwrap();
+        let dragon = next.assets.iter().find(|a| a.name == "青鳞龙").unwrap();
+        let winged = dragon.variants.iter().find(|v| v.name == "翼膜形态").unwrap();
+        let horned = dragon.variants.iter().find(|v| v.name == "赤角翼膜形态").unwrap();
+        assert_eq!(dragon.kind, "BEAST");
+        assert_eq!(dragon.metadata["role"], "主角");
+        assert_eq!(dragon.variants.len(), 3);
+        assert_eq!(winged.source_variant_id, Some(base_id(dragon).unwrap()));
+        assert_eq!(horned.source_variant_id, Some(winged.id.clone()));
+        assert_ne!(horned.source_variant_id, Some(base_id(dragon).unwrap()));
+        let flattened = super::super::flatten_foundation_assets(&next);
+        let horned_row = flattened.iter().find(|v| v["variantId"] == horned.id).unwrap();
+        let winged_row = flattened.iter().find(|v| v["variantId"] == winged.id).unwrap();
+        assert_eq!(
+            super::super::assets::resolve_asset_dependency(&flattened, horned_row).unwrap(),
+            Some(winged_row["id"].as_str().unwrap().to_owned())
+        );
+        let peer = next.assets.iter().find(|a| a.name == "另一条青鳞幼龙").unwrap();
+        assert_eq!(peer.kind, "BEAST");
+        assert_eq!(peer.variants[0].source_variant_id, None);
+        let peer_row = flattened.iter().find(|v| v["identityId"] == peer.id).unwrap();
+        assert_eq!(
+            super::super::assets::resolve_asset_dependency(&flattened, peer_row).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn f2_local_parent_independent_previous_body_survives_transport_and_flattening() {
+        let (s, batch, prior, _, mut raw) = local_parent_catalogue();
+        let mut independent = raw["assets"][0]["variants"][0].clone();
+        independent["localKey"] = json!("previous-body");
+        independent["name"] = json!("前世异体");
+        independent["preparation"] = json!({
+            "mode": "REFERENCE",
+            "note": "原文明示为不同实际身体，保留独立制作基线"
+        });
+        raw["assets"][0]["variants"]
+            .as_array_mut()
+            .unwrap()
+            .push(independent);
+        let context = json!({
+            "foundationModelInputProfile": super::super::foundation_wire::PROFILE
+        });
+        let input = input_for("F2", &s, &batch, &prior, &context, 0, 1, false, &[]);
+        let transport = super::super::foundation_wire::compile(
+            "foundation:F2",
+            &input,
+            &delivery_schema("F2", &input),
+        )
+        .unwrap();
+        let mut restored = raw.clone();
+        transport.restore(&mut restored).unwrap();
+        assert_eq!(restored, raw);
+        let next = apply_catalogue(
+            &restored,
+            &s,
+            &batch,
+            &input,
+            &prior,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let asset = &next.assets[0];
+        let past = asset.variants.iter().find(|v| v.name == "前世异体").unwrap();
+        assert_eq!(past.source_variant_id, None);
+        assert_eq!(past.metadata["preparation"]["mode"], "REFERENCE");
+        let flattened = super::super::flatten_foundation_assets(&next);
+        let past_row = flattened.iter().find(|v| v["variantId"] == past.id).unwrap();
+        assert_eq!(past_row["sourceVariantId"], Value::Null);
+        assert_eq!(
+            super::super::assets::resolve_asset_dependency(&flattened, past_row).unwrap(),
+            None
+        );
+        for child_name in ["西装", "西装受伤"] {
+            let child = asset.variants.iter().find(|v| v.name == child_name).unwrap();
+            let row = flattened.iter().find(|v| v["variantId"] == child.id).unwrap();
+            let parent = flattened
+                .iter()
+                .find(|v| Some(v["variantId"].as_str().unwrap()) == child.source_variant_id.as_deref())
+                .unwrap();
+            assert_eq!(
+                super::super::assets::resolve_asset_dependency(&flattened, row).unwrap(),
+                Some(parent["id"].as_str().unwrap().to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn f2_local_parent_missing_source_never_guesses_from_identity_or_another_asset() {
+        let (s, batch, prior, input, raw) = local_parent_catalogue();
+        let mut no_base_source = raw.clone();
+        no_base_source["assets"][0]["preparation"] = json!({"mode": "DERIVE"});
+        assert!(apply_catalogue(
+            &no_base_source, &s, &batch, &input, &prior, None, &HashSet::new()
+        )
+        .unwrap_err()
+        .contains("缺少真实来源"));
+
+        let mut independent = raw;
+        independent["assets"][0]["variants"][0]["preparation"] = json!({"mode": "REFERENCE"});
+        let registered = apply_catalogue(
+            &independent, &s, &batch, &input, &prior, None, &HashSet::new()
+        )
+        .unwrap();
+        let asset = &registered.assets[0];
+        let parentless = asset.variants.iter().find(|v| v.name == "西装受伤").unwrap();
+        assert_eq!(parentless.source_variant_id, None);
+        let mut edit = empty_edit(&s, &batch);
+        edit["changes"] = json!({"assets": [{
+            "key": asset.id,
+            "variants": [{"key": parentless.id, "preparation": {"mode": "DERIVE"}}]
+        }]});
+        let q1 = input_for("Q1", &s, &batch, &registered, &json!({}), 0, 1, true, &[]);
+        assert!(apply_optimization(&edit, &s, &batch, &q1, &registered, None)
+            .unwrap_err()
+            .contains("缺少真实来源"));
+        edit["changes"]["assets"][0]["variants"][0]["preparation"]["fromKey"] =
+            json!(base_id(asset).unwrap());
+        let repaired = apply_optimization(&edit, &s, &batch, &q1, &registered, None).unwrap().0;
+        assert_eq!(
+            repaired.assets[0].variants.iter().find(|v| v.id == parentless.id).unwrap().source_variant_id,
+            Some(base_id(asset).unwrap())
+        );
+    }
+
+    #[test]
     fn f2_local_parent_rejects_duplicate_unknown_self_cycle_and_registered_key_collision() {
         let (s, batch, prior, input, raw) = local_parent_catalogue();
         let run = |raw: &Value| apply_catalogue(raw, &s, &batch, &input, &prior, None, &HashSet::new());

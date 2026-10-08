@@ -23,6 +23,10 @@ pub const SDK_VERSION: &str = "0.160.1";
 pub const SDK_IMPLEMENTATION_SHA: &str =
     "d62ed107033bdba802b283c77d875e4bec3deb2704a910bb7e3f95059473b16f";
 pub const POLICY: &str = "sdk-text-only-offline/v1";
+pub const NATIVE_POLICY: &str = "sdk-text-only-native/v1";
+#[path = "sdk_native.rs"]
+mod native;
+pub use native::{enable_native_execution, native_execution_enabled, run_runtime_wrapper};
 const FRAME_LIMIT: usize = 1_048_576;
 const EVENT_LIMIT: usize = 2048;
 const JOURNAL_LIMIT: usize = 16_777_216;
@@ -49,32 +53,65 @@ pub struct SdkIdentity {
     pub runtime_identity: String,
     pub permission_profile: String,
     pub account_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
 }
 impl SdkIdentity {
     pub fn validate(&self) -> Result<()> {
-        if self.version != "official-sdk-identity/v1"
+        if !["official-sdk-identity/v1", "official-sdk-identity/v2"]
+            .contains(&self.version.as_str())
             || self.provider != "codex_sdk"
             || self.sdk_package != "@openai/codex-sdk"
             || self.sdk_version != SDK_VERSION
             || self.sdk_implementation_sha256 != SDK_IMPLEMENTATION_SHA
             || self.bridge_version != "0.1.0"
             || self.protocol_version != PROTOCOL
-            || self.runtime_package_version != SDK_VERSION
-            || self.permission_profile != POLICY
-            || self.bridge_sha256 != compiled_bridge_sha()
             || !Path::new(&self.node_executable).is_absolute()
             || !self.node_version.starts_with('v')
             || self.node_version.len() < 3
             || self.node_sha256.len() != 64
             || !self.node_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-            || !["unverified-no-live", "bundled-synthetic-fixture"]
-                .contains(&self.runtime_identity.as_str())
-            || !["not-inspected-no-account", "synthetic-no-account"]
-                .contains(&self.account_fingerprint.as_str())
         {
             return Err(
                 "SDK_IDENTITY_MISMATCH: 官方包、桥、权限或运行身份不匹配；禁止执行/回退".into(),
             );
+        }
+        if self.version == "official-sdk-identity/v1" {
+            if self.runtime_package_version != SDK_VERSION
+                || self.permission_profile != POLICY
+                || self.bridge_sha256 != compiled_bridge_sha()
+                || !["unverified-no-live", "bundled-synthetic-fixture"]
+                    .contains(&self.runtime_identity.as_str())
+                || !["not-inspected-no-account", "synthetic-no-account"]
+                    .contains(&self.account_fingerprint.as_str())
+                || [
+                    &self.runtime_executable,
+                    &self.runtime_sha256,
+                    &self.supervisor_executable,
+                    &self.supervisor_sha256,
+                    &self.resource_directory,
+                    &self.credential_home,
+                    &self.codex_home,
+                ]
+                .iter()
+                .any(|v| v.is_some())
+            {
+                return Err("SDK_IDENTITY_MISMATCH: 离线身份不得带入真实运行器".into());
+            }
+        } else {
+            native::validate_identity(self)?;
         }
         Ok(())
     }
@@ -100,18 +137,33 @@ pub fn identity(settings: &Value) -> Result<Value> {
 /// This DTO is safe even before Node has been installed. No runtime, account or model probe.
 pub async fn status(settings: &Value) -> Value {
     let frozen = identity(settings).ok();
+    let native = native_execution_enabled();
     json!({"backend":"codex_sdk","bridgeVersion":"0.1.0","protocolVersion":PROTOCOL,
         "sdk":{"package":"@openai/codex-sdk","version":SDK_VERSION,"implementationSha256":SDK_IMPLEMENTATION_SHA,"transport":"exec --experimental-json"},
-        "available":false,"liveCallsAllowed":false,"sharedRustExecutor":true,
+        "available":native,"liveCallsAllowed":native,"sharedRustExecutor":true,
         "offlineContractImplemented":true,"nativeVerified":false,"identityFrozen":frozen.is_some(),
         "runtime":{"version":null,"verified":false},
-        "capabilities":{"execute":"offline_fixture_only_in_tests","localReceiptObserve":true,"passiveRemoteObserve":false,"turnId":false,"cancel":"AbortSignal_best_effort","processTreeStopProven":false,"domainAcceptance":false,"rawRuntimeBytes":false,"maxActiveAttempts":1},
-        "blockers":["SDK_LIVE_DISABLED：本轮 SDK 真实调用未授权", "官方固定版本不提供远端被动对账、turn ID 或进程树停止证明", "SDK 内部 stderr/行缓冲无界；原生隔离、资源约束与打包尚未验收"],
+        "capabilities":{"execute":if native {"explicit_selection_after_native_readiness"} else {"offline_fixture_only_in_tests"},"localReceiptObserve":true,"passiveRemoteObserve":false,"turnId":false,"cancel":if native {"AbortSignal_then_owned_windows_job"} else {"AbortSignal_best_effort"},"processTreeStopProven":false,"domainAcceptance":false,"rawRuntimeBytes":false,"maxActiveAttempts":1},
+        "nativeExecutionRegistered":native,"explicitSelectionRequired":true,
+        "blockers":if native {vec!["真实执行前必须通过官方账户/模型检查并冻结身份", "固定 SDK 不提供远端被动对账或 turn ID；未知提交不自动重发"]} else {vec!["SDK_LIVE_DISABLED：此入口没有标准 Windows 原生能力", "离线、headless 与未验证平台保持关闭"]},
         "limits":{"frameBytes":FRAME_LIMIT,"eventCount":EVENT_LIMIT,"journalBytes":JOURNAL_LIMIT,"stderrBytes":STDERR_LIMIT},
         "frozenIdentity":frozen})
 }
-pub async fn resolve_for_workflow(_settings: &Value) -> Result<Value> {
-    Err("SDK_LIVE_DISABLED: 官方 SDK 已接入共享核心；本轮仅离线合成验证，真实执行未开放，不回退 CLI".into())
+pub async fn resolve_for_workflow(settings: &Value) -> Result<Value> {
+    native::resolve(settings).await
+}
+
+pub(crate) async fn add_native_readiness(settings: &Value, value: &mut Value) {
+    native::add_readiness(settings, value).await;
+}
+
+fn compiled_native_bridge_sha() -> String {
+    digest(&format!(
+        "{}{}{}",
+        include_str!("../../../../sdk-bridge/src/main.mjs"),
+        include_str!("../../../../sdk-bridge/src/bridge.mjs"),
+        include_str!("../../../../sdk-bridge/src/native-runtime.mjs")
+    ))
 }
 
 /// Canonical paths remain the identity used for verification. Node's main-module
@@ -207,7 +259,7 @@ impl Config {
             });
         }
         let _ = (root, identity);
-        Err("SDK_LIVE_DISABLED: 没有产品 SDK live 开关；未启动 Node/模型，不回退 CLI".into())
+        native::config(settings, root)
     }
     fn verify(&self) -> Result<()> {
         for p in [&self.node, &self.bridge, &self.state] {
@@ -224,14 +276,23 @@ impl Config {
             .and_then(Path::parent)
             .ok_or("SDK_PATH_IDENTITY")?;
         let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
-        let bridge = digest(&format!(
-            "{}{}{}{}",
-            read(&base.join("src/main.mjs"))?,
-            read(&base.join("src/bridge.mjs"))?,
-            read(&base.join("test/fixture-runtime.mjs"))?,
-            read(&base.join("test/fixtures/fake-codex.mjs"))?
-        ));
-        if bridge != compiled_bridge_sha()
+        let bridge = if self.fixture.is_some() {
+            digest(&format!(
+                "{}{}{}{}",
+                read(&base.join("src/main.mjs"))?,
+                read(&base.join("src/bridge.mjs"))?,
+                read(&base.join("test/fixture-runtime.mjs"))?,
+                read(&base.join("test/fixtures/fake-codex.mjs"))?
+            ))
+        } else {
+            digest(&format!(
+                "{}{}{}",
+                read(&base.join("src/main.mjs"))?,
+                read(&base.join("src/bridge.mjs"))?,
+                read(&base.join("src/native-runtime.mjs"))?
+            ))
+        };
+        if bridge != s(&self.identity, "bridgeSha256")
             || crate::store::hash_file(&self.node)?.0 != s(&self.identity, "nodeSha256")
             || crate::store::hash_file(&base.join("node_modules/@openai/codex-sdk/dist/index.js"))?
                 .0
@@ -242,7 +303,7 @@ impl Config {
             return Err("SDK_PACKAGE_IDENTITY: Node、桥或官方包文件与冻结身份不同".into());
         }
         if self.fixture.is_none() {
-            return Err("SDK_LIVE_DISABLED".into());
+            native::verify_config(self)?;
         }
         Ok(())
     }
@@ -332,6 +393,7 @@ struct Worker {
     stderr: tokio::task::JoinHandle<Result<Vec<u8>>>,
     stderr_evidence: Arc<Mutex<StderrEvidence>>,
     next_id: u64,
+    native_job: Option<native::ProcessJob>,
 }
 impl Worker {
     async fn spawn(config: &Config) -> Result<Self> {
@@ -340,6 +402,7 @@ impl Worker {
         // No inherited NODE_OPTIONS, HOME, credential, proxy, PATH or config variables.
         let mut command = tokio::process::Command::new(&config.node);
         command
+            .arg("--max-old-space-size=192")
             .arg(node_path_argument(&config.bridge)?)
             .arg("--state-dir")
             .arg(node_path_argument(&config.state)?)
@@ -351,6 +414,15 @@ impl Worker {
             .kill_on_drop(true);
         if let Some(fixture) = &config.fixture {
             command.arg("--offline-fixture").arg(fixture);
+        } else {
+            let file = config.state.join("native-config.json");
+            crate::store::atomic_json(
+                &file,
+                &json!({"version":"sdk-native-config/v1","identity":config.identity}),
+            )?;
+            command
+                .arg("--native-config")
+                .arg(node_path_argument(&file)?);
         }
         #[cfg(windows)]
         {
@@ -360,9 +432,33 @@ impl Worker {
             command
                 .env("SystemRoot", &system_root)
                 .env("WINDIR", system_root);
-            command.creation_flags(0x08000000);
+            command.creation_flags(if config.fixture.is_none() {
+                0x08000004
+            } else {
+                0x08000000
+            });
         }
         let (mut child, registration) = crate::text_executor::spawn_cli_child(&mut command)?;
+        let native_job = if config.fixture.is_none() {
+            // No execute request has been sent. Verified bridge import/hello do
+            // not construct a runtime; containment is established before dispatch.
+            match native::ProcessJob::attach_tokio(&child) {
+                Ok(job) => {
+                    if let Err(error) = job.start() {
+                        let _ = child.wait().await;
+                        return Err(error);
+                    }
+                    Some(job)
+                }
+                Err(error) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let stdin = child.stdin.take().ok_or("SDK_STDIN")?;
         let stdout = child.stdout.take().ok_or("SDK_STDOUT")?;
         let stderr = child.stderr.take().ok_or("SDK_STDERR")?;
@@ -376,6 +472,7 @@ impl Worker {
             stderr,
             stderr_evidence,
             next_id: 0,
+            native_job,
         })
     }
     async fn send(&mut self, method: &str, attempt: Option<&str>, params: Value) -> Result<String> {
@@ -422,7 +519,7 @@ impl Worker {
         }
         Ok(value["result"].clone())
     }
-    async fn close(&mut self) {
+    async fn close(&mut self) -> Result<Option<Value>> {
         let _ = self.send("shutdown", None, Value::Null).await;
         if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
             .await
@@ -432,11 +529,15 @@ impl Worker {
             let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
         }
         self.stderr.abort();
+        self.native_job.as_ref().map(|job| job.stop()).transpose()
     }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stderr.abort();
+        if let Some(job) = &self.native_job {
+            let _ = job.stop();
+        }
         let _ = self.child.start_kill();
     }
 }
@@ -471,7 +572,9 @@ impl OfficialSdkTransport {
     }
     pub(crate) async fn close(&self) -> Result<()> {
         if let Some(mut worker) = self.worker.lock().await.take() {
-            worker.close().await;
+            if let Some(proof) = worker.close().await? {
+                (self.observer)("sdk_process_tree", &proof)?;
+            }
             let evidence = worker.stderr_evidence.lock().map_err(|e| e.to_string())?;
             let hex = evidence
                 .kept
@@ -554,7 +657,7 @@ impl TextTransport for OfficialSdkTransport {
             || value["sdk"]["version"] != SDK_VERSION
             || value["protocolVersion"] != PROTOCOL
             || value["bridgeVersion"] != "0.1.0"
-            || value["liveCallsAllowed"] != false
+            || value["liveCallsAllowed"] != self.config.fixture.is_none()
             || value["capabilities"]["processTreeStopProven"] != false
         {
             return Err("SDK_INSPECT_IDENTITY".into());
@@ -770,6 +873,13 @@ pub(crate) fn offline_settings(scenario: &str) -> Value {
         runtime_identity: "bundled-synthetic-fixture".into(),
         permission_profile: POLICY.into(),
         account_fingerprint: "synthetic-no-account".into(),
+        runtime_executable: None,
+        runtime_sha256: None,
+        supervisor_executable: None,
+        supervisor_sha256: None,
+        resource_directory: None,
+        credential_home: None,
+        codex_home: None,
     };
     json!({"textProvider":"codex_sdk","textModel":"gpt-6.1-sol","reasoning":"medium","textSdkIdentity":identity,"sdkOfflineFixture":scenario})
 }

@@ -1,14 +1,17 @@
 import { OfficialSdkBridge, BridgeError, LIMITS, PROTOCOL_VERSION } from './bridge.mjs';
-import { offlineFixture } from '../test/fixture-runtime.mjs';
+import { readFile } from 'node:fs/promises';
+import { nativeRuntime } from './native-runtime.mjs';
 
 const args = process.argv.slice(2);
-let stateDirectory, scenario;
+let stateDirectory, scenario, nativeConfig;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--state-dir' && args[i + 1]) stateDirectory = args[++i];
   else if (args[i] === '--offline-fixture' && args[i + 1]) scenario = args[++i];
+  else if (args[i] === '--native-config' && args[i + 1]) nativeConfig = args[++i];
   else throw new Error('Expected --state-dir <dedicated absolute path> [--offline-fixture <known scenario>]');
 }
 if (!stateDirectory) throw new Error('--state-dir is required; no user home or production directory is inferred');
+if (scenario && nativeConfig) throw new Error('Native mode cannot use an offline fixture');
 let queuedBytes = 0, stopped = false, pendingRequests = 0, commandCount = 0, flushTimer;
 const seenRequestIds = new Set();
 const send = value => {
@@ -24,7 +27,9 @@ const send = value => {
     if (error) void stop('OUTPUT_CLOSED');
   });
 };
-const bridge = new OfficialSdkBridge({ stateDirectory, emit: send, offlineFixture: scenario ? offlineFixture(scenario) : null });
+const fixture = scenario ? (await import('../test/fixture-runtime.mjs')).offlineFixture(scenario) : null;
+const runtime = nativeConfig ? nativeRuntime(JSON.parse(await readFile(nativeConfig, 'utf8')), stateDirectory) : null;
+const bridge = new OfficialSdkBridge({ stateDirectory, emit: send, offlineFixture: fixture, nativeRuntime: runtime });
 await bridge.initialize();
 async function stop(reason) {
   if (stopped) return;

@@ -1290,12 +1290,18 @@ fn legacy_readiness_help_supported(command: Option<&str>, bytes: &[u8]) -> bool 
         || help.to_ascii_lowercase().contains("dreamina-canvas") { return false; }
     let usage = help.lines().any(|line| {
         let mut parts = line.split_whitespace();
-        parts.next() == Some("dreamina") && parts.next() == Some(command.unwrap_or("[command]"))
+        if parts.next() != Some("dreamina") { return false; }
+        match (command, parts.next()) {
+            (Some(expected), Some(actual)) => actual == expected,
+            (None, Some("[command]" | "[flags]")) => true,
+            _ => false,
+        }
     });
     if !usage { return false; }
     let flags: &[&str] = match command {
         None => return ["login", "user_credit", "query_result", "text2image", "image2image", "text2video", "multimodal2video"]
-            .iter().all(|name| has_token(help, name)) && has_token(help, "--version"),
+            .iter().all(|name| has_token(help, name))
+            && (has_token(help, "--version") || has_token(help, "version")),
         Some("text2image" | "image2image") => &["--model_version", "--ratio", "--resolution_type", "--prompt"],
         Some("text2video") => &["--model_version", "--ratio", "--video_resolution", "--duration", "--prompt"],
         Some("multimodal2video") => &["--model_version", "--ratio", "--video_resolution", "--duration", "--image", "--video", "--audio"],
@@ -2950,6 +2956,14 @@ mod tests {
     const EDIT_HELP: &str = "model_version: 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro\nratio: 21:9, 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16\n- 4.0/4.1/4.5/4.6/4.7/5.0 -> resolution_type 2k or 4k\n- 5.0Pro -> resolution_type 1.5k, 2k, or 4k\n--width and --height are mutually exclusive with --ratio\n- 2k: each side 768-3072; total pixels <= 4194304";
     #[test]
     fn legacy_readiness_help_requires_root_commands_and_each_legacy_flag_contract() {
+        let actual_root = include_str!("../../../tools/dreamina/1.4.19/root-help.txt");
+        assert!(legacy_readiness_help_supported(None, actual_root.as_bytes()));
+        for (command, help) in [
+            ("text2image", include_str!("../../../tools/dreamina/1.4.19/text2image-help.txt")),
+            ("image2image", include_str!("../../../tools/dreamina/1.4.19/image2image-help.txt")),
+        ] {
+            assert!(legacy_readiness_help_supported(Some(command), help.as_bytes()));
+        }
         let root = "Usage:\n  dreamina [command]\nAvailable Commands:\n login\n user_credit\n query_result\n text2image\n image2image\n text2video\n multimodal2video\nFlags:\n --version";
         assert!(legacy_readiness_help_supported(None, root.as_bytes()));
         assert!(!legacy_readiness_help_supported(None, root.replace("user_credit", "account").as_bytes()));

@@ -278,31 +278,33 @@ const CURRENT_PARSER_VERSION: &str = "source-parser/v3";
 const STRUCTURAL_PARSER_VERSION: &str = "source-parser/v4";
 const DISPLAY_PARSER_VERSION: &str = "source-parser/v5";
 const FIDELITY_PARSER_VERSION: &str = "source-parser/v6";
+const MULTILINE_DISPLAY_PARSER_VERSION: &str = "source-parser/v7";
+
+fn uses_fidelity_rules(version: &str) -> bool {
+    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION].contains(&version)
+}
 
 fn display_block_header(text: &str) -> bool {
     static HEADER: OnceLock<Regex> = OnceLock::new();
     HEADER.get_or_init(|| Regex::new(r"^[△▲]?\s*(?:面板|屏幕|界面|投影|显示屏)(?:上的?|中)?(?:字幕|文字|内容|显示内容)\s*[：:]\s*$").unwrap()).is_match(text.trim())
 }
 
-/// Only an explicit display header grants the following numbered field labels
-/// a non-spoken role. Ordinary dialogue and voice labels outside it are intact.
-fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
-    if ![DISPLAY_PARSER_VERSION, FIDELITY_PARSER_VERSION].contains(&source.parser_version.as_str())
-    {
-        return HashSet::new();
-    }
+fn numbered_display_field_re() -> &'static Regex {
     static FIELD: OnceLock<Regex> = OnceLock::new();
-    let field = FIELD.get_or_init(|| {
+    FIELD.get_or_init(|| {
         Regex::new(
             r"^(?:情报|任务|消息|提示|目标|奖励|内容|选项)[零〇一二三四五六七八九十百千\d]+$",
         )
         .unwrap()
-    });
+    })
+}
+
+fn declared_speaker_names(source: &LockedSource) -> HashSet<String> {
     static CAST: OnceLock<Regex> = OnceLock::new();
     let cast = CAST.get_or_init(|| {
         Regex::new(r"^\s*(?:人物|出场人物|出场角色|角色)\s*[：:]\s*(.*)$").unwrap()
     });
-    let named: HashSet<_> = source
+    source
         .rows
         .iter()
         .filter_map(|r| cast.captures(r.text.trim()))
@@ -318,9 +320,125 @@ fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
                 })
                 .collect::<Vec<_>>()
         })
-        .collect();
-    let mut scope = None;
+        .collect()
+}
+
+fn display_enclosure_field(line: &str) -> Option<&str> {
+    let inner = line.trim_start().strip_prefix('【')?;
+    let (label, _) = inner.split_once(['：', ':'])?;
+    let label = label.trim();
+    numbered_display_field_re().is_match(label).then_some(label)
+}
+
+/// A complete, row-started 【numbered field: ...】 enclosure establishes a
+/// display structure across lines. Its interior field names are not a blacklist
+/// of speakers: the same labels outside that exact enclosure remain dialogue.
+/// Incomplete enclosures and explicit speech cues never grant an exemption.
+fn multiline_display_row_ids(source: &LockedSource, named: &HashSet<String>) -> HashSet<String> {
+    if source.parser_version != MULTILINE_DISPLAY_PARSER_VERSION {
+        return HashSet::new();
+    }
     let mut ids = HashSet::new();
+    for (index, first) in source.rows.iter().enumerate() {
+        if first.kind != "body" || ids.contains(&first.id) {
+            continue;
+        }
+        let Some(label) = display_enclosure_field(&first.text) else {
+            continue;
+        };
+        if named.contains(label) {
+            continue;
+        }
+        let mut stack = Vec::new();
+        let mut quotation = None;
+        let mut covered = Vec::new();
+        'candidate: for (relative, row) in source.rows[index..].iter().enumerate() {
+            if row.episode_id != first.episode_id
+                || row.scene_id != first.scene_id
+                || row.kind != "body" && !row.text.trim().is_empty()
+            {
+                break;
+            }
+            if relative > 0 {
+                if let Some(dialogue) =
+                    row_dialogue(&row.text, row.range.start, &row.id, &source.parser_version)
+                {
+                    if dialogue.channel != "现场"
+                        || named.contains(&dialogue.speaker)
+                        || dialogue
+                            .performance_segments
+                            .iter()
+                            .any(|part| part.range.end <= dialogue.range.start)
+                    {
+                        break;
+                    }
+                }
+            }
+            covered.push(row.id.clone());
+            let line = if relative == 0 {
+                row.text.trim_start()
+            } else {
+                row.text.as_str()
+            };
+            for (byte, ch) in line.char_indices() {
+                if quotation == Some(ch) {
+                    quotation = None;
+                    continue;
+                }
+                if quotation.is_some() {
+                    continue;
+                }
+                if let Some(close) = match ch {
+                    '“' => Some('”'),
+                    '「' => Some('」'),
+                    '『' => Some('』'),
+                    '"' => Some('"'),
+                    _ => None,
+                } {
+                    quotation = Some(close);
+                    continue;
+                }
+                if let Some(close) = match ch {
+                    '【' => Some('】'),
+                    '[' => Some(']'),
+                    '（' => Some('）'),
+                    '(' => Some(')'),
+                    _ => None,
+                } {
+                    stack.push(close);
+                } else if ['】', ']', '）', ')'].contains(&ch) {
+                    if stack.pop() != Some(ch) {
+                        break 'candidate;
+                    }
+                    if stack.is_empty() {
+                        if relative > 0 && line[byte + ch.len_utf8()..].trim().is_empty() {
+                            ids.extend(covered);
+                        }
+                        break 'candidate;
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Only an explicit display header or the versioned complete enclosure grants
+/// a non-spoken role. Ordinary dialogue and voice labels outside it are intact.
+fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
+    if ![
+        DISPLAY_PARSER_VERSION,
+        FIDELITY_PARSER_VERSION,
+        MULTILINE_DISPLAY_PARSER_VERSION,
+    ]
+    .contains(&source.parser_version.as_str())
+    {
+        return HashSet::new();
+    }
+    let field = numbered_display_field_re();
+    let named = declared_speaker_names(source);
+    let mut scope = None;
+    let mut ids = multiline_display_row_ids(source, &named);
     for row in &source.rows {
         if display_block_header(&row.text) && row.kind == "body" {
             scope = Some((&row.episode_id, &row.scene_id));
@@ -396,7 +514,7 @@ fn prior_fresh_parser_version(text: &str) -> &'static str {
 // Compare complete deterministic projections so unaffected inputs retain their
 // established contract. Saved sources never pass through this opt-in selector.
 fn fresh_parser_version(text: &str) -> &'static str {
-    let prior = prior_fresh_parser_version(text);
+    let mut prior = prior_fresh_parser_version(text);
     if let (Ok(old), Ok(new)) = (
         parse_source(text, prior),
         parse_source(text, FIDELITY_PARSER_VERSION),
@@ -406,7 +524,25 @@ fn fresh_parser_version(text: &str) -> &'static str {
         old.as_object_mut().unwrap().remove("parserVersion");
         new.as_object_mut().unwrap().remove("parserVersion");
         if old != new {
-            return FIDELITY_PARSER_VERSION;
+            prior = FIDELITY_PARSER_VERSION;
+        }
+    }
+    if !raw_lines(text)
+        .iter()
+        .any(|line| display_enclosure_field(line).is_some())
+    {
+        return prior;
+    }
+    if let (Ok(old), Ok(new)) = (
+        parse_source(text, prior),
+        parse_source(text, MULTILINE_DISPLAY_PARSER_VERSION),
+    ) {
+        let mut old = serde_json::to_value(old).unwrap();
+        let mut new = serde_json::to_value(new).unwrap();
+        old.as_object_mut().unwrap().remove("parserVersion");
+        new.as_object_mut().unwrap().remove("parserVersion");
+        if old != new {
+            return MULTILINE_DISPLAY_PARSER_VERSION;
         }
     }
     prior
@@ -490,7 +626,7 @@ fn inline_scene_dialogue(text: &str, start: usize, row_id: &str) -> Option<Sourc
 
 fn row_dialogue(text: &str, start: usize, row_id: &str, version: &str) -> Option<SourceDialogue> {
     parse_dialogue(text, start, row_id, version).or_else(|| {
-        (version == FIDELITY_PARSER_VERSION)
+        uses_fidelity_rules(version)
             .then(|| inline_scene_dialogue(text, start, row_id))
             .flatten()
     })
@@ -662,7 +798,7 @@ fn parse_dialogue(
     static HEAD: OnceLock<Regex> = OnceLock::new();
     let re = HEAD.get_or_init(|| Regex::new(r"^([\p{L}\p{N}·・_]{1,24})(.*)$").unwrap());
     static FIDELITY_HEAD: OnceLock<Regex> = OnceLock::new();
-    let re = if parser_version == FIDELITY_PARSER_VERSION {
+    let re = if uses_fidelity_rules(parser_version) {
         FIDELITY_HEAD.get_or_init(|| Regex::new(r"^([\p{L}\p{M}\p{N}·・_]{1,24})(.*)$").unwrap())
     } else {
         re
@@ -712,6 +848,7 @@ fn parse_dialogue(
         STRUCTURAL_PARSER_VERSION,
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
+        MULTILINE_DISPLAY_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let (channel_text, channel_label) = if current_voice_rules {
@@ -739,7 +876,7 @@ fn parse_dialogue(
     }
     let suffix = channel_text;
     static HAN: OnceLock<Regex> = OnceLock::new();
-    let attached_cue = parser_version != FIDELITY_PARSER_VERSION
+    let attached_cue = !uses_fidelity_rules(parser_version)
         || label.char_indices().rev().nth(2).is_some_and(|(_, ch)| {
             HAN.get_or_init(|| Regex::new(r"^\p{Han}$").unwrap())
                 .is_match(&ch.to_string())
@@ -806,6 +943,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         STRUCTURAL_PARSER_VERSION,
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
+        MULTILINE_DISPLAY_PARSER_VERSION,
     ]
     .contains(&parser_version)
     {
@@ -815,9 +953,10 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         STRUCTURAL_PARSER_VERSION,
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
+        MULTILINE_DISPLAY_PARSER_VERSION,
     ]
     .contains(&parser_version);
-    let fidelity = parser_version == FIDELITY_PARSER_VERSION;
+    let fidelity = uses_fidelity_rules(parser_version);
     let sha256 = digest(text);
     let episode_re = episode_heading_re();
     let context_re = Regex::new(r"^(?:#{1,6}\s*)?(?:【)?(?:作者资料|故事大纲|人物小传|人物设定|世界观设定|背景资料|附录)(?:】)?(?:\s|[:：｜|]|$)").unwrap();
@@ -1799,7 +1938,7 @@ fn apply_decisions_inner(
     }
     out.episodes.retain(|e| !e.row_ids.is_empty());
     out.scenes.retain(|s| !s.row_ids.is_empty());
-    if out.parser_version == FIDELITY_PARSER_VERSION
+    if uses_fidelity_rules(&out.parser_version)
         || decisions
             .iter()
             .any(|d| d.decision_version.as_deref() == Some("boundary-decision/v2"))
@@ -2652,3 +2791,7 @@ mod tests {
 #[cfg(test)]
 #[path = "source_m2_tests.rs"]
 mod m2_tests;
+
+#[cfg(test)]
+#[path = "source_display_tests.rs"]
+mod display_tests;

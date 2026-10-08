@@ -247,6 +247,20 @@ fn isolated_startup_and_unsupported_readiness_requests_fail_before_any_probe() {
 }
 
 #[test]
+fn sdk_readiness_accepts_both_draft_executables_without_other_settings() {
+    let (_, settings) = crate::readiness::request_settings(
+        &json!({"provider":"codex_sdk","settings":{"textSdkNodePath":" C:/runtime/node.exe ","codexPath":" C:/runtime/codex.exe "}}),
+        &json!({"codexPath":"old.exe","textModel":"model","reasoning":"medium","textApiKey":"not-copied"}),
+    ).unwrap();
+    assert_eq!(settings["textSdkNodePath"], "C:/runtime/node.exe");
+    assert_eq!(settings["codexPath"], "C:/runtime/codex.exe");
+    assert_eq!(settings["textModel"], "model");
+    assert!(settings.get("textApiKey").is_none());
+    assert!(crate::readiness::request_settings(&json!({"provider":"codex_sdk","settings":{"codexPath":7}}), &json!({})).is_err());
+    assert!(crate::readiness::request_settings(&json!({"provider":"dreamina","settings":{"codexPath":"foreign.exe"}}), &json!({})).is_err());
+}
+
+#[test]
 fn rpc_failure_keeps_verified_cli_version_and_does_not_claim_logged_out_or_model_access() {
     let dir = tempfile::tempdir().unwrap();
     let path = native_fixture(dir.path(), "codex-rpc-failure");

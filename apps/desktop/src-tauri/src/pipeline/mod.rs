@@ -1521,12 +1521,14 @@ mod tests {
         }
         assert!(rules.iter().all(|r| r.sha256 == digest(&r.content)));
         for rule in &rules {
-            let expected = if [
+            let expected = if ["foundation-asset-catalog", "foundation-finishing-editor"]
+                .contains(&rule.id.as_str())
+            {
+                "2.0.1"
+            } else if [
                 "episode-emotion-planner",
                 "unit-performance-director",
                 "episode-finishing-editor",
-                "foundation-asset-catalog",
-                "foundation-finishing-editor",
             ]
             .contains(&rule.id.as_str())
                 || [
