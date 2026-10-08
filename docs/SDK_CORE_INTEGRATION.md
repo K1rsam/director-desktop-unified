@@ -103,4 +103,8 @@ M2 分项检查点日志见 `sdk-bridge/verification/m2-*`；该历史版本的�
 
 最新修复依据固定官方 SDK 的非致命 `ErrorItem` 合同，取消英文警告匹配：仅允许 `thread.started` 后、`turn.started` 前结构严格的 `item.completed`（合法 `id`、`type:error`、非空且不超过 4096 UTF-8 字节的 `message`，不含额外字段），保留原事件但不授予 turn、结果或采用。顶层 `error`、`turn.failed`、提前模型/工具事件、畸形事件及仅有诊断的流仍失败关闭。Windows 离线 JS 61/61、Rust SDK 定向 33/33 通过，两个 native Job 均 exit0、进程树为空；这轮回归真实请求为 0。
 
-第三个独立 case 尚未发起。现有 `34ca4d1` 候选 supervisor 冻结的是旧桥源码摘要，不能承载修复后的新桥或借旧配套资源运行；须先正常关闭候选 GUI，再构建并冻结匹配的新 supervisor 和资源。标准 Windows SDK 的真实完成、重开零额外 execute 和成稿质量仍待各自证据；离线回归不能追认前两次 unknown。本记录不包含账户身份、用户本机路径或私有请求/响应。
+第三个独立 case `sdk-native-error-item-contract-03` 已完成一次真实 SDK 请求：使用提交 `403f5d6` 的新候选 supervisor 与对应桥源码身份，固定 SDK 0.160.1、官方 `codex-cli 0.162.0-alpha.2`、`gpt-6.1-sol / medium`，120 秒执行上限。实际事件为 thread、两项非致命诊断、turn、模型 JSON 和 completed；合成小 JSON 校验通过，controller 用时 14.770 秒，状态 `transport_completed`。usage 为输入 10459、输出 23、cached/reasoning 0 tokens；图片、视频和旧项目库访问均为 0。两项诊断原样保留，不修改工具/skill 禁用参数。
+
+该 case 内重建 bridge 后只观察成功；另起独立进程的 observe-only 也通过，新增 execute、生成和远端观察均为 0，原文本与 journal 哈希不变。官方 runtime 的 Job 已证明停止，controller 与独立 observe 的 native Job 均 exit0、进程树为空。这验证合成请求的真实 transport 完成和本地恢复；标准 GUI 的实际阶段流程、项目领域采用及成稿质量仍需各自验收，不能追认前两次 unknown 成功或零费用。累计 SDK dispatch 为 3：2 个 unknown、1 个 completed。
+
+case03 控制器最初因缺少测试父目录在独占 `mkdir` 时报 `ENOENT`，预算、冻结请求及账户/运行器工作尚未开始，SDK dispatch 为 0；该失败回执保留。补齐父目录后仍使用同一独立 case 的一次预算。控制器现只为 parent 做递归创建，worker 目录继续独占创建、预算文件继续 `wx`，不能复用已有 attempt 或获取新预算。`34ca4d1` 旧候选的编译桥摘要不接受修复后新桥，因此在正常关闭 GUI 后构建新 supervisor；旧配套资源及两次未知原件均未改。本记录不包含账户身份、用户本机路径或私有请求/响应。

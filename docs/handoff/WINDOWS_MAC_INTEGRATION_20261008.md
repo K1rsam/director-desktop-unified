@@ -82,7 +82,7 @@ F2 2.0.1：11,227 bytes，SHA256 `4f7730877b5ffa6a664b655a81a7a5b40b0f13c396eebf
 | 旧 Dreamina CLI | 保留有效生成链、匿名账户识别、官方重新授权、会话修订和排队保护 | 不与 Canvas 账户、可用性或生成能力串用；本轮未真实重新登录或付费生成 |
 | Canvas OAuth | 保留 Mac OAuth 与账户卡、独立 readiness | Mac 最近实际检查仍 `oauth_scope_insufficient`；本轮不宣称 scope 或生图桥已解决 |
 | Codex CLI | 保留 Mac 10 秒版本/帮助冷启动预算及 Windows 额度、原 turn 恢复 | 冷检查预算不改变生成 deadline；未知结果与原回包不能自动重试覆盖 |
-| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1；标准 Windows GUI 可显式选择并核验运行器、Node、模型、推理强度及账户身份 | 离线/健康检查保持关闭；真实调用需要冻结执行身份，未知提交不自动重发。两个独立真实合成请求均为未知，不能称已验收 |
+| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1；标准 Windows GUI 可显式选择并核验运行器、Node、模型、推理强度及账户身份 | 离线/健康检查保持关闭；真实调用冻结执行身份，未知提交不自动重发。累计 3 个真实合成 dispatch：2 unknown，1 completed；第三 case 的重开只观察已通过，实际项目阶段另验 |
 | Windows SDK 路径 | 校验仍使用规范路径，Node argv 将 verbatim DOS/UNC 转为等价普通路径；`--import` 使用 file URL | 设备命名空间、相对路径和 `..` 拒绝；含中文、空格、`#`、`%` 路径有独立原生 Node 回归 |
 | Windows SDK 环境 | Node worker 清空继承环境；经审计的 native wrapper 单独启动官方 Codex runtime，使用已核验的既有 credentialHome | 不复制登录凭据，不混用 worker 环境与官方 runtime 登录路径；运行器、桥接、资源、模型、账户指纹绑定在冻结请求中。健康检查保持零生成 |
 | 新程序更新 | 独立同名 EXE 的 current/previous、按 EXE SHA256 配对资源、持锁发布、在用拒绝、原子替换 | BuildOnly 不发布；资源不与另一个版本错配；旧应用原 EXE 路径不替换 |
@@ -130,7 +130,9 @@ native runner 由 MSIX 外的真实 Windows 进程执行，并记录 `unpackaged
 
 SDK 已派发两个独立真实合成 case，各 1 次 dispatch。第一次在 `turn.started` 前收到忽略无效配置项的非致命诊断，第二次收到 `skip_host_skill_discovery` 的开发中特性诊断，当时的桥均误判 `OUT_OF_ORDER` 并保留 `submission_unknown`。两个 case 的冻结请求、原事件和未知收据已保全，12 项原件哈希复核未变；没有重试或最终结果/领域采用证明。本地 controller 的 Job 进程树已回收，但确认模型调用次数、远端完成和费用仍未知。
 
-最新修复按官方 SDK 非致命 `ErrorItem` 的结构合同校验，不再匹配英文警告：仅接受 thread 已建立而 turn 未开始时结构严格的 `item.completed`/`type:error`，校验事件与 item 字段、合法 id、非空且最多 4096 UTF-8 字节的 message；原事件照存，不当成 turn、生成结果或采用。真正的顶层 error/turn.failed、提前模型或工具事件、畸形事件及只有诊断的流仍拒绝。针对该修复的 Windows JS 61/61、Rust SDK 33/33 通过，native Job 均 exit0、进程树为空；该回归没有真实调用。第三个独立 case 尚未发起，需先构建桥摘要与 supervisor 一致的新候选，不修改正在运行的 `34ca4d1` 候选配套资源。详见 [SDK_CORE_INTEGRATION.md](../SDK_CORE_INTEGRATION.md)。
+最新修复按官方 SDK 非致命 `ErrorItem` 的结构合同校验，不再匹配英文警告：仅接受 thread 已建立而 turn 未开始时结构严格的 `item.completed`/`type:error`，校验事件与 item 字段、合法 id、非空且最多 4096 UTF-8 字节的 message；原事件照存，不当成 turn、生成结果或采用。真正的顶层 error/turn.failed、提前模型或工具事件、畸形事件及只有诊断的流仍拒绝。针对该修复的 Windows JS 61/61、Rust SDK 33/33 通过，native Job 均 exit0、进程树为空；该回归没有真实调用。
+
+随后正常关闭旧候选 GUI，BuildOnly 提交 `403f5d6` 的匹配 supervisor 和资源；候选 SHA256 `1d98bafd81955322ca4d12ee9cfc758d96ad77ee98c0bd5cb05437f88824cc28`，九份配套资源校验通过，旧 `34ca4d1` 资源未改。第三个独立 case `sdk-native-error-item-contract-03` 用 120 秒一次预算真实调用 SDK 0.160.1 / 官方 runtime 0.162.0-alpha.2 / gpt-6.1-sol medium，返回合成 JSON，状态 `transport_completed`，用量 10459 输入、23 输出 tokens。controller 14.770 秒 exit0、进程树为空；重建 bridge 和另起进程 observe-only 均不增加执行，原 raw/journal 哈希不变，runtime Job 停止证明成立。媒体和旧库访问均为 0。此前一次本地启动 `ENOENT` 发生在预算、账户检查和 SDK 派发之前，派发为 0，失败回执保持；只补建 parent 后使用该 case 的唯一预算，worker/预算仍独占。实际项目阶段、领域采用和成稿质量另验；前两个 unknown 的远端结果及费用仍未确认。详见 [SDK_CORE_INTEGRATION.md](../SDK_CORE_INTEGRATION.md)。
 
 第三阶段新增有界来源坐标提示，给情绪、主创、整编和精修共同定位镜头时长问题，去掉要求单元凑满 13–15 秒的适配偏好；22 份 3008 原规则不变。程序不将真实长镜头数字强行截成 5 秒，实际十集成稿仍须审查。
 

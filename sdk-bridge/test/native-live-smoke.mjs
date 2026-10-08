@@ -89,6 +89,8 @@ if (options.observeOnly) {
 } else {
   for (const key of ['runtime', 'supervisor']) check(path.isAbsolute(options[key] ?? ''), 'EXPLICIT_NATIVE_EXECUTABLES_REQUIRED');
   // Directory allocation is exclusive and persists before account/model work.
+  // Prepare only the parent; never reuse an existing worker or its budget.
+  await fs.mkdir(path.dirname(state), { recursive: true });
   await fs.mkdir(state);
   await fs.writeFile(path.join(state, 'authorized-budget.json'), JSON.stringify({ version: 'sdk-synthetic-live-budget/v1', caseId: attemptId, maximumExecuteCalls: 1, images: false, videos: false, productionProjects: false }), { flag: 'wx' });
   check(sha(await fs.readFile(path.join(sdkRoot, 'node_modules/@openai/codex-sdk/dist/index.js'))) === pinned.implementation, 'PINNED_SDK_IMPLEMENTATION_CHANGED');

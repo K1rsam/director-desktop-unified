@@ -1,5 +1,7 @@
 # 新独立桌面项目实施约束
 
+本次 Windows 集成的最新用户授权覆盖下文初始 Mac 范围：官方 SDK 可使用现有账户额度真实测试；测试剧本前十集需完成一至三阶段与第四阶段非生成测试；图片只在本次免费条件已核实时提交，禁止任何视频提交。保留原始证据和未知任务，不能通过重新创建任务绕过恢复与费用边界。最新实测记录见 docs/handoff/WINDOWS_MAC_INTEGRATION_20261008.md。
+
 先读 docs/IMPLEMENTATION.md、docs/DECISIONS.md、docs/ACCEPTANCE.md 和 docs/SOURCE_INDEX.json。
 
 - 用户已授权助理全权推进云端实现、对新仓库提交/推送、必要本地工程测试和反馈修复，不重复索取整体项目实施许可
