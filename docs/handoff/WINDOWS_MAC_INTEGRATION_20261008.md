@@ -278,4 +278,8 @@ Windows 精确源码工作树是 `_task-backups/github-desktop-20261005`，不�
 
 第四轮 Windows Rust 全量完成：`cargo test --release --locked --no-default-features --no-fail-fast --tests -- --test-threads=1`，library **889/889**、28 个 integration target 合计 **212/212**，总计 **1101 通过、0 失败、41 忽略**（library 37、integration 4），另一个 core binary target 为零测试。controller 604.067 秒、exit0、未超时、Job 子树清空；包含混合来源两轮及零重派恢复、API 原回包保护和修复后的 Windows loopback 代理测试。忽略项没有批量执行，真实 B2 只读探针以独立精确过滤器另列。此结果不替代新版原生客户端实跑或免费成图验收。
 
+上述后端与 Windows 脚本修复提交为 `959a6801976424b78def1a279cd49f02bffdd84a`，已推送新仓库的 main 与 integration/windows-mac-20261008，两个远端 SHA 回读一致。
+
+补齐实际复验所需的提示词入口：单资产“设计／重新设计提示词”只提交 images.design 与当前 assetIds，批量模式只处理所选有效资产、空选禁用，非批量保持全目录一键。父链补齐和采用仍交给后端，不保存图片渠道参数、不要求图片账户、不调用图片生成。原编辑正文及最终请求复制保留；不可写、详情未就绪、正文未保存、已有设计任务或非独立图片资产时拒绝。八项真实 React 合成交互通过，完整前端 **156/156**、TypeScript exit0；controller 6.742 秒、exit0、进程树清空，零模型/媒体调用。下一原生候选将以 C 的睡衣子形象验证该精确范围入口。
+
 主控补录：最终集成提交 SHA 与新仓库远端 SHA、最终 manifest/profile、完整 Rust/前端/SDK/适用平台策略结果、成品 EXE 与资源 SHA256、独立原生启动及隔离保存重开结果、实际渠道检查与未测范围。上述字段补齐后再移除本文草稿标记。
