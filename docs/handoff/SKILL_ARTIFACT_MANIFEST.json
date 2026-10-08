@@ -1,0 +1,488 @@
+{
+  "schema": "director-next-windows-handoff-artifacts/v1",
+  "date": "2026-10-07",
+  "snapshotCommit": "2c952f67b96878a90338ab5770c7d864bcf1b78f",
+  "publicationStatus": "prepared_not_uploaded",
+  "records": [
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/common-contract.md",
+      "bytes": 16752,
+      "sha256": "f1a576d1bc232787a396a2be94748ca2c20a0a954b72929fce77ddec7c0dedb9",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/acting-blocking-methods/SKILL.md",
+      "bytes": 14054,
+      "sha256": "71453a6d95d9bfe0248144f249dc46d8672c6c261e3a83aee8cf6bd72172a9bf",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/unit-performance-director/SKILL.md",
+      "bytes": 21902,
+      "sha256": "8a627052a0cc80d409514a4da51b7edefbd5efa350ac8210f0e45f87dcbff578",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/episode-emotion-planner/SKILL.md",
+      "bytes": 14131,
+      "sha256": "7d6da5154fbefe89490186f0c7905f7959ea6abe121b0c05ed73f21dc56deaa7",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/director-refinement/SKILL.md",
+      "bytes": 6869,
+      "sha256": "579e82ae4256cbc9e9af3bfdfd0a3ec3590b91f1af818b7a77611264ffd2c937",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/episode-finishing-editor/SKILL.md",
+      "bytes": 28735,
+      "sha256": "2083577fff437605cc0ff4f7d262786914f52f8427d636110b1e0a162855b465",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/fantasy-expression-methods/SKILL.md",
+      "bytes": 26333,
+      "sha256": "8c3d0c1eb38574de2c175c038935049d1f20efaf2aa4a054434936d56b709c3d",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/camera-emotion-methods/SKILL.md",
+      "bytes": 18615,
+      "sha256": "6c3630ff4d0ab654feda6072fca994d549640ed4fc68edf6351739ab4911b079",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/source-context-preparer/SKILL.md",
+      "bytes": 3596,
+      "sha256": "f563acc7ef27d08e60fd596778e511d7132d4e62144d4cb75f6fee63a4a9d291",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/sound-rhythm-methods/SKILL.md",
+      "bytes": 9567,
+      "sha256": "1000ea079ff9d4c42921fd5b0f058eb4b3a33ce01a3b5910f0c19f1b7bef1512",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/skills/lighting-space-methods/SKILL.md",
+      "bytes": 5035,
+      "sha256": "b97201cbbe4895bc0f5c3a6a3dfe4a16dfaebf9f84935a17b951d9f4ba01f614",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/danger-rescue.md",
+      "bytes": 1432,
+      "sha256": "84a5ea29fdb89a11cfc8bfd0787db72bda6a43c5ca25cbcc29ee5027ab606893",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/expressive-emphasis.md",
+      "bytes": 2922,
+      "sha256": "859627f68e7067f79d57afc787fcc08f4904dbff2c7c3394e30e5e21ba0644a2",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/camera-path-repair.md",
+      "bytes": 1982,
+      "sha256": "2c6c6c91706f04c2f311ee91df31315992cee58c7b808c4e6f1b1bd986db51de",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/status-conflict.md",
+      "bytes": 1284,
+      "sha256": "90281f3f9e6d764a7711ecd89b4c2ddb7d833aeb8bd94926e4150bdbb67d8f3f",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/joy-acceptance.md",
+      "bytes": 1383,
+      "sha256": "412e4fa0c83c61ea70ac60a131e58672eca6c406ab5a58a0de5fb44d47f8e216",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/comic-contrast.md",
+      "bytes": 1689,
+      "sha256": "462f6d3dc3cd0a055d31cf13941fb67327b762f91847927a4fff275076e90eed",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/quiet-nonhuman.md",
+      "bytes": 986,
+      "sha256": "e8d11f9819962328f4d5bfc39bfd383eb0a7cd8200a1820cbb0d453f7ac91cb3",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/scale-silence.md",
+      "bytes": 961,
+      "sha256": "20b47ff4dfe9b647ddb80e4492daf2d6be0619321c6d9f41fc371cf0ebd5c258",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/spatial-contact.md",
+      "bytes": 1823,
+      "sha256": "2d2b7bd1a922cfc61f1de84aca4ad6087e9bdac3f85ca1e378d4a9f13e6c4c1d",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/long-voice.md",
+      "bytes": 2299,
+      "sha256": "c917620f81197a0146fbca98750e4c679b08d4ca50f6847812faf1ff0bb7ac7b",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/mac-3008-original-20261006/references/cards/editing-integrity.md",
+      "bytes": 1966,
+      "sha256": "63a322cbde08040b5999ce38f113304389ca044e1e2214bf8e8bbe2b87ddf0b0",
+      "category": "original_3008",
+      "status": "preserved_original_not_runtime_activation",
+      "origin": "K1rsam/director-web@00093c632c45369106c7ef79a47b684fd5e77526"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/asset-image-production/SKILL.md",
+      "bytes": 2008,
+      "sha256": "96488c1f38f6552c9a4a5dd55f20777c0c2fb20b6cafd16af06c5092e5f48cf5",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/asset-art-director/SKILL.md",
+      "bytes": 6530,
+      "sha256": "9193cd59b44bdc77fb413fb8c40bb6531c2cfb9377ca17fafc0749808ba6cd82",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/unit-performance-director/SKILL.md",
+      "bytes": 21499,
+      "sha256": "70fba0987dda7804e7740dc6aaf4dd93262bb3d566ffec917214d1b17ef2557e",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/episode-emotion-planner/SKILL.md",
+      "bytes": 13466,
+      "sha256": "9d06e36572a9052cf9d72e0d9723db4f5adc39f44f7d56de8c3c403481ddef50",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/unit-video-production/SKILL.md",
+      "bytes": 2282,
+      "sha256": "6fbac2064e5f752ce90d55d6df36776b5b4b5ec18810dbc453939a1b65e33ab0",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/asset-visual-facts-extractor/SKILL.md",
+      "bytes": 4271,
+      "sha256": "53d0e92ba99704ef7b51e465ad2590dc2676ed62c13b7bfb1daaa6d21f607b66",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/episode-finishing-editor/SKILL.md",
+      "bytes": 26108,
+      "sha256": "64e13089d39f39b3eff099d0a610dd673cee37f77313514dc782d5226e797bcc",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/foundation-finishing-editor/SKILL.md",
+      "bytes": 9769,
+      "sha256": "5f28919467dd4ea25bb84eac60d42aa8d314f750e97af28ca1557d85b14866e9",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/storyboard-source-context.md",
+      "bytes": 2860,
+      "sha256": "a5daaefd50b9d944c3f2a0432339d77512272b8f33433af398c4dda70b08f700",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/lighting-space.md",
+      "bytes": 5050,
+      "sha256": "d12bd04c16d8ab0a1da5022beb9263731025927f8ea0dcb902ca0bf27f1306a3",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/camera-emotion.md",
+      "bytes": 18178,
+      "sha256": "fa2804b8bd1e3e9b52cbd172b2f7b9dc2723024265f4457de25990513c944ca9",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/sound-rhythm.md",
+      "bytes": 8389,
+      "sha256": "dd50cd16ee4430297ffdad330aa341426e65c4d6bdf09d46a7b39915a7ca41b6",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/fantasy-expression.md",
+      "bytes": 24814,
+      "sha256": "fdca3d4e23b4c61d2a485b9560042146f5c3a0587fd4f6e834cedbb1795c031f",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/acting-blocking.md",
+      "bytes": 14069,
+      "sha256": "c8f4543a559a0369766cd522946163adebac5dfe8bad78dbe39e493145d21067",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/storyboard-common.md",
+      "bytes": 13634,
+      "sha256": "02a63823900e1a0858fab86d7bc6819e6622075b969d8e4b6d385df0d487552c",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/foundation-asset-catalog/SKILL.md",
+      "bytes": 9107,
+      "sha256": "569af266afa5197f6b219d356c87b0f3a04288fd8b986a3f87a37e287c0dd87b",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/story-foundation/SKILL.md",
+      "bytes": 3402,
+      "sha256": "ff512dc45931daf82bebef6ec3b8c92c06d05cc27d4c6bd6676437718a13163d",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/screenplay-fidelity/SKILL.md",
+      "bytes": 2377,
+      "sha256": "8746ed7ee06be797c817d7f73e8e9b8f548ef0238e82ff9fd10bf9d08c027f0b",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/danger-rescue.md",
+      "bytes": 1432,
+      "sha256": "84a5ea29fdb89a11cfc8bfd0787db72bda6a43c5ca25cbcc29ee5027ab606893",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/expressive-emphasis.md",
+      "bytes": 2745,
+      "sha256": "c8b8cc18adc85ac109a01fdaac9fdbeeeab337a8d0253cbda8d920caa0a17fe5",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/camera-path-repair.md",
+      "bytes": 1982,
+      "sha256": "2c6c6c91706f04c2f311ee91df31315992cee58c7b808c4e6f1b1bd986db51de",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/status-conflict.md",
+      "bytes": 1284,
+      "sha256": "90281f3f9e6d764a7711ecd89b4c2ddb7d833aeb8bd94926e4150bdbb67d8f3f",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/joy-acceptance.md",
+      "bytes": 1383,
+      "sha256": "412e4fa0c83c61ea70ac60a131e58672eca6c406ab5a58a0de5fb44d47f8e216",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/comic-contrast.md",
+      "bytes": 1689,
+      "sha256": "462f6d3dc3cd0a055d31cf13941fb67327b762f91847927a4fff275076e90eed",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/quiet-nonhuman.md",
+      "bytes": 986,
+      "sha256": "e8d11f9819962328f4d5bfc39bfd383eb0a7cd8200a1820cbb0d453f7ac91cb3",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/scale-silence.md",
+      "bytes": 961,
+      "sha256": "20b47ff4dfe9b647ddb80e4492daf2d6be0619321c6d9f41fc371cf0ebd5c258",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/spatial-contact.md",
+      "bytes": 1374,
+      "sha256": "60bc191d84e225a13283c652c16d226d7b0b09a1467332707d4d5032ef74ef7b",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/long-voice.md",
+      "bytes": 1831,
+      "sha256": "e0812d4cbaf7a40ff4b8655c4ebf68d8842cf221b8e4c695724712cd882001bf",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/desktop-rules-at-M6.3/methods/cards/editing-integrity.md",
+      "bytes": 1966,
+      "sha256": "63a322cbde08040b5999ce38f113304389ca044e1e2214bf8e8bbe2b87ddf0b0",
+      "category": "desktop_rule_snapshot",
+      "status": "stage2_implemented_stage3_legacy_not_latest_3008",
+      "origin": "K1rsam/director-desktop-next@2c952f67b96878a90338ab5770c7d864bcf1b78f"
+    },
+    {
+      "path": "reference-archive/three-step-experiment/02_诊断并定向改稿.md",
+      "bytes": 19793,
+      "sha256": "1cf53322de4927a4de95173462c9a6171b2e463aba9f1788bc8b9bc0aead1e99",
+      "category": "three_step_experiment",
+      "status": "unaccepted_experiment_not_production",
+      "origin": "Earlier three-step standalone experiment; preserve bytes, do not activate"
+    },
+    {
+      "path": "reference-archive/three-step-experiment/01_完整创意分镜.md",
+      "bytes": 19532,
+      "sha256": "b11ff665f82a4a88309b617303f31ef4ff8a1313ffc2f4c599e19e2d04969ba4",
+      "category": "three_step_experiment",
+      "status": "unaccepted_experiment_not_production",
+      "origin": "Earlier three-step standalone experiment; preserve bytes, do not activate"
+    },
+    {
+      "path": "reference-archive/three-step-experiment/03_生产整编与独立单元.md",
+      "bytes": 24633,
+      "sha256": "1f9b34278e6b5eb864f0aa5cfba4d1472318f621c350e633fbe083410319cb61",
+      "category": "three_step_experiment",
+      "status": "unaccepted_experiment_not_production",
+      "origin": "Earlier three-step standalone experiment; preserve bytes, do not activate"
+    },
+    {
+      "path": "reference-archive/three-step-experiment/alternate-01_完整创意分镜.md",
+      "bytes": 18641,
+      "sha256": "5d0491782339af1c24e8bc63f7519c77bd4734d6ee59904f47d8f9f02df6c87c",
+      "category": "three_step_experiment_variant",
+      "status": "version_order_unverified_not_production",
+      "origin": "Recovered different-hash first-step attachment; relative chronology unverified"
+    },
+    {
+      "path": "reference-archive/proposals-5c10d31/DirectorDesktop_CLI与官方SDK双入口实施方案.md",
+      "bytes": 60763,
+      "sha256": "fd890e495e0da2fee9efc4a27da603b34b88cd80a26dca55a8eeb0b062f77747",
+      "category": "historical_proposal",
+      "status": "superseded_proposal_not_completion_proof",
+      "origin": "Read-only review against 5c10d315289862e8c452cb283e6df97616af57e5"
+    },
+    {
+      "path": "reference-archive/proposals-5c10d31/第二阶段资产生图系统提示词_修改意见.md",
+      "bytes": 21541,
+      "sha256": "f0dc7569752a91c14eeb208700250cc398a2712ce2dfbbb1a38c3a38419f4695",
+      "category": "historical_proposal",
+      "status": "superseded_proposal_not_completion_proof",
+      "origin": "Read-only review against 5c10d315289862e8c452cb283e6df97616af57e5"
+    },
+    {
+      "path": "reference-archive/proposals-5c10d31/桌面端旧修复与5c10d31逐项对照.md",
+      "bytes": 22489,
+      "sha256": "03ad2db69671c16d63cc4d0b39a16e1e66e916526ec37f71d5d98d8ba119c551",
+      "category": "historical_proposal",
+      "status": "superseded_proposal_not_completion_proof",
+      "origin": "Read-only review against 5c10d315289862e8c452cb283e6df97616af57e5"
+    },
+    {
+      "path": "reference-archive/proposals-970c36f/桌面端旧修复与970c36f逐项对照.md",
+      "bytes": 32102,
+      "sha256": "6e82760c2dca52711ebd9c99f8eb3faee9878398e111c9047d2ea28d72a9cdfc",
+      "category": "historical_proposal",
+      "status": "superseded_proposal_not_completion_proof",
+      "origin": "Updated review against 970c36f3ee22ed30df9981bb86f1cd703d709bd9"
+    },
+    {
+      "path": "reference-archive/proposals-970c36f/第二阶段资产生图系统提示词_修改意见_970c36f.md",
+      "bytes": 36143,
+      "sha256": "7d28c63e2dceb97be03afed21a4dd9fbb27107262842cdad0a2160fb193e30cd",
+      "category": "historical_proposal",
+      "status": "superseded_proposal_not_completion_proof",
+      "origin": "Updated review against 970c36f3ee22ed30df9981bb86f1cd703d709bd9"
+    }
+  ]
+}
