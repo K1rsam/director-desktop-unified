@@ -90,8 +90,17 @@ M2 分项检查点日志见 `sdk-bridge/verification/m2-*`；该历史版本的�
 - M2 对应版本的官方 SDK 桥 41 项 JS 离线回归通过；当时 Windows 实跑尚待 CI，不表示当前 Windows 状态仍未验证
 - M2 对应版本的主库、入口隔离、前端结果以随附 m2 日志为准；当时没有执行原生和 ignored live tests。后续 Windows 检查、离线回归与真实模型调用分别记证据，不重写这些历史记录
 
-## 2026-10-08 真实调用记录边界
+## 2026-10-08 至 10-09 真实调用记录边界
 
-已用合成、非私有输入发起首次 SDK 真实调用。该原 attempt 因当时将非 fatal 配置警告事件当作致命错误而记录 unknown；保留原请求、raw、事件和身份，不重发、不用新流程或另一 backend 覆盖它。后续代码仅对已观察到的配置警告格式作窄处理，真实 turn.failed/error 仍失败关闭，不能据修复追认旧 unknown 成功或零费用。
+已分别派发两个独立的合成、非私有 SDK 请求，每个 case 的预算为一次，输入、workflow、node、请求哈希和 state directory 均独立；不是对原任务重试。
 
-第二个独立新 case 尚未完成完整终态、结果与领域采用验收，不能预写通过。标准 Windows SDK 真实闭环和成稿质量仍待对应结果证明；只读就绪、离线合成通过和进程树停止分别报告。本次文档更新不发起调用或测试，不包含账户身份、用户本机路径或私有请求/响应。
+| 独立 case | SDK dispatch | 实际结果 |
+| --- | --- | --- |
+| `sdk-live-synthetic-once` | 1 | `thread.started` 后出现忽略无效配置项的非致命 `ErrorItem`，当时的桥误判 `OUT_OF_ORDER`，记录 `submission_unknown` |
+| `sdk-native-config-compatibility-02` | 1 | 出现 `skip_host_skill_discovery` 的开发中特性诊断，仍被当时按英文警告语法的桥误判 `OUT_OF_ORDER`，记录 `submission_unknown` |
+
+两个 case 均无可信最终结果或领域采用证据。原冻结请求、事件及未知收据保全，12 项原件哈希复核未变；未重试、未改写为成功，也未被新流程或另一 backend 覆盖。两次 controller 的 Windows Job 已查得本地进程树为空，但远端完成、实际模型调用次数和费用仍无法确认，不能称零调用或零费用。
+
+最新修复依据固定官方 SDK 的非致命 `ErrorItem` 合同，取消英文警告匹配：仅允许 `thread.started` 后、`turn.started` 前结构严格的 `item.completed`（合法 `id`、`type:error`、非空且不超过 4096 UTF-8 字节的 `message`，不含额外字段），保留原事件但不授予 turn、结果或采用。顶层 `error`、`turn.failed`、提前模型/工具事件、畸形事件及仅有诊断的流仍失败关闭。Windows 离线 JS 61/61、Rust SDK 定向 33/33 通过，两个 native Job 均 exit0、进程树为空；这轮回归真实请求为 0。
+
+第三个独立 case 尚未发起。现有 `34ca4d1` 候选 supervisor 冻结的是旧桥源码摘要，不能承载修复后的新桥或借旧配套资源运行；须先正常关闭候选 GUI，再构建并冻结匹配的新 supervisor 和资源。标准 Windows SDK 的真实完成、重开零额外 execute 和成稿质量仍待各自证据；离线回归不能追认前两次 unknown。本记录不包含账户身份、用户本机路径或私有请求/响应。

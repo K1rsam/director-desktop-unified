@@ -140,6 +140,19 @@ test('observed pre-turn configuration notice is durable, never model text, and s
   } finally { await restarted.disconnect(); }
 });
 
+for (const scenario of ['unstable-feature-notice', 'ordinary-error-item']) test(`${scenario} follows the official non-fatal ErrorItem contract without inspecting warning prose`, async t => {
+  const { bridge, dir, events } = await fixture(t, scenario);
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'transport_completed');
+  assert.equal(receipt.rawResult.rawText, '{"ok":true,"text":"合成测试"}');
+  const raw = events.filter(event => event.type === 'sdk_event');
+  assert.deepEqual(raw.map(event => event.rawEvent.type), ['thread.started', 'item.completed', 'turn.started', 'item.completed', 'turn.completed']);
+  assert.equal(raw[1].rawEvent.item.type, 'error');
+  assert.equal(raw[1].sequence, 2);
+  const journal = await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8');
+  assert.deepEqual(JSON.parse(journal.split('\n')[1]).rawEvent, raw[1].rawEvent);
+});
+
 for (const [scenario, expected] of [
   ['out-of-order', 'OUT_OF_ORDER'], ['early-complete', 'OUT_OF_ORDER'], ['changed-thread', 'THREAD_IDENTITY'],
   ['policy-violation', 'POLICY_VIOLATION'], ['failed-after-text', 'SDK_TURN_FAILED'],
@@ -147,6 +160,9 @@ for (const [scenario, expected] of [
   ['configuration-notice-only', 'INCOMPLETE_STREAM'], ['configuration-notice-before-thread', 'OUT_OF_ORDER'],
   ['configuration-notice-malformed', 'OUT_OF_ORDER'], ['configuration-notice-after-turn', 'POLICY_VIOLATION'],
   ['agent-before-turn', 'OUT_OF_ORDER'],
+  ['notice-missing-id', 'OUT_OF_ORDER'], ['notice-too-long', 'OUT_OF_ORDER'],
+  ['notice-extra-event-field', 'OUT_OF_ORDER'], ['tool-before-turn', 'OUT_OF_ORDER'],
+  ['fatal-error-before-turn', 'SDK_TURN_FAILED'],
 ]) test(`${scenario} fails closed, persists evidence, blocks retry/fallback and reserves unknown capacity`, async t => {
   const { bridge, dir } = await fixture(t, scenario);
   const { receipt } = await completed(bridge);

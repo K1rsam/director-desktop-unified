@@ -11858,6 +11858,52 @@ mod sdk_core_tests {
         assert_eq!(resumed.store.job(&original_run).unwrap(),parent_before);
     }
     #[tokio::test]
+    async fn sdk_core_nonfatal_preturn_diagnostics_preserve_raw_and_replay_accepted_without_dispatch() {
+        for scenario in ["unstable-feature-notice", "ordinary-error-item"] {
+            let (_temp, executor, request) = fixture(scenario);
+            let raw = executor.execute(request.clone()).await.unwrap();
+            let job = text_job(&executor);
+            assert_eq!(job["status"], "received");
+            assert!(job["receipt"].is_null(), "a diagnostic never grants domain acceptance");
+            assert_eq!(raw, json!({"ok":true,"text":"合成测试"}));
+            let events_path = executor.store.root.join("sdk-worker").join(s(&job, "id")).join("events.ndjson");
+            let before = std::fs::read(&events_path).unwrap();
+            let events: Vec<Value> = std::str::from_utf8(&before).unwrap().lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(events.len(), 5);
+            assert_eq!(events[0]["rawEvent"]["type"], "thread.started");
+            assert_eq!(events[1]["rawEvent"]["type"], "item.completed");
+            assert_eq!(events[1]["rawEvent"]["item"]["type"], "error");
+            assert!(!events[1]["rawEvent"]["item"]["message"].as_str().unwrap().is_empty());
+            assert_eq!(events[2]["rawEvent"]["type"], "turn.started");
+            assert_eq!(events[4]["rawEvent"]["type"], "turn.completed");
+            executor.accept(&request, &raw).await.unwrap();
+            let resumed = restart(&executor);
+            assert_eq!(resumed.execute(request.clone()).await.unwrap(), raw);
+            assert_eq!(calls(&resumed), 1, "a retained diagnostic never triggers another dispatch");
+            assert_eq!(std::fs::read(&events_path).unwrap(), before);
+        }
+    }
+    #[tokio::test]
+    async fn sdk_core_diagnostic_without_turn_preserves_unknown_and_blocks_restart_dispatch() {
+        let (_temp, executor, request) = fixture("configuration-notice-only");
+        assert!(executor.execute(request.clone()).await.is_err());
+        let job = text_job(&executor);
+        assert_eq!(job["status"], "submission_unknown");
+        assert!(job["result"].is_null());
+        let events_path = executor.store.root.join("sdk-worker").join(s(&job, "id")).join("events.ndjson");
+        let before = std::fs::read(&events_path).unwrap();
+        let events: Vec<Value> = std::str::from_utf8(&before).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["rawEvent"]["item"]["type"], "error");
+        let resumed = restart(&executor);
+        assert!(resumed.execute(request).await.is_err());
+        assert_eq!(text_job(&resumed)["status"], "submission_unknown");
+        assert_eq!(calls(&resumed), 1, "a nonfatal item is not a completed turn or permission to retry");
+        assert_eq!(std::fs::read(&events_path).unwrap(), before);
+    }
+    #[tokio::test]
     async fn sdk_core_official_package_raw_domain_accept_restart_exact_cache_zero_extra_execute() {
         let (_temp, executor, request) = fixture("happy");
         let raw = executor.execute(request.clone()).await.unwrap();

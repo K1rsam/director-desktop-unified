@@ -82,7 +82,7 @@ F2 2.0.1：11,227 bytes，SHA256 `4f7730877b5ffa6a664b655a81a7a5b40b0f13c396eebf
 | 旧 Dreamina CLI | 保留有效生成链、匿名账户识别、官方重新授权、会话修订和排队保护 | 不与 Canvas 账户、可用性或生成能力串用；本轮未真实重新登录或付费生成 |
 | Canvas OAuth | 保留 Mac OAuth 与账户卡、独立 readiness | Mac 最近实际检查仍 `oauth_scope_insufficient`；本轮不宣称 scope 或生图桥已解决 |
 | Codex CLI | 保留 Mac 10 秒版本/帮助冷启动预算及 Windows 额度、原 turn 恢复 | 冷检查预算不改变生成 deadline；未知结果与原回包不能自动重试覆盖 |
-| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1；标准 Windows GUI 可显式选择并核验运行器、Node、模型、推理强度及账户身份 | 离线/健康检查保持关闭；真实调用需要冻结执行身份，未知提交不自动重发。首个真实合成请求状态未知，不能称已验收 |
+| 官方 SDK | 固定 `@openai/codex-sdk` 0.160.1；标准 Windows GUI 可显式选择并核验运行器、Node、模型、推理强度及账户身份 | 离线/健康检查保持关闭；真实调用需要冻结执行身份，未知提交不自动重发。两个独立真实合成请求均为未知，不能称已验收 |
 | Windows SDK 路径 | 校验仍使用规范路径，Node argv 将 verbatim DOS/UNC 转为等价普通路径；`--import` 使用 file URL | 设备命名空间、相对路径和 `..` 拒绝；含中文、空格、`#`、`%` 路径有独立原生 Node 回归 |
 | Windows SDK 环境 | Node worker 清空继承环境；经审计的 native wrapper 单独启动官方 Codex runtime，使用已核验的既有 credentialHome | 不复制登录凭据，不混用 worker 环境与官方 runtime 登录路径；运行器、桥接、资源、模型、账户指纹绑定在冻结请求中。健康检查保持零生成 |
 | 新程序更新 | 独立同名 EXE 的 current/previous、按 EXE SHA256 配对资源、持锁发布、在用拒绝、原子替换 | BuildOnly 不发布；资源不与另一个版本错配；旧应用原 EXE 路径不替换 |
@@ -126,7 +126,11 @@ native runner 由 MSIX 外的真实 Windows 进程执行，并记录 `unpackaged
 
 同时发现跨行 `【情报…价值:一星】` 界面板的字段被错误标成现场对白。source parser v7 只识别完整界面区间，保留原文、UTF-16 坐标和精确覆盖；畸形或未闭合区间不能吞对白。既有 v1–v6 来源身份不静默重写，只有投影实际变化的新解析采用 v7。
 
-SDK 第一次真实合成请求产生 1 次 dispatch，确认模型调用次数未知。官方运行器的非致命配置警告出现在 turn.started 前，旧桥接误判 OUT_OF_ORDER。原事件和 `submission_unknown` 收据已保全，未重试。修复只接受已观察到的配置警告语法，不将其当成生成结果；桥接仍拒绝过早的模型内容、工具调用、畸形事件和没有完成事件的输出。第二次使用独立新 case 验证，结果另录。
+源码 `34ca4d1` 的候选经 GUI 新建另一项目复验：同一十集原文在 2026-10-08 15:58:11–16:05:25 UTC 一键完成 F2/Q1，约 7 分 14 秒，得到 65 个形象和 1 份制作基础，无人工补写。只读 source-v7 审核 30 项通过：原文 exact、10 集/23 场、第 0 背景独立，三处界面价值字段不再是对白，三条真实系统 VO 保留。本机程序路径自动继承，冻结请求仍为明确的 CLI/model/reasoning。资产内容质量另审，数量不作为质量通过证明。
+
+SDK 已派发两个独立真实合成 case，各 1 次 dispatch。第一次在 `turn.started` 前收到忽略无效配置项的非致命诊断，第二次收到 `skip_host_skill_discovery` 的开发中特性诊断，当时的桥均误判 `OUT_OF_ORDER` 并保留 `submission_unknown`。两个 case 的冻结请求、原事件和未知收据已保全，12 项原件哈希复核未变；没有重试或最终结果/领域采用证明。本地 controller 的 Job 进程树已回收，但确认模型调用次数、远端完成和费用仍未知。
+
+最新修复按官方 SDK 非致命 `ErrorItem` 的结构合同校验，不再匹配英文警告：仅接受 thread 已建立而 turn 未开始时结构严格的 `item.completed`/`type:error`，校验事件与 item 字段、合法 id、非空且最多 4096 UTF-8 字节的 message；原事件照存，不当成 turn、生成结果或采用。真正的顶层 error/turn.failed、提前模型或工具事件、畸形事件及只有诊断的流仍拒绝。针对该修复的 Windows JS 61/61、Rust SDK 33/33 通过，native Job 均 exit0、进程树为空；该回归没有真实调用。第三个独立 case 尚未发起，需先构建桥摘要与 supervisor 一致的新候选，不修改正在运行的 `34ca4d1` 候选配套资源。详见 [SDK_CORE_INTEGRATION.md](../SDK_CORE_INTEGRATION.md)。
 
 第三阶段新增有界来源坐标提示，给情绪、主创、整编和精修共同定位镜头时长问题，去掉要求单元凑满 13–15 秒的适配偏好；22 份 3008 原规则不变。程序不将真实长镜头数字强行截成 5 秒，实际十集成稿仍须审查。
 

@@ -15,20 +15,17 @@ export class BridgeError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
 function requireThat(value, code, message) { if (!value) throw new BridgeError(code, message); }
-// Codex 0.162 emits these SDK ErrorItem diagnostics after thread.started but
-// before a model turn. They are neither agent text nor a fatal stream error.
-// Accept only the observed configuration-warning grammar; preserve the raw
-// event, without granting a turn, final text, tool permission or completion.
-function preTurnConfigurationNotice(event) {
+// The pinned official SDK defines ErrorItem as a non-fatal diagnostic, distinct
+// from a fatal top-level error. Runtime startup can emit it before turn.started.
+// Validate the event contract, not the human-readable message. It grants no
+// turn, final text, tool permission or completion; the raw event stays durable.
+function preTurnDiagnostic(event) {
   const item = event.item;
   if (event.type !== 'item.completed' || !object(item) || item.type !== 'error'
     || !validId(item.id) || typeof item.message !== 'string'
-    || Object.keys(item).sort().join(',') !== 'id,message,type') return false;
-  const match = /^Codex is ignoring ([1-9]\d{0,2}) unrecognized configuration settings?\. Check for typos or deprecated settings\.\n([\s\S]+)$/.exec(item.message);
-  if (!match || Number(match[1]) > 64) return false;
-  const lines = match[2].replace(/\n$/, '').split('\n');
-  return lines.length === Number(match[1])
-    && lines.every(line => /^  session-flags: `[A-Za-z][A-Za-z0-9_.-]{0,127}` is ignored\.$/.test(line));
+    || !item.message.length || Buffer.byteLength(item.message) > 4096) return false;
+  return Object.keys(event).sort().join(',') === 'item,type'
+    && Object.keys(item).sort().join(',') === 'id,message,type';
 }
 function receiptPayload(value) { const { receiptEnvelopeSha256, ...payload } = value; return payload; }
 async function atomicJson(file, value) {
@@ -268,7 +265,7 @@ export class OfficialSdkBridge {
           active.threadStarted = true; record.state = active.canceled ? 'cancel_requested' : 'running';
         } else if (event.type === 'turn.started') {
           requireThat(active.threadStarted && !active.turnStarted, 'OUT_OF_ORDER', 'Turn started without exactly one thread'); active.turnStarted = true;
-        } else if (active.threadStarted && !active.turnStarted && preTurnConfigurationNotice(event)) {
+        } else if (active.threadStarted && !active.turnStarted && preTurnDiagnostic(event)) {
           // The notice is already durably recorded. A real turn and final
           // agent_message are still mandatory before transport completion.
         } else if (['item.started', 'item.updated', 'item.completed'].includes(event.type)) {
