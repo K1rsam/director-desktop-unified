@@ -1944,6 +1944,18 @@ fn restore_delivery_refs(value: &mut Value, input: &Value) -> Result<(), String>
     Ok(())
 }
 
+/// Acceptance may expand frozen source coordinates and materialize direction
+/// quotes. Permit exactly that original normalization, never arbitrary raw /
+/// domain differences or references outside the frozen request.
+pub(crate) fn accepted_scope_reason_raw_matches(
+    input: &Value,
+    raw: &Value,
+    accepted: &Value,
+) -> bool {
+    let mut normalized = raw.clone();
+    restore_delivery_refs(&mut normalized, input).is_ok() && normalized == *accepted
+}
+
 /// Narrow migration for a *saved* rejected F2. Group IDs may be expanded only
 /// into complete, contiguous, currently provided rows of one episode/scene.
 /// Never round a substring, fill a gap, borrow unprovided history, or guess text.
@@ -2510,6 +2522,21 @@ fn scope_value(
     })
 }
 
+// Scope reasons describe where/how an appearance may be used. They are not
+// visual SOURCE facts. Keep the earlier wording first, then exact new lines;
+// never paraphrase, infer an omitted reason, or repeat a previously saved line.
+fn merge_scope_reasons(previous: Option<&str>, supplied: Option<&str>) -> Option<String> {
+    let mut lines = Vec::new();
+    for reason in [previous, supplied].into_iter().flatten() {
+        for line in reason.lines().filter(|line| !line.trim().is_empty()) {
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn scope_for_patch(
     raw: Option<&WireScope>,
     places: Vec<Applicability>,
@@ -2871,6 +2898,8 @@ fn build_asset(
         if scope.kind == "GLOBAL" {
             base.scope = scope;
         } else {
+            base.scope.reason =
+                merge_scope_reasons(base.scope.reason.as_deref(), scope.reason.as_deref());
             for p in scope.scenes {
                 if !base.scope.scenes.contains(&p) {
                     base.scope.scenes.push(p);
@@ -3051,6 +3080,10 @@ fn build_asset(
                 if current.kind == "GLOBAL" {
                     variant.scope = current;
                 } else {
+                    variant.scope.reason = merge_scope_reasons(
+                        variant.scope.reason.as_deref(),
+                        current.reason.as_deref(),
+                    );
                     for p in current.scenes {
                         if !variant.scope.scenes.contains(&p) {
                             variant.scope.scenes.push(p);
@@ -3349,6 +3382,15 @@ fn apply_catalogue(
             for v in asset.variants {
                 if let Some(prior) = target.variants.iter_mut().find(|p| p.id == v.id) {
                     prior.metadata = v.metadata;
+                    // The shared identity merge unions scene coordinates, but
+                    // does not merge their usage explanations. Preserve the
+                    // accepted reason here for both new and existing variants.
+                    if prior.scope.kind != "GLOBAL" && v.scope.kind != "GLOBAL" {
+                        prior.scope.reason = merge_scope_reasons(
+                            prior.scope.reason.as_deref(),
+                            v.scope.reason.as_deref(),
+                        );
+                    }
                     // build_asset already retains uses outside this batch (and
                     // earlier fragments). Do not union stale in-batch base uses
                     // back in after the model explicitly supplied its scope.
@@ -3991,6 +4033,7 @@ fn automatic_receipts(
     batch: &Batch,
     prior: &FoundationProposal,
     input: &Value,
+    frozen_receipt_times: Option<&HashMap<String, String>>,
 ) -> Result<Vec<Value>, String> {
     let offered = input["automaticDecisions"]
         .as_array()
@@ -4157,7 +4200,17 @@ fn automatic_receipts(
         record["authority"] = json!("MODEL_PRODUCTION_INTERPRETATION");
         record["receipts"] = json!(receipts);
         record["appliedNote"] = json!(note);
-        record["appliedAt"] = json!(crate::store::now());
+        record["appliedAt"] = if let Some(times) = frozen_receipt_times {
+            let id = contract["id"]
+                .as_str()
+                .ok_or("理由再投影自动解释缺原回执ID")?;
+            json!(times
+                .get(id)
+                .filter(|time| !time.trim().is_empty())
+                .ok_or("理由再投影缺原自动解释采用时间，不制造新历史回执")?)
+        } else {
+            json!(crate::store::now())
+        };
         records.push(record);
     }
     if records.len() != expected.len() {
@@ -4249,11 +4302,23 @@ fn apply_optimization(
     prior: &FoundationProposal,
     confirmed: Option<&str>,
 ) -> Result<(FoundationProposal, Vec<Value>), String> {
+    apply_optimization_with_receipt_times(value, source, batch, input, prior, confirmed, None)
+}
+
+fn apply_optimization_with_receipt_times(
+    value: &Value,
+    source: &LockedSource,
+    batch: &Batch,
+    input: &Value,
+    prior: &FoundationProposal,
+    confirmed: Option<&str>,
+    frozen_receipt_times: Option<&HashMap<String, String>>,
+) -> Result<(FoundationProposal, Vec<Value>), String> {
     let applying =
         input.pointer("/delivery/phase").and_then(Value::as_str) == Some("APPLY_DECISION");
     let automatic = input["foundationDecisionPolicy"] == AUTO_INTERPRET_POLICY;
     let auto_records = if automatic {
-        automatic_receipts(value, source, batch, prior, input)?
+        automatic_receipts(value, source, batch, prior, input, frozen_receipt_times)?
     } else {
         vec![]
     };
@@ -4949,17 +5014,10 @@ pub(crate) async fn run_foundation_choice_application(
     Ok((foundation, applied))
 }
 
-/// No F1 model call: the trusted source contract and explicit decisions already
-/// establish source fidelity. F2 is packed across episodes; Q1 edits differences.
-pub async fn run_foundation_delivery(
+fn delivery_basis(
     source: &LockedSource,
     context: &Value,
-    executor: &dyn TextExecutor,
-    model: &str,
-    reasoning: &str,
-) -> Result<FoundationProposal, String> {
-    let source = upgrade_source_dialogues(source)?;
-    validate_source(&source)?;
+) -> Result<(Vec<String>, FoundationProposal, HashSet<(String, String)>), String> {
     if context
         .pointer("/selection/episodeIds")
         .is_some_and(|value| !value.is_array())
@@ -5003,7 +5061,7 @@ pub async fn run_foundation_delivery(
     }) {
         return Err("所选来源仍有集场/对白待确认；程序保真不能猜测".into());
     }
-    let mut foundation = existing_foundation(&source, context)?;
+    let mut foundation = existing_foundation(source, context)?;
     let resolved: HashSet<_> = foundation
         .assets
         .iter()
@@ -5014,13 +5072,6 @@ pub async fn run_foundation_delivery(
                 .map(|v| (a.id.clone(), v.id.clone()))
         })
         .collect();
-    let confirmed = context
-        .pointer("/settings/confirmedDirection")
-        .and_then(|v| {
-            v.as_str()
-                .or_else(|| v.get("content").and_then(Value::as_str))
-        })
-        .filter(|s| !s.trim().is_empty());
     foundation
         .episodes
         .retain(|e| !selected.contains(&e.episode_id));
@@ -5061,6 +5112,383 @@ pub async fn run_foundation_delivery(
             source_refs: vec![row.id.clone()],
         });
     }
+    Ok((selected, foundation, resolved))
+}
+
+/// One accepted DOMAIN result and its original frozen DOMAIN input. The caller
+/// must bind these to completed workflow/text-job/raw/receipt/request and frozen
+/// rule hashes before calling this pure projector. A raw transport response is
+/// not an accepted domain result, and this function never invokes an executor.
+pub(crate) struct AcceptedFoundationReasonStep<'a> {
+    pub stage: &'a str,
+    pub input: &'a Value,
+    pub result: &'a Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FoundationReasonProjection {
+    pub foundation: FoundationProposal,
+    pub restored_variant_ids: Vec<String>,
+    pub projected_source: LockedSource,
+}
+
+#[cfg(test)]
+pub(crate) fn reason_projection_test_fixture() -> (
+    LockedSource,
+    Value,
+    FoundationProposal,
+    Vec<(String, Value, Value)>,
+) {
+    let (source, context, current, f2_input, f2_raw, q1_input, q1_raw) =
+        tests::scope_reasons_saved_chain();
+    (
+        source,
+        context,
+        current,
+        vec![
+            ("foundation:F2".into(), f2_input, f2_raw),
+            ("foundation:Q1".into(), q1_input, q1_raw),
+        ],
+    )
+}
+
+fn reason_replay_batch(
+    source: &LockedSource,
+    selected: &[String],
+    stage: &str,
+    index: usize,
+    input: &Value,
+) -> Result<Batch, String> {
+    let scope: Vec<String> =
+        serde_json::from_value(input["scope"].clone()).map_err(|_| "理由再投影缺原冻结集范围")?;
+    let ordered: Vec<_> = source
+        .episodes
+        .iter()
+        .filter(|episode| scope.contains(&episode.id))
+        .map(|episode| episode.id.clone())
+        .collect();
+    if scope.is_empty()
+        || scope != ordered
+        || scope.iter().any(|episode| !selected.contains(episode))
+        || input["method"] != METHOD_VERSION
+        || input["sourceSha256"] != source.sha256
+        || input.pointer("/delivery/method").and_then(Value::as_str) != Some(METHOD_VERSION)
+        || input.pointer("/delivery/stage").and_then(Value::as_str) != Some(stage)
+        || input["batchIndex"].as_u64() != Some(index as u64)
+        || input
+            .pointer("/delivery/batchIndex")
+            .and_then(Value::as_u64)
+            != Some(index as u64)
+        || input.pointer("/delivery/scope") != Some(&input["scope"])
+        || input.pointer("/source/columns")
+            != Some(&json!([
+                "rowId",
+                "line",
+                "episodeId",
+                "sceneId",
+                "kind",
+                "speaker",
+                "channel",
+                "start",
+                "end",
+                "text"
+            ]))
+        || input
+            .pointer("/source/coordinateSystem")
+            .and_then(Value::as_str)
+            != Some("UTF-16 half-open")
+        || input.pointer("/delivery/phase").and_then(Value::as_str)
+            != Some(if stage == "F2" { "GENERATE_F2" } else { "EDIT" })
+    {
+        return Err("理由再投影冻结来源、阶段或批次身份不一致".into());
+    }
+    let rows = input
+        .pointer("/source/rows")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or("理由再投影缺原冻结来源行")?;
+    let mut pieces = Vec::new();
+    let mut last_position = None;
+    for value in rows {
+        let fields = value
+            .as_array()
+            .filter(|fields| fields.len() == 10)
+            .ok_or("理由再投影来源行坐标结构无效")?;
+        let (position, row) = source
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| fields[0].as_str() == Some(row.id.as_str()))
+            .ok_or("理由再投影引用未知原行")?;
+        let start = fields[7]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("理由再投影行起点无效")?;
+        let end = fields[8]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("理由再投影行终点无效")?;
+        if last_position.is_some_and(|last| position <= last)
+            || row
+                .episode_id
+                .as_ref()
+                .is_none_or(|episode| !scope.contains(episode))
+            || start < row.range.start
+            || end > row.range.end
+            || start >= end
+            || fields[..7]
+                != json!([
+                    row.id,
+                    row.number,
+                    row.episode_id,
+                    row.scene_id,
+                    row.kind,
+                    row.dialogue.as_ref().map(|dialogue| &dialogue.speaker),
+                    row.dialogue.as_ref().map(|dialogue| &dialogue.channel)
+                ])
+                .as_array()
+                .unwrap()[..]
+        {
+            return Err("理由再投影原行身份、集场、顺序或区间不一致".into());
+        }
+        let text = slice_utf16(&source.text, &SourceRange { start, end })?;
+        if fields[9].as_str() != Some(text.as_str()) {
+            return Err("理由再投影原冻结区间文本不一致".into());
+        }
+        pieces.push(Piece {
+            row_id: row.id.clone(),
+            start,
+            end,
+            text,
+        });
+        last_position = Some(position);
+    }
+    let fragment = input
+        .pointer("/delivery/fragment")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let batch = Batch {
+        scope,
+        pieces,
+        fragment,
+    };
+    if input["batch"].as_str() != Some(batch.key().as_str()) {
+        return Err("理由再投影冻结批次摘要不一致".into());
+    }
+    if let Some(fragment) = &batch.fragment {
+        let episode = fragment["episodeId"]
+            .as_str()
+            .ok_or("理由再投影长集片段无效")?;
+        let start = fragment["start"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("理由再投影片段起点无效")?;
+        let end = fragment["end"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("理由再投影片段终点无效")?;
+        let all = whole_rows(source, &batch.scope);
+        if batch.scope != vec![episode.to_owned()]
+            || fragment["sourceSha256"] != source.sha256
+            || fragment["index"].as_u64().is_none()
+            || fragment["count"]
+                .as_u64()
+                .is_none_or(|count| fragment["index"].as_u64().unwrap() >= count)
+            || start >= end
+            || end > all.iter().map(|piece| units(&piece.text)).sum::<usize>()
+        {
+            return Err("理由再投影片段身份或范围无效".into());
+        }
+        let mut cursor = 0;
+        let mut expected = Vec::new();
+        for piece in all {
+            let limit = cursor + units(&piece.text);
+            let a = start.max(cursor);
+            let b = end.min(limit);
+            if b > a {
+                expected.push(json!([
+                    piece.row_id,
+                    piece.start + a - cursor,
+                    piece.start + b - cursor
+                ]));
+            }
+            cursor = limit;
+        }
+        if expected
+            != batch
+                .pieces
+                .iter()
+                .map(|p| json!([p.row_id, p.start, p.end]))
+                .collect::<Vec<_>>()
+        {
+            return Err("理由再投影片段未精确包含原冻结区间".into());
+        }
+    } else if batch
+        .pieces
+        .iter()
+        .map(|p| json!([p.row_id, p.start, p.end]))
+        .collect::<Vec<_>>()
+        != whole_rows(source, &batch.scope)
+            .iter()
+            .map(|p| json!([p.row_id, p.start, p.end]))
+            .collect::<Vec<_>>()
+    {
+        return Err("理由再投影完整批次遗漏原行".into());
+    }
+    let ids = batch.row_ids();
+    let scenes = source
+        .scenes
+        .iter()
+        .filter(|scene| scene.row_ids.iter().any(|id| ids.contains(id.as_str())))
+        .map(|scene| json!([scene.episode_id, scene.id, scene.title]))
+        .collect::<Vec<_>>();
+    if input["scenes"] != json!(scenes) {
+        return Err("理由再投影原冻结集场身份不一致".into());
+    }
+    Ok(batch)
+}
+
+fn catalogue_without_scope_reasons(foundation: &FoundationProposal) -> Value {
+    let mut assets = json!(foundation.assets);
+    for asset in assets.as_array_mut().unwrap() {
+        for variant in asset["variants"].as_array_mut().unwrap() {
+            variant["scope"]["reason"] = Value::Null;
+        }
+    }
+    assets
+}
+
+/// Prepare a reason-only projection for a NEW workflow. No database, snapshot,
+/// historic result or source is mutated. Missing/ambiguous evidence and any
+/// catalogue change apart from reasons fail closed; callers retain `current`.
+pub(crate) fn project_missing_scope_reasons(
+    source: &LockedSource,
+    original_workflow_input: &Value,
+    current: &FoundationProposal,
+    steps: &[AcceptedFoundationReasonStep<'_>],
+) -> Result<FoundationReasonProjection, String> {
+    let source = upgrade_source_dialogues(source)?;
+    validate_source(&source)?;
+    if current.source_sha256 != source.sha256 || steps.is_empty() {
+        return Err("理由再投影缺同源已验收目录或原步骤".into());
+    }
+    let (selected, mut replayed, resolved) = delivery_basis(&source, original_workflow_input)?;
+    // Scope projection must not mint a new history timestamp. All other receipt
+    // fields are recalculated from the original accepted result and still take
+    // part in the exact catalogue comparison below.
+    let receipt_times: HashMap<String, String> = prior_auto_records(current)
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record["id"].as_str()?.to_owned(),
+                record["appliedAt"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let confirmed = original_workflow_input
+        .pointer("/settings/confirmedDirection")
+        .and_then(|v| {
+            v.as_str()
+                .or_else(|| v.get("content").and_then(Value::as_str))
+        })
+        .filter(|s| !s.trim().is_empty());
+    let mut f2_batches = Vec::new();
+    let mut q1_batches = Vec::new();
+    for step in steps {
+        let mut result = step.result.clone();
+        restore_delivery_refs(&mut result, step.input)?;
+        match step.stage {
+            "foundation:F2" if q1_batches.is_empty() => {
+                let batch =
+                    reason_replay_batch(&source, &selected, "F2", f2_batches.len(), step.input)?;
+                replayed = apply_catalogue(
+                    &result, &source, &batch, step.input, &replayed, confirmed, &resolved,
+                )?;
+                f2_batches.push(batch);
+            }
+            "foundation:Q1" if !f2_batches.is_empty() => {
+                verify_coverage(&source, &selected, &f2_batches)?;
+                let projected = source_projection(&source, &replayed.issues, &selected)?;
+                let batch =
+                    reason_replay_batch(&projected, &selected, "Q1", q1_batches.len(), step.input)?;
+                (replayed, _) = apply_optimization_with_receipt_times(
+                    &result,
+                    &projected,
+                    &batch,
+                    step.input,
+                    &replayed,
+                    confirmed,
+                    Some(&receipt_times),
+                )?;
+                q1_batches.push(batch);
+            }
+            _ => return Err("理由再投影只支持完整有序的已接受 F2→Q1 目录步骤".into()),
+        }
+    }
+    if f2_batches.is_empty() || q1_batches.is_empty() {
+        return Err("理由再投影缺完整已接受 F2／Q1 链".into());
+    }
+    verify_coverage(&source, &selected, &f2_batches)?;
+    verify_coverage(&source, &selected, &q1_batches)?;
+    let projected_source = source_projection(&source, &replayed.issues, &selected)?;
+    materialize_foundation(&projected_source, &mut replayed)?;
+    validate_foundation(&projected_source, &replayed)?;
+    if catalogue_without_scope_reasons(current) != catalogue_without_scope_reasons(&replayed) {
+        return Err("当前目录与原已接受链不再精确一致；不自动恢复或覆盖人工修改".into());
+    }
+    let mut foundation = current.clone();
+    let mut restored_variant_ids = Vec::new();
+    for asset in &mut foundation.assets {
+        let original = replayed.assets.iter().find(|a| a.id == asset.id).unwrap();
+        for variant in &mut asset.variants {
+            let original = original
+                .variants
+                .iter()
+                .find(|v| v.id == variant.id)
+                .unwrap();
+            if variant.scope.kind == "SCENES"
+                && variant
+                    .scope
+                    .reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+                && original
+                    .scope
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty())
+            {
+                variant.scope.reason = original.scope.reason.clone();
+                restored_variant_ids.push(variant.id.clone());
+            }
+        }
+    }
+    Ok(FoundationReasonProjection {
+        foundation,
+        restored_variant_ids,
+        projected_source,
+    })
+}
+
+/// No F1 model call: the trusted source contract and explicit decisions already
+/// establish source fidelity. F2 is packed across episodes; Q1 edits differences.
+pub async fn run_foundation_delivery(
+    source: &LockedSource,
+    context: &Value,
+    executor: &dyn TextExecutor,
+    model: &str,
+    reasoning: &str,
+) -> Result<FoundationProposal, String> {
+    let source = upgrade_source_dialogues(source)?;
+    validate_source(&source)?;
+    let (selected, mut foundation, resolved) = delivery_basis(&source, context)?;
+    let confirmed = context
+        .pointer("/settings/confirmedDirection")
+        .and_then(|v| {
+            v.as_str()
+                .or_else(|| v.get("content").and_then(Value::as_str))
+        })
+        .filter(|s| !s.trim().is_empty());
     let mut pending = plan_batches(&source, &selected)?;
     let mut accepted_batches = vec![];
     let mut call_index = 0;
@@ -5548,6 +5976,503 @@ mod tests {
     fn empty_edit(source: &LockedSource, batch: &Batch) -> Value {
         json!({"format":"ASSET_OPTIMIZATION_DESKTOP_V2","sourceSha256":source.sha256,"coverage":batch.scope,"changes":{}})
     }
+
+    #[test]
+    fn scope_reasons_raw_matches_only_original_frozen_ref_and_quote_normalization() {
+        let source = source(1);
+        let selected = source
+            .episodes
+            .iter()
+            .map(|episode| episode.id.clone())
+            .collect::<Vec<_>>();
+        let batch = plan_batches(&source, &selected).unwrap().remove(0);
+        let input = input_for(
+            "Q1",
+            &source,
+            &batch,
+            &empty_foundation(&source),
+            &json!({}),
+            0,
+            1,
+            true,
+            &[],
+        );
+        let row = source.rows.iter().find(|row| row.kind == "body").unwrap();
+        let prefix = format!("row:{}:", &source.sha256[..12]);
+        let short = format!("r:{}", row.id.strip_prefix(&prefix).unwrap());
+        let raw = json!({"sourceRefs":[short],"seriesDirection":{"signals":[{
+            "rowId":short,"episodeId":row.episode_id,"reading":"只读取冻结原行"
+        }]}});
+        let mut accepted = raw.clone();
+        accepted["sourceRefs"] = json!([row.id]);
+        accepted["seriesDirection"]["signals"][0]["rowId"] = json!(row.id);
+        accepted["seriesDirection"]["signals"][0]["quote"] =
+            json!(row.text.trim_end_matches(['\r', '\n']));
+        assert!(accepted_scope_reason_raw_matches(&input, &raw, &accepted));
+        let frozen = raw.clone();
+        let mut extra = raw.clone();
+        extra["transportOnly"] = json!("不能删除额外内容以伪称一致");
+        assert!(!accepted_scope_reason_raw_matches(
+            &input, &extra, &accepted
+        ));
+        let mut outside = raw.clone();
+        outside["sourceRefs"] = json!(["r:999999:1000000"]);
+        let mut outside_accepted = accepted.clone();
+        outside_accepted["sourceRefs"] = json!([format!("{prefix}999999:1000000")]);
+        assert!(!accepted_scope_reason_raw_matches(
+            &input,
+            &outside,
+            &outside_accepted
+        ));
+        let mut changed_quote = accepted.clone();
+        changed_quote["seriesDirection"]["signals"][0]["quote"] = json!("篡改锁定原句");
+        assert!(!accepted_scope_reason_raw_matches(
+            &input,
+            &raw,
+            &changed_quote
+        ));
+        assert_eq!(raw, frozen);
+    }
+
+    fn scope_reasons_fixture() -> (LockedSource, Value, Batch, FoundationProposal, Value, Value) {
+        let source = prepare_source(
+            "第1集\n场景：客厅\n刘富贵（电话声）：先打个电话。\n△苏阳接听电话。\n第2集\n场景：木船\n△木船返航，水泵和相连水管随船运载。\n",
+        ).unwrap();
+        let scope = source
+            .episodes
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>();
+        let context = json!({"selection":{"episodeIds":scope}});
+        let (_, basis, _) = delivery_basis(&source, &context).unwrap();
+        let batch = plan_batches(&source, &scope).unwrap().remove(0);
+        let input = input_for("F2", &source, &batch, &basis, &context, 0, 1, false, &[]);
+        let phone = &source.scenes[0];
+        let returning = &source.scenes[1];
+        let mut raw = empty_catalogue(&source, &batch);
+        raw["assets"] = json!([
+            {"name":"刘富贵｜默认","type":"CH","description":"剧本登记的刘富贵。",
+             "episodes":[phone.episode_id],"sceneRefs":[[phone.episode_id,phone.id]],
+             "scope":{"kind":"SCENES","reason":"电话声音，不计实体入镜。"},
+             "preparation":{"mode":"REFERENCE"}},
+            {"name":"水泵与相连水管","type":"PROP","description":"水泵及相连水管。",
+             "episodes":[returning.episode_id],"sceneRefs":[[returning.episode_id,returning.id]],
+             "scope":{"kind":"SCENES","reason":"返航运载配套。\n不新增抽水行为。"},
+             "preparation":{"mode":"REFERENCE"},
+             "variants":[{"name":"返航运输状态","episodes":[returning.episode_id],
+                "sceneRefs":[[returning.episode_id,returning.id]],
+                "scope":{"kind":"SCENES","reason":"返航运输状态。\n不新增抽水行为。"},
+                "note":"保持相连器具的运输状态。","preparation":{"mode":"DERIVE"}}]}
+        ]);
+        (source, context, batch, basis, input, raw)
+    }
+
+    #[test]
+    fn scope_reasons_f2_keeps_voice_only_and_returning_pump_without_visual_facts() {
+        let (source, _, batch, basis, input, raw) = scope_reasons_fixture();
+        let frozen = raw.clone();
+        let next =
+            apply_catalogue(&raw, &source, &batch, &input, &basis, None, &HashSet::new()).unwrap();
+        assert_eq!(
+            next.assets[0].variants[0].scope.reason.as_deref(),
+            Some("电话声音，不计实体入镜。")
+        );
+        assert_eq!(
+            next.assets[1].variants[0].scope.reason.as_deref(),
+            Some("返航运载配套。\n不新增抽水行为。")
+        );
+        assert_eq!(
+            next.assets[1].variants[1].scope.reason.as_deref(),
+            Some("返航运输状态。\n不新增抽水行为。")
+        );
+        assert_eq!(
+            next.assets[1].variants[1].source_variant_id.as_deref(),
+            Some(next.assets[1].variants[0].id.as_str())
+        );
+        assert_eq!(next.assets[1].description, "水泵及相连水管。");
+        assert!(next.facts.is_empty());
+        let flat = flatten_foundation_assets(&next);
+        assert_eq!(
+            flat[0]["scope"]["reason"],
+            raw["assets"][0]["scope"]["reason"]
+        );
+        assert_eq!(raw, frozen, "the accepted original reply remains literal");
+    }
+
+    #[test]
+    fn scope_reasons_f2_existing_base_and_child_merge_in_order_without_duplicates() {
+        let (source, context, batch, basis, input, raw) = scope_reasons_fixture();
+        let prior =
+            apply_catalogue(&raw, &source, &batch, &input, &basis, None, &HashSet::new()).unwrap();
+        let input = input_for("F2", &source, &batch, &prior, &context, 0, 1, false, &[]);
+        let mut update = raw.clone();
+        update["assets"].as_array_mut().unwrap().remove(0);
+        update["assets"][0]["key"] = json!(prior.assets[1].id);
+        update["assets"][0]["scope"]["reason"] =
+            json!("不新增抽水行为。\n仅甲板运载。\n仅甲板运载。");
+        update["assets"][0]["variants"][0]["key"] = json!(prior.assets[1].variants[1].id);
+        update["assets"][0]["variants"][0]["scope"]["reason"] =
+            json!("不新增抽水行为。\n仅甲板运载。");
+        let next = apply_catalogue(
+            &update,
+            &source,
+            &batch,
+            &input,
+            &prior,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            next.assets[1].variants[0].scope.reason.as_deref(),
+            Some("返航运载配套。\n不新增抽水行为。\n仅甲板运载。")
+        );
+        assert_eq!(
+            next.assets[1].variants[1].scope.reason.as_deref(),
+            Some("返航运输状态。\n不新增抽水行为。\n仅甲板运载。")
+        );
+        let repeated = apply_catalogue(
+            &update,
+            &source,
+            &batch,
+            &input,
+            &next,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(json!(next.assets), json!(repeated.assets));
+        assert_eq!(
+            next.assets[0].variants[0].scope.reason,
+            prior.assets[0].variants[0].scope.reason
+        );
+    }
+
+    #[test]
+    fn scope_reasons_q1_retains_prior_and_new_base_and_child_explanations() {
+        let (source, context, batch, basis, input, raw) = scope_reasons_fixture();
+        let prior =
+            apply_catalogue(&raw, &source, &batch, &input, &basis, None, &HashSet::new()).unwrap();
+        let input = input_for("Q1", &source, &batch, &prior, &context, 0, 1, true, &[]);
+        let returning = &source.scenes[1];
+        let mut edit = empty_edit(&source, &batch);
+        edit["changes"]["assets"] = json!([{"key":prior.assets[1].id,
+            "episodes":[returning.episode_id],"sceneRefs":[[returning.episode_id,returning.id]],
+            "scope":{"kind":"SCENES","reason":"不新增抽水行为。\n运输连续性保留。"},
+            "variants":[{"key":prior.assets[1].variants[1].id,"episodes":[returning.episode_id],
+                "sceneRefs":[[returning.episode_id,returning.id]],
+                "scope":{"kind":"SCENES","reason":"不新增抽水行为。\n运输连续性保留。"}}]}]);
+        let (next, _) = apply_optimization(&edit, &source, &batch, &input, &prior, None).unwrap();
+        assert_eq!(
+            next.assets[1].variants[0].scope.reason.as_deref(),
+            Some("返航运载配套。\n不新增抽水行为。\n运输连续性保留。")
+        );
+        assert_eq!(
+            next.assets[1].variants[1].scope.reason.as_deref(),
+            Some("返航运输状态。\n不新增抽水行为。\n运输连续性保留。")
+        );
+        assert!(next.facts.is_empty());
+        assert_eq!(next.assets[1].description, prior.assets[1].description);
+    }
+
+    pub(super) fn scope_reasons_saved_chain() -> (
+        LockedSource,
+        Value,
+        FoundationProposal,
+        Value,
+        Value,
+        Value,
+        Value,
+    ) {
+        let (source, context, batch, basis, f2_input, f2_raw) = scope_reasons_fixture();
+        let accepted = apply_catalogue(
+            &f2_raw,
+            &source,
+            &batch,
+            &f2_input,
+            &basis,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let mut old_projection = accepted.clone();
+        for variant in old_projection
+            .assets
+            .iter_mut()
+            .flat_map(|asset| &mut asset.variants)
+        {
+            variant.scope.reason = None;
+        }
+        // Freeze Q1 with the old lossy candidate, exactly as a saved workflow
+        // would have done. Do not regenerate its input from enriched metadata.
+        let q1_input = input_for(
+            "Q1",
+            &source,
+            &batch,
+            &old_projection,
+            &context,
+            0,
+            1,
+            true,
+            &[],
+        );
+        let q1_raw = empty_edit(&source, &batch);
+        let (current, _) =
+            apply_optimization(&q1_raw, &source, &batch, &q1_input, &old_projection, None).unwrap();
+        (source, context, current, f2_input, f2_raw, q1_input, q1_raw)
+    }
+
+    #[test]
+    fn scope_reasons_projection_replays_frozen_chain_and_only_fills_missing_reasons() {
+        let (source, context, mut current, f2_input, f2_raw, q1_input, q1_raw) =
+            scope_reasons_saved_chain();
+        current.assets[0].variants[0].scope.reason = Some("已由用户确认的电话范围解释。".into());
+        current.direction = "保留现有制作方向".into();
+        let original = json!(current);
+        let frozen = json!([f2_input, f2_raw, q1_input, q1_raw]);
+        let steps = [
+            AcceptedFoundationReasonStep {
+                stage: "foundation:F2",
+                input: &f2_input,
+                result: &f2_raw,
+            },
+            AcceptedFoundationReasonStep {
+                stage: "foundation:Q1",
+                input: &q1_input,
+                result: &q1_raw,
+            },
+        ];
+        let projected = project_missing_scope_reasons(&source, &context, &current, &steps).unwrap();
+        assert_eq!(
+            projected.restored_variant_ids,
+            current.assets[1]
+                .variants
+                .iter()
+                .map(|v| v.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            projected.foundation.assets[0].variants[0].scope.reason,
+            current.assets[0].variants[0].scope.reason
+        );
+        assert_eq!(
+            projected.foundation.assets[1].variants[0]
+                .scope
+                .reason
+                .as_deref(),
+            Some("返航运载配套。\n不新增抽水行为。")
+        );
+        assert_eq!(
+            projected.foundation.assets[1].variants[1]
+                .scope
+                .reason
+                .as_deref(),
+            Some("返航运输状态。\n不新增抽水行为。")
+        );
+        assert_eq!(projected.foundation.direction, current.direction);
+        assert_eq!(json!(projected.projected_source), json!(source));
+        assert_eq!(json!(current), original);
+        assert_eq!(json!([f2_input, f2_raw, q1_input, q1_raw]), frozen);
+        assert_eq!(
+            catalogue_without_scope_reasons(&projected.foundation),
+            catalogue_without_scope_reasons(&current)
+        );
+    }
+
+    #[test]
+    fn scope_reasons_projection_rejects_manual_catalogue_or_broadened_scope() {
+        let (source, context, current, f2_input, f2_raw, q1_input, q1_raw) =
+            scope_reasons_saved_chain();
+        let steps = [
+            AcceptedFoundationReasonStep {
+                stage: "foundation:F2",
+                input: &f2_input,
+                result: &f2_raw,
+            },
+            AcceptedFoundationReasonStep {
+                stage: "foundation:Q1",
+                input: &q1_input,
+                result: &q1_raw,
+            },
+        ];
+        for mutation in [
+            "name",
+            "description",
+            "parent",
+            "metadata",
+            "scope",
+            "missing",
+        ] {
+            let mut changed = current.clone();
+            match mutation {
+                "name" => changed.assets[0].name.push_str("人工修订"),
+                "description" => changed.assets[0].description.push_str("人工修订"),
+                "parent" => changed.assets[1].variants[1].source_variant_id = None,
+                "metadata" => {
+                    changed.assets[0]
+                        .metadata
+                        .insert("manualRevision".into(), json!(true));
+                }
+                "scope" => {
+                    let additional = Applicability {
+                        episode_id: source.scenes[1].episode_id.clone(),
+                        scene_id: source.scenes[1].id.clone(),
+                    };
+                    changed.assets[0].variants[0]
+                        .scope
+                        .scenes
+                        .push(additional.clone());
+                    changed.assets[0].variants[0].applicability.push(additional);
+                }
+                "missing" => {
+                    changed.assets.remove(0);
+                }
+                _ => unreachable!(),
+            }
+            let frozen = json!(changed);
+            let error = project_missing_scope_reasons(&source, &context, &changed, &steps)
+                .err()
+                .unwrap();
+            assert!(error.contains("不再精确一致"), "{mutation}: {error}");
+            assert_eq!(json!(changed), frozen);
+        }
+    }
+
+    #[test]
+    fn scope_reasons_projection_rejects_missing_chain_and_changed_frozen_source() {
+        let (source, context, current, f2_input, f2_raw, q1_input, q1_raw) =
+            scope_reasons_saved_chain();
+        let f2_only = [AcceptedFoundationReasonStep {
+            stage: "foundation:F2",
+            input: &f2_input,
+            result: &f2_raw,
+        }];
+        assert!(
+            project_missing_scope_reasons(&source, &context, &current, &f2_only)
+                .err()
+                .unwrap()
+                .contains("完整已接受")
+        );
+        for mutation in ["text", "scene", "hash", "index", "phase", "interval"] {
+            let mut altered = f2_input.clone();
+            match mutation {
+                "text" => altered["source"]["rows"][0][9] = json!("篡改原文"),
+                "scene" => altered["scenes"][0][1] = json!("伪造场号"),
+                "hash" => altered["batch"] = json!("unknown"),
+                "index" => altered["batchIndex"] = json!(1),
+                "phase" => altered["delivery"]["phase"] = json!("AUTO_INTERPRET"),
+                "interval" => altered["source"]["rows"][0][7] = json!(source.rows[0].range.end),
+                _ => unreachable!(),
+            }
+            let steps = [
+                AcceptedFoundationReasonStep {
+                    stage: "foundation:F2",
+                    input: &altered,
+                    result: &f2_raw,
+                },
+                AcceptedFoundationReasonStep {
+                    stage: "foundation:Q1",
+                    input: &q1_input,
+                    result: &q1_raw,
+                },
+            ];
+            assert!(
+                project_missing_scope_reasons(&source, &context, &current, &steps).is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_reasons_projection_preserves_original_auto_receipt_time_and_content() {
+        let (source, mut context, batch, basis, f2_input, mut f2_raw) = scope_reasons_fixture();
+        context["projectId"] = json!("synthetic-scope-reasons");
+        context["sourceVersion"] = json!(1);
+        context["foundationDecisionPolicy"] = json!(AUTO_INTERPRET_POLICY);
+        context["userReviewRequirements"] = json!([]);
+        let refs = json!([source.rows[0].id, source.rows[1].id]);
+        f2_raw["humanChoices"] = json!([{
+            "decisionKey":"scope-reason-test","kind":"PRODUCTION_CHOICE",
+            "question":"电话声采用哪种制作解释？","reason":"保留电话场范围说明",
+            "options":["仅作为声音","制作解释分离"],"recommended":"仅作为声音",
+            "recommendationReason":"不追加原文未写的实体入镜","evidence":"已提供锁定原行",
+            "episodes":[source.episodes[0].id],"sourceRefs":refs,
+            "changeTargets":{"assetKeys":[],"assetFields":["description"],"sceneFields":[]}
+        }]);
+        let mut current = apply_catalogue(
+            &f2_raw,
+            &source,
+            &batch,
+            &f2_input,
+            &basis,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        for variant in current
+            .assets
+            .iter_mut()
+            .flat_map(|asset| &mut asset.variants)
+        {
+            variant.scope.reason = None;
+        }
+        let q1_input = input_for("Q1", &source, &batch, &current, &context, 0, 1, true, &[]);
+        let decision = &q1_input["automaticDecisions"][0];
+        let mut q1_raw = empty_edit(&source, &batch);
+        q1_raw["appliedDecisions"] = json!([{
+            "id":decision["id"],"answer":"仅作为声音","note":"解释单独留存，原文及目录不改写",
+            "subjectAssetKeys":[current.assets[0].id]
+        }]);
+        let original_time = "2026-10-08T16:05:25.000Z";
+        let times = HashMap::from([(
+            decision["id"].as_str().unwrap().to_owned(),
+            original_time.to_owned(),
+        )]);
+        let q1_basis = current.clone();
+        (current, _) = apply_optimization_with_receipt_times(
+            &q1_raw,
+            &source,
+            &batch,
+            &q1_input,
+            &current,
+            None,
+            Some(&times),
+        )
+        .unwrap();
+        let accepted_receipts = prior_auto_records(&current);
+        assert_eq!(accepted_receipts[0]["appliedAt"], original_time);
+        let steps = [
+            AcceptedFoundationReasonStep {
+                stage: "foundation:F2",
+                input: &f2_input,
+                result: &f2_raw,
+            },
+            AcceptedFoundationReasonStep {
+                stage: "foundation:Q1",
+                input: &q1_input,
+                result: &q1_raw,
+            },
+        ];
+        let projected = project_missing_scope_reasons(&source, &context, &current, &steps).unwrap();
+        assert_eq!(prior_auto_records(&projected.foundation), accepted_receipts);
+        assert_eq!(projected.restored_variant_ids.len(), 3);
+        let empty_times = HashMap::new();
+        assert!(
+            apply_optimization_with_receipt_times(
+                &q1_raw,
+                &source,
+                &batch,
+                &q1_input,
+                &q1_basis,
+                None,
+                Some(&empty_times),
+            )
+            .unwrap_err()
+            .contains("不制造新历史回执"),
+            "pure replay must not fall back to the current clock"
+        );
+    }
+
     fn author_fixture() -> (LockedSource, FoundationProposal, Value) {
         let source = source(2);
         let scope = source

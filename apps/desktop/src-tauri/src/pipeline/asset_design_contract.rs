@@ -1,9 +1,15 @@
 //! Stage2 design validity is deliberately independent of visual-fact receipts.
 use super::{digest, resolve_asset_dependency, rule_snapshot};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub const DESIGN_PROFILE: &str = "asset-design-context/v2";
+pub const IDENTITY_MATERIAL_PROFILE: &str = "asset-identity-production-material/v1";
+pub const IDENTITY_MATERIAL_PROFILE_FIELD: &str = "stage2IdentityMaterialProfile";
+pub const IDENTITY_MATERIALS_FIELD: &str = "identityProductionMaterials";
+pub const SCOPE_MATERIALS_FIELD: &str = "assetScopeProductionMaterials";
+pub const SCOPE_MATERIAL_PROFILE: &str = "asset-scope-production-material/v1";
+pub const IDENTITY_MATERIAL_POLICY: &str = "identityProductionMaterial/identityProductionMaterials 是已采用制作基础的主体身份说明，scopeProductionMaterial/assetScopeProductionMaterials 是准确形象适用范围的制作理由。两者仅供定位身份与理解制作意图，不是 SOURCE 视觉事实，不能写入 facts/deltaFacts 或代替原文证据。当前 asset.description、形象范围及 preparation 仍独立保留；说明不覆盖用户编辑、子形象说明或当前状态。涉及外观、年龄、物种和未来变化必须核对本包锁定原文、准确主体及适用版本；说明与原文或当前形象冲突时保留差异，不移植为外观事实。";
 pub const PRESENTATION_PROFILE: &str = "asset-image-presentation/v1";
 pub const CH_PRESENTATION: &str = "左侧大幅肖像/近景，右侧正面、侧面、背面全身；各区保持同一身份、发型、衣装和当前状态，全身头脚完整，肖像保留头顶发型，各分区清晰，不以浅景深虚化其它视图，干净中性背景，无资料栏、标签。";
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -27,6 +33,291 @@ pub fn identity(asset: &Value) -> &str {
         s(asset, "baseAssetId"),
         s(asset, "id"),
     ])
+}
+/// Freeze this addendum only at a new Stage2 workflow boundary. Existing flat
+/// rows keep their user/variant description; old workflow inputs remain legacy.
+pub fn freeze_identity_production_materials(input: &mut Value) -> Result<(), String> {
+    let source_sha = s(&input["source"], "sha256");
+    let foundation_sha = s(&input["foundation"], "sourceSha256");
+    if !foundation_sha.is_empty() && foundation_sha != source_sha {
+        return Err("身份制作资料不属于当前锁定原文，未冻结新设计输入".into());
+    }
+    let mut registered = HashSet::new();
+    for asset in input["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|asset| !crate::store::asset_deleted(asset))
+    {
+        if !s(asset, "identityId").is_empty()
+            && !s(asset, "baseAssetId").is_empty()
+            && s(asset, "identityId") != s(asset, "baseAssetId")
+        {
+            return Err("资产的主体身份字段冲突，不能选择制作说明".into());
+        }
+        registered.insert(identity(asset));
+    }
+    let mut materials = serde_json::Map::new();
+    let mut seen = HashSet::new();
+    for subject in input["foundation"]["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let id = s(subject, "id");
+        if id.is_empty() || !registered.contains(id) {
+            continue;
+        }
+        if !seen.insert(id) {
+            return Err("制作基础主体身份重复，不能选择身份说明".into());
+        }
+        let description = s(subject, "description");
+        if description.trim().is_empty() {
+            continue;
+        }
+        materials.insert(id.to_owned(), json!({"version":IDENTITY_MATERIAL_PROFILE,"identityId":id,"description":description,"sourceSha256":source_sha,"provenance":"FOUNDATION_IDENTITY_DESCRIPTION_NOT_VISUAL_FACT"}));
+    }
+    let scope_materials = projected_scope_materials(input)?;
+    input[IDENTITY_MATERIAL_PROFILE_FIELD] = json!(IDENTITY_MATERIAL_PROFILE);
+    input[IDENTITY_MATERIALS_FIELD] = Value::Object(materials);
+    input[SCOPE_MATERIALS_FIELD] = Value::Object(scope_materials);
+    Ok(())
+}
+
+pub(crate) fn scope_pairs(scope: &Value) -> Option<BTreeSet<(String, String)>> {
+    if scope["kind"] != "SCENES" {
+        return None;
+    }
+    let mut pairs = BTreeSet::new();
+    for place in scope["scenes"].as_array()? {
+        let (episode, scene) = if let Some(pair) = place.as_array().filter(|pair| pair.len() == 2) {
+            (pair[0].as_str()?, pair[1].as_str()?)
+        } else {
+            (place["episodeId"].as_str()?, place["sceneId"].as_str()?)
+        };
+        if episode.is_empty()
+            || scene.is_empty()
+            || !pairs.insert((episode.to_owned(), scene.to_owned()))
+        {
+            return None;
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// The legacy flat row and the current foundation must describe exactly the
+/// same scoped version. Nonempty user reasons are authoritative and untouched.
+fn projected_scope_materials(input: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    let mut materials = serde_json::Map::new();
+    if input["foundation"]["sourceSha256"] != input["source"]["sha256"]
+        || input["foundation"]["sourceVersion"] != input["source"]["version"]
+        || !input["foundation"]["version"]
+            .as_u64()
+            .is_some_and(|v| v > 0)
+    {
+        return Ok(materials);
+    }
+    for asset in input["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|asset| !crate::store::asset_deleted(asset))
+    {
+        if !asset["version"].as_u64().is_some_and(|v| v > 0) {
+            continue;
+        }
+        // Current saved/user reasons are production context in their own right;
+        // the foundation is only a fallback for the old missing-reason shape.
+        let own_reason = s(&asset["scope"], "reason");
+        let Some(pairs) = scope_pairs(&asset["scope"]) else {
+            continue;
+        };
+        if !pairs.iter().all(|(episode, scene)| {
+            input["source"]["scenes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|known| {
+                    known["id"] == scene.as_str() && known["episodeId"] == episode.as_str()
+                })
+        }) {
+            continue;
+        }
+        let ids = |key: &str| {
+            asset["applicability"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        };
+        if ids("episodes") != pairs.iter().map(|(episode, _)| episode.clone()).collect()
+            || ids("scenes") != pairs.iter().map(|(_, scene)| scene.clone()).collect()
+        {
+            continue;
+        }
+        let (reason, provenance) = if own_reason.trim().is_empty() {
+            let owners: Vec<_> = input["foundation"]["assets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|owner| owner["id"] == identity(asset))
+                .collect();
+            let [owner] = owners.as_slice() else {
+                continue;
+            };
+            let variants: Vec<_> = owner["variants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|variant| variant["id"] == asset["variantId"])
+                .collect();
+            let [variant] = variants.as_slice() else {
+                continue;
+            };
+            let reason = s(&variant["scope"], "reason");
+            if reason.trim().is_empty()
+                || variant
+                    .get("assetRowId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id != s(asset, "id"))
+                || variant
+                    .get("assetVersion")
+                    .is_some_and(|version| version != &asset["version"])
+                || variant["sourceRefs"] != asset["sourceRefs"]
+                || scope_pairs(&variant["scope"]).as_ref() != Some(&pairs)
+            {
+                continue;
+            }
+            (reason.to_owned(), "FOUNDATION_SCOPE_REASON_NOT_VISUAL_FACT")
+        } else {
+            (
+                own_reason.to_owned(),
+                "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT",
+            )
+        };
+        let mut scope = asset["scope"].clone();
+        scope["reason"] = json!(reason);
+        let material = json!({"version":SCOPE_MATERIAL_PROFILE,"assetId":asset["id"],"identityId":identity(asset),"variantId":asset["variantId"],"assetVersion":asset["version"],"foundationVersion":input["foundation"]["version"],"sourceVersion":input["source"]["version"],"sourceSha256":input["source"]["sha256"],"scope":scope,"originalScopeSha256":digest(&asset["scope"].to_string()),"sourceRefsSha256":digest(&asset["sourceRefs"].to_string()),"provenance":provenance});
+        if materials
+            .insert(s(asset, "id").to_owned(), material)
+            .is_some()
+        {
+            return Err("形象范围制作资料的资产行身份重复".into());
+        }
+    }
+    Ok(materials)
+}
+
+pub fn scope_production_material(input: &Value, asset: &Value) -> Result<Option<Value>, String> {
+    if input[IDENTITY_MATERIAL_PROFILE_FIELD].as_str() != Some(IDENTITY_MATERIAL_PROFILE) {
+        return Ok(None);
+    }
+    let Some(material) = input[SCOPE_MATERIALS_FIELD].get(s(asset, "id")) else {
+        return Ok(None);
+    };
+    if material["version"] != SCOPE_MATERIAL_PROFILE
+        || material["assetId"] != asset["id"]
+        || material["identityId"] != identity(asset)
+        || material["variantId"] != asset["variantId"]
+        || material["sourceSha256"] != input["source"]["sha256"]
+        || material["sourceVersion"] != input["source"]["version"]
+        || !matches!(
+            s(material, "provenance"),
+            "FOUNDATION_SCOPE_REASON_NOT_VISUAL_FACT"
+                | "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT"
+        )
+        || material["provenance"] == "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT"
+            && material["scope"] != asset["scope"]
+        || !material["assetVersion"]
+            .as_u64()
+            .is_some_and(|version| version > 0)
+        || material["originalScopeSha256"] != digest(&asset["scope"].to_string())
+        || material["sourceRefsSha256"] != digest(&asset["sourceRefs"].to_string())
+        || scope_pairs(&material["scope"]) != scope_pairs(&asset["scope"])
+        || scope_pairs(&material["scope"]).is_none()
+        || s(&material["scope"], "reason").trim().is_empty()
+    {
+        return Err("形象范围制作说明的主体/版本/集场或来源绑定无效".into());
+    }
+    Ok(Some(material.clone()))
+}
+
+/// Stage3 publishes units, never assets. Enrich only its new input clone. Stage2
+/// instead applies this same reason in model cards, retaining raw asset hashes.
+pub(crate) fn apply_scope_reasons_to_new_asset_context(input: &mut Value) -> Result<(), String> {
+    let materials = projected_scope_materials(input)?;
+    for asset in input["assets"].as_array_mut().into_iter().flatten() {
+        if let Some(material) = materials.get(s(asset, "id")) {
+            asset["scope"]["reason"] = material["scope"]["reason"].clone();
+        }
+    }
+    input["foundationScopeReasonBindings"] = Value::Object(materials);
+    Ok(())
+}
+
+fn scope_material_semantics(material: &Value) -> Value {
+    let mut result = material.clone();
+    if let Some(object) = result.as_object_mut() {
+        for counter in ["assetVersion", "foundationVersion", "sourceVersion"] {
+            object.remove(counter);
+        }
+    }
+    result
+}
+
+fn consumed_scope_materials(
+    input: &Value,
+    asset_ids: &HashSet<&str>,
+) -> Result<Vec<Value>, String> {
+    let mut materials = Vec::new();
+    for asset in input["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|asset| asset_ids.contains(s(asset, "id")))
+    {
+        if let Some(material) = scope_production_material(input, asset)? {
+            materials.push(scope_material_semantics(&material));
+        }
+    }
+    materials.sort_by_key(Value::to_string);
+    Ok(materials)
+}
+
+pub fn identity_production_material(input: &Value, asset: &Value) -> Result<Option<Value>, String> {
+    match input.get(IDENTITY_MATERIAL_PROFILE_FIELD) {
+        None | Some(Value::Null) => return Ok(None), // Never enrich an old frozen request.
+        Some(value) if value.as_str() == Some(IDENTITY_MATERIAL_PROFILE) => {}
+        _ => return Err("未知的第二阶段身份制作资料版本，未创建请求".into()),
+    }
+    let materials = input[IDENTITY_MATERIALS_FIELD]
+        .as_object()
+        .ok_or("冻结身份制作资料目录无效")?;
+    let Some(material) = materials.get(identity(asset)) else {
+        return Ok(None); // No name/alias/first-item fallback across identities.
+    };
+    if material["version"] != IDENTITY_MATERIAL_PROFILE
+        || material["identityId"] != identity(asset)
+        || material["sourceSha256"] != input["source"]["sha256"]
+        || material["provenance"] != "FOUNDATION_IDENTITY_DESCRIPTION_NOT_VISUAL_FACT"
+        || s(material, "description").trim().is_empty()
+    {
+        return Err("身份制作资料的源版本或准确主体绑定无效".into());
+    }
+    Ok(Some(material.clone()))
+}
+
+fn consumed_identity_materials(
+    input: &Value,
+    subjects: &HashSet<&str>,
+) -> Result<Vec<Value>, String> {
+    let mut ids: Vec<_> = subjects.iter().copied().collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .filter_map(|id| identity_production_material(input, &json!({"identityId":id})).transpose())
+        .collect()
 }
 pub fn project_visual_style(settings: &Value) -> &str {
     let style = first([
@@ -153,13 +444,16 @@ pub fn validate_resume_facts(
     let assets = current["assets"].as_array().ok_or("图片续跑缺少资产目录")?;
     let selection = current["selection"]["assetIds"].as_array();
     let mut subjects = HashSet::new();
+    let mut related_asset_ids = HashSet::new();
     for asset in assets
         .iter()
         .filter(|a| selection.is_none_or(|ids| ids.contains(&a["id"])))
     {
         subjects.insert(identity(asset).to_owned());
+        related_asset_ids.insert(s(asset, "id").to_owned());
         for source in source_chain(assets, asset)? {
             subjects.insert(s(&source, "identityId").to_owned());
+            related_asset_ids.insert(s(&source, "assetId").to_owned());
         }
     }
     let expected = result
@@ -180,6 +474,52 @@ pub fn validate_resume_facts(
     if normalized(expected) != normalized(&current["foundation"]["facts"]) {
         return Err("图片续跑的相关视觉事实语义版本已变化；原包与预算保留，请发起新制作".into());
     }
+    if original
+        .get(IDENTITY_MATERIAL_PROFILE_FIELD)
+        .is_some_and(|value| !value.is_null())
+    {
+        let mut current_materials = current.clone();
+        freeze_identity_production_materials(&mut current_materials)?;
+        let selected: HashSet<_> = subjects.iter().map(String::as_str).collect();
+        if consumed_identity_materials(original, &selected)?
+            != consumed_identity_materials(&current_materials, &selected)?
+        {
+            return Err("图片续跑的相关主体制作说明已变化；原请求与预算保留，请发起新设计".into());
+        }
+        let related: HashSet<_> = related_asset_ids.iter().map(String::as_str).collect();
+        let expected_scope = consumed_scope_materials(original, &related)?;
+        let mut frozen_scope = current.clone();
+        frozen_scope[IDENTITY_MATERIAL_PROFILE_FIELD] =
+            original[IDENTITY_MATERIAL_PROFILE_FIELD].clone();
+        frozen_scope[SCOPE_MATERIALS_FIELD] = original[SCOPE_MATERIALS_FIELD].clone();
+        if expected_scope != consumed_scope_materials(&frozen_scope, &related)? {
+            return Err("图片续跑的准确形象制作范围已变化，原请求未重建".into());
+        }
+        for material in expected_scope {
+            if material["provenance"] == "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT" {
+                continue; // Its saved row hash above is authoritative, not the foundation reason.
+            }
+            let variants: Vec<_> = current["foundation"]["assets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|owner| owner["id"] == material["identityId"])
+                .flat_map(|owner| owner["variants"].as_array().into_iter().flatten())
+                .filter(|variant| variant["id"] == material["variantId"])
+                .collect();
+            let [variant] = variants.as_slice() else {
+                return Err("图片续跑的范围制作说明主体/形象不存在或身份重复".into());
+            };
+            let current_reason = s(&variant["scope"], "reason");
+            if scope_pairs(&variant["scope"]) != scope_pairs(&material["scope"])
+                || material["sourceRefsSha256"] != digest(&variant["sourceRefs"].to_string())
+                || !current_reason.trim().is_empty()
+                    && current_reason != s(&material["scope"], "reason")
+            {
+                return Err("图片续跑的已冻结形象范围制作理由已变化，未重新投影或重发".into());
+            }
+        }
+    }
     Ok(())
 }
 pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
@@ -196,7 +536,23 @@ pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
         .map(fact_semantics)
         .collect();
     facts.sort_by_key(Value::to_string);
-    let basis = json!({"version":DESIGN_PROFILE,"ruleSha256":rule_snapshot("asset-art-director")?["sha256"],"sourceSha256":input["source"]["sha256"],"assetSemanticVersion":digest(&asset_semantics(asset).to_string()),"sourceChain":chain,"factsSha256":digest(&json!(facts).to_string()),"projectVisualStyle":project_visual_style(&input["settings"]),"productionDirection":production_direction(input),"imagePresentation":image_presentation(&input["settings"],asset)});
+    let mut basis = json!({"version":DESIGN_PROFILE,"ruleSha256":rule_snapshot("asset-art-director")?["sha256"],"sourceSha256":input["source"]["sha256"],"assetSemanticVersion":digest(&asset_semantics(asset).to_string()),"sourceChain":chain,"factsSha256":digest(&json!(facts).to_string()),"projectVisualStyle":project_visual_style(&input["settings"]),"productionDirection":production_direction(input),"imagePresentation":image_presentation(&input["settings"],asset)});
+    let materials = consumed_identity_materials(input, &subjects)?;
+    if !materials.is_empty() {
+        basis["identityProductionMaterialsSha256"] = json!(digest(&json!(materials).to_string()));
+    }
+    let scoped_ids: HashSet<_> = std::iter::once(s(asset, "id"))
+        .chain(
+            chain
+                .iter()
+                .filter_map(|ancestor| ancestor["assetId"].as_str()),
+        )
+        .collect();
+    let scope_materials = consumed_scope_materials(input, &scoped_ids)?;
+    if !scope_materials.is_empty() {
+        basis["assetScopeProductionMaterialsSha256"] =
+            json!(digest(&json!(scope_materials).to_string()));
+    }
     Ok(json!({"version":DESIGN_PROFILE,"sha256":digest(&basis.to_string()),"basis":basis}))
 }
 pub fn design_receipt_current(input: &Value, asset: &Value) -> bool {

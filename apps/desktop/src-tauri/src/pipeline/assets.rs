@@ -303,7 +303,7 @@ fn has_program_source_scope(asset: &Value) -> bool {
 
 const SOURCE_SCOPE_POLICY: &str = "SOURCE_SCOPE/PROGRAM_SCOPE引用仅用于定位原文阅读范围，不是这些行已证明属于该资产的外观事实。facts/deltaFacts才是已按主体和版本登记的视觉提取记录，仍须对照其引用原文；claim保留原层次，CHARACTER_CLAIM不得升级为SOURCE。目录名称、description和preparation.note是身份/制作资料，不自动成为视觉事实；原文中的其它主体和后续状态不得套入当前形象。";
 
-fn asset_design_card(asset: &Value) -> Value {
+fn asset_design_card(input: &Value, asset: &Value) -> Result<Value, String> {
     let mut card = json!({
         "id":asset["id"],"baseAssetId":asset["baseAssetId"],"variantId":asset["variantId"],
         "name":asset["name"],"kind":asset.get("kind").or_else(||asset.get("type")),
@@ -314,7 +314,14 @@ fn asset_design_card(asset: &Value) -> Value {
         card["sourceRefsPurpose"] = asset["sourceRefsPurpose"].clone();
         card["sourceScope"] = asset["sourceScope"].clone();
     }
-    card
+    if let Some(material) = super::asset_design_contract::identity_production_material(input, asset)? {
+        card["identityProductionMaterial"] = material;
+    }
+    if let Some(material) = super::asset_design_contract::scope_production_material(input, asset)? {
+        card["scope"]["reason"] = material["scope"]["reason"].clone();
+        card["scopeProductionMaterial"] = material;
+    }
+    Ok(card)
 }
 
 fn reference_design_card(asset: &Value, design: Option<&Value>) -> Value {
@@ -847,14 +854,31 @@ pub async fn run_asset_design(
             let output_schema = obj(
                 json!({"schemaVersion":choices(&["asset-design/v1"]),"assetId":{"type":"string","enum":[id]},"variantId":{"type":"string","enum":[variant]},"prompt":string(),"freeDesignScope":string(),"sourceRefs":refs(&evidence.iter().map(|r|r.id.clone()).collect::<Vec<_>>()),"referenceVariantIds":refs(&allowed_references)}),
             );
-            let mut design_input = json!({"sourceSha256":source.sha256,"designMode":mode,"asset":asset_design_card(asset),"facts":facts,"deltaFacts":delta_facts,"evidence":evidence,"parentDesign":parent_design,"parentAsset":parent.and_then(|p|by_id.get(p)).map(|asset|asset_design_card(asset)),"referenceCatalog":parent.and_then(|p|by_id.get(p)).map(|asset|vec![asset_design_card(asset)]).unwrap_or_default(),"productionDirection":production_direction,"imageEvidence":"NO_PIXELS_READ","instruction":"执行designMode确定的C基础/D派生岗位。referenceVariantIds只使用指定直接来源资产行id；基础形象为空。名称只作显示，不推断身份。原文仅在evidence物化一次；facts与deltaFacts不重抄原句。未提供当前旧提示词与历史候选，不以历史代替证据。"});
+            let asset_card = asset_design_card(&design_basis, asset)?;
+            let parent_card = parent.and_then(|p|by_id.get(p)).map(|asset|asset_design_card(&design_basis, asset)).transpose()?;
+            let mut design_input = json!({"sourceSha256":source.sha256,"designMode":mode,"asset":asset_card,"facts":facts,"deltaFacts":delta_facts,"evidence":evidence,"parentDesign":parent_design,"parentAsset":parent_card,"referenceCatalog":parent_card.into_iter().collect::<Vec<_>>(),"productionDirection":production_direction,"imageEvidence":"NO_PIXELS_READ","instruction":"执行designMode确定的C基础/D派生岗位。referenceVariantIds只使用指定直接来源资产行id；基础形象为空。名称只作显示，不推断身份。原文仅在evidence物化一次；facts与deltaFacts不重抄原句。未提供当前旧提示词与历史候选，不以历史代替证据。"});
+            if design_input["asset"].get("identityProductionMaterial").is_some()
+                || design_input["parentAsset"].get("identityProductionMaterial").is_some()
+                || design_input["asset"].get("scopeProductionMaterial").is_some()
+                || design_input["parentAsset"].get("scopeProductionMaterial").is_some()
+            {
+                design_input["identityProductionMaterialPolicy"] = json!(super::asset_design_contract::IDENTITY_MATERIAL_POLICY);
+            }
             design_input["projectVisualStyle"] = json!(super::asset_design_contract::project_visual_style(&input["settings"]));
             design_input["imagePresentation"] = super::asset_design_contract::image_presentation(&input["settings"], asset);
             design_input["comparisonDesigns"] = json!(comparison_designs);
             if !scope_context.is_empty() {
                 design_input["sourceScopeContext"] = json!({"version":"asset-scene-context/v1","instruction":"evidence包含SOURCE_SCOPE标记所定位场次的锁定原文，不再只提供场次标题。先在原文中确认当前主体及其物种/空间/物件身份；空facts仅表示尚无已登记外观约束，不表示原文没有该主体。仍按原C/D岗位区分原文依据与普通非剧情美术补足，补足写入freeDesignScope；不得把同场其它主体或后期状态移植给当前形象，也不得把整场原文标成该资产的外观事实。"});
             }
-            let frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
+            let mut frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
+            for (card, key) in [("asset", "assetIdentityProductionMaterial"), ("parentAsset", "parentIdentityProductionMaterial")] {
+                if let Some(material) = design_input[card].get("identityProductionMaterial") {
+                    frozen_context[key] = material.clone();
+                }
+            }
+            for (card, key) in [("asset", "assetScopeProductionMaterial"), ("parentAsset", "parentScopeProductionMaterial")] {
+                if let Some(material) = design_input[card].get("scopeProductionMaterial") { frozen_context[key] = material.clone(); }
+            }
             if reference_parent.as_deref() != parent {
                 design_input["inlineReference"] = json!({"directAssetId":parent,"reusedDesignAssetId":reference_parent,"instruction":"直接来源为INLINE覆盖态，parentDesign复用其明确来源形象；referenceVariantIds仍按指定直接来源id输出，不新增独立INLINE图片。"});
             }
@@ -1687,7 +1711,7 @@ mod tests {
     fn legacy_exact_reference_cards_keep_their_existing_wire_shape() {
         let legacy = json!({"id":"row-a","baseAssetId":"person","variantId":"base","name":"小王","kind":"CH","sourceRefs":["exact-row"]});
         assert_eq!(
-            asset_design_card(&legacy),
+            asset_design_card(&json!({}), &legacy).unwrap(),
             json!({
                 "id":"row-a","baseAssetId":"person","variantId":"base","name":"小王","kind":"CH",
                 "description":null,"sourceRefs":["exact-row"],"scope":null,"applicability":null,"preparation":null

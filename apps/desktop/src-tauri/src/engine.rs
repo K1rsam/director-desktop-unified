@@ -2800,7 +2800,7 @@ impl Engine {
     }
     fn spawn_production(self: &Arc<Self>, store: Store, request: Value) -> Result<()> {
         let stage = s(&request, "action");
-        let mut input = if stage == "storyboard.refine" { refinement_input(&store, &request)? } else { production_input(&store, &request)? };
+        let mut input = if stage == "storyboard.refine" { refinement_input(&store, &request)? } else { production_input_for_new_workflow(&store, &request)? };
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
             |settings| runtime.block_on(resolve_text_execution_settings(settings)))?;
@@ -3075,6 +3075,11 @@ impl Engine {
             .map(|j| j["entityId"].clone())
             .collect();
         let mut design_input = json!({"source":store.source()?,"foundation":store.foundation()?,"assets":all_assets,"settings":saved_settings,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
+        if !original_context.is_object() {
+            let projection = store.foundation_context_for_new_workflow()?;
+            design_input["foundation"] = projection.foundation;
+            design_input["foundationReasonProjection"] = projection.diagnostic;
+        }
         design_input["designRuleSha256"] = if original_context.is_object() {
             original_context["designRuleSha256"].clone()
         } else {
@@ -3100,7 +3105,11 @@ impl Engine {
             // comparisons remain those captured by the original workflow.
             design_input["foundation"]["directionConfirmed"] = original_context["foundation"]["directionConfirmed"].clone();
             design_input["foundation"]["productionDirection"] = original_context["foundation"]["productionDirection"].clone();
+            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD] {
+                if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
+            }
         } else {
+            pipeline::asset_design_contract::freeze_identity_production_materials(&mut design_input)?;
             let mut comparisons = json!({});
             for asset in &all_assets { comparisons[s(asset,"id")] = json!(pipeline::asset_design_contract::comparison_designs(&design_input,asset)); }
             design_input["comparisonDesignsByAssetId"] = comparisons;
@@ -3165,7 +3174,10 @@ impl Engine {
                         let basis_version=basis["version"].as_i64().unwrap_or(0);
                         let policy=r["imageProductionPolicy"].as_str().filter(|p|["automatic","trialReview"].contains(p)).unwrap_or_else(||pipeline::image_production_policy(&settings));
                         let active_image_ids:Vec<_>=store.job_summaries()?.iter().filter(|j|s(j,"kind")=="image"&&is_active_generation(s(j,"status"))).map(|j|j["entityId"].clone()).collect();
-                        let input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
+                        let mut input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
+                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD] {
+                            if let Some(value) = stage2_context.get(key) { input[key] = value.clone(); }
+                        }
                         let needs_design=all.iter().any(|a|wanted.iter().any(|id|id==s(a,"id"))&&pipeline::automatic_design_required(&input,a));
                         let needs_visual_check=pipeline::asset_visual_facts::cached_visual_check_required(&input)?;
                         let needs_asset_step=needs_design||needs_visual_check;
@@ -4800,6 +4812,18 @@ fn production_input(store: &Store, request: &Value) -> Result<Value> {
     }
     Ok(input)
 }
+/// Only an actual new Stage3 writer receives this read-only projection. The
+/// refinement reader and every saved recovery snapshot use production_input.
+fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<Value> {
+    let mut input = production_input(store, request)?;
+    if s(request, "action") == "storyboard.run" {
+        let projection = store.foundation_context_for_new_workflow()?;
+        input["foundation"] = projection.foundation;
+        input["foundationReasonProjection"] = projection.diagnostic;
+        pipeline::asset_design_contract::apply_scope_reasons_to_new_asset_context(&mut input)?;
+    }
+    Ok(input)
+}
 #[cfg(test)]
 fn storyboard_input(store: &Store, request: &Value) -> Result<Value> {
     storyboard_input_inner(store, request, true)
@@ -5919,6 +5943,33 @@ mod refinement_cas_tests;
 #[cfg(test)]
 mod production_input_transport_tests {
     use super::*;
+
+    #[test]
+    fn new_workflow_reason_projection_reaches_flat_stage3_cards_without_mutating_old_contexts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("project")).unwrap();
+        store.create("synthetic projection", "fixture").unwrap();
+        let source = store.save_source(json!(pipeline::prepare_source("第一集\n场景：门口\n甲：开门。\n").unwrap())).unwrap();
+        let place = json!({"episodeId":source["episodes"][0]["id"],"sceneId":source["scenes"][0]["id"]});
+        store.save_asset(json!({"id":"p-base","baseAssetId":"p","identityId":"p","variantId":"base","name":"甲","kind":"CH","sourceRefs":[source["rows"][2]["id"]],"scope":{"kind":"SCENES","scenes":[place],"reason":null},"applicability":{"episodes":[source["episodes"][0]["id"]],"scenes":[source["scenes"][0]["id"]]}})).unwrap();
+        store.save_foundation(json!({"schemaVersion":"foundation/v1","sourceSha256":source["sha256"],"overview":"","direction":"","episodes":[],"facts":[],"issues":[],"assets":[{"id":"p","name":"甲","kind":"CH","description":"主体制作说明","aliases":[],"sourceRefs":[source["rows"][2]["id"]],"variants":[{"id":"base","assetRowId":"p-base","name":"基础","description":"","sourceVariantId":null,"sourceRefs":[source["rows"][2]["id"]],"applicability":[place],"scope":{"kind":"SCENES","scenes":[place],"reason":"本场明确出场。"}}]}]})).unwrap();
+        let raw_assets = store.values("assets").unwrap();
+        let raw_foundation = store.foundation().unwrap();
+        let request = json!({"action":"storyboard.run","episodeId":source["episodes"][0]["id"]});
+        let old = production_input(&store, &request).unwrap();
+        let bytes = old.to_string();
+        let job = store.add_job("workflow","storyboard.run","local","local",&json!({"input":old}),"interrupted").unwrap();
+        let new = production_input_for_new_workflow(&store, &request).unwrap();
+        assert_eq!(new["assets"][0]["scope"]["reason"], "本场明确出场。");
+        assert!(new["foundationReasonProjection"].is_object());
+        assert_eq!(new["foundationScopeReasonBindings"]["p-base"]["variantId"], "base");
+        assert_eq!(store.values("assets").unwrap(), raw_assets);
+        assert_eq!(store.foundation().unwrap(), raw_foundation);
+        assert_eq!(store.job(&job).unwrap()["snapshot"]["input"].to_string(), bytes);
+        let foundation = production_input_for_new_workflow(&store,&json!({"action":"foundation.run","episodeId":source["episodes"][0]["id"]})).unwrap();
+        assert!(foundation.get("foundationReasonProjection").is_none());
+        assert!(foundation["assets"][0]["scope"]["reason"].is_null());
+    }
     #[test]
     fn fresh_storyboard_whole_and_partial_runs_opt_in_without_rewriting_legacy_inputs() {
         let temp = tempfile::tempdir().unwrap();

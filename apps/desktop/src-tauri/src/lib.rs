@@ -8,6 +8,7 @@ pub mod portable;
 pub mod project_library;
 pub mod providers;
 pub mod store;
+mod store_foundation_projection;
 pub mod tasks;
 pub mod text_cli;
 pub mod text_executor;

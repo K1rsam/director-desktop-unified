@@ -301,6 +301,102 @@ fn aliases<'a>(
 }
 
 impl PacketWire {
+    /// Optional production context is frozen in the actual domain request, but
+    /// is not an appearance fact or a reason to rerun an accepted source packet.
+    fn add_identity_materials(&mut self, input: &Value, identities: &[Value]) -> Result<(), String> {
+        let mut materials = Vec::new();
+        let mut scope_materials = Vec::new();
+        let registry = input["assetRegistry"].as_array().or_else(|| input["assets"].as_array());
+        for identity in identities {
+            if let Some(material) = super::asset_design_contract::identity_production_material(
+                input, &json!({"identityId":identity["assetId"]}),
+            )? {
+                materials.push(material);
+            }
+            for version in identity["versions"].as_array().into_iter().flatten() {
+                if let Some(asset) = registry.into_iter().flatten().find(|asset| asset["id"] == version["assetRowId"]) {
+                    if let Some(material) = super::asset_design_contract::scope_production_material(input, asset)? {
+                        scope_materials.push(self.scope_material_for_packet(&material)?);
+                    }
+                }
+            }
+        }
+        if !materials.is_empty() || !scope_materials.is_empty() {
+            self.input[super::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD] =
+                json!(super::asset_design_contract::IDENTITY_MATERIAL_PROFILE);
+            if !materials.is_empty() { self.input[super::asset_design_contract::IDENTITY_MATERIALS_FIELD] = json!(materials); }
+            if !scope_materials.is_empty() { self.input[super::asset_design_contract::SCOPE_MATERIALS_FIELD] = json!(scope_materials); }
+            self.input["identityProductionMaterialPolicy"] =
+                json!(super::asset_design_contract::IDENTITY_MATERIAL_POLICY);
+        }
+        Ok(())
+    }
+
+    fn scope_material_for_packet(&self, material: &Value) -> Result<Value, String> {
+        let pairs = super::asset_design_contract::scope_pairs(&material["scope"]).ok_or("视觉包范围制作资料缺少准确集场")?;
+        let places = pairs.into_iter().map(|(episode, scene)| Ok(json!({
+            "episodeId":self.episode_aliases.get(&episode).ok_or("范围制作资料集号不在本包目录")?,
+            "sceneId":self.scene_aliases.get(&scene).ok_or("范围制作资料场号不在本包目录")?
+        }))).collect::<Result<Vec<Value>, String>>()?;
+        let mut scoped = material.clone();
+        scoped["packetScope"] = json!({"kind":"SCENES","scenes":places,"reason":material["scope"]["reason"]});
+        Ok(scoped)
+    }
+
+    /// A bounded continuation uses the proven original request's addendum,
+    /// never today's foundation description or a regenerated request identity.
+    fn restore_identity_materials(&mut self, original: &Value, identities: &[Value]) -> Result<(), String> {
+        use super::asset_design_contract::{IDENTITY_MATERIAL_PROFILE_FIELD, IDENTITY_MATERIALS_FIELD, SCOPE_MATERIALS_FIELD};
+        if original.get(IDENTITY_MATERIAL_PROFILE_FIELD).is_none() {
+            if original.get(IDENTITY_MATERIALS_FIELD).is_some()
+                || original.get(SCOPE_MATERIALS_FIELD).is_some()
+                || original.get("identityProductionMaterialPolicy").is_some()
+            {
+                return Err("旧视觉包身份制作资料缺少冻结版本，未续发".into());
+            }
+            return Ok(());
+        }
+        let mut materials = serde_json::Map::new();
+        let descriptions = original.get(IDENTITY_MATERIALS_FIELD).map(|value| value.as_array().ok_or("旧视觉包身份制作资料类型错误")).transpose()?.cloned().unwrap_or_default();
+        for material in &descriptions {
+            let id = text(material, "identityId");
+            if !identities.iter().any(|identity| identity["assetId"] == id)
+                || materials.insert(id.to_owned(), material.clone()).is_some()
+            {
+                return Err("旧视觉包身份制作资料越界或重复，未续发".into());
+            }
+        }
+        let mut frozen = json!({"source":{"sha256":original["sourceSha256"]}});
+        frozen[IDENTITY_MATERIAL_PROFILE_FIELD] = original[IDENTITY_MATERIAL_PROFILE_FIELD].clone();
+        frozen[IDENTITY_MATERIALS_FIELD] = Value::Object(materials);
+        self.add_identity_materials(&frozen, identities)?;
+        if let Some(scopes) = original.get(SCOPE_MATERIALS_FIELD) {
+            let mut seen = HashSet::new();
+            for material in scopes.as_array().ok_or("旧视觉包形象范围制作资料类型错误")? {
+                let owned = identities.iter().find(|identity| identity["assetId"] == material["identityId"])
+                    .is_some_and(|identity| identity["versions"].as_array().into_iter().flatten().any(|version| version["assetRowId"] == material["assetId"] && version["variantId"] == material["variantId"]));
+                if !owned || !seen.insert(text(material, "assetId"))
+                    || material["version"] != super::asset_design_contract::SCOPE_MATERIAL_PROFILE
+                    || material["sourceSha256"] != original["sourceSha256"]
+                    || !matches!(text(material, "provenance"), "FOUNDATION_SCOPE_REASON_NOT_VISUAL_FACT" | "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT")
+                    || ["assetVersion", "sourceVersion", "foundationVersion"].iter().any(|key| !material[*key].as_u64().is_some_and(|v| v > 0))
+                    || ["originalScopeSha256", "sourceRefsSha256"].iter().any(|key| text(material, key).len() != 64 || !text(material, key).bytes().all(|b| b.is_ascii_hexdigit()))
+                    || text(&material["scope"], "reason").trim().is_empty()
+                    || self.scope_material_for_packet(material)? != *material
+                { return Err("旧视觉包形象范围制作资料绑定无效，未续发".into()); }
+            }
+            self.input[IDENTITY_MATERIAL_PROFILE_FIELD] = json!(super::asset_design_contract::IDENTITY_MATERIAL_PROFILE);
+            self.input[SCOPE_MATERIALS_FIELD] = scopes.clone();
+            self.input["identityProductionMaterialPolicy"] = json!(super::asset_design_contract::IDENTITY_MATERIAL_POLICY);
+        }
+        for key in [IDENTITY_MATERIAL_PROFILE_FIELD, IDENTITY_MATERIALS_FIELD, SCOPE_MATERIALS_FIELD, "identityProductionMaterialPolicy"] {
+            if self.input.get(key) != original.get(key) {
+                return Err("旧视觉包身份制作资料无法按冻结原请求完整还原，未续发".into());
+            }
+        }
+        Ok(())
+    }
+
     fn compile(source: &LockedSource, identities: &[Value], rows: &[&SourceRow]) -> Self {
         let packet = canonical_packet(source, identities, rows);
         let packet_hash = digest(&packet.to_string());
@@ -1452,7 +1548,8 @@ async fn continue_cached_production_choice(
             .ok_or("旧视觉修订缺少原主体目录")?,
     )?;
     let rows = cached_rows(source, cache)?;
-    let wire = PacketWire::compile(source, &identities, &rows);
+    let mut wire = PacketWire::compile(source, &identities, &rows);
+    wire.restore_identity_materials(&original.input, &identities)?;
     if wire.input != original.input
         || wire.schema(&identities) != original.schema
         || wire.packet_hash != text(cache, "inputFingerprint")
@@ -1915,7 +2012,8 @@ pub async fn run_asset_visual_facts(
             }
             continue;
         }
-        let wire = PacketWire::compile(&source, &identities, rows);
+        let mut wire = PacketWire::compile(&source, &identities, rows);
+        wire.add_identity_materials(input, &identities)?;
         debug_assert_eq!(wire.packet_hash, packet_hash);
         let schema = wire.schema(&identities);
         let mut rejected_raw = None;
@@ -2441,6 +2539,130 @@ mod tests {
         let source = prepare_source("第一集\n场景：门口\n△小王和小李黑发出现。\n").unwrap();
         let row = source.rows[2].id.clone();
         json!({"source":source,"assets":[{"id":"王:base","baseAssetId":"王","variantId":"base","name":"王","sourceRefs":[row],"prompt":"旧历史不应发给提取岗"},{"id":"李:base","baseAssetId":"李","variantId":"base","name":"李","sourceRefs":[row]}],"foundation":{"sourceSha256":source.sha256,"facts":[]}})
+    }
+
+    #[test]
+    fn identity_material_addendum_restores_exact_original_packet_without_changing_fact_cache_identity() {
+        use super::super::asset_design_contract as contract;
+        let mut input = basis();
+        input["foundation"]["assets"] = json!([
+            {"id":"王","name":"王","description":"已采用的主体制作说明。"},
+            {"id":"李","name":"李","description":"另一主体的制作说明。"}
+        ]);
+        input["source"]["version"] = json!(1);
+        input["foundation"]["version"] = json!(1);
+        input["foundation"]["sourceVersion"] = json!(1);
+        let place = json!({"episodeId":input["source"]["episodes"][0]["id"],"sceneId":input["source"]["scenes"][0]["id"]});
+        input["assets"][0]["version"] = json!(1);
+        input["assets"][0]["scope"] = json!({"kind":"SCENES","scenes":[place],"reason":null});
+        input["assets"][0]["applicability"] = json!({"episodes":[place["episodeId"]],"scenes":[place["sceneId"]]});
+        input["foundation"]["assets"][0]["variants"] = json!([{"id":"base","assetRowId":"王:base","sourceRefs":input["assets"][0]["sourceRefs"],"scope":{"kind":"SCENES","scenes":[place],"reason":"本场需此形象。"}}]);
+        contract::freeze_identity_production_materials(&mut input).unwrap();
+        let source: LockedSource = serde_json::from_value(input["source"].clone()).unwrap();
+        let identities = identity_cards(&input, input["assets"].as_array().unwrap());
+        let rows: Vec<_> = source.rows.iter().collect();
+        let legacy = PacketWire::compile(&source, &identities, &rows);
+        let mut current = PacketWire::compile(&source, &identities, &rows);
+        current.add_identity_materials(&input, &identities).unwrap();
+        assert_eq!(legacy.packet_hash, current.packet_hash);
+        assert_eq!(legacy.schema(&identities), current.schema(&identities));
+        assert_ne!(legacy.input, current.input, "actual new A15 request receives the addendum");
+        let original = current.input.clone();
+        assert_eq!(original[contract::SCOPE_MATERIALS_FIELD].as_array().unwrap().len(), 1);
+        input["foundation"]["assets"][0]["description"] = json!("后来编辑，不得读入原请求。");
+        input["foundation"]["assets"][0]["variants"][0]["scope"]["reason"] = json!("后来范围取舍，不得续发。");
+        contract::freeze_identity_production_materials(&mut input).unwrap();
+        let mut restored = PacketWire::compile(&source, &identities, &rows);
+        restored.restore_identity_materials(&original, &identities).unwrap();
+        assert_eq!(restored.input, original);
+        let mut old_restored = PacketWire::compile(&source, &identities, &rows);
+        old_restored.restore_identity_materials(&legacy.input, &identities).unwrap();
+        assert_eq!(old_restored.input, legacy.input);
+        for (pointer, value) in [
+            ("/identityProductionMaterials/0/identityId", json!("wrong-subject")),
+            ("/identityProductionMaterials/0/sourceSha256", json!("wrong-source")),
+            ("/identityProductionMaterials/0/provenance", json!("SOURCE")),
+            ("/assetScopeProductionMaterials/0/variantId", json!("another-version")),
+            ("/assetScopeProductionMaterials/0/packetScope/scenes/0/sceneId", json!("another-scene")),
+            ("/assetScopeProductionMaterials/0/sourceVersion", json!(0)),
+            ("/assetScopeProductionMaterials/0/provenance", json!("SOURCE")),
+            ("/identityProductionMaterialPolicy", json!("promote-to-facts")),
+        ] {
+            let mut wrong = original.clone();
+            *wrong.pointer_mut(pointer).unwrap() = value;
+            assert!(PacketWire::compile(&source, &identities, &rows).restore_identity_materials(&wrong, &identities).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_material_addendum_is_frozen_in_a15_and_delta_repair_without_replaying_accepted_facts() {
+        use super::super::asset_design_contract as contract;
+        let mut input = production_choice_basis();
+        input["foundation"]["assets"] = json!([
+            {"id":"王","name":"王","description":"王的身份制作说明；当前状态另查原文。"},
+            {"id":"李","name":"李","description":"李的身份制作说明，不是视觉事实。"}
+        ]);
+        contract::freeze_identity_production_materials(&mut input).unwrap();
+        let frozen = input.to_string();
+        let executor = Extractor::new("repair-defer");
+        let output = run_asset_visual_facts(&input, &executor, "offline", "medium").await.unwrap();
+        assert!(output["blocked"].as_array().unwrap().is_empty(), "{output}");
+        {
+            let requests = executor.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let original = &requests[0];
+            let repair = &requests[1];
+            assert_eq!(original.input[contract::IDENTITY_MATERIALS_FIELD].as_array().unwrap().len(), 2);
+            assert_eq!(repair.input[contract::IDENTITY_MATERIALS_FIELD], original.input[contract::IDENTITY_MATERIALS_FIELD]);
+            assert_eq!(repair.input["visualFactRepair"]["originalDomainRequestSha256"], digest(&serde_json::to_string(original).unwrap()));
+            validate_visual_fact_repair_request(repair).unwrap();
+        }
+        assert_eq!(input.to_string(), frozen);
+        input["foundation"]["visualFactBatches"] = output["visualFactBatches"].clone();
+        let receipts = input["foundation"]["visualFactBatches"].clone();
+        let resumed = run_asset_visual_facts(&input, &Never, "offline", "medium").await.unwrap();
+        assert_eq!(resumed["visualFactBatches"], receipts);
+        assert_eq!(resumed["facts"], output["facts"]);
+        assert!(resumed["blocked"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_material_addendum_retains_current_scope_reason_over_foundation_and_restores_original() {
+        use super::super::asset_design_contract as contract;
+        let mut input = basis();
+        input["assets"].as_array_mut().unwrap().truncate(1);
+        input["source"]["version"] = json!(1);
+        input["foundation"]["version"] = json!(1);
+        input["foundation"]["sourceVersion"] = json!(1);
+        let place = json!({"episodeId":input["source"]["episodes"][0]["id"],"sceneId":input["source"]["scenes"][0]["id"]});
+        input["assets"][0]["version"] = json!(2);
+        input["assets"][0]["scope"] = json!({"kind":"SCENES","scenes":[place],"reason":"用户当前已保存的制作理由。"});
+        input["assets"][0]["applicability"] = json!({"episodes":[place["episodeId"]],"scenes":[place["sceneId"]]});
+        input["foundation"]["assets"] = json!([{"id":"王","variants":[{"id":"base","assetVersion":1,"sourceRefs":input["assets"][0]["sourceRefs"],"scope":{"kind":"SCENES","scenes":[place],"reason":"旧制作基础的不同理由。"}}]}]);
+        let raw = input["assets"].clone();
+        contract::freeze_identity_production_materials(&mut input).unwrap();
+        let source: LockedSource = serde_json::from_value(input["source"].clone()).unwrap();
+        let identities = identity_cards(&input, input["assets"].as_array().unwrap());
+        let rows: Vec<_> = source.rows.iter().collect();
+        let legacy = PacketWire::compile(&source, &identities, &rows);
+        let mut wire = PacketWire::compile(&source, &identities, &rows);
+        wire.add_identity_materials(&input, &identities).unwrap();
+        assert_eq!(wire.packet_hash, legacy.packet_hash);
+        assert_eq!(wire.schema(&identities), legacy.schema(&identities));
+        assert_eq!(input["assets"], raw);
+        let material = &wire.input[contract::SCOPE_MATERIALS_FIELD][0];
+        assert_eq!(material["scope"]["reason"], "用户当前已保存的制作理由。");
+        assert_eq!(material["provenance"], "CURRENT_ASSET_SCOPE_REASON_NOT_VISUAL_FACT");
+        assert!(wire.input.get(contract::IDENTITY_MATERIALS_FIELD).is_none(), "scope-only addendum does not invent an identity description");
+        let original = wire.input.clone();
+        input["assets"][0]["scope"]["reason"] = json!("后续编辑不得进入旧请求。");
+        contract::freeze_identity_production_materials(&mut input).unwrap();
+        let mut restored = PacketWire::compile(&source, &identities, &rows);
+        restored.restore_identity_materials(&original, &identities).unwrap();
+        assert_eq!(restored.input, original);
+        let mut old = PacketWire::compile(&source, &identities, &rows);
+        old.add_identity_materials(&json!({"assets":raw,"source":source}), &identities).unwrap();
+        assert_eq!(old.input, legacy.input, "legacy profile cannot gain current production material");
     }
 
     #[tokio::test]
