@@ -28,6 +28,92 @@ struct ProgressStep {
     event: Value,
 }
 
+struct RefinementAdoption<'a> {
+    run: &'a str,
+    expected_candidate_sha: &'a str,
+}
+
+fn rewire_refinement_groups(tx: &Transaction<'_>, delta: &Value) -> Result<()> {
+    for group in delta["replacements"]
+        .as_array()
+        .ok_or("精修采用缺少替换组")?
+    {
+        let old: Vec<_> = group["replaces"]
+            .as_array()
+            .ok_or("精修采用缺少原身份")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let next: Vec<_> = group["units"]
+            .as_array()
+            .ok_or("精修采用缺少新稿")?
+            .iter()
+            .map(|unit| s(unit, "id"))
+            .collect();
+        let first = *old.first().ok_or("精修采用原组为空")?;
+        let new_first = *next.first().ok_or("精修采用新组为空")?;
+        let new_last = *next.last().unwrap();
+        let mut query = tx
+            .prepare("SELECT unit_id,dependency_id FROM unit_dependencies")
+            .map_err(|e| e.to_string())?;
+        let links = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(query);
+        let ingress: Vec<_> = links
+            .iter()
+            .filter(|(unit, parent)| unit == first && !old.contains(&parent.as_str()))
+            .collect();
+        let successors: Vec<_> = links
+            .iter()
+            .filter(|(unit, parent)| {
+                !old.contains(&unit.as_str()) && old.contains(&parent.as_str())
+            })
+            .collect();
+        for id in &old {
+            tx.execute(
+                "DELETE FROM unit_dependencies WHERE unit_id=?1 OR dependency_id=?1",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for id in &next {
+            tx.execute("DELETE FROM unit_dependencies WHERE unit_id=?1", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        for (_, parent) in ingress {
+            if parent != new_first {
+                tx.execute(
+                    "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
+                    params![new_first, parent],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        for pair in next.windows(2) {
+            tx.execute(
+                "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
+                params![pair[1], pair[0]],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for (unit, _) in successors {
+            if unit != new_last && !next.contains(&unit.as_str()) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
+                    params![unit, new_last],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn progress_step(c: &Connection, run: &str, node: &str) -> Result<Option<ProgressStep>> {
     let row:Option<Value>=c.query_row("SELECT w.request_hash,w.state,w.error,w.result,j.snapshot,j.result,j.receipt,j.state,j.error,w.stage,j.kind,(SELECT e.data FROM events e WHERE e.job_id=j.id AND e.type='text_received_raw' ORDER BY e.rowid DESC LIMIT 1) FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",params![run,node],|r|Ok(json!({"hash":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"error":r.get::<_,Option<String>>(2)?,"result":r.get::<_,Option<String>>(3)?,"snapshot":r.get::<_,String>(4)?,"raw":r.get::<_,Option<String>>(5)?,"receipt":r.get::<_,Option<String>>(6)?,"jobStatus":r.get::<_,String>(7)?,"jobError":r.get::<_,Option<String>>(8)?,"stage":r.get::<_,String>(9)?,"kind":r.get::<_,String>(10)?,"event":r.get::<_,Option<String>>(11)?}))).optional().map_err(|e|e.to_string())?;
     let Some(row) = row else {
@@ -271,6 +357,72 @@ fn author_scope_attempt_resolution(
         })
 }
 
+/// Reuse the same durable repair proof for author-cache recovery as for the
+/// progress projection. The rejected author stays rejected; only the original
+/// editor's source-bound, adopted draft can supply a recovered predecessor.
+pub(crate) fn accepted_author_repair_predecessor(
+    store: &Store,
+    run: &str,
+    node: &str,
+    tail: &Value,
+) -> Result<bool> {
+    let c = store.conn()?;
+    let Some(resolver) = progress_step(&c, run, node)? else {
+        return Ok(false);
+    };
+    let input = &resolver.request.input;
+    let draft = &resolver.result["materializedDraft"];
+    if input["executionBatch"]["version"] != "author-domain-repair/v1"
+        || input["executionBatch"]["originExecutionBatchId"] != tail["executionBatchId"]
+        || draft["units"].as_array().and_then(|units| units.last()) != Some(&tail["unit"])
+    {
+        return Ok(false);
+    }
+    let source: Option<String> = c.query_row(
+        "SELECT json_extract(snapshot,'$.input.source') FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run'",
+        [run], |r| r.get(0),
+    ).optional().map_err(|e| e.to_string())?.flatten();
+    let Some(source) = source.and_then(|v| serde_json::from_str::<Value>(&v).ok()) else {
+        return Ok(false);
+    };
+    if source["sha256"].as_str().is_none_or(|sha| sha.len() != 64)
+        || source["text"]
+            .as_str()
+            .is_none_or(|text| crate::pipeline::digest(text) != s(&source, "sha256"))
+    {
+        return Ok(false);
+    }
+    let mut query = c.prepare(
+        "SELECT w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='rejected' AND json_extract(j.snapshot,'$.input.episodeId')=?2 AND ((w.stage='storyboardCreate' AND json_extract(j.snapshot,'$.input.executionBatch.id')=?3) OR (w.stage='storyboardFinish' AND json_extract(j.snapshot,'$.input.authorRepair.originDomainRequestSha256')=?4))",
+    ).map_err(|e| e.to_string())?;
+    let keys = query
+        .query_map(
+            params![
+                run,
+                progress_episode(&resolver),
+                s(tail, "executionBatchId"),
+                s(&input["authorRepair"], "originDomainRequestSha256")
+            ],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut origins = Vec::new();
+    for key in keys {
+        if let Some(origin) = progress_step(&c, run, &key)? {
+            origins.push(origin);
+        }
+    }
+    Ok(origins.iter().any(|origin| {
+        author_scope_resolution(origin, &resolver, &source)
+            && (input["authorRepair"]["attempt"] == 1
+                || origins.iter().any(|earlier| {
+                    author_scope_attempt_resolution(earlier, &resolver, &source, &origins)
+                }))
+    }))
+}
+
 fn continuity_resolution(
     origin: &ProgressStep,
     resolver: &ProgressStep,
@@ -356,22 +508,55 @@ fn continuity_resolution(
             == revision["currentTailSha256"]
 }
 
-fn project_transport_resolutions(store:&Store,c:&Connection,run:&str,nodes:&mut[Value])->Result<()> {
-    if !nodes.iter().any(|node|node["status"]=="failed") {return Ok(())}
+fn project_transport_resolutions(
+    store: &Store,
+    c: &Connection,
+    run: &str,
+    nodes: &mut [Value],
+) -> Result<()> {
+    if !nodes.iter().any(|node| node["status"] == "failed") {
+        return Ok(());
+    }
     let mut query=c.prepare("SELECT w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.state='completed' AND json_extract(j.snapshot,'$.input.textTransportRetry.version')='stopped-text-transport-retry/v1'").map_err(|e|e.to_string())?;
-    let keys=query.query_map([run],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let keys = query
+        .query_map([run], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
     for key in keys {
-        let Some(resolver)=progress_step(c,run,&key)? else {continue};
-        if !crate::text_executor::accepted_transport_retry_proof(store,run,&resolver.request)? {continue}
-        let proof=&resolver.request.input["textTransportRetry"];
-        if let Some(origin)=nodes.iter_mut().find(|node|node["status"]=="failed" && node["id"]==proof["originNodeKey"] && node["requestHash"]==proof["originRequestHash"]) {
-            origin["resolution"]=json!({"version":"workflow-step-resolution/v1","kind":"text-transport-recovered","workflowId":run,"originNodeId":origin["id"],"originRequestHash":origin["requestHash"],"resolverNodeId":resolver.node,"resolverRequestHash":resolver.hash,"verified":true});
+        let Some(resolver) = progress_step(c, run, &key)? else {
+            continue;
+        };
+        if !crate::text_executor::accepted_transport_retry_proof(store, run, &resolver.request)? {
+            continue;
+        }
+        let proof = &resolver.request.input["textTransportRetry"];
+        if let Some(origin) = nodes.iter_mut().find(|node| {
+            node["status"] == "failed"
+                && node["id"] == proof["originNodeKey"]
+                && node["requestHash"] == proof["originRequestHash"]
+        }) {
+            origin["resolution"] = json!({"version":"workflow-step-resolution/v1","kind":"text-transport-recovered","workflowId":run,"originNodeId":origin["id"],"originRequestHash":origin["requestHash"],"resolverNodeId":resolver.node,"resolverRequestHash":resolver.hash,"verified":true});
+        }
+        for prior in proof["priorFailures"].as_array().into_iter().flatten() {
+            if let Some(origin) = nodes.iter_mut().find(|node| {
+                node["status"] == "failed"
+                    && node["id"] == prior["nodeKey"]
+                    && node["requestHash"] == prior["requestHash"]
+            }) {
+                origin["resolution"] = json!({"version":"workflow-step-resolution/v1","kind":"text-transport-recovered","workflowId":run,"originNodeId":origin["id"],"originRequestHash":origin["requestHash"],"resolverNodeId":resolver.node,"resolverRequestHash":resolver.hash,"verified":true});
+            }
         }
     }
     Ok(())
 }
-fn project_step_resolutions(store:&Store,c: &Connection, run: &str, nodes: &mut [Value]) -> Result<()> {
-    project_transport_resolutions(store,c,run,nodes)?;
+fn project_step_resolutions(
+    store: &Store,
+    c: &Connection,
+    run: &str,
+    nodes: &mut [Value],
+) -> Result<()> {
+    project_transport_resolutions(store, c, run, nodes)?;
     if !nodes.iter().any(|node| {
         node["stage"] == "storyboardCreate"
             && node["status"] == "rejected"
@@ -719,23 +904,41 @@ impl Store {
     /// advancing asset/foundation versions; complete publication and terminal parent
     /// state commit together so a crash cannot leave an adopted-but-runnable parent.
     pub fn finish_asset_design_workflow(
-        &self, source_version:i64, foundation_version:i64, output:&Value, run:&str,
+        &self,
+        source_version: i64,
+        foundation_version: i64,
+        output: &Value,
+        run: &str,
     ) -> Result<Value> {
-        let mut result=output.clone();
-        let blocked=result["blocked"].as_array().ok_or("设计结果缺少阻塞列表")?;
+        let mut result = output.clone();
+        let blocked = result["blocked"].as_array().ok_or("设计结果缺少阻塞列表")?;
         if !blocked.is_empty() {
-            result["publication"]=json!({"version":"stage2-atomic-publication/v1","status":"held_partial","workflowId":run});
-            if !self.claim_job_fields(run,"running","partially_blocked",&json!({"result":result}))? {
+            result["publication"] = json!({"version":"stage2-atomic-publication/v1","status":"held_partial","workflowId":run});
+            if !self.claim_job_fields(
+                run,
+                "running",
+                "partially_blocked",
+                &json!({"result":result}),
+            )? {
                 return Err("原资产设计父流程不再运行，未改写其结果".into());
             }
         } else {
-            result["publication"]=json!({"version":"stage2-atomic-publication/v1","status":"completed","workflowId":run});
-            self.publish_asset_design_inner(source_version,foundation_version,&result,Some(run))?;
+            result["publication"] = json!({"version":"stage2-atomic-publication/v1","status":"completed","workflowId":run});
+            self.publish_asset_design_inner(
+                source_version,
+                foundation_version,
+                &result,
+                Some(run),
+            )?;
         }
         Ok(result)
     }
     fn publish_asset_design_inner(
-        &self, source_version:i64, foundation_version:i64, output:&Value, run:Option<&str>,
+        &self,
+        source_version: i64,
+        foundation_version: i64,
+        output: &Value,
+        run: Option<&str>,
     ) -> Result<()> {
         let mut c = self.conn()?;
         let tx = c
@@ -757,13 +960,24 @@ impl Store {
         // Validate against the complete prospective batch before any write. A
         // direct source edited during generation must not be silently adopted.
         let proposals = output["assets"].as_array().ok_or("设计结果缺少资产列表")?;
-        let mut statement = tx.prepare("SELECT data FROM assets").map_err(|e|e.to_string())?;
-        let rows = statement.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
-        let mut effective = rows.map(|r|parse(r.map_err(|e|e.to_string())?)).collect::<Result<Vec<_>>>()?;
+        let mut statement = tx
+            .prepare("SELECT data FROM assets")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut effective = rows
+            .map(|r| parse(r.map_err(|e| e.to_string())?))
+            .collect::<Result<Vec<_>>>()?;
         drop(statement);
         for proposal in proposals {
-            let current = effective.iter_mut().find(|a|a["id"]==proposal["id"]).ok_or("设计资产已经不存在")?;
-            if current["version"] != proposal["version"] {return Err("资产在设计期间已经编辑，结果保留供核对".into());}
+            let current = effective
+                .iter_mut()
+                .find(|a| a["id"] == proposal["id"])
+                .ok_or("设计资产已经不存在")?;
+            if current["version"] != proposal["version"] {
+                return Err("资产在设计期间已经编辑，结果保留供核对".into());
+            }
             *current = proposal.clone();
         }
         for proposal in proposals {
@@ -771,8 +985,16 @@ impl Store {
             if receipt.is_object() {
                 let basis = &receipt["basis"];
                 if receipt["sha256"] != crate::pipeline::digest(&basis.to_string())
-                    || basis["assetSemanticVersion"] != crate::pipeline::digest(&crate::pipeline::asset_design_contract::asset_semantics(proposal).to_string())
-                    || basis["sourceChain"] != json!(crate::pipeline::asset_design_contract::source_chain(&effective,proposal)?) {
+                    || basis["assetSemanticVersion"]
+                        != crate::pipeline::digest(
+                            &crate::pipeline::asset_design_contract::asset_semantics(proposal)
+                                .to_string(),
+                        )
+                    || basis["sourceChain"]
+                        != json!(crate::pipeline::asset_design_contract::source_chain(
+                            &effective, proposal
+                        )?)
+                {
                     return Err("资产设计或指定来源语义版本已变化，未采用过期设计".into());
                 }
             }
@@ -801,6 +1023,13 @@ impl Store {
         if let Some(facts) = output["facts"].as_array() {
             let mut safe = vec![];
             for fact in facts {
+                let source_binding = fact.get("sourceSha256").cloned();
+                if source_binding
+                    .as_ref()
+                    .is_some_and(|sha| sha != &json!(source.sha256))
+                {
+                    return Err("视觉事实源摘要与当前锁定原文不一致".into());
+                }
                 let mut fact: crate::pipeline::FoundationFact =
                     serde_json::from_value(fact.clone()).map_err(|e| e.to_string())?;
                 if fact.source_refs.is_empty() {
@@ -820,7 +1049,11 @@ impl Store {
                     .collect::<std::result::Result<Vec<_>, _>>()?
                     .into_iter()
                     .collect();
-                safe.push(json!(fact));
+                let mut saved = json!(fact);
+                if let Some(sha) = source_binding {
+                    saved["sourceSha256"] = sha;
+                }
+                safe.push(saved);
             }
             foundation["facts"] = json!(safe);
         }
@@ -839,9 +1072,11 @@ impl Store {
             foundation["visualFactBatches"] = json!(all);
         }
         write_foundation(&tx, foundation, source_version)?;
-        if let Some(run)=run {
+        if let Some(run) = run {
             let n=tx.execute("UPDATE jobs SET state='completed',result=?1,error=NULL,updated_at=?2 WHERE id=?3 AND kind='workflow' AND state='running' AND json_extract(snapshot,'$.stage')='images.design' AND json_extract(snapshot,'$.sourceVersion')=?4",params![output.to_string(),now(),run,source_version]).map_err(|e|e.to_string())?;
-            if n!=1 {return Err("原资产设计父流程不再运行或源不符，整笔采用已回滚".into());}
+            if n != 1 {
+                return Err("原资产设计父流程不再运行或源不符，整笔采用已回滚".into());
+            }
             tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'asset_design_published',?2,?3)",params![run,json!({"version":"stage2-atomic-publication/v1","sourceVersion":source_version,"outputSha256":crate::pipeline::digest(&output.to_string())}).to_string(),now()]).map_err(|e|e.to_string())?;
         }
         mark_changed(&tx)?;
@@ -854,7 +1089,7 @@ impl Store {
         input: &Value,
         run: Option<&str>,
     ) -> Result<()> {
-        self.publish_storyboard_inner(guard, output, input, run, false)
+        self.publish_storyboard_inner(guard, output, input, run, false, None)
     }
     /// Complete episode publication and its running-workflow receipt share one
     /// transaction. A transport fragment or an accepted author is insufficient.
@@ -866,7 +1101,58 @@ impl Store {
         run: &str,
     ) -> Result<()> {
         crate::pipeline::validate_episode_delivery(input, output)?;
-        self.publish_storyboard_inner(guard, output, input, Some(run), true)
+        self.publish_storyboard_inner(guard, output, input, Some(run), true, None)
+    }
+
+    /// Reserve a fresh refinement only while its original project settings and
+    /// complete publication preimage still match. Preflight execution identity
+    /// is frozen separately and never substituted for this settings guard.
+    pub(crate) fn reserve_storyboard_refinement_workflow(&self, snapshot: &Value) -> Result<String> {
+        if snapshot["stage"] != "storyboard.refine"
+            || snapshot["runnerVersion"] != "desktop-runner/v1"
+            || snapshot["guard"] != guard_from_input(&snapshot["input"])
+        {
+            return Err("新精修流程身份或冻结发布依据无效；未创建任务".into());
+        }
+        let mut connection = self.conn()?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if snapshot["savedSettingsSha256"]
+            != crate::pipeline::digest(&self.settings()?.to_string())
+        {
+            return Err("项目保存设置在精修创建前变化；未创建任务或派发请求，请刷新后重新开始".into());
+        }
+        verify_guard(&tx, &snapshot["guard"])?;
+        let run = crate::store::id();
+        tx.execute("INSERT INTO jobs(id,kind,entity_id,provider,state,account_id,snapshot,created_at,updated_at) VALUES(?1,'workflow','storyboard.refine','local','queued','local',?2,?3,?3)",
+            params![run,snapshot.to_string(),now()]).map_err(|e|e.to_string())?;
+        mark_changed(&tx)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(run)
+    }
+
+    /// A completed director operation stores a candidate. Only this explicit
+    /// publication path can adopt it. Candidate bytes and its text checkpoints
+    /// stay immutable; unit writes and an independent adoption receipt commit
+    /// together. Repeating the same adoption never creates new unit versions.
+    pub fn publish_storyboard_refinement(
+        &self,
+        run: &str,
+        expected_candidate_sha: &str,
+        current_input: &Value,
+    ) -> Result<()> {
+        self.publish_storyboard_inner(
+            &guard_from_input(current_input),
+            &Value::Null,
+            current_input,
+            None,
+            false,
+            Some(RefinementAdoption {
+                run,
+                expected_candidate_sha,
+            }),
+        )
     }
     fn publish_storyboard_inner(
         &self,
@@ -875,12 +1161,117 @@ impl Store {
         input: &Value,
         run: Option<&str>,
         episode_progress: bool,
+        adoption: Option<RefinementAdoption<'_>>,
     ) -> Result<()> {
         self.ensure_workflow_storage()?;
         let mut c = self.conn()?;
         let tx = c
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let mut adoption_basis = None;
+        let mut adopted_output = None;
+        if let Some(adoption) = &adoption {
+            let (snapshot_raw, candidate_raw, prepared_raw, state): (String, Option<String>, Option<String>, String) = tx
+                .query_row("SELECT snapshot,result,prepared,state FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.refine'",
+                    [adoption.run], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))
+                .map_err(|_| "导演精修来源流程不存在")?;
+            let snapshot = parse(snapshot_raw)?;
+            let candidate_raw = candidate_raw.ok_or("精修来源尚无完整候选")?;
+            let candidate = parse(candidate_raw.clone())?;
+            let prepared = prepared_raw.map(parse).transpose()?.unwrap_or(json!({}));
+            if state != "completed"
+                || snapshot["stage"] != "storyboard.refine"
+                || snapshot["runnerVersion"] != "desktop-runner/v1"
+                || candidate["candidateSha256"] != adoption.expected_candidate_sha
+            {
+                return Err("精修候选来源状态或预览指纹已变化；原稿保持".into());
+            }
+            if let Some(receipt) = prepared.get("refinementAdoption") {
+                if receipt["version"] != "storyboard-refinement-adoption/v1"
+                    || receipt["workflowId"] != adoption.run
+                    || receipt["candidateSha256"] != adoption.expected_candidate_sha
+                {
+                    return Err("精修已有采用记录的身份不符，未改写历史记录".into());
+                }
+                return Ok(());
+            }
+            // The immediate write lock is already held, so the complete Store
+            // settings view cannot change between this check and commit.
+            if snapshot["savedSettingsSha256"]
+                != crate::pipeline::digest(&self.settings()?.to_string())
+            {
+                return Err("项目保存设置已变化，精修候选保留但未采用".into());
+            }
+            verify_guard(&tx, guard)?;
+            let episode = s(&candidate, "episodeId");
+            if !guard["episodeIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == episode))
+            {
+                return Err("精修发布未保护完整采用集稿范围".into());
+            }
+            let mut query=tx.prepare("SELECT data FROM units WHERE episode_id=?1 AND COALESCE(json_extract(data,'$.retired'),0)<>1").map_err(|e|e.to_string())?;
+            let actual = query
+                .query_map([episode], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .map(|row| parse(row.map_err(|e| e.to_string())?))
+                .collect::<Result<Vec<_>>>()?;
+            drop(query);
+            let supplied: Vec<_> = input["existingUnits"]
+                .as_array()
+                .ok_or("精修采用缺少当前集稿")?
+                .iter()
+                .filter(|unit| unit["episodeId"] == episode && unit["retired"] != true)
+                .collect();
+            if actual.len() != supplied.len()
+                || actual.iter().any(|unit| {
+                    supplied
+                        .iter()
+                        .filter(|saved| saved["id"] == unit["id"] && **saved == unit)
+                        .count()
+                        != 1
+                })
+            {
+                return Err("精修采用依据不是当前数据库的完整集稿；未覆盖人工编辑".into());
+            }
+            // Require the original domain-accepted text checkpoint as well as
+            // the top-level candidate. A copied result is not a new authority.
+            let mut query=tx.prepare("SELECT node_key FROM workflow_steps WHERE workflow_id=?1 AND stage='storyboardRefine'").map_err(|e|e.to_string())?;
+            let nodes = query
+                .query_map([adoption.run], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            drop(query);
+            let mut matching = 0;
+            for node in nodes {
+                if let Some(step) = progress_step(&tx, adoption.run, &node)? {
+                    let mut raw = step.result.clone();
+                    if let Some(object) = raw.as_object_mut() {
+                        object.remove("materializedDraft");
+                    }
+                    if step.status == "accepted"
+                        && step.request.stage == "storyboardRefine"
+                        && step.request.skill == "director-refinement"
+                        && step.domain_hash == candidate["domainRequestSha256"]
+                        && step.request.rule_snapshot["creativePack"] == candidate["ruleReceipt"]
+                        && raw == candidate["rawDelta"]
+                        && step.event["requestHash"] == step.hash
+                        && step.event["value"] == candidate["rawDelta"]
+                    {
+                        matching += 1;
+                    }
+                }
+            }
+            if matching != 1 {
+                return Err("精修候选未回绑唯一原始验收回包；未采用复制或不明来源成果".into());
+            }
+            adopted_output = Some(crate::pipeline::adopt_storyboard_refinement(
+                input, &candidate,
+            )?);
+            adoption_basis = Some((candidate, candidate_raw, prepared));
+        }
+        let output = adopted_output.as_ref().unwrap_or(output);
         verify_guard(&tx, guard)?;
         let authored = output["units"].as_array().ok_or("创作结果缺少单元数组")?;
         // A successful transport group is a saved draft, not proof that the
@@ -959,7 +1350,20 @@ impl Store {
         for old in current.iter().filter(|old| in_scope(old)) {
             let id = s(old, "id");
             let replacement = units.iter().find(|u| s(u, "id") == id);
-            if replacement.is_none_or(|u| u["exitState"] != old["exitState"]) {
+            let state_changed = if let Some((candidate, _, _)) = &adoption_basis {
+                candidate["validatedDelta"]["replacements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| {
+                        group["replaces"].as_array().unwrap().last() == Some(&old["id"])
+                            && group["units"].as_array().unwrap().last().unwrap()["exitState"]
+                                != old["exitState"]
+                    })
+            } else {
+                replacement.is_none_or(|u| u["exitState"] != old["exitState"])
+            };
+            if state_changed {
                 mark_dependents_tx(&tx, id, &published)?;
             }
             let mut successors = tx
@@ -1013,20 +1417,22 @@ impl Store {
             value["foundationVersion"] = guard["foundationVersion"].clone();
             let saved = save_unit_tx(&tx, value)?;
             let uid = s(&saved, "id");
-            tx.execute("DELETE FROM unit_dependencies WHERE unit_id=?1", [uid])
-                .map_err(|e| e.to_string())?;
-            if let Some(ref previous) = prior {
-                if previous != uid {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
-                        params![uid, previous],
-                    )
+            if adoption.is_none() {
+                tx.execute("DELETE FROM unit_dependencies WHERE unit_id=?1", [uid])
                     .map_err(|e| e.to_string())?;
+                if let Some(ref previous) = prior {
+                    if previous != uid {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
+                            params![uid, previous],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             prior = Some(uid.to_owned());
         }
-        if let Some(last) = prior.as_deref() {
+        if let Some(last) = prior.as_deref().filter(|_| adoption.is_none()) {
             for next in external_successors {
                 for old in &scoped {
                     tx.execute(
@@ -1048,6 +1454,32 @@ impl Store {
                 mark_unit_stale_tx(&tx, id)?;
                 mark_dependents_tx(&tx, id, &published)?;
             }
+        }
+        if let (Some(adoption), Some((candidate, candidate_raw, mut prepared))) =
+            (&adoption, adoption_basis)
+        {
+            rewire_refinement_groups(&tx, &candidate["validatedDelta"])?;
+            let episode = s(&candidate, "episodeId");
+            let mut query=tx.prepare("SELECT data FROM units WHERE episode_id=?1 AND COALESCE(json_extract(data,'$.retired'),0)<>1").map_err(|e|e.to_string())?;
+            let adopted_units = query
+                .query_map([episode], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .map(|row| parse(row.map_err(|e| e.to_string())?))
+                .collect::<Result<Vec<_>>>()?;
+            drop(query);
+            let receipt = json!({"version":"storyboard-refinement-adoption/v1","workflowId":adoption.run,
+                "candidateSha256":adoption.expected_candidate_sha,"sourceSha256":candidate["sourceSha256"],"episodeId":episode,
+                "domainRequestSha256":candidate["domainRequestSha256"],"deliverySha256":delivery_sha,
+                "acceptedPlanContext":candidate["acceptedContext"],"adoptedUnits":adopted_units,
+                "unitBindings":adopted_units.iter().map(|unit|json!({"unitId":unit["id"],"unitVersion":unit["version"],"unitSha256":crate::pipeline::digest(&unit.to_string())})).collect::<Vec<_>>(),
+                "fantasyRealization":candidate["draft"]["fantasyRealization"],"ruleReceipt":candidate["ruleReceipt"],"adoptedAt":now()});
+            prepared["refinementAdoption"] = receipt.clone();
+            let changed=tx.execute("UPDATE jobs SET prepared=?1,updated_at=?2 WHERE id=?3 AND kind='workflow' AND entity_id='storyboard.refine' AND state='completed' AND result=?4",
+                params![prepared.to_string(),now(),adoption.run,candidate_raw]).map_err(|e|e.to_string())?;
+            if changed != 1 {
+                return Err("精修候选在采用期间改变，整笔发布已回滚".into());
+            }
+            tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'storyboard_refinement_adopted',?2,?3)",params![adoption.run,receipt.to_string(),now()]).map_err(|e|e.to_string())?;
         }
         if let Some(run) = run {
             let mut next_guard = guard.clone();

@@ -50,6 +50,13 @@ export default function App() {
     try { const list = await request<ProjectSummary[]>({ action: 'projects.list' }); if (sequence === projectListSequence.current) setProjects(list); } catch (reason) { if (desktop && sequence === projectListSequence.current) setError(messageOf(reason)); } finally { if (sequence === projectListSequence.current) setLoading(false); }
   }, []);
   useEffect(() => { void listProjects(); }, [listProjects]);
+  useEffect(() => {
+    if (page !== 'projects') return;
+    const refreshLibrary = () => { if (!document.hidden && !busyRef.current) void listProjects(); };
+    window.addEventListener('focus', refreshLibrary);
+    document.addEventListener('visibilitychange', refreshLibrary);
+    return () => { window.removeEventListener('focus', refreshLibrary); document.removeEventListener('visibilitychange', refreshLibrary); };
+  }, [page, listProjects]);
 
   const loadProject = useCallback(async (project: ProjectSummary, target: Page = 'foundation') => {
     if (project.archivedAt || busyRef.current && !['projects.create', 'project.import'].includes(busyRef.current)) return;
@@ -88,8 +95,8 @@ export default function App() {
       if (next && (next.project.id === workspaceRef.current?.project.id || action === 'backup.restore')) setWorkspace(next);
       const imageQueue = next?.imageQueueReport;
       const videoQueue = next?.videoQueueReport;
-      const videoNotice = videoQueue?.blockedCount ? `视频${action === 'videos.submit' ? '提交' : '素材准备'}：${videoQueue.queuedCount + (videoQueue.reusedCount || 0)} 个单元已接收，${videoQueue.blockedCount} 个需要处理：${videoQueue.blocked.map(item => `${next?.units.find(unit => unit.id === item.unitId)?.title || item.unitId} · ${item.reason}`).join('；')}` : '';
-      setNotice(videoNotice || (imageQueue?.blockedCount ? `已排队 ${imageQueue.queuedCount} 项图片，${imageQueue.blockedCount} 项需要处理：${imageQueue.blocked.map(item => `${next?.assets.find(asset => asset.id === item.assetId)?.name || item.assetId} · ${item.reason}`).join('；')}` : success)); void listProjects(); return next;
+      const videoNotice = videoQueue?.blockedCount ? `视频${action === 'videos.submit' ? '提交' : '素材准备'}：${videoQueue.queuedCount + (videoQueue.reusedCount || 0)} 个单元已接收，${videoQueue.blockedCount} 个尚未就绪。具体原因见对应单元的配图与问题。` : '';
+      setNotice(videoNotice || (imageQueue?.blockedCount ? `已排队 ${imageQueue.queuedCount} 项图片，${imageQueue.blockedCount} 项尚未就绪。具体原因见资产的任务状态与任务记录。` : success)); void listProjects(); return next;
     } catch (reason) { setError(messageOf(reason)); return null; } finally { busyRef.current = ''; setBusy(''); }
   }, [listProjects]);
 
@@ -128,7 +135,7 @@ export default function App() {
   const selectedStage = stages.find(stage => stage.id === page), activeJobs = workspace?.jobs.filter(jobActive).length || 0;
   const pageTitle = selectedStage?.title || ({ projects: '所有项目', jobs: '任务记录', settings: '渠道与执行设置' } as Partial<Record<Page, string>>)[page];
   const missingCatalogKeys = new Set(workspace ? missingCatalogs(workspace).map(item => item.key) : []), catalogNotices = catalogStates.filter(item => missingCatalogKeys.has(item.key) && item.status !== 'ready');
-  function navigate(target: Page) { setPage(target); setMobileNav(false); setError(''); setNotice(''); }
+  function navigate(target: Page) { setPage(target); setMobileNav(false); setError(''); setNotice(''); if (target === 'projects') void listProjects(); }
 
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>

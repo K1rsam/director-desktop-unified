@@ -414,7 +414,7 @@ pub(super) fn author_batches(
     Ok(result)
 }
 
-pub(super) fn capacity_brief(
+pub(in crate::pipeline) fn capacity_brief(
     caps: &Value,
     draft: Option<&Value>,
     voice: Option<&Value>,

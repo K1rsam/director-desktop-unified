@@ -159,7 +159,7 @@ fn project_scope(card: &mut Value, episode_id: &str) {
     }
 }
 
-pub(super) fn project_for_episode(
+pub(in crate::pipeline) fn project_for_episode(
     input: &Value,
     assets: &[Value],
     episode_id: &str,
@@ -186,6 +186,130 @@ pub(super) fn project_for_episode(
         }
     }
     Ok(cards)
+}
+
+/// New Mac-compatible requests select at the role's source boundary before
+/// serialization. Unknown imported scope shapes stay literal; only explicit
+/// episode/scene identities authorize pruning. Full validators keep receiving
+/// the original catalogue, so a context/material card never grants appearance.
+pub(in crate::pipeline) fn project_for_scope(
+    input: &Value,
+    assets: &[Value],
+    episode_id: &str,
+    rows: &[crate::pipeline::SourceRow],
+    context: &[crate::pipeline::SourceRow],
+) -> Result<(Vec<Value>, Value), String> {
+    let cards = project_for_episode(input, assets, episode_id)?;
+    if !crate::pipeline::stage3_pack::uses_profile(input)? {
+        return Ok((cards, Value::Null));
+    }
+    let scenes: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|row| row.scene_id.as_deref())
+        .collect();
+    let context_refs: BTreeSet<_> = context.iter().map(|row| row.id.as_str()).collect();
+    let mut selected = Vec::new();
+    let mut purposes = Vec::new();
+    for (asset, card) in assets.iter().zip(cards) {
+        // This is an exact identity predicate, never a name/description search.
+        let applicable = if asset["scope"]["kind"] == "GLOBAL" {
+            Some(true)
+        } else if asset["scope"]["kind"] == "SCENES" {
+            asset["scope"]["scenes"]
+                .as_array()
+                .filter(|pairs| !pairs.is_empty())
+                .filter(|pairs| {
+                    pairs
+                        .iter()
+                        .all(|pair| pair["episodeId"].is_string() && pair["sceneId"].is_string())
+                })
+                .map(|pairs| {
+                    pairs.iter().any(|pair| {
+                        pair["episodeId"] == episode_id
+                            && pair["sceneId"]
+                                .as_str()
+                                .is_some_and(|scene| scenes.contains(scene))
+                    })
+                })
+        } else if let Some(scope) = asset["applicability"].as_object() {
+            scope
+                .get("scenes")
+                .and_then(Value::as_array)
+                .filter(|items| !items.is_empty())
+                .filter(|items| items.iter().all(Value::is_string))
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|scene| scenes.contains(scene.as_str().unwrap()))
+                })
+        } else if let Some(pairs) = asset["applicability"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            if pairs
+                .iter()
+                .all(|pair| pair["episodeId"].is_string() && pair["sceneId"].is_string())
+            {
+                Some(pairs.iter().any(|pair| {
+                    pair["episodeId"] == episode_id
+                        && pair["sceneId"]
+                            .as_str()
+                            .is_some_and(|scene| scenes.contains(scene))
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let context_evidence = asset["sourceRefs"].as_array().is_some_and(|refs| {
+            refs.iter()
+                .filter_map(Value::as_str)
+                .any(|id| context_refs.contains(id))
+        });
+        if applicable == Some(false) && !context_evidence {
+            continue;
+        }
+        let mut card = card;
+        let purpose = if applicable == Some(false) {
+            card["materialRole"] = json!("CONTEXT_EVIDENCE_ONLY");
+            "CONTEXT_EVIDENCE_ONLY"
+        } else if asset["materialRole"] == "MATERIAL_SOURCE_ONLY" {
+            "MATERIAL_SOURCE_ONLY"
+        } else if applicable.is_none() {
+            "LITERAL_IMPORTED_SCOPE"
+        } else {
+            "PRODUCTION_SCOPE"
+        };
+        purposes
+            .push(json!({"assetId":asset["id"],"variantId":asset["variantId"],"purpose":purpose}));
+        selected.push(card);
+    }
+    // Keep image lineage even if its original appearance is outside this role's
+    // source range. It is explicitly a material parent, not a future shape.
+    let mut cursor = 0;
+    while cursor < selected.len() {
+        if let Some(parent) = crate::pipeline::resolve_asset_dependency(assets, &selected[cursor])?
+        {
+            if !selected.iter().any(|card| card["id"] == parent) {
+                let original = assets
+                    .iter()
+                    .find(|asset| asset["id"] == parent)
+                    .ok_or("分镜来源父资产不在已绑定目录，未猜测形象来源")?;
+                let mut card =
+                    project_for_episode(input, &[original.clone()], episode_id)?.remove(0);
+                card["materialRole"] = json!("MATERIAL_SOURCE_ONLY");
+                purposes.push(json!({"assetId":card["id"],"variantId":card["variantId"],"purpose":"MATERIAL_SOURCE_ONLY"}));
+                selected.push(card);
+            }
+        }
+        cursor += 1;
+    }
+    let receipt = json!({"version":crate::pipeline::stage3_pack::SELECTOR_VERSION,"episodeId":episode_id,
+        "sourceRefs":rows.iter().map(|row|&row.id).collect::<Vec<_>>(),"contextRefs":context.iter().map(|row|&row.id).collect::<Vec<_>>(),
+        "productionSceneIds":scenes,"selectedAssets":purposes,
+        "policy":"按正式集场和源锚取料；上下文与图片来源不授予当前入画或源事实。未知导入范围保留正文，不按姓名猜剪。"});
+    Ok((selected, receipt))
 }
 
 /// The shared source binding is production metadata, not a claim of appearance
@@ -303,6 +427,55 @@ fn adopted_design(input: &Value, asset: &Value) -> Result<Option<Value>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mac_role_selection_keeps_exact_material_parents_and_excludes_future_appearance() {
+        let source = crate::pipeline::prepare_source(
+            "第一集\n场景：门口\n△小王推门。\n场景：院内\n△小王换衣。\n",
+        )
+        .unwrap();
+        let episode = &source.episodes[0].id;
+        let now = &source.scenes[0].id;
+        let future = &source.scenes[1].id;
+        let parent = json!({"id":"formal-parent","variantId":"base","scope":{"kind":"SCENES","scenes":[{"episodeId":episode,"sceneId":future}]},"description":"正式父资产形象仅作材质来源"});
+        let current = json!({"id":"formal-current","variantId":"current","sourceAssetId":"formal-parent","scope":{"kind":"SCENES","scenes":[{"episodeId":episode,"sceneId":now}]},"description":"当前适用形象"});
+        let later = json!({"id":"formal-later","variantId":"future","scope":{"kind":"SCENES","scenes":[{"episodeId":episode,"sceneId":future}]},"description":"未来形象的细节不供当前主创"});
+        let literal = json!({"id":"literal-import","variantId":"raw","scope":{"kind":"IMPORTED","rawCoordinates":["unknown"]}});
+        let assets = vec![parent, current, later, literal];
+        let mut input = json!({"source":source,"storyboardAssetInputProfile":SCOPED_PROFILE});
+        crate::pipeline::stage3_pack::mark_input(&mut input).unwrap();
+        let rows: Vec<_> = source
+            .rows
+            .iter()
+            .filter(|row| row.kind == "body" && row.scene_id.as_ref() == Some(now))
+            .cloned()
+            .collect();
+        let (cards, receipt) = project_for_scope(&input, &assets, episode, &rows, &[]).unwrap();
+        assert!(!cards.iter().any(|card| card["id"] == "formal-later"));
+        assert!(cards.iter().any(|card| card["id"] == "formal-current"));
+        assert!(cards
+            .iter()
+            .any(|card| card["id"] == "formal-parent"
+                && card["materialRole"] == "MATERIAL_SOURCE_ONLY"));
+        assert_eq!(
+            cards
+                .iter()
+                .find(|card| card["id"] == "literal-import")
+                .unwrap()["scope"],
+            assets[3]["scope"]
+        );
+        assert_eq!(receipt["productionSceneIds"], json!([now]));
+        assert_eq!(receipt["selectedAssets"].as_array().unwrap().len(), 3);
+        input
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::pipeline::stage3_pack::PROFILE_FIELD);
+        let (legacy, no_receipt) = project_for_scope(&input, &assets, episode, &rows, &[]).unwrap();
+        assert_eq!(
+            legacy,
+            project_for_episode(&input, &assets, episode).unwrap()
+        );
+        assert!(no_receipt.is_null());
+    }
     use serde_json::json;
 
     fn input() -> Value {

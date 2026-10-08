@@ -55,7 +55,7 @@ const LOCAL_WRITE_ACTIONS = new Set([
 ]);
 const GENERATION_ACTIONS = new Set([
   'foundation.run', 'foundation.choices.apply', 'images.design', 'images.produce', 'images.run',
-  'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'workflows.resume', 'videos.submit',
+  'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',
 ]);
 const PROVIDER_ACTIONS = new Set([
   'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
@@ -66,8 +66,8 @@ const CREDENTIAL_ACTIONS = new Set([
   'dreamina.status', 'dreamina.login', 'dreamina.logout', 'dreamina.open_authorization',
 ]);
 const STANDARD_ACTIONS = new Set([...LOCAL_READ_ACTIONS, ...LOCAL_WRITE_ACTIONS,
-  ...GENERATION_ACTIONS, ...PROVIDER_ACTIONS, ...CREDENTIAL_ACTIONS, 'readiness.check']);
-const STAGE3_ACTIONS = new Set(['storyboard.run', 'storyboard.decision.resolve', 'units.regenerate']);
+  ...GENERATION_ACTIONS, ...PROVIDER_ACTIONS, ...CREDENTIAL_ACTIONS, 'readiness.check', 'storyboard.refinement.adopt']);
+const STAGE3_ACTIONS = new Set(['storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'storyboard.refinement.adopt']);
 export const CREDENTIAL_SETTING_KEYS = ['bhToken', 'chromeToken', 'textApiKey'] as const;
 
 export function classifyAction(input: PolicyRequest | string): ActionCategory {

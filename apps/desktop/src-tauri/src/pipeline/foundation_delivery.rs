@@ -453,7 +453,7 @@ fn asset_schema(patch: bool) -> Value {
     // Original light catalog: models declare identity and actual use. Rust binds
     // the source scope; a row-by-row evidence inventory is not F2/Q1's job.
     let variant = optional_obj(
-        json!({"key":string(),"name":string(),"episodes":refs_schema(),"sceneRefs":array(array(string())),"note":string(),"preparation":preparation_schema(),"scope":optional_obj(json!({"kind":choices(&["SCENES","GLOBAL","UNRESOLVED"]),"reason":string()}), &["kind"])}),
+        json!({"key":string(),"localKey":string(),"name":string(),"episodes":refs_schema(),"sceneRefs":array(array(string())),"note":string(),"preparation":preparation_schema(),"scope":optional_obj(json!({"kind":choices(&["SCENES","GLOBAL","UNRESOLVED"]),"reason":string()}), &["kind"])}),
         if patch {
             &[][..]
         } else {
@@ -2146,7 +2146,7 @@ fn bind_explicit_global_context(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Preparation {
     mode: String,
@@ -2167,6 +2167,8 @@ struct WireScope {
 struct VariantWire {
     #[serde(default)]
     key: Option<String>,
+    #[serde(default)]
+    local_key: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -2768,7 +2770,7 @@ fn build_asset(
         // source-backed alias declaration or a replacement identity key.
         asset.name = name.clone();
         asset.kind = kind.clone();
-        if kind != "CH" {
+        if !matches!(kind.as_str(), "CH" | "BEAST") {
             asset.metadata.remove("role");
         }
     }
@@ -2793,7 +2795,10 @@ fn build_asset(
     }
     asset.metadata.extend(metadata(
         wire.preparation.as_ref(),
-        wire.role.as_ref(),
+        // Narrative importance and image-template classification are separate:
+        // a non-human individual can be the protagonist without becoming CH.
+        // Empty/non-applicable roles are transport noise, not user decisions.
+        wire.role.as_ref().filter(|role| matches!(kind.as_str(), "CH" | "BEAST") && !role.trim().is_empty()),
         wire.relation_note.as_ref(),
         None,
     )?);
@@ -2804,8 +2809,8 @@ fn build_asset(
     if let Some(episodes) = &wire.episodes {
         update_usage(&mut asset.metadata, episodes, batch, patch);
     }
-    if wire.role.is_some() && kind != "CH" {
-        return Err("角色定位只属于基础人物，不广播至群像或异兽".into());
+    if !matches!(kind.as_str(), "CH" | "BEAST") {
+        asset.metadata.remove("role");
     }
     let base_changed = old.is_none()
         || patch && kind != "CH" && wire.name.is_some()
@@ -2905,7 +2910,11 @@ fn build_asset(
         }
     }
     if let Some(variants) = &wire.variants {
-        let mut seen = HashSet::new();
+        // Allocate all stable IDs before resolving edges. localKey is an exact,
+        // owner-local transport alias, never a persisted identity or name lookup.
+        let mut local_keys = HashMap::new();
+        let mut planned = Vec::new();
+        let mut planned_ids = HashSet::new();
         for v in variants {
             let existing = v
                 .key
@@ -2923,7 +2932,56 @@ fn build_asset(
             let vid = existing
                 .map(|v| v.id.clone())
                 .unwrap_or_else(|| format!("{id}_V_{}", &digest(&name)[..16]));
-            if !seen.insert(vid.clone()) || (vid == bid && !patch) {
+            if !planned_ids.insert(vid.clone()) {
+                return Err("子形象重复或再次声明基础形象".into());
+            }
+            if let Some(alias) = &v.local_key {
+                if alias.trim().is_empty() || alias.trim() != alias {
+                    return Err("形象localKey不能为空或含首尾空白".into());
+                }
+                if alias.split_at_checked(1).is_some_and(|(head, tail)|
+                    ["e", "s", "r", "a", "v"].contains(&head)
+                        && !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit()))
+                {
+                    return Err("形象localKey不能占用运输短键eN/sN/rN/aN/vN".into());
+                }
+                if local_keys.insert(alias.clone(), vid.clone()).is_some() {
+                    return Err("同一资产的形象localKey重复".into());
+                }
+            }
+            planned.push((vid, name));
+        }
+        for alias in local_keys.keys() {
+            if alias == &id || alias == &bid || planned_ids.contains(alias)
+                || prior.assets.iter().any(|a| &a.id == alias || a.variants.iter().any(|v| &v.id == alias))
+            {
+                return Err("形象localKey与已登记或本包稳定键冲突，来源不明确".into());
+            }
+        }
+        let mut reference_owner = asset.clone();
+        for (vid, name) in &planned {
+            if !reference_owner.variants.iter().any(|v| &v.id == vid) {
+                reference_owner.variants.push(FoundationVariant {
+                    id: vid.clone(), name: name.clone(), description: String::new(),
+                    source_variant_id: None, source_refs: vec![], applicability: vec![],
+                    scope: FoundationScope::default(), asset_row_id: None, metadata: Map::new(),
+                });
+            }
+        }
+        let mut all = prior.assets.clone();
+        if let Some(at) = all.iter().position(|a| a.id == id) {
+            all[at] = reference_owner;
+        } else {
+            all.push(reference_owner);
+        }
+        let mut seen = HashSet::new();
+        for (v, (vid, name)) in variants.iter().zip(planned) {
+            let existing = v.key.as_ref().and_then(|key| asset.variants.iter().find(|v| &v.id == key));
+            // The registry exposes the base as an existing keyed appearance.
+            // F2 may describe its uses alongside the other appearances; that
+            // updates the same record, rather than creating a duplicate child.
+            if !seen.insert(vid.clone())
+                || (vid == bid && !patch && !old.is_some_and(|a| a.variants.iter().any(|v| v.id == bid))) {
                 return Err("子形象重复或再次声明基础形象".into());
             }
             if vid == bid && !patch && name != existing.unwrap().name {
@@ -2984,7 +3042,7 @@ fn build_asset(
                     batch,
                     patch,
                 )?;
-                if patch && batch.fragment.is_none() {
+                if (patch || vid == bid) && batch.fragment.is_none() {
                     variant
                         .scope
                         .scenes
@@ -3012,33 +3070,40 @@ fn build_asset(
                 }
             }
             variant.applicability = variant.scope.scenes.clone();
-            let mut all = prior.assets.clone();
-            if let Some(at) = all.iter().position(|a| a.id == id) {
-                all[at] = asset.clone();
-            } else {
-                all.push(asset.clone());
+            let mut preparation = v.preparation.clone();
+            if let Some(p) = &mut preparation {
+                if let Some(stable) = p.from_key.as_ref().and_then(|key| local_keys.get(key)) {
+                    p.from_key = Some(stable.clone());
+                }
             }
             variant.source_variant_id = source_parent(
-                v.preparation.as_ref(),
+                preparation.as_ref(),
                 &id,
                 &vid,
                 &all,
                 variant.source_variant_id.as_deref(),
             )?;
+            // Persist only the canonical immediate parent, including asset-key
+            // references which resolve to an existing base appearance.
+            if let Some(p) = &mut preparation {
+                if p.from_key.is_some() && ["DERIVE", "INLINE"].contains(&p.mode.as_str()) {
+                    p.from_key = variant.source_variant_id.clone();
+                }
+            }
             variant.metadata.extend(metadata(
-                v.preparation.as_ref(),
+                preparation.as_ref(),
                 None,
                 None,
                 v.note.as_ref(),
             )?);
             mark_scope(&mut variant.metadata, source);
             if let Some(episodes) = &v.episodes {
-                update_usage(&mut variant.metadata, episodes, batch, patch);
+                update_usage(&mut variant.metadata, episodes, batch, patch || vid == bid && batch.fragment.is_none());
             }
             if existing.is_none() && v.preparation.is_none() {
                 variant
                     .metadata
-                    .insert("preparation".into(), json!({"mode":"DERIVE","fromKey":id}));
+                    .insert("preparation".into(), json!({"mode":"DERIVE","fromKey":bid}));
             }
             if let Some(note) = &v.note {
                 variant.description = note.clone();
@@ -3238,8 +3303,15 @@ fn apply_catalogue(
     let mut candidate = empty_foundation(source);
     let mut staged = prior.clone();
     let mut seen = HashSet::new();
+    let mut explicit_base_scopes = HashSet::new();
     for (ordinal, wire) in wire.assets.iter().enumerate() {
         let asset = build_asset(source, batch, wire, &staged, &allowed, false, ordinal)?;
+        let bid = base_id(&asset)?;
+        if wire.variants.as_ref().is_some_and(|variants| {
+            variants.iter().any(|v| v.key.as_deref() == Some(bid.as_str()))
+        }) {
+            explicit_base_scopes.insert(bid);
+        }
         if !seen.insert(asset.id.clone()) {
             return Err("本批资产身份重复".into());
         }
@@ -3277,6 +3349,13 @@ fn apply_catalogue(
             for v in asset.variants {
                 if let Some(prior) = target.variants.iter_mut().find(|p| p.id == v.id) {
                     prior.metadata = v.metadata;
+                    // build_asset already retains uses outside this batch (and
+                    // earlier fragments). Do not union stale in-batch base uses
+                    // back in after the model explicitly supplied its scope.
+                    if explicit_base_scopes.contains(&v.id) {
+                        prior.scope = v.scope;
+                        prior.applicability = prior.scope.scenes.clone();
+                    }
                 }
             }
         }
@@ -6751,6 +6830,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn catalogue_narrative_role_is_independent_of_human_image_template() {
+        let source = source(1);
+        let scope = source.episodes.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        let batch = plan_batches(&source, &scope).unwrap().remove(0);
+        let prior = empty_foundation(&source);
+        let input = input_for("F2", &source, &batch, &prior, &json!({}), 0, 1, false, &[]);
+        for kind in ["CH", "BEAST", "GROUP", "LOC", "PROP"] {
+            for role in ["主角", "", "  "] {
+                let mut raw = empty_catalogue(&source, &batch);
+                raw["assets"] = json!([{"name":"测试对象", "type":kind, "episodes":scope,
+                    "sceneRefs":source.scenes.iter().map(|s|json!([s.episode_id,s.id])).collect::<Vec<_>>(),
+                    "role":role,"preparation":{"mode":"REFERENCE"}}]);
+                let next = apply_catalogue(&raw, &source, &batch, &input, &prior, None, &HashSet::new()).unwrap();
+                assert_eq!(next.assets[0].kind, kind);
+                let expected = if matches!(kind, "CH" | "BEAST") && !role.trim().is_empty() { Some(json!(role)) } else { None };
+                assert_eq!(next.assets[0].metadata.get("role"), expected.as_ref());
+                assert!(!flatten_foundation_assets(&next).is_empty());
+                if matches!(kind, "CH" | "BEAST") {
+                    raw["assets"][0]["role"] = json!("invalid-role");
+                    assert!(apply_catalogue(&raw, &source, &batch, &input, &prior, None, &HashSet::new()).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f2_existing_base_is_updated_once_with_its_own_scope() {
+        let (source, prior) = two_episode_catalogue();
+        let all = source.episodes.iter().map(|e|e.id.clone()).collect::<Vec<_>>();
+        let batch = plan_batches(&source, &all).unwrap().remove(0);
+        let input = input_for("F2", &source, &batch, &prior, &json!({}), 0, 1, false, &[]);
+        let base = &prior.assets[0].variants[0];
+        let first = &source.scenes[0];
+        let mut raw = empty_catalogue(&source, &batch);
+        raw["assets"] = json!([{"key":prior.assets[0].id,"name":"小王｜白衣","type":"CH","episodes":all,
+            "sceneRefs":source.scenes.iter().map(|s|json!([s.episode_id,s.id])).collect::<Vec<_>>(),"preparation":{"mode":"REFERENCE"},
+            "variants":[{"key":base.id,"name":base.name,"episodes":[first.episode_id],"sceneRefs":[[first.episode_id,first.id]],"preparation":{"mode":"REFERENCE"}}]}]);
+        let next = apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap();
+        let retained = &next.assets[0].variants[0];
+        assert_eq!(next.assets[0].variants.len(), prior.assets[0].variants.len());
+        assert_eq!(retained.id, base.id);
+        assert_eq!(retained.name, base.name);
+        assert_eq!(retained.scope.scenes.len(), 1);
+        assert_eq!(retained.scope.scenes[0].episode_id, first.episode_id);
+        assert_eq!(retained.metadata["usageEpisodes"], json!([first.episode_id]));
+        raw["assets"][0]["variants"][0]["name"] = json!("隐式改名");
+        assert!(apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap_err().contains("隐式改名"));
+        raw["assets"][0]["variants"][0]["name"] = json!(base.name);
+        let duplicate = raw["assets"][0]["variants"][0].clone();
+        raw["assets"][0]["variants"].as_array_mut().unwrap().push(duplicate);
+        assert!(apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap_err().contains("子形象重复"));
+    }
+
+    #[test]
+    #[ignore = "explicit readonly DB/workflow/text job via DIRECTOR_ROLE_REAL_DB, DIRECTOR_ROLE_WORKFLOW, DIRECTOR_ROLE_TEXT; no CLI or project writes"]
+    fn saved_actual_nonhuman_protagonist_catalogue_revalidates_without_generation() {
+        let env = |key| std::env::var(key).expect(key);
+        let connection = rusqlite::Connection::open_with_flags(env("DIRECTOR_ROLE_REAL_DB"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let workflow = env("DIRECTOR_ROLE_WORKFLOW");
+        let job = env("DIRECTOR_ROLE_TEXT");
+        let parent: String = connection.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow'", [&workflow], |r| r.get(0)).unwrap();
+        let (snapshot, raw): (String, String) = connection.query_row("SELECT j.snapshot,j.result FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id WHERE j.id=?1 AND w.workflow_id=?2 AND w.stage='foundation:F2'", rusqlite::params![job,workflow], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let parent: Value = serde_json::from_str(&parent).unwrap();
+        let source: LockedSource = serde_json::from_value(parent["input"]["source"].clone()).unwrap();
+        let snapshot: Value = serde_json::from_str(&snapshot).unwrap();
+        let raw: Value = serde_json::from_str(&raw).unwrap();
+        let input = &snapshot["input"];
+        let scope: Vec<String> = serde_json::from_value(input["scope"].clone()).unwrap();
+        let batch = Batch { pieces: whole_rows(&source, &scope), scope, fragment: None };
+        let prior = existing_foundation(&source, &parent["input"]).unwrap();
+        let next = apply_catalogue(&raw, &source, &batch, input, &prior, None, &HashSet::new()).unwrap();
+        assert!(next.assets.len() >= raw["assets"].as_array().unwrap().len());
+        assert!(next.assets.iter().any(|a| a.kind == "BEAST" && a.metadata.get("role") == Some(&json!("主角"))));
+        println!("Saved catalogue accepted: {} assets, {} stage-two rows, zero model calls", next.assets.len(), flatten_foundation_assets(&next).len());
+    }
+
     fn two_episode_catalogue() -> (LockedSource, FoundationProposal) {
         let s = source(2);
         let selected = s.episodes.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
@@ -6773,6 +6929,116 @@ mod tests {
         let next =
             apply_catalogue(&wire, &s, &batch, &input, &prior, None, &HashSet::new()).unwrap();
         (s, next)
+    }
+
+    fn local_parent_catalogue() -> (LockedSource, Batch, FoundationProposal, Value, Value) {
+        let s = source(2);
+        let scope: Vec<_> = s.episodes.iter().map(|e| e.id.clone()).collect();
+        let batch = Batch { pieces: whole_rows(&s, &scope), scope, fragment: None };
+        let prior = empty_foundation(&s);
+        let pairs: Vec<_> = s.scenes.iter().map(|scene| json!([scene.episode_id, scene.id])).collect();
+        let mut raw = empty_catalogue(&s, &batch);
+        raw["assets"] = json!([{"name":"小王｜默认","type":"CH","episodes":batch.scope,"sceneRefs":pairs,
+            "preparation":{"mode":"REFERENCE"},"variants":[
+                {"localKey":"injured","name":"西装受伤","episodes":batch.scope,"sceneRefs":pairs,"preparation":{"mode":"DERIVE","fromKey":"suit"}},
+                {"localKey":"suit","name":"西装","episodes":batch.scope,"sceneRefs":pairs,"preparation":{"mode":"DERIVE"}}
+            ]}]);
+        let input = input_for("F2", &s, &batch, &prior, &json!({}), 0, 1, false, &[]);
+        (s, batch, prior, input, raw)
+    }
+
+    #[test]
+    fn f2_local_parent_forward_references_keep_immediate_parent_and_persist_only_stable_keys() {
+        let (s, batch, prior, input, raw) = local_parent_catalogue();
+        assert_eq!(asset_schema(false)["properties"]["variants"]["items"]["properties"]["localKey"]["type"], "string");
+        let transport_context = json!({"foundationModelInputProfile":super::super::foundation_wire::PROFILE});
+        let transport_input = input_for("F2", &s, &batch, &prior, &transport_context, 0, 1, false, &[]);
+        let transport = super::super::foundation_wire::compile("foundation:F2", &transport_input, &delivery_schema("F2", &transport_input)).unwrap();
+        let mut restored = raw.clone();
+        transport.restore(&mut restored).unwrap();
+        assert_eq!(restored, raw, "local aliases must survive transport without becoming persistent IDs");
+        let next = apply_catalogue(&raw, &s, &batch, &input, &prior, None, &HashSet::new()).unwrap();
+        let asset = &next.assets[0];
+        let suit = asset.variants.iter().find(|v| v.name == "西装").unwrap();
+        let injured = asset.variants.iter().find(|v| v.name == "西装受伤").unwrap();
+        assert_eq!(suit.source_variant_id.as_deref(), Some(base_id(asset).unwrap().as_str()));
+        assert_eq!(injured.source_variant_id.as_deref(), Some(suit.id.as_str()));
+        assert_eq!(injured.metadata["preparation"]["fromKey"], suit.id);
+        let persisted = serde_json::to_value(&next).unwrap();
+        assert!(!persisted.to_string().contains("localKey"));
+        let round_trip: FoundationProposal = serde_json::from_value(persisted).unwrap();
+        assert_eq!(serde_json::to_value(&round_trip.assets[0].variants).unwrap(), serde_json::to_value(&next.assets[0].variants).unwrap());
+        let flat = flatten_foundation_assets(&round_trip);
+        assert_eq!(flat.iter().find(|a| a["variantId"] == injured.id).unwrap()["sourceVariantId"], suit.id);
+    }
+
+    #[test]
+    fn f2_local_parent_eleven_level_chain_is_order_independent() {
+        let (s, batch, prior, input, mut raw) = local_parent_catalogue();
+        let template = raw["assets"][0]["variants"][0].clone();
+        raw["assets"][0]["variants"] = json!((1..=10).rev().map(|n| {
+            let mut v = template.clone();
+            v["localKey"] = json!(format!("form{n}"));
+            v["name"] = json!(format!("形态{n}"));
+            v["preparation"] = if n == 1 { json!({"mode":"DERIVE"}) }
+                else { json!({"mode":"DERIVE","fromKey":format!("form{}",n-1)}) };
+            v
+        }).collect::<Vec<_>>());
+        let next = apply_catalogue(&raw, &s, &batch, &input, &prior, None, &HashSet::new()).unwrap();
+        let asset = &next.assets[0];
+        assert_eq!(asset.variants.len(), 11);
+        for n in 1..=10 {
+            let v = asset.variants.iter().find(|v| v.name == format!("形态{n}")).unwrap();
+            let expected = if n == 1 { base_id(asset).unwrap() } else {
+                asset.variants.iter().find(|v| v.name == format!("形态{}", n-1)).unwrap().id.clone()
+            };
+            assert_eq!(v.source_variant_id.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn f2_local_parent_rejects_duplicate_unknown_self_cycle_and_registered_key_collision() {
+        let (s, batch, prior, input, raw) = local_parent_catalogue();
+        let run = |raw: &Value| apply_catalogue(raw, &s, &batch, &input, &prior, None, &HashSet::new());
+        let mut duplicate = raw.clone();
+        duplicate["assets"][0]["variants"][0]["localKey"] = json!("suit");
+        assert!(run(&duplicate).unwrap_err().contains("localKey重复"));
+        let mut unknown = raw.clone();
+        unknown["assets"][0]["variants"][0]["preparation"]["fromKey"] = json!("missing");
+        assert!(run(&unknown).is_err());
+        let mut own = raw.clone();
+        own["assets"][0]["variants"][0]["preparation"]["fromKey"] = json!("injured");
+        assert!(run(&own).unwrap_err().contains("自身"));
+        let mut cycle = raw.clone();
+        cycle["assets"][0]["variants"][1]["preparation"]["fromKey"] = json!("injured");
+        assert!(run(&cycle).unwrap_err().contains("循环"));
+        let mut invalid_mode = raw.clone();
+        invalid_mode["assets"][0]["variants"][0]["preparation"]["mode"] = json!("REFERENCE");
+        assert!(run(&invalid_mode).is_err());
+        let mut reserved = raw.clone();
+        reserved["assets"][0]["variants"][0]["localKey"] = json!("v1");
+        assert!(run(&reserved).unwrap_err().contains("运输短键"));
+        let existing = run(&raw).unwrap();
+        let mut collision = raw;
+        collision["assets"][0]["variants"][0]["localKey"] = json!(existing.assets[0].variants[0].id);
+        assert!(apply_catalogue(&collision, &s, &batch, &input, &existing, None, &HashSet::new()).unwrap_err().contains("稳定键冲突"));
+    }
+
+    #[test]
+    fn f2_local_parent_aliases_do_not_escape_the_owner_or_return_package() {
+        let (s, batch, prior, input, mut raw) = local_parent_catalogue();
+        let mut other = raw["assets"][0].clone();
+        other["name"] = json!("小李｜默认");
+        other["variants"].as_array_mut().unwrap().pop();
+        raw["assets"].as_array_mut().unwrap().push(other);
+        assert!(apply_catalogue(&raw, &s, &batch, &input, &prior, None, &HashSet::new()).is_err());
+        raw["assets"].as_array_mut().unwrap().pop();
+        let registered = apply_catalogue(&raw, &s, &batch, &input, &prior, None, &HashSet::new()).unwrap();
+        let mut next = raw.clone();
+        next["assets"][0]["key"] = json!(registered.assets[0].id);
+        next["assets"][0]["variants"].as_array_mut().unwrap().pop();
+        next["assets"][0]["variants"][0]["name"] = json!("新的伤态");
+        assert!(apply_catalogue(&next, &s, &batch, &input, &registered, None, &HashSet::new()).is_err());
     }
 
     fn preparation_conflict_fixture() -> (LockedSource, FoundationProposal, Batch) {

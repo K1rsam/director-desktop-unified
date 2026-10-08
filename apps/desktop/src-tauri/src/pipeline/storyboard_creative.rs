@@ -269,8 +269,61 @@ fn restore_fantasy_schema(schema: &mut Value) {
     }
 }
 
-pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, String> {
+pub(in crate::pipeline) fn prepare_request(
+    mut request: TextRequest,
+) -> Result<TextRequest, String> {
+    let mac_pack = super::super::stage3_pack::uses_profile(&request.input)?;
+    if request.stage == "storyboardRefine" {
+        if !mac_pack || request.skill != "director-refinement" {
+            return Err("导演精修必须绑定冻结生产规则的独立兼容适配".into());
+        }
+        request.rule_snapshot["runtimeContract"] =
+            super::super::stage3_pack::runtime_contract("storyboardRefine", true)?;
+        request
+            .input
+            .as_object_mut()
+            .ok_or("精修输入不是对象")?
+            .remove("instruction");
+        restore_fantasy_schema(&mut request.schema);
+        return super::super::stage3_pack::prepare_request(request);
+    }
     let carrier = uses_carrier_profile(&request.input)?;
+    let planner_repair = if let Some(proof) = request.input.get("planRepair") {
+        if request.stage != "storyboardPlan"
+            || request.skill != "episode-emotion-planner"
+            || proof["version"] != "rejected-plan-repair/v1"
+            || proof["maximumAttempts"] != 2
+            || proof["attempt"]
+                .as_u64()
+                .is_none_or(|attempt| !(1..=2).contains(&attempt))
+            || proof["previousPlanSha256"] != digest(&request.input["previousPlan"].to_string())
+            || ![
+                "sourceSha256",
+                "originDomainRequestSha256",
+                "originalPlanSha256",
+                "previousRequestSha256",
+            ]
+            .iter()
+            .all(|key| {
+                proof[*key].as_str().is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+            || !request.input["validationIssues"]
+                .as_array()
+                .is_some_and(|items| {
+                    !items.is_empty()
+                        && items
+                            .iter()
+                            .all(|issue| issue["code"] == "PLAN_EVENT_BOUNDARY")
+                })
+        {
+            return Err("规划定向修订缺少冻结原稿、准确问题或有界次数；未调用模型".into());
+        }
+        true
+    } else {
+        false
+    };
     let author_repair = if let Some(proof) = request.input.get("authorRepair") {
         if proof["version"] != AUTHOR_SCOPE_REPAIR_PROFILE
             || request.stage != "storyboardFinish"
@@ -299,6 +352,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
                     issues.is_empty()
                         || issues.iter().any(|issue| {
                             issue["code"] != "ASSET_SCENE_SCOPE"
+                                && issue["code"] != "SHOT_DURATION"
                                 && !source_coordinate_issue(issue)
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
@@ -340,6 +394,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
                     issues.is_empty()
                         || issues.iter().any(|issue| {
                             issue["code"] != "ASSET_SCENE_SCOPE"
+                                && issue["code"] != "SHOT_DURATION"
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
                         })
@@ -352,7 +407,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         false
     };
     if !uses_profile(&request.input)? {
-        if carrier || author_repair || finish_repair {
+        if carrier || author_repair || finish_repair || mac_pack {
             return Err("视频载体合同须与原三岗制作合同共同使用".into());
         }
         return Ok(request);
@@ -383,7 +438,14 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
             remove_program_exports(draft);
         }
     }
-    let mut runtime_contract = contract(&request.stage, request.input["finishMode"] == "delta")?;
+    let mut runtime_contract = if mac_pack {
+        super::super::stage3_pack::runtime_contract(
+            &request.stage,
+            request.input["finishMode"] == "delta",
+        )?
+    } else {
+        contract(&request.stage, request.input["finishMode"] == "delta")?
+    };
     if uses_revision_profile(&request.input)? {
         if text(&request.input, "mode") != "revision"
             || !["storyboardCreate", "storyboardFinish"].contains(&request.stage.as_str())
@@ -408,6 +470,12 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
             text(&runtime_contract, "content")
         );
         runtime_contract["carrierProfile"] = json!(CARRIER_PROFILE);
+        runtime_contract["content"] = json!(content);
+        runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
+    }
+    if planner_repair {
+        let content=format!("{}\n\n本次是原情绪统筹岗位的定向规划修复。previousPlan为完整未采用原回包，validationIssues由程序校验给出。保留正确的情绪、事件、来源归属、入口事实、选择及初排；只修复明确问题及其必要关联。真实集场以sourceRows和episode为准，continuous只适用于同一真实场景；跨场的时空或事件边界由本岗依据原文判断，程序不代写剧情。交完整规划并再次经过覆盖、顺序、身份及场景校验。不得重抄原文或改写源事实。最多两次定向修订，同样问题不循环。",text(&runtime_contract,"content"));
+        runtime_contract["planRepairProfile"] = json!("rejected-plan-repair/v1");
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
@@ -445,6 +513,15 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
+    if (author_repair || finish_repair)
+        && request.input["validationIssues"]
+            .as_array()
+            .is_some_and(|issues| issues.iter().any(|issue| issue["code"] == "SHOT_DURATION"))
+    {
+        let content=format!("{}\n\nSHOT_DURATION：本次候选含零秒无对白镜。原镜头、来源和原话均完整保留，仅由原整编重新组织该镜与必要关联镜的动作、声画共时和切点；可将瞬时演法写进合法镜内或依真实动作重新估时，不自动填空凑秒、不删除源内容、不裁声窗。交差量作品，所有镜长须为正数并再过完整领域验收；相同问题无进展即停止修订。",text(&runtime_contract,"content"));
+        runtime_contract["content"] = json!(content);
+        runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
+    }
     if author_repair
         && request.input["validationIssues"]
             .as_array()
@@ -458,11 +535,21 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
     request.rule_snapshot["runtimeContract"] = runtime_contract;
-    if author_repair && request.input["validationIssues"].as_array().is_some_and(|issues|
-        issues.iter().any(|issue|issue["code"]=="DIALOGUE_SOURCE_COVERAGE")) {
+    if author_repair
+        && request.input["validationIssues"]
+            .as_array()
+            .is_some_and(|issues| {
+                issues
+                    .iter()
+                    .any(|issue| issue["code"] == "DIALOGUE_SOURCE_COVERAGE")
+            })
+    {
         let content=format!("{}\n\nDIALOGUE_SOURCE_COVERAGE：本单元缺失或只覆盖部分锁定对白。依lineId与allowedSpokenRanges完整选择全部原话区间，逐字恰好一次，不发声括号演法；由Rust物化说者与文字。可以在问题单元及其连续源关联组内合理拆镜、拆单元和重算声窗，不补写源外台词，不删除其它原话。",text(&request.rule_snapshot["runtimeContract"],"content"));
-        request.rule_snapshot["runtimeContract"]["content"]=json!(content);
-        request.rule_snapshot["runtimeContract"]["sha256"]=json!(digest(text(&request.rule_snapshot["runtimeContract"],"content")));
+        request.rule_snapshot["runtimeContract"]["content"] = json!(content);
+        request.rule_snapshot["runtimeContract"]["sha256"] = json!(digest(text(
+            &request.rule_snapshot["runtimeContract"],
+            "content"
+        )));
     }
     // Program instructions live only in the trusted rule snapshot. Never promote
     // arbitrary source/raw/user text by copying input.instruction into that slot.
@@ -474,14 +561,16 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
     if request.stage != "storyboardPlan" {
         restore_fantasy_schema(&mut request.schema);
     }
-    Ok(request)
+    super::super::stage3_pack::prepare_request(request)
 }
 
 pub(super) struct Executor<'a>(pub(super) &'a dyn TextExecutor);
 #[async_trait]
 impl TextExecutor for Executor<'_> {
     async fn prepare_transport_request(&self, request: TextRequest) -> Result<TextRequest, String> {
-        self.0.prepare_transport_request(prepare_request(request)?).await
+        self.0
+            .prepare_transport_request(prepare_request(request)?)
+            .await
     }
     fn input_transport_characters(&self, request: &TextRequest) -> Result<usize, String> {
         self.0
@@ -511,8 +600,14 @@ impl TextExecutor for Executor<'_> {
     async fn continuity_changed(&self, evidence: &Value) -> Result<(), String> {
         self.0.continuity_changed(evidence).await
     }
-    async fn author_chain_revision(&self, request: &TextRequest, repair: &Value) -> Result<Option<Value>, String> {
-        self.0.author_chain_revision(&prepare_request(request.clone())?, repair).await
+    async fn author_chain_revision(
+        &self,
+        request: &TextRequest,
+        repair: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.0
+            .author_chain_revision(&prepare_request(request.clone())?, repair)
+            .await
     }
 }
 
@@ -947,7 +1042,7 @@ pub(super) fn render_units(
     Ok(output)
 }
 
-pub(super) fn add_delivery(
+pub(in crate::pipeline) fn add_delivery(
     draft: &mut Value,
     source: &LockedSource,
     style: &str,

@@ -1,9 +1,27 @@
 {
   "schemaVersion": "creative-candidate-manifest/v1",
   "packId": "mac-3008-original-export-20261006",
-  "status": "production_rules_verified_runtime_adapter_pending",
-  "active": false,
-  "activePackId": null,
+  "status": "production_rules_active_on_reconstructed_compatible_rust_adapter",
+  "active": true,
+  "activePackId": "mac-3008-original-export-20261006",
+  "adapter": {
+    "profile": "mac-3008-compatible-rust/v1",
+    "version": "mac-3008-rust-adapter/v1",
+    "implementation": "reconstructed_compatible_rust_not_original_mac_runtime",
+    "sourceSelector": "source-bound-rust-selector/v1",
+    "dialogueProfile": "locked-utf16-reference/v1",
+    "normalRoleOrder": [
+      "episode-emotion-planner",
+      "unit-performance-director",
+      "episode-finishing-editor"
+    ],
+    "independentRefinement": "optional_candidate_then_explicit_atomic_adoption",
+    "offlineRegressionVerified": true,
+    "originalMacRuntimeBodyTransferred": false,
+    "liveGenerationVerified": false,
+    "episode1And2QualityCompared": false,
+    "evidence": "docs/handoff/STAGE3_COMPATIBLE_RUST_ADAPTER_20261008.md"
+  },
   "repository": "K1rsam/director-desktop-next",
   "source": {
     "repository": "K1rsam/director-web",
@@ -15,7 +33,7 @@
   },
   "evidence": {
     "byteHashVerification": "verified_against_pinned_export_and_source_manifest",
-    "fullMacRuntimeCode": "adapter_not_integrated_current_dependency_manifest_only",
+    "fullMacRuntimeCode": "42_dependency_files_metadata_only_no_runtime_bodies_transferred",
     "lastAdoptedRunHistoryMessage": 228,
     "failedExperimentIsBaseline": false,
     "integratedSkillIsBaseline": false,
@@ -41,6 +59,11 @@
     "director-refinement-v3"
   ],
   "activationRequires": [
+    "Original 22 production texts byte hashes verified and loaded by explicit versioned profile",
+    "Reconstructed Rust transport/source/delta/refinement contract reviewed without rewriting frozen originals",
+    "Windows offline rule-loading, source-protection, recovery, adoption and provenance regression evidence"
+  ],
+  "originalMacRuntimeActivationRequires": [
     "Read-only verification of actual adopted Mac runtime rules and required schema/loader/refinement files",
     "Source-backed resolution of any version differences without rewriting original creative files",
     "Reviewed adapter contract and offline regression evidence"

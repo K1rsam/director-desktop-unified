@@ -14,3 +14,5 @@ __pycache__/
 *.partial
 .DS_Store
 *.tsbuildinfo
+apps/desktop/src-tauri/gen/
+apps/desktop/docs/verification/

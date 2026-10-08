@@ -10,8 +10,8 @@
 
 72份快照共552341字节。它们分别保留，没有覆盖同名的初版、当前版或候选版。
 
-当前桌面注册表仍是 `apps/desktop/src-tauri/src/pipeline/mod.rs::rule_snapshots`，编译 [apps/desktop/rules](../apps/desktop/rules) 中29份规则。`asset-art-director` 当前为2.0.0，初版快照为1.3.0。注册到二进制与实际发送模型请求是不同状态：第一、二阶段采用实现中的主规则；第三阶段旧规则仍可显示和离线回归，新派发因完整 Mac 运行适配未接入而阻断。
+桌面通用注册表是 `apps/desktop/src-tauri/src/pipeline/mod.rs::rule_snapshots`，编译 [apps/desktop/rules](../apps/desktop/rules) 中29份规则。`asset-art-director` 当前为2.0.0，初版快照为1.3.0；生图生产采用 Windows 1.2.0。第三阶段新任务由 `pipeline::stage3_pack` 显式加载下述22份原件，旧冻结请求保留原 profile 和规则。注册、发送请求与真实成稿质量是分别核验的状态。
 
-[rules/stage3/manifest.json](../rules/stage3/manifest.json) 中的22份候选与生产规则相同，但仍 inactive。只有规则一致不能证明读包、schema、主动整集导演精修、分组采用和现场修复已接入。没有启用导出的整合 SKILL，也没有把后续短段实验替换为生产规则。
+[rules/stage3/manifest.json](../rules/stage3/manifest.json) 的22份原件现注册为 `mac-3008-compatible-rust/v1`：兼容 Rust 适配已接入取料、三岗、独立导演精修、采用和恢复，并有 Windows 离线回归。它不是未交付正文的42个 Mac 运行文件；真实第1、2集新旧质量比较尚未完成。没有启用导出的整合 SKILL，也没有把后续短段实验替换为生产规则。具体证据见 [适配记录](../docs/handoff/STAGE3_COMPATIBLE_RUST_ADAPTER_20261008.md)。
 
-Windows 合并先读 [本机修改与合并回执](../docs/handoff/LOCAL_STANDARD_EDITION.md)。可运行 `python3 scripts/verify_skill_lineage.py` 校验本仓库的规则原件与索引；此命令不读取用户登录目录或私人剧本。
+来源交接保留于 [Mac本机修改回执](../docs/handoff/LOCAL_STANDARD_EDITION.md)，当前结果见 [Windows/Mac集成记录](../docs/handoff/WINDOWS_MAC_INTEGRATION_20261008.md)。运行 `node scripts/verify-integration-lineage.mjs` 校验当前注册、规则原件与历史口径；此命令不读取用户登录目录或私人剧本。

@@ -307,6 +307,92 @@ impl Store {
     pub fn foundation(&self) -> Result<Value> {
         self.latest("foundations")
     }
+    /// Carry provenance across a proven parser-only migration. Every complete
+    /// affected episode is revalidated against the current source and capacity;
+    /// creative data and submitted snapshots are never edited in place.
+    pub(crate) fn rebind_verified_source_projection(&self, unit_ids: &[Value], caps: &Value) -> Result<Value> {
+        let mut c = self.conn()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let latest_workflow:Option<String>=tx.query_row("SELECT state FROM jobs WHERE kind='workflow' AND json_extract(snapshot,'$.stage')='storyboard.run' ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if latest_workflow.as_deref().is_some_and(|state|state!="completed" && state!="failed" && state!="cancelled") {
+            // The current coordinator still owns immutable guards. Its normal
+            // completion/recovery must precede a provenance-only migration.
+            return Ok(json!({"rebound":[],"blocked":[],"deferred":"storyboard_workflow_active"}));
+        }
+        let current: Option<String> = tx.query_row("SELECT data FROM sources ORDER BY version DESC LIMIT 1",[],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let Some(current) = current else { return Ok(json!({"rebound":[],"blocked":[]})); };
+        let current = parse(current)?;
+        let read_values = |sql: &str| -> Result<Vec<Value>> {
+            let mut q=tx.prepare(sql).map_err(|e|e.to_string())?;
+            let rows=q.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+            rows.map(|r|parse(r.map_err(|e|e.to_string())?)).collect()
+        };
+        let selected: HashSet<_>=unit_ids.iter().filter_map(Value::as_str).collect();
+        if selected.is_empty(){return Ok(json!({"rebound":[],"blocked":[]}));}
+        let placeholders=vec!["?";selected.len()].join(",");
+        let mut q=tx.prepare(&format!("SELECT data FROM units WHERE episode_id IN (SELECT episode_id FROM units WHERE id IN ({placeholders})) AND COALESCE(json_extract(data,'$.retired'),0)<>1 ORDER BY rowid")).map_err(|e|e.to_string())?;
+        let units:Vec<Value>=q.query_map(rusqlite::params_from_iter(selected.iter()),|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.map(|r|parse(r.map_err(|e|e.to_string())?)).collect::<Result<_>>()?;
+        drop(q);
+        let foundation:Option<(i64,i64,String)>=tx.query_row("SELECT version,source_version,data FROM foundations ORDER BY version DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        let mut old_versions:HashSet<i64>=units.iter().filter_map(|u|u["sourceVersion"].as_i64()).filter(|v|Some(*v)!=current["version"].as_i64()).collect();
+        if let Some((_,v,_))=&foundation {if Some(*v)!=current["version"].as_i64(){old_versions.insert(*v);}}
+        if old_versions.is_empty(){return Ok(json!({"rebound":[],"blocked":[],"foundationRebound":false}));}
+        let source: crate::pipeline::LockedSource = serde_json::from_value(current.clone()).map_err(|e|e.to_string())?;
+        crate::pipeline::validate_source(&source)?;
+        let assets=read_values("SELECT data FROM assets WHERE COALESCE(json_extract(data,'$.deletedAt'),'')='' ORDER BY rowid")?;
+        let mut q=tx.prepare(&format!("SELECT data FROM sources WHERE version IN ({}) ORDER BY version",vec!["?";old_versions.len()].join(","))).map_err(|e|e.to_string())?;
+        let sources:Vec<Value>=q.query_map(rusqlite::params_from_iter(old_versions.iter()),|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.map(|r|parse(r.map_err(|e|e.to_string())?)).collect::<Result<_>>()?;
+        drop(q);
+        // Identical old versions share one canonical proof across all units.
+        let compatible:HashSet<i64>=sources.iter().filter(|old|source_channel_metadata_only(old,&current)).filter_map(|old|old["version"].as_i64()).collect();
+        let episodes: HashSet<_>=units.iter().filter(|u|selected.contains(s(u,"id"))).map(|u|s(u,"episodeId")).collect();
+        let mut rebound=Vec::new();
+        let mut blocked=Vec::new();
+        for episode in episodes {
+            let episode_units:Vec<_>=units.iter().filter(|u|s(u,"episodeId")==episode).cloned().collect();
+            let stale:Vec<_>=episode_units.iter().filter(|u|u["sourceVersion"].as_i64().is_some_and(|v|Some(v)!=current["version"].as_i64())).collect();
+            if stale.is_empty(){continue;}
+            if stale.iter().any(|u|u["sourceVersion"].as_i64().is_none_or(|v|!compatible.contains(&v))) {
+                blocked.push(json!({"episodeId":episode,"code":"SOURCE_REVISION_REQUIRED","message":"原文或集场已经变化，保留旧分镜，须修订关联集。"}));
+                continue;
+            }
+            let draft=json!({"schemaVersion":"storyboard-draft/v2","units":episode_units});
+            if let Err(error)=crate::pipeline::validate_storyboard(&source,&draft,&assets,caps){
+                blocked.push(json!({"episodeId":episode,"code":"SOURCE_REVISION_REQUIRED","message":error}));
+                continue;
+            }
+            let proof_hash=crate::pipeline::digest(&draft.to_string());
+            for unit in stale {
+                let old=sources.iter().find(|old|old["version"]==unit["sourceVersion"]).unwrap();
+                let mut carried=unit.clone();
+                carried["expectedVersion"]=unit["version"].clone();
+                carried["sourceVersion"]=current["version"].clone();
+                carried["sourceMetadataRebind"]=json!({"version":"validated-storyboard-source-projection/v1","previousSourceVersion":unit["sourceVersion"],"sourceVersion":current["version"],"sourceSha256":current["sha256"],"fromParser":old["parserVersion"],"toParser":current["parserVersion"],"validatedEpisodeDraftSha256":proof_hash,"creativeContentUnchanged":true});
+                let carried=save_unit_tx(&tx,carried)?;
+                rebound.push(json!({"unitId":carried["id"],"unitVersion":carried["version"],"sourceVersion":carried["sourceVersion"]}));
+            }
+        }
+        let mut foundation_rebound=false;
+        if let Some((version,source_version,raw))=foundation {
+            let mut data=parse(raw)?;
+            if let Some(old)=sources.iter().find(|old|old["version"]==source_version && compatible.contains(&source_version)) {
+                if s(&data,"sourceSha256")==s(&current,"sha256") {
+                    data["version"]=json!(version+1);
+                    data["sourceVersion"]=current["version"].clone();
+                    data["sourceMetadataRebind"]=json!({"version":"source-channel-metadata-rebind/v1","previousSourceVersion":source_version,"sourceVersion":current["version"],"sourceSha256":current["sha256"],"fromParser":old["parserVersion"],"toParser":current["parserVersion"],"rawTextAndCoordinatesUnchanged":true,"assetAndMediaVersionsUnchanged":true});
+                    tx.execute("INSERT INTO foundations VALUES(?1,?2,?3,?4)",params![version+1,current["version"].as_i64(),data.to_string(),now()]).map_err(|e|e.to_string())?;
+                    foundation_rebound=true;
+                }
+            }
+        }
+        let report=json!({"version":"validated-source-projection-rebind/v1","rebound":rebound,"blocked":blocked,"foundationRebound":foundation_rebound});
+        if !rebound.is_empty() || foundation_rebound {
+            tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES('','source_projection_rebound',?1,?2)",params![report.to_string(),now()]).map_err(|e|e.to_string())?;
+            mark_changed(&tx)?;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(report)
+    }
     pub fn foundation_choices(&self) -> Result<Value> {
         let mut c = self.conn()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
@@ -1592,8 +1678,9 @@ impl Store {
 }
 
 fn source_channel_metadata_only(previous: &Value, current: &Value) -> bool {
-    if s(previous, "parserVersion") != "source-parser/v2"
-        || s(current, "parserVersion") != "source-parser/v3"
+    let channel = s(previous,"parserVersion")=="source-parser/v2" && s(current,"parserVersion")=="source-parser/v3";
+    let display = s(previous,"parserVersion")=="source-parser/v4" && s(current,"parserVersion")=="source-parser/v5";
+    if (!channel && !display)
         || s(previous, "text") != s(current, "text")
         || s(previous, "sha256") != s(current, "sha256")
     {
@@ -1615,7 +1702,9 @@ fn source_channel_metadata_only(previous: &Value, current: &Value) -> bool {
             map.remove("parserVersion");
         }
         for row in source["rows"].as_array_mut().into_iter().flatten() {
-            if let Some(dialogue) = row["dialogue"].as_object_mut() {
+            if display {
+                if let Some(row)=row.as_object_mut(){row.remove("dialogue");}
+            } else if let Some(dialogue) = row["dialogue"].as_object_mut() {
                 dialogue.remove("speaker");
                 dialogue.remove("channel");
             }
@@ -2381,6 +2470,77 @@ mod tests {
             .save_reparsed_source_if_current(json!(changed), 1)
             .unwrap();
         assert_eq!(store.foundation().unwrap()["sourceVersion"], 1);
+    }
+    #[test]
+    fn source_projection_rebind_validates_whole_episode_preserves_creative_history_and_submissions() {
+        for invalid in [false,true] {
+            let (_temp,store)=fixture();
+            let current=crate::pipeline::prepare_source("第1集\n场景：门口\n小王os：我听见了😀。\n").unwrap();
+            let mut old=current.clone();old.parser_version="source-parser/v2".into();
+            let old_dialogue=old.rows.iter_mut().find_map(|row|row.dialogue.as_mut()).unwrap();
+            old_dialogue.speaker="小王os".into();old_dialogue.channel="现场".into();
+            store.save_source(json!(old)).unwrap();
+            store.save_foundation(json!({"sourceSha256":current.sha256,"overview":"原制作基础"})).unwrap();
+            let row=&current.rows[2];let quote=row.dialogue.as_ref().unwrap();
+            let unit=store.save_unit(json!({"id":"U","episodeId":row.episode_id,"sceneId":row.scene_id,"sourceVersion":1,"sourceSha256":current.sha256,"prompt":"原完整分镜提示词","title":"听见","eventId":"E","unitDirection":"人物在门口停步。","scene":"门口","initialState":"人物停步。","exitState":"人物抬头。","lighting":"侧光","duration":3,"sourceRefs":[row.id],"assetRefs":[],"shots":[{"id":"S","duration":3,"camera":"近景","picture":"人物抬头。","lighting":"侧光","sound":"原声音","transition":"切","sourceRefs":[row.id],"contextRefs":[],"dialogueParts":[{"lineId":quote.id,"text":if invalid{"改过的原话"}else{&quote.quote},"speaker":quote.speaker,"channel":quote.channel,"presentation":quote.channel,"voiceStart":0,"voiceEnd":2.9,"delivery":"低声"}]}]})).unwrap();
+            let task=store.add_job("video","U","dreamina","account",&json!({"unit":unit,"sourceVersion":1}),"submitted").unwrap();
+            store.conn().unwrap().execute("UPDATE jobs SET task_id='original-cloud-task' WHERE id=?1",[&task]).unwrap();
+            let before=store.job(&task).unwrap();
+            store.save_reparsed_source_if_current(json!(current),1).unwrap();
+            let report=store.rebind_verified_source_projection(&[json!("U")],&json!({"minDuration":0,"maxDuration":15,"imageLimit":0})).unwrap();
+            let carried=store.get("units","U").unwrap();
+            assert_eq!(store.job(&task).unwrap(),before);
+            assert_eq!(carried["shots"],unit["shots"]);assert_eq!(carried["prompt"],unit["prompt"]);
+            if invalid {
+                assert!(report["rebound"].as_array().unwrap().is_empty());
+                assert_eq!(report["blocked"].as_array().unwrap().len(),1);
+                assert_eq!(carried["sourceVersion"],1);
+            } else {
+                assert_eq!(report["rebound"].as_array().unwrap().len(),1);
+                assert_eq!(carried["sourceVersion"],2);assert_eq!(carried["version"],2);
+                let original:String=store.conn().unwrap().query_row("SELECT data FROM unit_versions WHERE unit_id='U' AND version=1",[],|r|r.get(0)).unwrap();
+                assert_eq!(parse(original).unwrap(),unit);
+                let repeated=store.rebind_verified_source_projection(&[json!("U")],&json!({"minDuration":0,"maxDuration":15,"imageLimit":0})).unwrap();
+                assert!(repeated["rebound"].as_array().unwrap().is_empty());
+                assert_eq!(store.get("units","U").unwrap(),carried);
+            }
+        }
+    }
+    #[test]
+    #[ignore="explicit consistent private copy only; production DB is never writable in this regression"]
+    fn actual_source_projection_rebind_preserves_all_twenty_four_units_and_all_cloud_receipts() {
+        let root=std::env::var("DIRECTOR_PROJECTION_ISOLATED_ROOT").expect("explicit isolated root");
+        assert!(root.replace('\\',"/").contains("/reports/desktop-real-e2e-20261005/boundary-regression-projection-"));
+        let store=Store::open(PathBuf::from(&root)).unwrap();
+        let source=store.source().unwrap();assert_eq!(source["sha256"],"39d7551dcd8802cf25d597e2e8932b8b6edfe93517ec8a181343458169960b17");
+        let units:Vec<_>=store.values("units").unwrap().into_iter().filter(|u|u["retired"]!=true && u["sourceVersion"]==1).collect();assert_eq!(units.len(),24);
+        let ids:Vec<_>=units.iter().map(|u|u["id"].clone()).collect();
+        let raw:String=store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id='36b872ee-72d4-4a60-8bc0-15625a6fe318'",[],|r|r.get(0)).unwrap();
+        let caps=parse(raw).unwrap()["input"]["capabilities"].clone();
+        assert!(caps["maxDuration"].as_f64().is_some_and(|v|v>0.));
+        assert_eq!(store.rebind_verified_source_projection(&ids,&caps).unwrap()["deferred"],"storyboard_workflow_active");
+        // Simulate coordinator completion exclusively in the disposable copy.
+        store.conn().unwrap().execute("UPDATE jobs SET state='completed' WHERE id='36b872ee-72d4-4a60-8bc0-15625a6fe318' AND kind='workflow'",[]).unwrap();
+        let read_media = || {
+            let c=store.conn().unwrap();let mut q=c.prepare("SELECT data FROM media ORDER BY rowid").unwrap();
+            q.query_map([],|r|r.get::<_,String>(0)).unwrap().map(|r|r.unwrap()).collect::<Vec<_>>()
+        };
+        let assets=store.values("assets").unwrap();let media=read_media();
+        let known:Vec<_>=store.jobs().unwrap().into_iter().filter(|j|!s(j,"providerTaskId").is_empty()).collect();
+        let foundation=store.foundation().unwrap();
+        let report=store.rebind_verified_source_projection(&ids,&caps).unwrap();
+        assert_eq!(report["rebound"].as_array().unwrap().len(),24,"{report}");assert!(report["blocked"].as_array().unwrap().is_empty());assert_eq!(report["foundationRebound"],true);
+        for unit in units {
+            let mut carried=store.get("units",s(&unit,"id")).unwrap();let mut original=unit.clone();
+            assert_eq!(carried["sourceVersion"],2);assert_eq!(carried["sourceMetadataRebind"]["creativeContentUnchanged"],true);
+            for key in ["version","sourceVersion","sourceMetadataRebind"] {carried.as_object_mut().unwrap().remove(key);original.as_object_mut().unwrap().remove(key);}
+            assert_eq!(carried,original);
+        }
+        let mut carried=store.foundation().unwrap();let mut original=foundation;
+        for key in ["version","sourceVersion","sourceMetadataRebind"] {carried.as_object_mut().unwrap().remove(key);original.as_object_mut().unwrap().remove(key);}
+        assert_eq!(carried,original);assert_eq!(store.values("assets").unwrap(),assets);assert_eq!(read_media(),media);
+        let after:Vec<_>=store.jobs().unwrap().into_iter().filter(|j|!s(j,"providerTaskId").is_empty()).collect();assert_eq!(after,known);
+        assert!(store.rebind_verified_source_projection(&ids,&caps).unwrap()["rebound"].as_array().unwrap().is_empty());
     }
     fn author_store_fixture() -> (tempfile::TempDir, Store, Value) {
         let (tmp, store) = fixture();

@@ -1,11 +1,11 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 #[path = "storyboard_assets.rs"]
-mod asset_cards;
+pub(super) mod asset_cards;
 #[path = "storyboard_creative.rs"]
-mod creative;
+pub(super) mod creative;
 #[path = "storyboard_original.rs"]
-mod original;
+pub(super) mod original;
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
@@ -57,7 +57,7 @@ fn plan_schema(
     )
 }
 
-fn draft_schema(
+pub(super) fn draft_schema(
     rows: &[SourceRow],
     context: &[SourceRow],
     assets: &[Value],
@@ -160,7 +160,7 @@ pub(crate) fn finish_base_hash(base: &Value) -> String {
     digest(&json!({"schemaVersion":base["schemaVersion"],"units":base["units"],"fantasyRealization":base["fantasyRealization"]}).to_string())
 }
 
-fn finish_delta_schema(full: &Value, base: &Value) -> Value {
+pub(super) fn finish_delta_schema(full: &Value, base: &Value) -> Value {
     let ids: Vec<_> = base["units"]
         .as_array()
         .unwrap()
@@ -183,7 +183,7 @@ fn finish_delta_schema(full: &Value, base: &Value) -> Value {
 
 /// Equivalent to the old applyDelta partition contract. Retained units and
 /// their fantasies are copied by Rust; an edit must supply a complete group.
-fn apply_finish_delta(base: &Value, delta: &Value) -> Result<Value, String> {
+pub(super) fn apply_finish_delta(base: &Value, delta: &Value) -> Result<Value, String> {
     if text(delta, "schemaVersion") != "storyboard-delta/v2"
         || text(delta, "baseDraftHash") != finish_base_hash(base)
     {
@@ -404,19 +404,33 @@ fn finish_request(
     let mut author_revisions = Vec::new();
     for scope in scopes {
         if let Some(revision) = scope.input.get("authorChainRevision") {
-            if !author_revisions.contains(revision) { author_revisions.push(revision.clone()); }
+            if !author_revisions.contains(revision) {
+                author_revisions.push(revision.clone());
+            }
         }
     }
     if author_revisions.len() == 1 {
         input["authorChainRevision"] = author_revisions[0].clone();
     } else if !author_revisions.is_empty() {
-        input["authorChainRevision"] = json!({"version":"accepted-author-chain-change/v1","authorRevisions":author_revisions});
+        input["authorChainRevision"] =
+            json!({"version":"accepted-author-chain-change/v1","authorRevisions":author_revisions});
     }
     input.as_object_mut().unwrap().remove("workPackage");
     input.as_object_mut().unwrap().remove("dependencyOutputs");
     input["workPackages"] = json!(owners);
     input["sourceRows"] = json!(source_rows);
     input["contextRows"] = json!(context_rows);
+    if super::stage3_pack::uses_profile(&input)? {
+        let (cards, selection) = asset_cards::project_for_scope(
+            &scopes[0].input,
+            assets,
+            episode_id,
+            &source_rows,
+            &context_rows,
+        )?;
+        input["assets"] = json!(cards);
+        input["assetSelection"] = selection;
+    }
     let mut decisions = Vec::new();
     for scope in scopes {
         for record in scope.input["scopedAuthorDecisions"]["records"]
@@ -1083,7 +1097,7 @@ pub fn validate_storyboard(
     validate_storyboard_scope(&source, draft, assets, caps, None)
 }
 
-fn validate_storyboard_scope(
+pub(super) fn validate_storyboard_scope(
     source: &LockedSource,
     draft: &Value,
     assets: &[Value],
@@ -1112,6 +1126,7 @@ fn validate_storyboard_scope_with_issues(
         expected_refs,
         scope_issues,
         false,
+        false,
     )
 }
 
@@ -1126,6 +1141,7 @@ fn validate_storyboard_repair_scope(
     expected_refs: Option<&[String]>,
     mut scope_issues: Option<&mut Vec<Value>>,
     defer_scene_coordinate: bool,
+    defer_zero_duration: bool,
 ) -> Result<(), String> {
     validate_source(source)?;
     let (min, max, image_limit) = capabilities(&json!({"capabilities":caps}))?;
@@ -1328,16 +1344,27 @@ fn validate_storyboard_repair_scope(
             return Err("单元镜表不能为空".into());
         }
         let mut duration = 0.0;
-        for shot in shots {
+        for (shot_index, shot) in shots.iter().enumerate() {
             let id = text(shot, "id");
             if id.is_empty() || !shot_ids.insert(id) {
                 return Err("镜号空或重复".into());
             }
-            let seconds = shot
-                .get("duration")
-                .and_then(Value::as_f64)
-                .filter(|s| s.is_finite() && *s > 0.0)
-                .ok_or("镜长须为正数")?;
+            let seconds = match shot.get("duration").and_then(Value::as_f64) {
+                Some(seconds) if seconds.is_finite() && seconds > 0.0 => seconds,
+                Some(0.0)
+                    if defer_zero_duration
+                        && shot["dialogueParts"].as_array().is_some_and(Vec::is_empty) =>
+                {
+                    let issues = scope_issues
+                        .as_deref_mut()
+                        .ok_or(crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION)?;
+                    issues.push(json!({"code":"SHOT_DURATION","unitId":uid,"coordinate":format!("{uid}.shots[{shot_index}].duration"),"shotId":id,"originalDuration":0,"sourceRefs":shot["sourceRefs"],"problem":crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION}));
+                    // Only a rejected candidate can carry this issue. Do not
+                    // invent seconds or alter the original shot/voice windows.
+                    0.0
+                }
+                _ => return Err(crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION.into()),
+            };
             duration += seconds;
             for field in ["camera", "picture", "lighting", "sound", "transition"] {
                 if text(shot, field).trim().is_empty() {
@@ -1707,11 +1734,16 @@ fn author_context(
     scoped: bool,
 ) -> Vec<SourceRow> {
     let historical: HashSet<_> = base.iter().map(|row| row.id.as_str()).collect();
-    base.iter().chain(rows).filter(|row| {
-        !owned.contains(&row.id)
-            && (row.kind == "context" || evidence.contains(&row.id)
-                || (!scoped && historical.contains(row.id.as_str())))
-    }).cloned().collect()
+    base.iter()
+        .chain(rows)
+        .filter(|row| {
+            !owned.contains(&row.id)
+                && (row.kind == "context"
+                    || evidence.contains(&row.id)
+                    || (!scoped && historical.contains(row.id.as_str())))
+        })
+        .cloned()
+        .collect()
 }
 
 fn relevant_context(
@@ -1831,7 +1863,7 @@ fn relevant_context(
         .collect()
 }
 
-fn validate_event_bindings(draft: &Value, plan: &Value) -> Result<(), String> {
+pub(super) fn validate_event_bindings(draft: &Value, plan: &Value) -> Result<(), String> {
     validate_event_bindings_for_repair(draft, plan, None)
 }
 
@@ -1966,6 +1998,14 @@ pub async fn run_storyboard(
     reasoning: &str,
 ) -> Result<Value, String> {
     let creative_enabled = creative::uses_profile(input)?;
+    let mac_pack = super::stage3_pack::uses_profile(input)?;
+    if mac_pack {
+        if !creative_enabled {
+            return Err("Mac生产规则适配缺少锁定原话与导出合同，未派发请求".into());
+        }
+        let mut bound = json!({});
+        super::stage3_pack::attach_profile(&mut bound, input)?;
+    }
     let carrier_enabled = creative::uses_carrier_profile(input)?;
     if carrier_enabled && !creative_enabled {
         return Err("视频载体合同须与原三岗制作合同共同使用".into());
@@ -2151,14 +2191,30 @@ pub async fn run_storyboard(
             asset_cards::attach_catalog_scope(&mut plan_input, input, &episode.id);
             creative::mark_input(&mut plan_input, creative_enabled);
             creative::attach_carrier_profile(&mut plan_input, input)?;
+            super::stage3_pack::attach_profile(&mut plan_input, input)?;
             if !continuity_revision.is_null(){plan_input["continuityRevision"]=continuity_revision.clone();}
             attach_author_decisions(&mut plan_input, scoped_decisions.as_ref());
             if fantasy_mode!="off" || methods_for(&rows,&[],&[],false,&episode_facts)?.contains(&"fantasy-expression") {plan_methods.push("fantasy-expression");}
-            let plan = call_validated(executor, "storyboardPlan", "episode-emotion-planner", model, reasoning,
-                plan_input,
-                plan_schema(&rows, &context, &scenes, fantasy_mode), &plan_methods, |value| {
+            // The original coordinator returns malformed planning to the same
+            // planner with its preserved candidate, rather than asking the user
+            // to repair internal contracts or restarting the episode.
+            let plan_schema_value=plan_schema(&rows,&context,&scenes,fantasy_mode);
+            let base_plan_input=plan_input.clone();
+            let origin_request=creative::prepare_request(TextRequest{stage:"storyboardPlan".into(),skill:"episode-emotion-planner".into(),model:model.into(),reasoning:reasoning.into(),input:plan_input.clone(),schema:plan_schema_value.clone(),rule_snapshot:snapshot("episode-emotion-planner",&plan_methods)?})?;
+            let origin_hash=digest(&serde_json::to_string(&origin_request).map_err(|e|e.to_string())?);
+            let mut original_raw_hash=String::new(); let mut last_problem=String::new();
+            let mut attempt=0usize;
+            let plan=loop {
+                let mut rejected_raw=None;
+                let request_hash=digest(&serde_json::to_string(&creative::prepare_request(TextRequest{input:plan_input.clone(),..origin_request.clone()})?).map_err(|e|e.to_string())?);
+                let planned=call_validated(executor, "storyboardPlan", "episode-emotion-planner", model, reasoning,
+                plan_input.clone(), plan_schema_value.clone(), &plan_methods, |value| {
+                    let raw=value.clone();
                     validate_plan(value, &rows, &context, &scenes)?;
-                    original::normalize_event_plan(value,&rows)?;
+                    if let Err(reason)=original::normalize_event_plan(value,&rows) {
+                        if crate::text_executor::planner_repairable_rejection(&reason) {rejected_raw=Some(raw);}
+                        return Err(reason);
+                    }
                     for fact in value["entryFacts"].as_array_mut().ok_or("缺少入口事实")? {
                         let evidence:Vec<_>=strings(fact,"sourceRefs")?.iter().map(|id|rows.iter().chain(&context).find(|r|&r.id==id).map(|r|r.text.clone()).ok_or("未知源证据")).collect::<Result<_,_>>()?;
                         fact["evidence"]=json!(evidence);fact["currentApplicability"]=json!("SOURCE_ANCHORED");
@@ -2166,7 +2222,21 @@ pub async fn run_storyboard(
                     value["sourceFingerprints"]=json!(rows.iter().chain(&context).map(|r|(r.id.clone(),digest(&r.text))).collect::<HashMap<_,_>>());
                     if fantasy_mode == "off" && !value["fantasyCandidates"].as_array().unwrap().is_empty() { return Err("关闭额外幻想时不得新增幻想候选".into()); }
                     Ok(())
-                }).await?;
+                }).await;
+                match (planned,rejected_raw) {
+                    (Ok(plan),_)=>break plan,
+                    (Err(reason),Some(raw))=>{
+                        if attempt>=2 || last_problem==reason {return Err(format!("PLAN_REPAIR_{}：原情绪统筹的定向修订未通过；已保存全部回包，不重复调用",if last_problem==reason{"NO_PROGRESS"}else{"LIMIT"}));}
+                        if attempt==0 {original_raw_hash=digest(&raw.to_string());}
+                        attempt+=1; last_problem=reason.clone();
+                        plan_input=base_plan_input.clone();
+                        plan_input["previousPlan"]=raw.clone();
+                        plan_input["validationIssues"]=json!([{"code":"PLAN_EVENT_BOUNDARY","problem":reason}]);
+                        plan_input["planRepair"]=json!({"version":"rejected-plan-repair/v1","attempt":attempt,"maximumAttempts":2,"sourceSha256":source.sha256,"originDomainRequestSha256":origin_hash,"originalPlanSha256":original_raw_hash,"previousRequestSha256":request_hash,"previousPlanSha256":digest(&raw.to_string())});
+                    },
+                    (Err(reason),None)=>return Err(reason),
+                }
+            };
             if fantasy_mode == "review" && require_fantasy_review && !plan["fantasyCandidates"].as_array().unwrap().is_empty() && decision.is_none() {
                 return Ok(json!({"pendingPlan":plan}));
             }
@@ -2213,6 +2283,7 @@ pub async fn run_storyboard(
                 let package_base_context=author_context(&base_context,&rows,&batch.source_refs,&context_ids,scoped_author_context);
                 let package_context=decision_context(&source,&package_rows,&package_base_context,package_decisions.as_ref());
                 let package_facts=if scoped_author_context {scoped_facts(input,&package_rows,&package_context)}else{episode_facts.clone()};
+                let (package_assets,asset_selection)=asset_cards::project_for_scope(input,&current_assets,&episode.id,&package_rows,&package_context)?;
                 let scenario_keys:Vec<_>=owners.iter().flat_map(|p|strings(p,"scenarioKeys").unwrap_or_default()).collect();
                 let dependency_outputs:Vec<_>=package_outputs.iter().filter(|(id,_)|dependencies.contains(id)).map(|(_,output)|output).collect();
                 let accepted_continuity=if accepted_boundary.is_null(){Value::Null}else{json!({"version":"accepted-tail-v1","executionBatchId":previous_batch,"unit":accepted_boundary,"sourceRefs":accepted_boundary["sourceRefs"],"boundaryBefore":events.iter().find(|e|text(e,"id")==text(owners[0],"eventId")).map(|e|&e["boundaryBefore"]),"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"})};
@@ -2222,10 +2293,12 @@ pub async fn run_storyboard(
                     plan_view["dependencyExits"] = storyboard_dependencies::project(&plan,&batch.package_ids,&source_order,&package_outputs)?;
                 }
                 let prefix=format!("{}:{}:",episode.id,batch.id);
-                let mut author_input=json!({"episodeId":episode.id,"productionDirection":direction,"foundationEpisode":foundation_episode,"workPackage":owners.first(),"workPackages":owners,"plan":plan_view,"sourceRows":package_rows,"contextRows":package_context,"entryFacts":entry_facts,"facts":package_facts,"assets":model_assets,"selectedFantasy":candidates,"acceptedContinuity":accepted_continuity,"dependencyOutputs":dependency_outputs,"executionBatch":batch.value(),"settings":settings,"capabilities":caps,"capacityBrief":original::capacity_brief(caps,None,input.get("voiceReference"),&package_rows),"instruction":"作者范围不是视频单元数量。对白只选择lineId及spokenSegments内绝对UTF16 quoteStart/quoteEnd，演法不发声；Rust物化台词/说者/声道。本批正文完整一次；上下文和已采用前稿不重演，不自动继承前包幻想许可。"});
+                let mut author_input=json!({"episodeId":episode.id,"productionDirection":direction,"foundationEpisode":foundation_episode,"workPackage":owners.first(),"workPackages":owners,"plan":plan_view,"sourceRows":package_rows,"contextRows":package_context,"entryFacts":entry_facts,"facts":package_facts,"assets":package_assets,"selectedFantasy":candidates,"acceptedContinuity":accepted_continuity,"dependencyOutputs":dependency_outputs,"executionBatch":batch.value(),"settings":settings,"capabilities":caps,"capacityBrief":original::capacity_brief(caps,None,input.get("voiceReference"),&package_rows),"instruction":"作者范围不是视频单元数量。对白只选择lineId及spokenSegments内绝对UTF16 quoteStart/quoteEnd，演法不发声；Rust物化台词/说者/声道。本批正文完整一次；上下文和已采用前稿不重演，不自动继承前包幻想许可。"});
+                if !asset_selection.is_null() { author_input["assetSelection"]=asset_selection; }
                 asset_cards::attach_catalog_scope(&mut author_input, input, &episode.id);
                 creative::mark_input(&mut author_input, creative_enabled);
                 creative::attach_carrier_profile(&mut author_input, input)?;
+            super::stage3_pack::attach_profile(&mut author_input, input)?;
                 if !continuity_revision.is_null(){author_input["continuityRevision"]=continuity_revision.clone();}
                 if creative_enabled { author_input["settings"]["fantasyEnabled"] = json!(!candidates.is_empty()); }
                 if compact_dependency_exits {
@@ -2235,7 +2308,7 @@ pub async fn run_storyboard(
                 let batch_result:Result<Value,String>=async {
                     let methods=methods_for(&package_rows,&candidates,&scenario_keys,false,&entry_facts)?;
                     let schema=draft_schema(&package_rows,&package_context,&current_assets,&event_ids,&episode.id);
-                    if !author_repair_cause.is_null() {
+                    {
                         let request = creative::prepare_request(TextRequest{stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),model:model.into(),reasoning:reasoning.into(),input:author_input.clone(),schema:schema.clone(),rule_snapshot:snapshot("unit-performance-director",&methods)?})?;
                         if let Some(revision) = executor.author_chain_revision(&request,&author_repair_cause).await? {
                             author_input["authorChainRevision"] = revision;
@@ -2334,7 +2407,7 @@ pub async fn run_storyboard(
                         Ok(draft)=>{executor.accept(&request,&response).await?;Ok(draft)},
                         Err(reason)=>{
                             executor.reject(&request,&original_response,&reason).await?;
-                            if !creative_enabled || reason!=crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION {return Err(reason);}
+                            if !creative_enabled || ![crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION,crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION].contains(&reason.as_str()) {return Err(reason);}
                             // The editor can reintroduce a reference rejected in
                             // an author. The original coordinator routes either
                             // unadopted role back to the same bounded editor.
@@ -2344,7 +2417,11 @@ pub async fn run_storyboard(
                             prefix_ids_preserving(&mut candidate,&new_prefix,&preserved_units,&preserved_shots)?;
                             original::pack_event_units(&mut candidate,&plan,caps["maxDuration"].as_f64().unwrap())?;
                             let validation_caps=carrier_validation_caps(&candidate,caps,true);
-                            let (candidate,issues)=author_scope_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates,true)?;
+                            let (candidate,issues)=if reason==crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
+                                author_duration_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
+                            } else {
+                                author_scope_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates,true)?
+                            };
                             if issues.is_empty(){return Err("整编原拒绝没有可证实的适用范围问题；原回包保留，不重新整编".into());}
                             let mut batch=first.batch.clone();
                             batch.id=text(&request.input["executionBatch"],"id").to_string();
@@ -2402,7 +2479,7 @@ pub async fn run_storyboard(
                     .as_array()
                     .is_some_and(|items| items.is_empty());
                 if complete {
-                    let delivery = json!({"schemaVersion":"complete-episode-delivery/v1","status":"running","scope":"episodes","sourceSha256":source.sha256,"episodeId":episode.id,"updatedEpisodeIds":[episode.id],"replacedUnitIds":[],"units":draft["units"],"plans":[{"episodeId":episode.id,"plan":done["plan"]}],"fantasyRealization":draft["fantasyRealization"],"revisionNotes":draft["revisionNotes"],"unresolved":draft["unresolved"],"finishProvenance":done["finishProvenance"],"blocked":[],"ruleSnapshots":storyboard_rules()});
+                    let delivery = json!({"schemaVersion":"complete-episode-delivery/v1","status":"running","scope":"episodes","sourceSha256":source.sha256,"episodeId":episode.id,"updatedEpisodeIds":[episode.id],"replacedUnitIds":[],"units":draft["units"],"plans":[{"episodeId":episode.id,"plan":done["plan"]}],"fantasyRealization":draft["fantasyRealization"],"revisionNotes":draft["revisionNotes"],"unresolved":draft["unresolved"],"finishProvenance":done["finishProvenance"],"blocked":[],"ruleSnapshots":storyboard_rules(input)?});
                     validate_episode_delivery(input, &delivery)?;
                     let mut publication_input = input.clone();
                     publication_input["previousBoundary"] = previous.clone();
@@ -2455,11 +2532,11 @@ pub async fn run_storyboard(
         }
     }
     Ok(
-        json!({"schemaVersion":"storyboard-delivery/v1","sourceSha256":source.sha256,"status":if !waiting.is_empty(){"waiting_decision"}else if !blocked.is_empty(){"partially_blocked"}else{"completed"},"scope":"episodes","updatedEpisodeIds":updated_episodes,"replacedUnitIds":[],"units":all_units,"plans":plans,"waitingDecision":waiting.first(),"waitingDecisions":waiting,"fantasyRealization":all_realizations,"revisionNotes":all_revisions,"unresolved":all_unresolved,"blocked":blocked,"ruleSnapshots":storyboard_rules()}),
+        json!({"schemaVersion":"storyboard-delivery/v1","sourceSha256":source.sha256,"status":if !waiting.is_empty(){"waiting_decision"}else if !blocked.is_empty(){"partially_blocked"}else{"completed"},"scope":"episodes","updatedEpisodeIds":updated_episodes,"replacedUnitIds":[],"units":all_units,"plans":plans,"waitingDecision":waiting.first(),"waitingDecisions":waiting,"fantasyRealization":all_realizations,"revisionNotes":all_revisions,"unresolved":all_unresolved,"blocked":blocked,"ruleSnapshots":storyboard_rules(input)?}),
     )
 }
 
-fn episode_assets(assets: &[Value], episode_id: &str) -> Vec<Value> {
+pub(super) fn episode_assets(assets: &[Value], episode_id: &str) -> Vec<Value> {
     let mut selected: Vec<Value> = assets
         .iter()
         .filter(|asset| {
@@ -2641,7 +2718,7 @@ fn materialize_asset_references(draft: &mut Value, assets: &[Value]) -> Result<(
     Ok(())
 }
 
-fn scoped_facts(input: &Value, rows: &[SourceRow], context: &[SourceRow]) -> Vec<Value> {
+pub(super) fn scoped_facts(input: &Value, rows: &[SourceRow], context: &[SourceRow]) -> Vec<Value> {
     input
         .pointer("/foundation/facts")
         .and_then(Value::as_array)
@@ -2667,7 +2744,7 @@ fn scoped_facts(input: &Value, rows: &[SourceRow], context: &[SourceRow]) -> Vec
         .collect()
 }
 
-fn methods_for(
+pub(super) fn methods_for(
     rows: &[SourceRow],
     selected: &[Value],
     scenario_keys: &[String],
@@ -2707,7 +2784,7 @@ fn methods_for(
     Ok(methods)
 }
 
-fn validate_authored(
+pub(super) fn validate_authored(
     source: &LockedSource,
     draft: &mut Value,
     assets: &[Value],
@@ -2769,6 +2846,11 @@ fn author_validation_candidate(
     selected: &[Value],
     reason: &str,
 ) -> Result<(Value, Vec<Value>), String> {
+    if reason == crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
+        return author_duration_candidate(
+            source, raw, assets, caps, refs, style, prefix, plan, selected,
+        );
+    }
     if reason == crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION {
         return author_scope_candidate(
             source, raw, assets, caps, refs, style, prefix, plan, selected, true,
@@ -2787,8 +2869,8 @@ fn author_validation_candidate(
     }
     if missing_dialogue.is_some() {
         let mut checked = raw.clone();
-        match validate_authored(source,&mut checked,assets,caps,refs,style,prefix) {
-            Err(found) if found == reason => {},
+        match validate_authored(source, &mut checked, assets, caps, refs, style, prefix) {
+            Err(found) if found == reason => {}
             _ => return Err("原主创对白缺失与锁定源校验不一致；未创建修订".into()),
         }
     }
@@ -2804,9 +2886,19 @@ fn author_validation_candidate(
         })
         .collect();
     let missing_row = if let Some(line) = missing_dialogue {
-        Some(source.rows.iter().find(|row| row.dialogue.as_ref().is_some_and(|quote|quote.id==line)
-            && allowed.contains(row.id.as_str())).ok_or("缺失对白不属于冻结主创正文；未扩大修订")?)
-    } else {None};
+        Some(
+            source
+                .rows
+                .iter()
+                .find(|row| {
+                    row.dialogue.as_ref().is_some_and(|quote| quote.id == line)
+                        && allowed.contains(row.id.as_str())
+                })
+                .ok_or("缺失对白不属于冻结主创正文；未扩大修订")?,
+        )
+    } else {
+        None
+    };
     let mut draft = raw.clone();
     materialize_asset_references(&mut draft, assets)?;
     prefix_ids(&mut draft, prefix)?;
@@ -2960,6 +3052,7 @@ fn scope_repair_candidate(
         Some(refs),
         Some(&mut issues),
         defer_scene_coordinate,
+        false,
     )?;
     validate_event_bindings_for_repair(&draft, plan, Some(&issues))?;
     validate_fantasy_profile(&draft, selected, creative_enabled)?;
@@ -2969,14 +3062,54 @@ fn scope_repair_candidate(
     Ok((draft, issues))
 }
 
+fn author_duration_candidate(
+    source: &LockedSource,
+    raw: &Value,
+    assets: &[Value],
+    caps: &Value,
+    refs: &[String],
+    style: &str,
+    prefix: &str,
+    plan: &Value,
+    selected: &[Value],
+) -> Result<(Value, Vec<Value>), String> {
+    if raw["schemaVersion"] != "storyboard-draft/v2" {
+        return Err("镜长修订缺少原话区间协议；未调用模型".into());
+    }
+    let mut draft = raw.clone();
+    materialize_dialogue(source, &mut draft, false)?;
+    materialize_asset_references(&mut draft, assets)?;
+    prefix_ids(&mut draft, prefix)?;
+    add_delivery_fields(&mut draft, style)?;
+    let mut issues = Vec::new();
+    validate_storyboard_repair_scope(
+        source,
+        &draft,
+        assets,
+        caps,
+        Some(refs),
+        Some(&mut issues),
+        false,
+        true,
+    )?;
+    if !issues.iter().any(|issue| issue["code"] == "SHOT_DURATION") {
+        return Err("原镜长拒绝没有可定位的零秒无对白镜；未扩大修订".into());
+    }
+    validate_event_bindings(&draft, plan)?;
+    validate_fantasy_profile(&draft, selected, true)?;
+    materialize_unit_coverage(source, &mut draft)?;
+    creative::add_delivery(&mut draft, source, style, assets, true)?;
+    Ok((draft, issues))
+}
+
 fn author_scope_problem_signature(issues: &[Value]) -> String {
     let mut keys: Vec<_> = issues.iter().map(|issue| {
         let mut refs:Vec<_>=issue["sourceRefs"].as_array().into_iter().flatten().cloned().collect();
         refs.sort_by_key(Value::to_string);refs.dedup();
         let mut identity=json!({"code":issue["code"],"assetId":issue["assetId"],"variantId":issue["variantId"],"episodeId":issue["episodeId"],"sceneId":issue["sceneId"],"sourceRefs":refs});
         if issue["code"]=="UNIT_SCENE_COORDINATE" {identity["expectedSceneId"]=issue["expectedSceneId"].clone();}
-        if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE"].contains(&text(issue,"code")) {
-            for field in ["coordinate","lineId","quoteStart","quoteEnd","allowedSpokenRanges","requiredSourceRefs"] {identity[field]=issue[field].clone();}
+        if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE","SHOT_DURATION"].contains(&text(issue,"code")) {
+            for field in ["coordinate","lineId","quoteStart","quoteEnd","allowedSpokenRanges","requiredSourceRefs","shotId","originalDuration"] {identity[field]=issue[field].clone();}
         }
         identity.to_string()
     }).collect::<HashSet<_>>().into_iter().collect();
@@ -3001,6 +3134,21 @@ fn author_scope_repair_units(base: &Value, issues: &[Value]) -> Result<HashSet<S
     }
     loop {
         let before = permitted.len();
+        // A wrong scene coordinate can require repacking the same event's
+        // adjacent units. They are a causal group, even when the original row
+        // was split into disjoint intervals. Other events remain untouched.
+        let coordinate_events: HashSet<_> = issues
+            .iter()
+            .filter(|issue| issue["code"] == "UNIT_SCENE_COORDINATE")
+            .filter_map(|issue| units.iter().find(|unit| unit["id"] == issue["unitId"]))
+            .map(|unit| text(unit, "eventId"))
+            .filter(|id| !id.is_empty())
+            .collect();
+        for unit in units {
+            if coordinate_events.contains(text(unit, "eventId")) {
+                permitted.insert(text(unit, "id").into());
+            }
+        }
         let refs: HashSet<_> = units
             .iter()
             .filter(|unit| permitted.contains(text(unit, "id")))
@@ -3102,6 +3250,7 @@ async fn repair_author_scope(
             "DIALOGUE_SOURCE_COVERAGE",
             "UNIT_SOURCE_COVERAGE",
             "ASSET_SOURCE_SCOPE",
+            "SHOT_DURATION",
         ]
         .contains(&text(issue, "code"))
     });
@@ -3353,7 +3502,7 @@ pub(crate) fn validate_episode_delivery(input: &Value, output: &Value) -> Result
     Ok(())
 }
 
-fn carrier_problems(draft: &Value, caps: &Value) -> Vec<Value> {
+pub(super) fn carrier_problems(draft: &Value, caps: &Value) -> Vec<Value> {
     let minimum = caps["minDuration"].as_f64().unwrap_or(0.0);
     let maximum = caps["maxDuration"].as_f64().unwrap_or(f64::INFINITY);
     draft["units"]
@@ -3711,8 +3860,11 @@ fn mark_short_endings(draft: &mut Value, minimum: f64) {
     }
 }
 
-fn storyboard_rules() -> Vec<RuleSnapshot> {
-    rule_snapshots()
+fn storyboard_rules(input: &Value) -> Result<Vec<RuleSnapshot>, String> {
+    if super::stage3_pack::uses_profile(input)? {
+        return super::stage3_pack::rule_snapshots();
+    }
+    Ok(rule_snapshots()
         .into_iter()
         .filter(|rule| {
             [
@@ -3728,13 +3880,13 @@ fn storyboard_rules() -> Vec<RuleSnapshot> {
             .contains(&rule.id.as_str())
                 || rule.id.starts_with("storyboard-")
         })
-        .collect()
+        .collect())
 }
 
 /// The engine binds this material to the exact adopted producer chain. The
 /// pipeline independently checks source content, current unit versions and
 /// canonical hashes; it never picks a latest plan or joins assets by name.
-fn accepted_revision_context(
+pub(super) fn accepted_revision_context(
     source: &LockedSource,
     input: &Value,
     episode_id: &str,
@@ -3935,6 +4087,14 @@ async fn run_storyboard_revision(
     reasoning: &str,
 ) -> Result<Value, String> {
     let creative_enabled = creative::uses_profile(input)?;
+    let mac_pack = super::stage3_pack::uses_profile(input)?;
+    if mac_pack {
+        if !creative_enabled {
+            return Err("Mac生产规则适配缺少锁定原话与导出合同，未派发请求".into());
+        }
+        let mut bound = json!({});
+        super::stage3_pack::attach_profile(&mut bound, input)?;
+    }
     let revision_enabled = creative::uses_revision_profile(input)?;
     let selected = strings(&input["selection"], "unitIds")?;
     let selected_ids: HashSet<_> = selected.iter().map(String::as_str).collect();
@@ -4207,9 +4367,15 @@ async fn run_storyboard_revision(
         let result: Result<Value,String> = async {
             if refs.is_empty() || target_refs.len()!=refs.len() { return Err("原单元来源已失效，请按当前原文重新创作整集".into()); }
             let mut author_input=json!({"mode":"revision","episodeId":episode.id,"productionDirection":direction,"sourceRows":rows,"contextRows":context,"facts":facts,"assets":model_assets,"events":plan["events"],"revisionTargetUnits":originals,"revisionInstruction":instruction,"acceptedContinuity":before,"nextBoundary":after,"selectedFantasy":candidates,"settings":settings,"capabilities":caps,"instruction":"仅重做本源范围，保留完整源事实、原话和前后连续状态。可拆合；对白仅选lineId与绝对UTF16原话区间，不发声演法。"});
+            if mac_pack {
+                let (cards, selection)=asset_cards::project_for_scope(input,&current_assets,&episode.id,&rows,&context)?;
+                author_input["assets"]=json!(cards);
+                author_input["assetSelection"]=selection;
+            }
             asset_cards::attach_catalog_scope(&mut author_input, input, &episode.id);
             creative::mark_input(&mut author_input, creative_enabled);
             creative::attach_carrier_profile(&mut author_input, input)?;
+            super::stage3_pack::attach_profile(&mut author_input, input)?;
             if let Some(context) = &accepted_context {
                 author_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
                 author_input["plan"]=plan.clone();
@@ -4234,6 +4400,7 @@ async fn run_storyboard_revision(
             asset_cards::attach_catalog_scope(&mut finish_input, input, &episode.id);
             creative::mark_input(&mut finish_input, creative_enabled);
             creative::attach_carrier_profile(&mut finish_input, input)?;
+            super::stage3_pack::attach_profile(&mut finish_input, input)?;
             if accepted_context.is_some() {
                 finish_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
                 finish_input["workPackages"]=plan["workPackages"].clone();
@@ -4304,11 +4471,11 @@ async fn run_storyboard_revision(
         }
     }
     Ok(
-        json!({"schemaVersion":"storyboard-delivery/v1","sourceSha256":source.sha256,"scope":"units","status":if blocked.is_empty(){"completed"}else{"partially_blocked"},"updatedEpisodeIds":updated,"replacedUnitIds":replaced,"units":units,"plans":[],"waitingDecision":null,"waitingDecisions":[],"continuityImpacts":impacts,"fantasyRealization":realized,"revisionNotes":revisions,"unresolved":unresolved,"blocked":blocked,"ruleSnapshots":storyboard_rules()}),
+        json!({"schemaVersion":"storyboard-delivery/v1","sourceSha256":source.sha256,"scope":"units","status":if blocked.is_empty(){"completed"}else{"partially_blocked"},"updatedEpisodeIds":updated,"replacedUnitIds":replaced,"units":units,"plans":[],"waitingDecision":null,"waitingDecisions":[],"continuityImpacts":impacts,"fantasyRealization":realized,"revisionNotes":revisions,"unresolved":unresolved,"blocked":blocked,"ruleSnapshots":storyboard_rules(input)?}),
     )
 }
 
-fn unit_source_position(source: &LockedSource, unit: &Value) -> usize {
+pub(super) fn unit_source_position(source: &LockedSource, unit: &Value) -> usize {
     unit["sourceCoverage"]
         .as_array()
         .into_iter()
@@ -4566,7 +4733,7 @@ fn prefix_ids_preserving(
     Ok(())
 }
 
-fn validate_fantasy_profile(
+pub(super) fn validate_fantasy_profile(
     draft: &Value,
     selected: &[Value],
     enabled: bool,
@@ -4914,6 +5081,7 @@ mod production_contract_tests {
         fail_finish: bool,
         invalid_finish_delta: bool,
         plan_override: Option<Value>,
+        planner_boundary_repair: Option<&'static str>,
         long_dialogue: bool,
         author_scope_response: Option<&'static str>,
         author_chain_branch: bool,
@@ -4976,6 +5144,11 @@ mod production_contract_tests {
                     .plan_override
                     .clone()
                     .unwrap_or_else(|| mock_plan(&request, self.fantasy));
+                if self.planner_boundary_repair == Some("FIX")
+                    && request.input["planRepair"].is_object()
+                {
+                    value["events"][1]["boundaryBefore"]["kind"] = json!("time_space_jump");
+                }
                 if self.recommended_fantasy {
                     for candidate in value["fantasyCandidates"].as_array_mut().unwrap() {
                         candidate["recommended"] = json!(true);
@@ -5012,7 +5185,11 @@ mod production_contract_tests {
                     } else if self.author_source_error.is_some() {
                         "SOURCE_FIX"
                     } else if request.input["finishRepair"].is_object() {
-                        self.finish_scope_response.unwrap()
+                        match self.finish_scope_response.unwrap() {
+                            "TIMING_FIX" => "SOURCE_FIX",
+                            "TIMING_NO_PROGRESS" => "NO_PROGRESS",
+                            mode => mode,
+                        }
                     } else {
                         self.author_scope_response.unwrap()
                     };
@@ -5177,7 +5354,18 @@ mod production_contract_tests {
                 if self.finish_scope_response.is_some() {
                     let old = &request.input["previousDraft"]["units"][0];
                     let mut next = old.clone();
-                    next["assetRefs"]=json!(request.input["assets"].as_array().unwrap().iter().take(2).enumerate().map(|(index,asset)|json!({"assetId":asset["id"],"variantId":asset["variantId"],"order":index+1,"use":"character","sourceRefs":old["sourceRefs"]})).collect::<Vec<_>>());
+                    if matches!(
+                        self.finish_scope_response,
+                        Some("TIMING_FIX" | "TIMING_NO_PROGRESS")
+                    ) {
+                        let mut silent = next["shots"][0].clone();
+                        silent["id"] = json!("finish-zero-duration");
+                        silent["duration"] = json!(0);
+                        silent["dialogueParts"] = json!([]);
+                        next["shots"].as_array_mut().unwrap().push(silent);
+                    } else {
+                        next["assetRefs"]=json!(request.input["assets"].as_array().unwrap().iter().take(2).enumerate().map(|(index,asset)|json!({"assetId":asset["id"],"variantId":asset["variantId"],"order":index+1,"use":"character","sourceRefs":old["sourceRefs"]})).collect::<Vec<_>>());
+                    }
                     retained.retain(|id| id != &old["id"]);
                     return Ok(
                         json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":request.input["baseDraftHash"],"retainedUnitIds":retained,"replacements":[{"replaces":[old["id"]],"units":[next],"fantasyRealization":[]}],"revisionNotes":[],"unresolved":[]}),
@@ -5275,8 +5463,18 @@ mod production_contract_tests {
                             draft["units"][0]["shots"][0]["dialogueParts"] = json!([]);
                         }
                         "PARTIAL_DIALOGUE" => {
-                            let part=&mut draft["units"][0]["shots"][0]["dialogueParts"][0];
-                            part["quoteEnd"]=json!(part["quoteStart"].as_u64().unwrap()+1);
+                            let part = &mut draft["units"][0]["shots"][0]["dialogueParts"][0];
+                            part["quoteEnd"] = json!(part["quoteStart"].as_u64().unwrap() + 1);
+                        }
+                        "ZERO_DURATION" => {
+                            let mut silent = draft["units"][0]["shots"][0].clone();
+                            silent["id"] = json!("zero-duration-silent-shot");
+                            silent["duration"] = json!(0);
+                            silent["dialogueParts"] = json!([]);
+                            draft["units"][0]["shots"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(silent);
                         }
                         _ => panic!("unknown source-error fixture"),
                     }
@@ -5325,13 +5523,80 @@ mod production_contract_tests {
             self.continuity_updates.lock().await.push(evidence.clone());
             Ok(())
         }
-        async fn author_chain_revision(&self, request:&TextRequest, repair:&Value) -> Result<Option<Value>,String> {
-            Ok(self.author_chain_branch.then(||json!({"version":"accepted-author-chain-change/v1","repairProofSha256":digest(&repair.to_string()),"executionBatchId":request.input["executionBatch"]["id"]})))
+        async fn author_chain_revision(
+            &self,
+            request: &TextRequest,
+            repair: &Value,
+        ) -> Result<Option<Value>, String> {
+            Ok((self.author_chain_branch && !repair.is_null()).then(||json!({"version":"accepted-author-chain-change/v1","repairProofSha256":digest(&repair.to_string()),"executionBatchId":request.input["executionBatch"]["id"]})))
         }
     }
 
     fn input(source: &LockedSource) -> Value {
         json!({"source":source,"assets":[],"foundation":{"overview":"人物拒绝离开。","direction":"克制且保留局部爆发。","episodes":[],"facts":[]},"settings":{"fantasyMode":"off","visualStyle":"16:9真人","videoProvider":"private-channel","textApiToken":"test-placeholder","imageResolution":"4k"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":5},"selection":{"episodeIds":source.episodes.iter().map(|episode|episode.id.clone()).collect::<Vec<_>>()}})
+    }
+
+    #[tokio::test]
+    async fn rejected_planning_uses_the_original_planner_and_stops_identical_errors() {
+        let source =
+            prepare_source("第一集\n场景：门口\n甲：走吧。\n场景：屋内\n甲：来了。").unwrap();
+        let rows: Vec<_> = source
+            .rows
+            .iter()
+            .filter(|row| row.kind == "body")
+            .collect();
+        let emotion = json!({"subject":"甲","contextTone":"回应","audienceEffect":"可读","change":"依原文回应","landing":"到达","retain":["全部原话"]});
+        let plan = json!({"schemaVersion":"storyboard-plan/v2","unitPackingPolicy":"event-first-v1","emotionArc":"到达回应","entryFacts":[],"fantasyCandidates":[],
+            "events":rows.iter().enumerate().map(|(i,row)|json!({"id":format!("E{i}"),"sceneId":row.scene_id,"sourceRefs":[row.id],"boundaryBefore":{"kind":if i==0{"episode_start"}else{"continuous"},"reason":"原文场景"},"emotionContract":emotion})).collect::<Vec<_>>(),
+            "workPackages":rows.iter().enumerate().map(|(i,row)|json!({"id":format!("W{i}"),"eventId":format!("E{i}"),"sourceRefs":[row.id],"contextRefs":[],"entryFactIds":[],"dependsOn":[],"scenarioKeys":[],"emotionContract":emotion})).collect::<Vec<_>>(),
+            "provisionalUnits":rows.iter().enumerate().map(|(i,row)|json!({"id":format!("P{i}"),"packageId":format!("W{i}"),"sourceRefs":[row.id],"secondsRange":[3,4]})).collect::<Vec<_>>()});
+        for mode in ["FIX", "NO_PROGRESS"] {
+            let executor = Recorded {
+                plan_override: Some(plan.clone()),
+                planner_boundary_repair: Some(mode),
+                ..Default::default()
+            };
+            let mut payload = input(&source);
+            creative::mark_input(&mut payload, true);
+            let output = run_storyboard(&payload, &executor, "offline", "medium")
+                .await
+                .unwrap();
+            let calls = executor.calls.lock().await;
+            let plans: Vec<_> = calls
+                .iter()
+                .filter(|request| request.stage == "storyboardPlan")
+                .collect();
+            assert_eq!(plans.len(), 2, "bounded original planner repair");
+            assert_eq!(plans[0].skill, plans[1].skill);
+            assert_eq!(plans[0].input["sourceRows"], plans[1].input["sourceRows"]);
+            assert_eq!(plans[0].schema, plans[1].schema);
+            assert_eq!(plans[1].input["previousPlan"], plan);
+            assert_eq!(plans[1].input["planRepair"]["attempt"], 1);
+            if mode == "FIX" {
+                assert_eq!(output["status"], "completed");
+            } else {
+                assert_eq!(output["status"], "partially_blocked");
+                assert!(output["blocked"]
+                    .to_string()
+                    .contains("PLAN_REPAIR_NO_PROGRESS"));
+                assert_eq!(calls.len(), 2, "no author or endless planner retry");
+            }
+        }
+    }
+
+    #[test]
+    fn scene_coordinate_repair_keeps_same_event_group_and_preserves_unrelated_events() {
+        let base = json!({"units":[{"id":"u1","eventId":"e1","sourceRefs":["r1"]},{"id":"u2","eventId":"e1","sourceRefs":["r2"]},{"id":"u3","eventId":"e2","sourceRefs":["r3"]}],"fantasyRealization":[]});
+        let coordinate = author_scope_repair_units(
+            &base,
+            &[json!({"code":"UNIT_SCENE_COORDINATE","unitId":"u2"})],
+        )
+        .unwrap();
+        assert_eq!(coordinate, HashSet::from(["u1".into(), "u2".into()]));
+        let asset =
+            author_scope_repair_units(&base, &[json!({"code":"ASSET_SCENE_SCOPE","unitId":"u2"})])
+                .unwrap();
+        assert_eq!(asset, HashSet::from(["u2".into()]));
     }
 
     fn author_scope_input(lines: usize) -> (LockedSource, Value) {
@@ -5379,7 +5644,14 @@ mod production_contract_tests {
     #[tokio::test]
     async fn original_editor_repairs_source_coordinates_without_reauthoring_or_adopting_rejected_raw(
     ) {
-        for mode in ["DIALOGUE", "COVERAGE", "ASSET_SOURCE", "MISSING_DIALOGUE", "PARTIAL_DIALOGUE"] {
+        for mode in [
+            "DIALOGUE",
+            "COVERAGE",
+            "ASSET_SOURCE",
+            "MISSING_DIALOGUE",
+            "PARTIAL_DIALOGUE",
+            "ZERO_DURATION",
+        ] {
             let source = prepare_source(
                 "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n",
             )
@@ -5426,7 +5698,11 @@ mod production_contract_tests {
             assert!(repair.rule_snapshot["runtimeContract"]["content"]
                 .as_str()
                 .unwrap()
-                .contains("括号演法不发声"));
+                .contains(if mode == "ZERO_DURATION" {
+                    "SHOT_DURATION"
+                } else {
+                    "括号演法不发声"
+                }));
             let rejected = exec.rejected_values.lock().await.clone();
             let original = rejected
                 .iter()
@@ -5466,7 +5742,14 @@ mod production_contract_tests {
 
     #[tokio::test]
     async fn unchanged_source_coordinate_repair_stops_once_and_resume_does_not_reset_budget() {
-        for mode in ["DIALOGUE", "COVERAGE", "ASSET_SOURCE", "MISSING_DIALOGUE", "PARTIAL_DIALOGUE"] {
+        for mode in [
+            "DIALOGUE",
+            "COVERAGE",
+            "ASSET_SOURCE",
+            "MISSING_DIALOGUE",
+            "PARTIAL_DIALOGUE",
+            "ZERO_DURATION",
+        ] {
             let source = prepare_source(
                 "第一集\n场景：门口\n甲：（低声）原话😀完整保留。\n甲：下一句完整保留。\n",
             )
@@ -5511,77 +5794,79 @@ mod production_contract_tests {
 
     #[tokio::test]
     async fn ordinary_finisher_scope_repair_preserves_its_rejected_raw_and_reuses_all_paid_steps() {
-        let (source, request) = author_scope_input(1);
-        let exec = Recorded {
-            finish_scope_response: Some("FIX"),
-            ..Default::default()
-        };
-        let output = run_storyboard(&request, &exec, "offline", "medium")
-            .await
-            .unwrap();
-        assert_eq!(output["status"], "completed", "{}", output["blocked"]);
-        validate_storyboard_scope(
-            &source,
-            &output,
-            request["assets"].as_array().unwrap(),
-            &request["capabilities"],
-            None,
-        )
-        .unwrap();
-        let calls = exec.calls.lock().await.clone();
-        assert_eq!(
-            calls.iter().filter(|r| r.stage == "storyboardPlan").count(),
-            1
-        );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|r| r.stage == "storyboardCreate")
-                .count(),
-            1
-        );
-        let ordinary = calls
-            .iter()
-            .find(|r| r.input["executionBatch"]["version"] == "related-range-finish/v1")
-            .unwrap();
-        let repair = calls
-            .iter()
-            .find(|r| {
-                r.input["executionBatch"]["version"]
-                    == creative::FINISH_SCOPE_REPAIR_EXECUTION_VERSION
-            })
-            .unwrap();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(repair.input["finishRepair"]["attempt"], 1);
-        assert_eq!(repair.input["finishRepair"]["maximumAttempts"], 2);
-        assert_eq!(
-            repair.input["finishRepair"]["originDomainRequestSha256"],
-            digest(&serde_json::to_string(ordinary).unwrap())
-        );
-        let rejected = exec.rejected_values.lock().await.clone();
-        let original = rejected
-            .iter()
-            .find(|(r, _)| r.input["executionBatch"]["version"] == "related-range-finish/v1")
-            .unwrap();
-        assert_eq!(
-            repair.input["finishRepair"]["originalFinishRawSha256"],
-            digest(&original.1.to_string())
-        );
-        let accepted = exec.accepted.lock().await;
-        assert!(!accepted.contains_key(&serde_json::to_string(ordinary).unwrap()));
-        let proof = &accepted[&serde_json::to_string(repair).unwrap()]["materializedDraft"]
-            ["finishRepairProvenance"];
-        assert_eq!(proof["originalFinishAccepted"], false);
-        assert_eq!(proof["version"], "accepted-finish-scope-repair/v1");
-        drop(accepted);
-        let before = calls.len();
-        assert_eq!(
-            run_storyboard(&request, &exec, "offline", "medium")
+        for mode in ["FIX", "TIMING_FIX"] {
+            let (source, request) = author_scope_input(1);
+            let exec = Recorded {
+                finish_scope_response: Some(mode),
+                ..Default::default()
+            };
+            let output = run_storyboard(&request, &exec, "offline", "medium")
                 .await
-                .unwrap()["units"],
-            output["units"]
-        );
-        assert_eq!(exec.calls.lock().await.len(),before,"resume must replay the original rejected Finish and the accepted repair, without new model calls");
+                .unwrap();
+            assert_eq!(output["status"], "completed", "{}", output["blocked"]);
+            validate_storyboard_scope(
+                &source,
+                &output,
+                request["assets"].as_array().unwrap(),
+                &request["capabilities"],
+                None,
+            )
+            .unwrap();
+            let calls = exec.calls.lock().await.clone();
+            assert_eq!(
+                calls.iter().filter(|r| r.stage == "storyboardPlan").count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|r| r.stage == "storyboardCreate")
+                    .count(),
+                1
+            );
+            let ordinary = calls
+                .iter()
+                .find(|r| r.input["executionBatch"]["version"] == "related-range-finish/v1")
+                .unwrap();
+            let repair = calls
+                .iter()
+                .find(|r| {
+                    r.input["executionBatch"]["version"]
+                        == creative::FINISH_SCOPE_REPAIR_EXECUTION_VERSION
+                })
+                .unwrap();
+            assert_eq!(calls.len(), 4);
+            assert_eq!(repair.input["finishRepair"]["attempt"], 1);
+            assert_eq!(repair.input["finishRepair"]["maximumAttempts"], 2);
+            assert_eq!(
+                repair.input["finishRepair"]["originDomainRequestSha256"],
+                digest(&serde_json::to_string(ordinary).unwrap())
+            );
+            let rejected = exec.rejected_values.lock().await.clone();
+            let original = rejected
+                .iter()
+                .find(|(r, _)| r.input["executionBatch"]["version"] == "related-range-finish/v1")
+                .unwrap();
+            assert_eq!(
+                repair.input["finishRepair"]["originalFinishRawSha256"],
+                digest(&original.1.to_string())
+            );
+            let accepted = exec.accepted.lock().await;
+            assert!(!accepted.contains_key(&serde_json::to_string(ordinary).unwrap()));
+            let proof = &accepted[&serde_json::to_string(repair).unwrap()]["materializedDraft"]
+                ["finishRepairProvenance"];
+            assert_eq!(proof["originalFinishAccepted"], false);
+            assert_eq!(proof["version"], "accepted-finish-scope-repair/v1");
+            drop(accepted);
+            let before = calls.len();
+            assert_eq!(
+                run_storyboard(&request, &exec, "offline", "medium")
+                    .await
+                    .unwrap()["units"],
+                output["units"]
+            );
+            assert_eq!(exec.calls.lock().await.len(),before,"resume must replay the original rejected Finish and the accepted repair, without new model calls");
+        }
     }
 
     #[tokio::test]
@@ -5589,6 +5874,7 @@ mod production_contract_tests {
     ) {
         for (mode, maximum) in [
             ("NO_PROGRESS", 1),
+            ("TIMING_NO_PROGRESS", 1),
             ("LIMIT", 2),
             ("BAD_QUOTE", 1),
             ("PARTIAL", 2),
@@ -6004,6 +6290,7 @@ mod production_contract_tests {
                 Some(&refs),
                 Some(&mut issues),
                 true,
+                false,
             )
             .unwrap();
             validate_event_bindings_for_repair(&draft, &request.input["plan"], Some(&issues))
@@ -6139,19 +6426,50 @@ mod production_contract_tests {
 
     #[tokio::test]
     async fn repaired_author_dependency_branch_reaches_related_finisher_and_reuses_its_cache() {
-        let (source, request)=author_scope_input(6);
-        let executor=Recorded{author_scope_response:Some("FIX"),rough_per_row:true,author_chain_branch:true,..Default::default()};
-        let output=run_storyboard(&request,&executor,"offline","medium").await.unwrap();
-        assert_eq!(output["status"],"completed","{}",output["blocked"]);
-        validate_storyboard_scope(&source,&output,request["assets"].as_array().unwrap(),&request["capabilities"],None).unwrap();
-        let calls=executor.calls.lock().await.clone();
-        let authors:Vec<_>=calls.iter().filter(|r|r.stage=="storyboardCreate").collect();
-        assert!(authors.len()>1);
+        let (source, request) = author_scope_input(6);
+        let executor = Recorded {
+            author_scope_response: Some("FIX"),
+            rough_per_row: true,
+            author_chain_branch: true,
+            ..Default::default()
+        };
+        let output = run_storyboard(&request, &executor, "offline", "medium")
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "completed", "{}", output["blocked"]);
+        validate_storyboard_scope(
+            &source,
+            &output,
+            request["assets"].as_array().unwrap(),
+            &request["capabilities"],
+            None,
+        )
+        .unwrap();
+        let calls = executor.calls.lock().await.clone();
+        let authors: Vec<_> = calls
+            .iter()
+            .filter(|r| r.stage == "storyboardCreate")
+            .collect();
+        assert!(authors.len() > 1);
         assert!(authors[0].input.get("authorChainRevision").is_none());
-        assert_eq!(authors[1].input["authorChainRevision"]["version"],"accepted-author-chain-change/v1");
-        assert!(calls.iter().any(|r|r.stage=="storyboardFinish" && !is_author_repair_request(r) && r.input["authorChainRevision"]["version"]=="accepted-author-chain-change/v1"));
-        assert_eq!(run_storyboard(&request,&executor,"offline","medium").await.unwrap(),output);
-        assert_eq!(executor.calls.lock().await.len(),calls.len(),"resume must reuse the same repaired dependency branch");
+        assert_eq!(
+            authors[1].input["authorChainRevision"]["version"],
+            "accepted-author-chain-change/v1"
+        );
+        assert!(calls.iter().any(|r| r.stage == "storyboardFinish"
+            && !is_author_repair_request(r)
+            && r.input["authorChainRevision"]["version"] == "accepted-author-chain-change/v1"));
+        assert_eq!(
+            run_storyboard(&request, &executor, "offline", "medium")
+                .await
+                .unwrap(),
+            output
+        );
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls.len(),
+            "resume must reuse the same repaired dependency branch"
+        );
     }
 
     fn is_author_repair_request(request: &TextRequest) -> bool {
@@ -7555,9 +7873,12 @@ mod production_contract_tests {
             old > FINISH_TRANSPORT_LIMIT,
             "an old workflow cannot greedily merge this extra adjacent scope"
         );
-        let grouping=finish_grouping_characters(&request,true).unwrap();
-        assert!(grouping<=FINISH_TRANSPORT_LIMIT);
-        assert!(actual<=grouping,"dispatch can be smaller without changing existing marked grouping");
+        let grouping = finish_grouping_characters(&request, true).unwrap();
+        assert!(grouping <= FINISH_TRANSPORT_LIMIT);
+        assert!(
+            actual <= grouping,
+            "dispatch can be smaller without changing existing marked grouping"
+        );
         let wire = compile_storyboard_transport(&request).unwrap().unwrap();
         assert_eq!(wire.input["previousDraft"], request.input["previousDraft"]);
         assert_eq!(
@@ -7973,33 +8294,79 @@ mod production_contract_tests {
     #[test]
     #[ignore = "explicit read-only accepted author evidence; zero model calls or database writes"]
     fn readonly_indivisible_author_finish_measures_actual_cli_after_lossless_projection() {
-        let path=std::env::var("DIRECTOR_CAPACITY_READONLY_DB").unwrap();
-        let job=std::env::var("DIRECTOR_CAPACITY_READONLY_JOB").unwrap();
-        let connection=rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let path = std::env::var("DIRECTOR_CAPACITY_READONLY_DB").unwrap();
+        let job = std::env::var("DIRECTOR_CAPACITY_READONLY_JOB").unwrap();
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         connection.execute_batch("PRAGMA query_only=ON;").unwrap();
         let (snapshot,raw):(String,String)=connection.query_row("SELECT snapshot,result FROM jobs WHERE id=?1 AND kind='text' AND state='completed' AND json_extract(receipt,'$.validation')='accepted'",[&job],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        let author:TextRequest=serde_json::from_str(&snapshot).unwrap();let draft:Value=serde_json::from_str(&raw).unwrap();
-        assert_eq!(author.stage,"storyboardCreate");
-        let workflow=std::env::var("DIRECTOR_CAPACITY_READONLY_WORKFLOW").unwrap();
+        let author: TextRequest = serde_json::from_str(&snapshot).unwrap();
+        let draft: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(author.stage, "storyboardCreate");
+        let workflow = std::env::var("DIRECTOR_CAPACITY_READONLY_WORKFLOW").unwrap();
         let plan:String=connection.query_row("SELECT j.result FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardPlan' AND w.state='accepted' AND j.state='completed' AND json_extract(j.snapshot,'$.input.episode.id')=?2",rusqlite::params![workflow,text(&author.input,"episodeId")],|r|r.get(0)).unwrap();
-        let plan:Value=serde_json::from_str(&plan).unwrap();
-        let execution=&author.input["executionBatch"];
-        let scope=AcceptedAuthorScope{index:0,batch:original::ExecutionBatch{
-            id:text(execution,"id").into(),package_ids:strings(execution,"packageIds").unwrap(),source_refs:strings(execution,"sourceRefs").unwrap(),
-            provisional_unit_ids:strings(execution,"provisionalUnitIds").unwrap(),estimated_seconds:execution["estimatedSeconds"].as_f64().unwrap(),exceeds_soft_target:execution["exceedsSoftTarget"].as_bool().unwrap(),
-        },input:author.input.clone(),draft};
-        let rows:Vec<SourceRow>=serde_json::from_value(author.input["sourceRows"].clone()).unwrap();
-        let context:Vec<SourceRow>=serde_json::from_value(author.input["contextRows"].clone()).unwrap();
-        let (request,_,_)=finish_request(&[scope],&plan,&rows,&context,author.input["assets"].as_array().unwrap(),author.input["selectedFantasy"].as_array().unwrap(),text(&author.input,"episodeId"),&author.model,&author.reasoning,None,None,None).unwrap();
-        let baseline=compile_storyboard_transport(&request).unwrap();
-        let old=baseline.as_ref().map(|w|(&w.input,&w.schema)).unwrap_or((&request.input,&request.schema));
-        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
-        let current=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);
-        println!("{}",json!({"readOnly":true,"newModelCalls":0,"databaseWrites":0,"baselineCliCharacters":crate::text_executor::codex_wire_characters(&request,old.0,old.1),"dispatchCliCharacters":current,"limit":FINISH_TRANSPORT_LIMIT}));
-        assert_eq!(super::storyboard_transport::expand_storyboard_input(&wire.input).unwrap(),request.input);
-        assert!(current<=FINISH_TRANSPORT_LIMIT);
-        let after:(String,String)=connection.query_row("SELECT snapshot,result FROM jobs WHERE id=?1",[&job],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(after,(snapshot,raw));
+        let plan: Value = serde_json::from_str(&plan).unwrap();
+        let execution = &author.input["executionBatch"];
+        let scope = AcceptedAuthorScope {
+            index: 0,
+            batch: original::ExecutionBatch {
+                id: text(execution, "id").into(),
+                package_ids: strings(execution, "packageIds").unwrap(),
+                source_refs: strings(execution, "sourceRefs").unwrap(),
+                provisional_unit_ids: strings(execution, "provisionalUnitIds").unwrap(),
+                estimated_seconds: execution["estimatedSeconds"].as_f64().unwrap(),
+                exceeds_soft_target: execution["exceedsSoftTarget"].as_bool().unwrap(),
+            },
+            input: author.input.clone(),
+            draft,
+        };
+        let rows: Vec<SourceRow> =
+            serde_json::from_value(author.input["sourceRows"].clone()).unwrap();
+        let context: Vec<SourceRow> =
+            serde_json::from_value(author.input["contextRows"].clone()).unwrap();
+        let (request, _, _) = finish_request(
+            &[scope],
+            &plan,
+            &rows,
+            &context,
+            author.input["assets"].as_array().unwrap(),
+            author.input["selectedFantasy"].as_array().unwrap(),
+            text(&author.input, "episodeId"),
+            &author.model,
+            &author.reasoning,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let baseline = compile_storyboard_transport(&request).unwrap();
+        let old = baseline
+            .as_ref()
+            .map(|w| (&w.input, &w.schema))
+            .unwrap_or((&request.input, &request.schema));
+        let wire = compile_storyboard_dispatch_transport(&request)
+            .unwrap()
+            .unwrap();
+        let current =
+            crate::text_executor::codex_wire_characters(&request, &wire.input, &wire.schema);
+        println!(
+            "{}",
+            json!({"readOnly":true,"newModelCalls":0,"databaseWrites":0,"baselineCliCharacters":crate::text_executor::codex_wire_characters(&request,old.0,old.1),"dispatchCliCharacters":current,"limit":FINISH_TRANSPORT_LIMIT})
+        );
+        assert_eq!(
+            super::storyboard_transport::expand_storyboard_input(&wire.input).unwrap(),
+            request.input
+        );
+        assert!(current <= FINISH_TRANSPORT_LIMIT);
+        let after: (String, String) = connection
+            .query_row(
+                "SELECT snapshot,result FROM jobs WHERE id=?1",
+                [&job],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, (snapshot, raw));
     }
 
     fn applied_interpretation(source: &LockedSource, scope: Value, refs: Vec<String>) -> Value {
@@ -8850,33 +9217,51 @@ mod production_contract_tests {
 
     #[test]
     fn owner_context_keeps_declared_evidence_and_background_without_broadcasting_eighty_episodes() {
-        let mut text=String::from("世界规则：刀不能穿过护盾。\n");
-        for n in 1..=80 {text.push_str(&format!("第{n}集\n场景：门口\n甲：第{n}次检查，原话😀。\n"));}
-        let source=prepare_source(&text).unwrap();
-        assert_eq!(source.episodes.len(),80);
-        let episode=source.episodes.last().unwrap();
-        let rows:Vec<_>=source.rows.iter().filter(|r|r.kind=="body"&&r.episode_id.as_ref()==Some(&episode.id)).cloned().collect();
-        let assets=vec![json!({"id":"A:v","baseAssetId":"A","name":"甲｜基础"})];
-        let base=relevant_context(&source,episode,&assets,&Value::Null);
-        let historical:Vec<_>=base.iter().filter(|r|r.kind=="body").collect();
-        assert!(historical.len()>=79);
-        let chosen=&historical[0];
-        let evidence=HashSet::from([chosen.id.clone()]);
-        let owned=rows.iter().map(|r|r.id.clone()).collect::<Vec<_>>();
-        let old=author_context(&base,&rows,&owned,&evidence,false);
-        assert_eq!(json!(old),json!(base),"unmarked frozen workflows keep their exact old context");
-        let scoped=author_context(&base,&rows,&owned,&evidence,true);
-        assert!(scoped.iter().any(|r|json!(r)==json!(chosen)),"explicit historical claims remain verbatim with coordinates");
-        for background in base.iter().filter(|r|r.kind=="context") {assert!(scoped.iter().any(|r|json!(r)==json!(background)));}
-        assert_eq!(scoped.iter().filter(|r|r.kind=="body").count(),1);
-        let mut input=json!({"foundation":{"facts":source.rows.iter().map(|r|json!({"id":r.id,"sourceRefs":[r.id],"quotes":[r.text]})).collect::<Vec<_>>()}});
-        let facts=scoped_facts(&input,&rows,&scoped);
-        assert!(facts.iter().all(|fact|rows.iter().chain(&scoped).any(|r|r.id==fact["id"])));
-        assert!(facts.iter().all(|fact|fact.get("quotes").is_none()));
+        let mut text = String::from("世界规则：刀不能穿过护盾。\n");
+        for n in 1..=80 {
+            text.push_str(&format!("第{n}集\n场景：门口\n甲：第{n}次检查，原话😀。\n"));
+        }
+        let source = prepare_source(&text).unwrap();
+        assert_eq!(source.episodes.len(), 80);
+        let episode = source.episodes.last().unwrap();
+        let rows: Vec<_> = source
+            .rows
+            .iter()
+            .filter(|r| r.kind == "body" && r.episode_id.as_ref() == Some(&episode.id))
+            .cloned()
+            .collect();
+        let assets = vec![json!({"id":"A:v","baseAssetId":"A","name":"甲｜基础"})];
+        let base = relevant_context(&source, episode, &assets, &Value::Null);
+        let historical: Vec<_> = base.iter().filter(|r| r.kind == "body").collect();
+        assert!(historical.len() >= 79);
+        let chosen = &historical[0];
+        let evidence = HashSet::from([chosen.id.clone()]);
+        let owned = rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let old = author_context(&base, &rows, &owned, &evidence, false);
+        assert_eq!(
+            json!(old),
+            json!(base),
+            "unmarked frozen workflows keep their exact old context"
+        );
+        let scoped = author_context(&base, &rows, &owned, &evidence, true);
+        assert!(
+            scoped.iter().any(|r| json!(r) == json!(chosen)),
+            "explicit historical claims remain verbatim with coordinates"
+        );
+        for background in base.iter().filter(|r| r.kind == "context") {
+            assert!(scoped.iter().any(|r| json!(r) == json!(background)));
+        }
+        assert_eq!(scoped.iter().filter(|r| r.kind == "body").count(), 1);
+        let mut input = json!({"foundation":{"facts":source.rows.iter().map(|r|json!({"id":r.id,"sourceRefs":[r.id],"quotes":[r.text]})).collect::<Vec<_>>()}});
+        let facts = scoped_facts(&input, &rows, &scoped);
+        assert!(facts
+            .iter()
+            .all(|fact| rows.iter().chain(&scoped).any(|r| r.id == fact["id"])));
+        assert!(facts.iter().all(|fact| fact.get("quotes").is_none()));
         assert!(!uses_owner_context(&input).unwrap());
-        input[CONTEXT_INPUT_PROFILE_FIELD]=json!(CONTEXT_INPUT_PROFILE);
+        input[CONTEXT_INPUT_PROFILE_FIELD] = json!(CONTEXT_INPUT_PROFILE);
         assert!(uses_owner_context(&input).unwrap());
-        input[CONTEXT_INPUT_PROFILE_FIELD]=json!("unknown");
+        input[CONTEXT_INPUT_PROFILE_FIELD] = json!("unknown");
         assert!(uses_owner_context(&input).is_err());
     }
 

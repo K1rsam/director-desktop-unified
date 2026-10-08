@@ -8,6 +8,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let home = PathBuf::from(args.next().unwrap_or_else(|| ".director-next".into()));
     let result = (|| {
+        director_core::windows_runtime::verify_shared_directory(&home)?;
         let mut body = String::new();
         io::stdin()
             .read_to_string(&mut body)

@@ -7,6 +7,9 @@ pub(crate) mod foundation_wire;
 mod scene_edits;
 mod source;
 mod storyboard;
+pub mod stage3_pack;
+pub(crate) mod storyboard_refinement;
+pub use storyboard_refinement::{run_storyboard_refinement, adopt_storyboard_refinement};
 pub(crate) mod storyboard_dependencies;
 mod storyboard_transport;
 
@@ -67,6 +70,11 @@ pub trait TextExecutor: Send + Sync {
         _original_domain_hash: &str,
         _original_raw_hash: &str,
     ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Recover the original identity selection of a legacy accepted A15 packet.
+    /// Read-only evidence; the domain must still rebuild its hash and facts.
+    async fn visual_fact_packet_identities(&self, _source_sha: &str, _packet_hash: &str) -> Result<Option<Vec<Value>>, String> {
         Ok(None)
     }
     async fn accept(&self, _request: &TextRequest, _value: &Value) -> Result<(), String> {
@@ -1533,6 +1541,8 @@ mod tests {
                 "2.0.0"
             } else if rule.id == "asset-art-director" {
                 "2.0.0"
+            } else if rule.id == "asset-image-production" {
+                "1.2.0"
             } else if [
                 "screenplay-fidelity",
                 "story-foundation",

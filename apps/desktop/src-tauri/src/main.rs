@@ -63,6 +63,13 @@ fn startup_verification_report(
     report["developmentServerAtFinish"] = serde_json::json!(development_server_at_finish);
     report["standalone"] = serde_json::json!(standalone);
     report["platform"] = serde_json::json!(std::env::consts::OS);
+    let unvirtualized = director_core::windows_runtime::verify_shared_directory(&v.home).is_ok();
+    report["unvirtualizedRuntime"] = serde_json::json!(unvirtualized);
+    report["sharedProjectRegistry"] = serde_json::json!(unvirtualized);
+    if !unvirtualized {
+        report["ok"] = serde_json::json!(false);
+        report["error"] = serde_json::json!("Desktop startup still inherited a packaged host filesystem");
+    }
     report["diagnosticPid"] = serde_json::json!(std::process::id());
     report["diagnosticSchema"] = serde_json::json!("startup-diagnostics/v1");
     report["home"] = serde_json::json!(v.home);
@@ -99,6 +106,26 @@ const STARTUP_PROBE: &str = r#"
     }
     if (!document.querySelector('.project-card')) throw new Error('React project view did not render');
     const projects = await invoke('desktop_request', {request:{action:'projects.list'}});
+    // A second launch against this same isolated home verifies persisted data.
+    // The first launch leaves precisely these two projects after lifecycle tests.
+    if (projects.length === 2 && projects.some(project => project.title === '行内项目一') && projects.some(project => project.title === '行内项目二')) {
+      const savedProject = projects.find(project => project.title === '行内项目二');
+      const saved = await invoke('desktop_request', {request:{action:'workspace.get',projectId:savedProject.id}});
+      if (saved.source.text !== '第1集\n场景：门口\n甲：保存后重开。\n' || saved.jobs.length || saved.assets.length !== 1 || saved.units.length !== 1 || saved.media.length !== 1) throw new Error('Saved workspace did not survive process restart');
+      const asset = saved.assets[0], media = saved.media[0], unit = saved.units[0];
+      if (asset.id !== 'reopen-asset' || asset.adoptedMediaId !== media.id || unit.id !== 'reopen-unit' || unit.assetRefs[0]?.assetId !== asset.id) throw new Error('Saved asset, image or unit identity changed after restart');
+      const image = new Image();
+      await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=()=>reject(new Error('Saved media failed to load after restart'));image.src=window.__TAURI_INTERNALS__.convertFileSrc(media.path);});
+      if(image.naturalWidth!==32 || image.naturalHeight!==24) throw new Error('Saved media dimensions changed after restart');
+      const card=[...document.querySelectorAll('.project-card')].find(card=>card.dataset.projectId===savedProject.id);
+      if(!card) throw new Error('Saved project did not appear in the native library');
+      card.querySelector('.project-card-open').click();
+      for(let attempt=0;attempt<100 && !document.querySelector('.production-source-document')?.textContent.includes('甲：保存后重开。');attempt++) await new Promise(resolve=>setTimeout(resolve,50));
+      if(!document.querySelector('.production-source-document')?.textContent.includes('甲：保存后重开。')) throw new Error('Saved source did not render after restart');
+      await progress('completed');
+      await invoke('startup_verification_report',{report:{ok:true,saveReopenVerified:true,frontendRendered:true,ipcRoundTrip:true,sqliteRead:true,assetProtocol:true,projectId:savedProject.id,mediaSha256:media.sha256,projectCount:projects.length,generationRequestsSent:0,generationJobs:0}});
+      return;
+    }
     if (projects.length !== 1) throw new Error('Isolated project registry did not round trip');
     const workspace = await invoke('desktop_request', {request:{action:'workspace.get', projectId:projects[0].id}});
     if (!workspace.source.text || workspace.jobs.length || workspace.media.length !== 1) throw new Error('SQLite workspace did not round trip');
@@ -150,7 +177,7 @@ const STARTUP_PROBE: &str = r#"
     settingsButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.dreamina-account-card'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     const accountCard=document.querySelector('.dreamina-account-card');
-    if (!accountCard || !accountCard.textContent.includes('即梦账户与积分') || !accountCard.textContent.includes('OAuth 连接即梦')) throw new Error('OAuth account panel did not render');
+    if (!accountCard || !accountCard.textContent.includes('即梦生成 CLI') || !accountCard.textContent.includes('OAuth 登录')) throw new Error('OAuth account panel did not render');
     const cliCard=document.querySelector('.text-execution-settings');
     if (!cliCard || !cliCard.textContent.includes('文本执行 · 阶段 1 / 2 / 3') || !cliCard.textContent.includes('检查 CLI 与账户')) throw new Error('Text CLI connection settings did not render');
     await progress('settings');
@@ -277,6 +304,15 @@ const STARTUP_PROBE: &str = r#"
     if(libraryCreated.id===secondLibraryCreated.id || parent(libraryCreated.rootPath)!==parent(workspace.project.rootPath) || parent(secondLibraryCreated.rootPath)!==parent(workspace.project.rootPath)) throw new Error('Inline projects did not use independent directories under the same default root');
     const finalProjects=await invoke('desktop_request',{request:{action:'projects.list'}});
     if(finalProjects.length!==2 || document.querySelector('.inline-project-create')) throw new Error('Inline creation left duplicate projects or leaked the creation entry into Stage 1');
+    const saveCall=request=>invoke('desktop_request',{request:{projectId:secondLibraryCreated.id,...request}});
+    await saveCall({action:'source.import',text:'第1集\n场景：门口\n甲：保存后重开。\n'});
+    await saveCall({action:'assets.save',asset:{id:'reopen-asset',variantId:'base',name:'重开测试资产',kind:'character',sourceRefs:[],prompt:'隔离验证',applicability:{episodes:[],scenes:[]}}});
+    await saveCall({action:'media.import',path:media.path,kind:'image',assetId:'reopen-asset',variantId:'base'});
+    const saved=await saveCall({action:'workspace.get'});
+    if(saved.media.length!==1) throw new Error('Reopen fixture media was not saved');
+    await saveCall({action:'media.adopt',assetId:'reopen-asset',variantId:'base',mediaId:saved.media[0].id});
+    const savedEpisode=saved.source.episodes[0].id,savedScene=saved.source.scenes[0].id,savedRow=saved.source.rows.find(row=>row.kind==='body' && row.episodeId===savedEpisode && row.sceneId===savedScene).id;
+    await saveCall({action:'units.save',unit:{id:'reopen-unit',episodeId:savedEpisode,sceneId:savedScene,sourceRefs:[savedRow],title:'保存后重开验证',prompt:'{{asset:reopen-asset:base}} 保存',duration:5,assetRefs:[{assetId:'reopen-asset',variantId:'base',role:'人物',order:1}]}});
     await progress('inline_create');
     await progress('completed');
     await invoke('startup_verification_report', {report:{ok:true, frontendRendered:true, ipcRoundTrip:true, sqliteRead:true, assetProtocol:true, accountPanelRendered:true, stage1LockedSourceRendered:true, sourceStructureReviewRendered:true, backgroundSourceRendered:true, stage3OfflineCreationBlocked:true, rawIpcGenerationBlocked:true, textCliSettingsRendered:true, textExecutionSummaryRendered:true, assetUsageRoundTrip:true, assetDeleteRestoreRoundTrip:true, imageRetainedAfterRestore:true, nativeAssetEditorOpened:true, nativeUnitAssetEditorOpened:true, projectArchiveRestoreDeleteUiRoundTrip:true, unarchivedProjectDeleteRejected:true, archivedWorkspaceClosed:true, sourceAndMediaRetainedAfterRestore:true, projectFileRetentionDisclosed:true, projectRemovedFromRegistry:true, libraryInlineCreateRoundTrip:true, libraryInlineEnterCreateRoundTrip:true, stageOneCreationEntryAbsent:true, sharedDefaultRoot:true, createdProjectIds:[libraryCreated.id,secondLibraryCreated.id], projectRoot:workspace.project.rootPath, originalMediaPath:media.path, rules:workspace.rules.map(rule=>({id:rule.id,version:rule.version})), generationRequestsSent:0, projectId:pid, mediaSha256:media.sha256, generationJobs:finalWorkspace.jobs.length, width:innerWidth, height:innerHeight}});
@@ -310,6 +346,10 @@ async fn desktop_request(
     result
 }
 fn main() {
+    // Leave packaged-host file redirection before opening application state or CLI workers.
+    if director_core::windows_runtime::ensure_unvirtualized().expect("无法切换到共享桌面项目环境") {
+        return;
+    }
     let args: Vec<_> = std::env::args_os().collect();
     let verification = args.iter().position(|a| a == "--verify-startup").map(|i| {
         let output = args.get(i + 1).map(std::path::PathBuf::from).unwrap_or_else(|| {
@@ -348,6 +388,7 @@ fn main() {
         .setup(move |app| {
             if let Some(v) = &setup_verification { v.diagnostics.mark(DiagnosticStage::SetupEntered); }
             let home = match &setup_verification { Some(v) => v.home.clone(), None => app.path().app_data_dir()? };
+            director_core::windows_runtime::verify_shared_directory(&home).map_err(std::io::Error::other)?;
             // Diagnostic projects have no channel account configured. Disable live-account
             // lookup so automatic Stage 4 preflight fails locally without touching a user session.
             let engine = match &acceptance_grant {
@@ -355,7 +396,8 @@ fn main() {
                 None if setup_verification.is_some() => Engine::new_offline_verification(home),
                 None => Engine::new_standard(home),
             }.map_err(std::io::Error::other)?;
-            let engine=engine.with_native_resource_root(app.path().resource_dir()?).map_err(std::io::Error::other)?;
+            let resource_root=director_core::platform::native_resource_root(app.path().resource_dir()?).map_err(std::io::Error::other)?;
+            let engine=engine.with_native_resource_root(resource_root).map_err(std::io::Error::other)?;
             if let Some(v) = &setup_verification {
                 v.diagnostics.mark(DiagnosticStage::EngineReady);
                 if engine.project_list().map_err(std::io::Error::other)?.is_empty() {

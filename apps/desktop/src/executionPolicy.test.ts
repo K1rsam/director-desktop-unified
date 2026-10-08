@@ -23,6 +23,23 @@ test('standard native capabilities enable existing flows and keep unported Stage
   } finally { installExecutionPolicy(OFFLINE_EXECUTION_POLICY); }
 });
 import type { PolicyRequest } from './executionPolicy.ts';
+
+test('director refinement requires the verified pack and cannot unlock video generation', async () => {
+  const { installExecutionPolicy } = await import('./executionPolicy.ts');
+  const actions = ['storyboard.refine', 'storyboard.refinement.adopt'];
+  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true,
+    stage3CreativePackStatus: 'verified_active', reasons: ['synthetic verified adapter'], allowedActions: actions };
+  try {
+    assert.throws(() => validateExecutionPolicy({ ...policy, stage3CreativePackStatus: 'inactive' }));
+    installExecutionPolicy(validateExecutionPolicy(policy));
+    const sent: string[] = [];
+    for (const action of actions) await dispatchOfflineRequest({ action }, async input => { sent.push(input.action); });
+    assert.deepEqual(sent, actions);
+    await assert.rejects(dispatchOfflineRequest({ action: 'videos.submit' }, async () => { throw new Error('video reached transport'); }), /尚未开放/);
+    installExecutionPolicy(OFFLINE_EXECUTION_POLICY);
+    for (const action of actions) await assert.rejects(dispatchOfflineRequest({ action }, async () => { throw new Error('offline reached transport'); }), /离线准备模式/);
+  } finally { installExecutionPolicy(OFFLINE_EXECUTION_POLICY); }
+});
 import { createCatalogDiscovery } from './contracts.ts';
 import type { Workspace } from './types.ts';
 

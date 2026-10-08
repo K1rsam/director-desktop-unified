@@ -353,12 +353,22 @@ async fn run_health(node: &Path, root: &Path, state_parent: Option<&Path>) -> Ch
     let state = temp.path().join("worker");
     let mut command = tokio::process::Command::new(node);
     #[cfg(test)]
-    command.arg("--import").arg(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../sdk-bridge/test/health-no-effects.mjs"),
-    );
+    {
+        let preload = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../sdk-bridge/test/health-no-effects.mjs"),
+        )
+        .map_err(|_| "SDK_HEALTH_PRELOAD_INVALID")?;
+        command.arg("--import").arg(
+            crate::text_sdk::node_import_specifier(&preload)
+                .map_err(|_| "SDK_HEALTH_PRELOAD_INVALID")?,
+        );
+    }
     command
-        .arg(root.join("src/health.mjs"))
+        .arg(
+            crate::text_sdk::node_path_argument(&root.join("src/health.mjs"))
+                .map_err(|_| "SDK_HEALTH_PATH_INVALID")?,
+        )
         .arg("--state-dir")
         .arg(&state)
         .env_clear()
@@ -380,14 +390,11 @@ async fn run_health(node: &Path, root: &Path, state_parent: Option<&Path>) -> Ch
     #[cfg(windows)]
     {
         command.creation_flags(0x08000000);
-        if let Some(system_root) = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .filter(|p| safe_absolute(p) && p.is_dir())
-        {
-            command
-                .env("SystemRoot", &system_root)
-                .env("WINDIR", system_root);
-        }
+        let system_root =
+            crate::text_sdk::node_system_root().map_err(|_| "SDK_HEALTH_WINDOWS_ENV_INVALID")?;
+        command
+            .env("SystemRoot", &system_root)
+            .env("WINDIR", system_root);
     }
     let (mut child, _registration) = crate::text_executor::spawn_cli_child(&mut command)
         .map_err(|_| "SDK_HEALTH_START_FAILED")?;

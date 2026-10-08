@@ -1119,14 +1119,14 @@ fn a_derived_image_waits_for_every_adopted_parent_then_freezes_the_ordered_refer
         }
         f.store.save_asset(asset).unwrap();
     }
-    f.engine.dispatch(json!({"action":"images.run","projectId":f.project_id,"provider":"mock","model":"mock-image","assetIds":["child"]})).unwrap();
-    let job = f
-        .store
-        .jobs()
-        .unwrap()
-        .into_iter()
-        .find(|j| s(j, "entityId") == "child")
-        .unwrap();
+    // Legacy waiting records can have no pinned parent jobs and be satisfied
+    // by explicit image imports. New queue closure/ancestor submission is
+    // covered separately by engine::image_scheduler_tests.
+    let asset = f.store.active_asset("child").unwrap();
+    let snapshot = json!({"requestId":"legacy-manual-parents","kind":"image","assetId":"child","variantId":"child","assetVersion":asset["version"],"model":"mock-image","prompt":asset["prompt"],"ratio":"16:9","resolution":"2K","references":[],"dependencyJobIds":[],"options":{},"autoSubmit":true});
+    let (_, account) = f.engine.config(&f.store, "mock").unwrap();
+    let key = f.store.add_job("image", "child", "mock", &account, &snapshot, "waiting_dependency").unwrap();
+    let job = f.store.job(&key).unwrap();
     let job_id = s(&job, "id").to_string();
     let request_id = s(&job["snapshot"], "requestId").to_string();
     assert_eq!(s(&job, "status"), "waiting_dependency");

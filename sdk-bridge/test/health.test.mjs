@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { packageReadiness, resourceFiles, pinned } from '../scripts/package-readiness.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -14,7 +14,7 @@ async function worker(bundle, temp, requests, extraArgs = []) {
   const audit = path.join(temp, 'audit.json');
   const home = path.join(temp, 'isolated-home');
   await fs.mkdir(home, { recursive: true });
-  const child = spawn(process.execPath, ['--import', path.join(root, 'test/health-no-effects.mjs'),
+  const child = spawn(process.execPath, ['--import', pathToFileURL(path.join(root, 'test/health-no-effects.mjs')).href,
     path.join(bundle, 'src/health.mjs'), '--state-dir', path.join(temp, 'state'), ...extraArgs], {
     cwd: temp, env: { HOME: home, USERPROFILE: home, CODEX_HOME: path.join(home, 'codex'),
       DIRECTOR_HEALTH_AUDIT: audit, ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot } : {}) },

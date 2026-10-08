@@ -1,6 +1,22 @@
 import type { Job } from './types.ts';
 
 const ACTIVE = /^(queued|preparing|ready|running|submitted|pending|processing|uploading|submitting|executing|downloading)$/i;
+const LOCAL_VIDEO_STATES = new Set(['queued', 'preparing', 'ready', 'blocked', 'stale', 'failed', 'auth_required']);
+/** Only explicit local-only records may be described as not submitted. */
+export function isLocalVideoPreparation(job: Job): boolean {
+  const snapshot = job.snapshot;
+  return job.kind === 'video' && !job.providerTaskId && job.submissionUnknown !== true
+    && LOCAL_VIDEO_STATES.has(job.status.toLowerCase())
+    && snapshot !== null && typeof snapshot === 'object' && !Array.isArray(snapshot)
+    && (snapshot as Record<string, unknown>).autoSubmit === false;
+}
+export function videoPreparationLabel(job: Job): string {
+  const labels: Record<string, string> = {
+    queued: '等待素材准备 · 未生成', preparing: '正在准备素材 · 未生成', ready: '本地素材就绪 · 未生成',
+    blocked: '素材待处理 · 未生成', stale: '素材准备已过期 · 未生成', failed: '素材准备失败 · 未生成', auth_required: '素材检查需登录 · 未生成',
+  };
+  return labels[job.status.toLowerCase()] || '本地素材准备 · 未生成';
+}
 /** Running work is separate from the ownership that prevents duplicate generation. */
 export function jobActive(job: Job): boolean {
   if (job.submissionUnknown || !ACTIVE.test(job.status)) return false;

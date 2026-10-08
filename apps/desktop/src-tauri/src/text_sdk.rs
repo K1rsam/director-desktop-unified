@@ -114,6 +114,70 @@ pub async fn resolve_for_workflow(_settings: &Value) -> Result<Value> {
     Err("SDK_LIVE_DISABLED: 官方 SDK 已接入共享核心；本轮仅离线合成验证，真实执行未开放，不回退 CLI".into())
 }
 
+/// Canonical paths remain the identity used for verification. Node's main-module
+/// resolver cannot use Windows verbatim drive/UNC prefixes as script arguments.
+/// Translate only those two filesystem spellings after the caller has verified
+/// the path; never accept device namespaces or resolve relative input here.
+pub(crate) fn node_path_argument(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("SDK_PATH_IDENTITY: Node 参数需要独立绝对路径".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut parts = path.components();
+        let mut regular = match parts.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut value = std::ffi::OsString::from("\\\\");
+                    value.push(server);
+                    value.push("\\");
+                    value.push(share);
+                    value.push("\\");
+                    PathBuf::from(value)
+                }
+                Prefix::Disk(_) | Prefix::UNC(_, _) => return Ok(path.to_path_buf()),
+                _ => return Err("SDK_PATH_IDENTITY: Node 不接受设备命名空间".into()),
+            },
+            _ => return Err("SDK_PATH_IDENTITY: Node 路径缺少卷标".into()),
+        };
+        for part in parts {
+            match part {
+                Component::RootDir => (),
+                Component::Normal(value) => regular.push(value),
+                _ => return Err("SDK_PATH_IDENTITY: Node 路径不是规范绝对路径".into()),
+            }
+        }
+        Ok(regular)
+    }
+    #[cfg(not(windows))]
+    Ok(path.to_path_buf())
+}
+
+#[cfg(windows)]
+pub(crate) fn node_system_root() -> Result<PathBuf> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or("SDK_NODE_WINDOWS_ENV: Windows 系统目录缺失")?;
+    let root = node_path_argument(&root)?;
+    if !root.is_dir() {
+        return Err("SDK_NODE_WINDOWS_ENV: Windows 系统目录无效".into());
+    }
+    Ok(root)
+}
+
+#[cfg(test)]
+pub(crate) fn node_import_specifier(path: &Path) -> Result<String> {
+    reqwest::Url::from_file_path(node_path_argument(path)?)
+        .map(|url| url.into())
+        .map_err(|_| "SDK_PATH_IDENTITY: Node 预加载模块需要 file URL".into())
+}
+
 #[derive(Clone)]
 pub(crate) struct Config {
     node: PathBuf,
@@ -276,9 +340,9 @@ impl Worker {
         // No inherited NODE_OPTIONS, HOME, credential, proxy, PATH or config variables.
         let mut command = tokio::process::Command::new(&config.node);
         command
-            .arg(&config.bridge)
+            .arg(node_path_argument(&config.bridge)?)
             .arg("--state-dir")
-            .arg(&config.state)
+            .arg(node_path_argument(&config.state)?)
             .env_clear()
             .current_dir(&config.state)
             .stdin(Stdio::piped())
@@ -289,7 +353,15 @@ impl Worker {
             command.arg("--offline-fixture").arg(fixture);
         }
         #[cfg(windows)]
-        command.creation_flags(0x08000000);
+        {
+            // Windows Node/OpenSSL requires this system-directory entry even
+            // with no user environment. It grants no account or model access.
+            let system_root = node_system_root()?;
+            command
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", system_root);
+            command.creation_flags(0x08000000);
+        }
         let (mut child, registration) = crate::text_executor::spawn_cli_child(&mut command)?;
         let stdin = child.stdin.take().ok_or("SDK_STDIN")?;
         let stdout = child.stdout.take().ok_or("SDK_STDOUT")?;
@@ -705,6 +777,107 @@ pub(crate) fn offline_settings(scenario: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn sdk_node_paths_keep_drive_unc_and_reject_devices_or_relative_paths() {
+        for (verbatim, regular) in [
+            (
+                r"\\?\D:\SDK checks\三视图\health.mjs",
+                r"D:\SDK checks\三视图\health.mjs",
+            ),
+            (
+                r"\\?\UNC\server\share\SDK checks\三视图.mjs",
+                r"\\server\share\SDK checks\三视图.mjs",
+            ),
+        ] {
+            assert_eq!(
+                node_path_argument(Path::new(verbatim)).unwrap(),
+                Path::new(regular)
+            );
+            assert_eq!(
+                node_path_argument(Path::new(regular)).unwrap(),
+                Path::new(regular)
+            );
+        }
+        for invalid in [
+            r"relative.mjs",
+            r"D:\..\health.mjs",
+            r"\\.\pipe\sdk",
+            r"\\?\GLOBALROOT\Device\sdk",
+        ] {
+            assert!(node_path_argument(Path::new(invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn sdk_node_entry_and_import_support_canonical_non_ascii_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("SDK 预加载 # %");
+        std::fs::create_dir(&directory).unwrap();
+        let preload = directory.join("preload.mjs");
+        let main = directory.join("main.mjs");
+        std::fs::write(
+            &preload,
+            "globalThis.__directorSyntheticPreload = 'fixture-loaded';",
+        )
+        .unwrap();
+        std::fs::write(
+            &main,
+            "process.stdout.write(JSON.stringify({preload:globalThis.__directorSyntheticPreload || 'missing',environment:Object.keys(process.env)}));",
+        )
+        .unwrap();
+        let preload = std::fs::canonicalize(preload).unwrap();
+        let main = std::fs::canonicalize(main).unwrap();
+        let specifier = node_import_specifier(&preload).unwrap();
+        assert!(specifier.starts_with("file:"));
+        assert!(
+            specifier.contains("%20") && specifier.contains("%23") && specifier.contains("%25")
+        );
+        assert_eq!(
+            reqwest::Url::parse(&specifier)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            node_path_argument(&preload).unwrap()
+        );
+        let settings = offline_settings("happy");
+        let mut command =
+            std::process::Command::new(s(&settings["textSdkIdentity"], "nodeExecutable"));
+        command
+            .arg("--import")
+            .arg(specifier)
+            .arg(node_path_argument(&main).unwrap())
+            .env_clear()
+            .current_dir(&directory)
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let system_root = node_system_root().unwrap();
+            command
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", system_root);
+            command.creation_flags(0x08000000);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let evidence: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(evidence["preload"], "fixture-loaded");
+        for key in evidence["environment"].as_array().unwrap() {
+            assert!(
+                (cfg!(windows) && ["SystemRoot", "WINDIR"].contains(&key.as_str().unwrap()))
+                    || (cfg!(target_os = "macos")
+                        && key.as_str() == Some("__CF_USER_TEXT_ENCODING")),
+                "unexpected inherited Node environment key: {key}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sdk_frames_reassemble_split_utf8_and_reject_partial_invalid_and_large_frames() {
         let (mut tx, rx) = tokio::io::duplex(32);

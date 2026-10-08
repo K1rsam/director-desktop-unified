@@ -1,9 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assetGenerationJob, generationBlocksNewJob, generationProgress, jobActive } from './generationState.ts';
+import { assetGenerationJob, generationBlocksNewJob, generationProgress, isLocalVideoPreparation, jobActive, videoPreparationLabel } from './generationState.ts';
 import type { Job } from './types.ts';
 
 const job = (status: string, extra: Partial<Job> = {}): Job => ({ id: status, provider: 'dreamina', kind: 'image', assetId: 'a', status, ...extra });
+test('explicit local video preparation is distinguished from any submit, identity or unknown state', () => {
+  const local = job('ready', { kind: 'video', snapshot: { autoSubmit: false } });
+  assert.equal(isLocalVideoPreparation(local), true);
+  assert.equal(videoPreparationLabel(local), '本地素材就绪 · 未生成');
+  for (const status of ['queued', 'preparing', 'blocked', 'stale', 'failed', 'auth_required']) {
+    assert.equal(isLocalVideoPreparation({ ...local, status }), true, status);
+    assert.match(videoPreparationLabel({ ...local, status }), /未生成/);
+  }
+  for (const status of ['submitting', 'submission_unknown', 'submitted', 'processing', 'succeeded', 'downloading', 'downloaded', 'query_failed', 'recovery_paused']) assert.equal(isLocalVideoPreparation({ ...local, status }), false, status);
+  for (const snapshot of [undefined, null, {}, [], { autoSubmit: true }, { autoSubmit: 'false' }]) assert.equal(isLocalVideoPreparation({ ...local, snapshot }), false);
+  assert.equal(isLocalVideoPreparation({ ...local, providerTaskId: 'original-cloud-task' }), false);
+  assert.equal(isLocalVideoPreparation({ ...local, submissionUnknown: true }), false);
+  assert.equal(isLocalVideoPreparation({ ...local, kind: 'image' }), false);
+});
 test('only explicitly manual-ready videos are idle; unknown or submitted identities stay conservative', () => {
   const manual = job('ready', { kind: 'video', snapshot: { autoSubmit: false } });
   assert.equal(jobActive(manual), false);

@@ -27,6 +27,33 @@ resolved or spawned, and no account/model/network request is sent.
 Release builds load `<Tauri resource_dir>/sdk-readiness`. The resource directory
 is passed by the native host, never read from IPC settings. Debug development
 builds can fall back to the verified staged resources or sibling SDK source.
+Portable Windows clients instead select the adjacent
+`.client-resources/<actual EXE SHA256>/sdk-readiness` directory. The current and
+previous EXEs each keep their own resources; a Cargo candidate under `release/deps`
+can select the same hash directory in its parent release directory. Copying only
+the EXE omits this resource set and cannot establish SDK readiness. The published
+current/previous entry points default to `apps/desktop/.local/client`, separate
+from Cargo's `src-tauri/target` artifacts. `ReleaseDirectory` can select another
+publish directory outside the Cargo target tree.
+
+`desktop:update` prepares a candidate by default; `-BuildOnly -CandidatePath`
+stages an explicitly supplied prebuilt candidate without running the compiler.
+The launchable `director-desktop-next-candidate.exe` is staged in the publish
+directory beside its hash-bound resources; Cargo outputs remain build artifacts.
+Only `-PublishOnly -CandidatePath` rotates the current/previous EXEs. The launcher
+uses the same default publish directory and accepts `ReleaseDirectory` for an
+explicit custom location. Publish the resources produced with that candidate,
+retaining its hash directory when keeping the previous version.
+After successful publication, the script removes only its own recorded,
+byte-matching candidate from that client directory. An occupied candidate is
+retained with a message and can be cleaned by repeating PublishOnly after it
+closes; caller-supplied external candidate files are preserved.
+
+Node is not included in either the portable resources or the Tauri bundle. SDK
+readiness requires an installed native Node executable (18 or later), selected
+by the validated installation locations or `textSdkNodePath`; a missing Node
+does not authorize installation, runtime execution, or a CLI fallback.
+
 `textSdkNodePath` may select an existing absolute native Node executable. Without
 it, macOS checks Homebrew/system Node paths and Windows checks native Node install
 locations. No shell/PATH wrapper, installer, download, login, or stored credential

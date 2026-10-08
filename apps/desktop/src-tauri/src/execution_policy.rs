@@ -53,7 +53,7 @@ pub const STANDARD_ACTIONS: &[&str] = &[
     "textCli.loginStatus", "textCli.cancelLogin", "textCli.openLogin", "dreamina.status",
     "dreamina.login", "dreamina.logout", "dreamina.open_authorization",
 ];
-pub const STAGE3_ACTIONS: &[&str] = &["storyboard.run", "storyboard.decision.resolve", "units.regenerate"];
+pub const STAGE3_ACTIONS: &[&str] = &["storyboard.run", "storyboard.decision.resolve", "units.regenerate", "storyboard.refine", "storyboard.refinement.adopt"];
 
 pub fn check_standard(request: &Value) -> Result<(), String> {
     let action = request["action"].as_str().unwrap_or("");
@@ -73,7 +73,7 @@ pub fn standard_report() -> Value {
         "allowedActions":actions,"credentialBackend":crate::platform::credential_backend_status(),
         "reasons":["第一阶段制作和第二阶段提示词设计使用所选真实文字渠道。",
             "图片及视频沿用已实现渠道的账户、模型、费用确认和未知提交保护；即梦画布生成桥尚未接入。",
-            "最新 3008 第三阶段尚待运行适配；官方 SDK 真实执行尚未开放。"],
+            if creative_runtime_ready() { "第三阶段使用已验证接线的 3008 规则与 Rust 兼容适配；真实成稿质量仍待同源比较。官方 SDK 真实执行尚未开放。" } else { "最新 3008 第三阶段尚待运行适配；官方 SDK 真实执行尚未开放。" }],
         "textBackends":[{"id":"codex_cli","status":"enabled"},{"id":"codex_sdk","status":"offline_contract_only"}],
         "localAcceptance":{"backend":"codex_cli","model":"gpt-6.1-sol","reasoning":"medium"}})
 }
@@ -135,10 +135,10 @@ impl Channels for OfflineChannels {
     }
 }
 
-// Stage3 remains structurally closed until the verified Mac runtime adapter is integrated.
-// No mutable settings flag or provenance-only manifest can bypass this code gate.
+// Only the compiled compatibility adapter with verified frozen originals can open Stage3.
+// User settings cannot activate another creative pack.
 pub fn creative_runtime_ready() -> bool {
-    false
+    crate::pipeline::stage3_pack::runtime_ready()
 }
 pub const NATIVE_TEXT_ACTIONS: &[&str] = &[
     "foundation.run",

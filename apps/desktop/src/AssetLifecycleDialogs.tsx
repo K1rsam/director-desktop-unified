@@ -12,7 +12,7 @@ const kinds = [['character', '人物'], ['beast', '非人角色'], ['scene', '�
 
 type EditProps = { asset: Asset; workspace: Workspace; writable: boolean; mutate: Mutation; onClose: () => void };
 export function AssetEditDialog({ asset, workspace, writable, mutate, onClose }: EditProps) {
-  const [values, setValues] = useState<AssetEditValues>(() => initialAssetEdit(asset));
+  const [values, setValues] = useState<AssetEditValues>(() => initialAssetEdit(asset, workspace.assets));
   const [sourceSearch, setSourceSearch] = useState('');
   const [sourceOpen, setSourceOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -20,6 +20,7 @@ export function AssetEditDialog({ asset, workspace, writable, mutate, onClose }:
   const invalidRefs = values.sourceRefs.filter(ref => typeof ref === 'string' && !rowIds.has(ref));
   const sourceOptions = workspace.assets.filter(item => item.id !== asset.id);
   const hasSource = sourceOptions.some(item => item.id === values.sourceAssetId);
+  const sourceProblem = values.sourceError && values.sourceError.value === values.sourceAssetId ? values.sourceError.message : '';
   const scenes = (workspace.source?.scenes || []).filter(scene => !values.episodeIds.length || values.episodeIds.includes(scene.episodeId));
   const scopeProblems = assetScopeProblems(values, workspace.source?.scenes);
   const sourceRows = (workspace.source?.rows || []).filter(row => row.text.trim() && ['body', 'context'].includes(row.kind)
@@ -27,7 +28,7 @@ export function AssetEditDialog({ asset, workspace, writable, mutate, onClose }:
   const change = <K extends keyof AssetEditValues>(key: K, value: AssetEditValues[K]) => setValues(current => ({ ...current, [key]: value }));
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (!writable || saving || !values.name.trim() || invalidRefs.length || scopeProblems.length) return;
+    if (!writable || saving || !values.name.trim() || invalidRefs.length || scopeProblems.length || sourceProblem) return;
     setSaving(true);
     try {
       const next = await mutate('assets.save', { asset: assetEditPayload(asset, values, workspace.assets, workspace.source?.scenes) }, '资产已更新，受影响的未提交素材需要重新准备。');
@@ -37,12 +38,12 @@ export function AssetEditDialog({ asset, workspace, writable, mutate, onClose }:
   return <Modal title={`编辑资产 · ${asset.name}`} onClose={onClose}><form className="asset-management-form" onSubmit={event => void save(event)}>
     {(asset.scope as { kind?: string } | undefined)?.kind === 'UNRESOLVED' && <p className="warning">此形象的适用范围尚未确认。未限定集场时，保存后按全剧通用；服装、伤态等局部形象请先选择适用集场。</p>}
     <div className="form-grid"><label>资产名称<input autoFocus required value={values.name} onChange={event => change('name', event.target.value)}/></label><label>资产类型<select value={values.kind} onChange={event => change('kind', event.target.value)}>{!kinds.some(([id]) => id === values.kind) && <option value={values.kind}>{kindName(values.kind)}</option>}{kinds.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label></div>
-    <label>来源形象<select value={values.sourceAssetId} onChange={event => change('sourceAssetId', event.target.value)}><option value="">独立基础形象</option>{values.sourceAssetId && !hasSource && <option value={values.sourceAssetId}>原来源已删除或不可用，请重新选择</option>}{sourceOptions.map(item => <option key={item.id} value={item.id}>{item.name} · {kindName(item.kind || item.type)}</option>)}</select><small>服装、伤态或进化形象，可指定所依赖的基础形象。</small></label>
+    <label>直接父形象<select value={values.sourceAssetId} onChange={event => setValues(current => ({ ...current, sourceAssetId: event.target.value, sourceError: undefined }))}><option value="">独立形象，不指定父形象</option>{values.sourceAssetId && (!hasSource || sourceProblem) && <option value={values.sourceAssetId} disabled>原直接父形象待修正，原来源保留</option>}{sourceOptions.filter(item => !sourceProblem || item.id !== values.sourceAssetId).map(item => <option key={item.id} value={item.id}>{item.name} · {kindName(item.kind || item.type)}</option>)}</select><small>可选基础形象或另一衍生形象，例如换装后的伤态；留空表示独立形象。</small>{sourceProblem && <span className="warning">{sourceProblem}</span>}</label>
     <section className="asset-edit-scope"><div className="section-heading compact"><h4>适用集数</h4><small>{values.episodeIds.length ? `已选 ${values.episodeIds.length} 集` : values.sceneIds.length ? '按所选场景' : '全剧通用'}</small></div>{workspace.source?.episodes?.length ? <div className="scope-editor">{workspace.source.episodes.map((episode, index) => episode.id && <label className="check-label" key={episode.id}><input type="checkbox" checked={values.episodeIds.includes(episode.id)} onChange={event => setValues(current => ({ ...current, episodeIds: toggleAssetScope(current.episodeIds, episode.id!, event.target.checked), sceneIds: [] }))}/>{episode.title || `第${episode.number || index + 1}集`}</label>)}</div> : <p className="muted">导入剧本后可以指定适用集数。</p>}{scopeProblems.length > 0 && <p className="warning">{scopeProblems.join(' ')}<Button variant="ghost" onClick={() => setValues(current => ({ ...current, episodeIds: [], sceneIds: [] }))}>重新设置范围</Button></p>}</section>
     <details className="details asset-edit-scenes"><summary>适用场景 · {values.sceneIds.length ? `已选 ${values.sceneIds.length} 场` : values.episodeIds.length ? '所选集数全部场景' : '未限定'}</summary><p className="muted">改变集数后，使用这些集数的全部场景；可在此继续细分。</p><div className="scope-editor">{scenes.map(scene => <label className="check-label" key={scene.id}><input type="checkbox" checked={values.sceneIds.includes(scene.id)} onChange={event => change('sceneIds', toggleAssetScope(values.sceneIds, scene.id, event.target.checked))}/>{workspace.source?.episodes?.find(episode => episode.id === scene.episodeId)?.title} · {scene.title}</label>)}</div>{!scenes.length && <p className="muted">当前没有可选场景。</p>}</details>
     <details className="details asset-source-edit" open={sourceOpen || invalidRefs.length > 0} onToggle={event => setSourceOpen(event.currentTarget.open)}><summary>原文依据 · {values.sourceRefs.length} 处</summary>{(sourceOpen || invalidRefs.length > 0) && <>{invalidRefs.length > 0 && <p className="warning">{invalidRefs.length} 处原文行引用已失效。<Button variant="ghost" onClick={() => change('sourceRefs', values.sourceRefs.filter(ref => typeof ref !== 'string' || rowIds.has(ref)))}>清除失效引用</Button></p>}<label>查找原文<input value={sourceSearch} placeholder="输入角色、地点或原文片段" onChange={event => setSourceSearch(event.target.value)}/></label><div className="source-row-choices">{sourceRows.slice(0, 80).map(row => <label key={row.id}><input type="checkbox" checked={values.sourceRefs.includes(row.id)} onChange={event => change('sourceRefs', event.target.checked ? [...values.sourceRefs, row.id] : values.sourceRefs.filter(ref => ref !== row.id))}/><span><small>第{row.number}行</small>{row.text}</span></label>)}</div>{sourceRows.length > 80 && <p className="muted">当前显示前 80 行，请增加搜索词缩小范围。</p>}<p className="muted">输入名称或片段查找原文；已有选择会保留。手动测试资产可以不选。</p></>}</details>
     <details className="details asset-identity-details"><summary>内部身份信息</summary><dl><dt>资产身份</dt><dd>{asset.id}</dd><dt>基础主体</dt><dd>{asset.baseAssetId || asset.id}</dd><dt>形象身份</dt><dd>{asset.variantId || 'base'}</dd></dl><p className="muted">关联使用固定身份；修改名称和类型会保留已有图片与记录。</p></details>
-    <div className="form-actions"><Button onClick={onClose} disabled={saving}>取消</Button><Button type="submit" variant="primary" disabled={!writable || saving || !values.name.trim() || invalidRefs.length > 0 || scopeProblems.length > 0}>{saving ? '正在保存' : '保存资产'}</Button></div>
+    <div className="form-actions"><Button onClick={onClose} disabled={saving}>取消</Button><Button type="submit" variant="primary" disabled={!writable || saving || !values.name.trim() || invalidRefs.length > 0 || scopeProblems.length > 0 || !!sourceProblem}>{saving ? '正在保存' : '保存资产'}</Button></div>
   </form></Modal>;
 }
 

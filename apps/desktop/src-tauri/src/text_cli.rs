@@ -712,6 +712,17 @@ pub fn validate_selection(status: &Value, model: &str, reasoning: &str) -> Resul
     {
         return Err("所选文本模型不支持此推理强度，请调整后再生成".into());
     }
+    for limit in status["limits"].as_array().into_iter().flatten().filter(|v| v["id"] == "codex") {
+        if limit.pointer("/credits/unlimited").and_then(Value::as_bool) == Some(true)
+            || limit.pointer("/credits/hasCredits").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        for window in [&limit["primary"], &limit["secondary"]] {
+            if window["usedPercent"].as_f64().is_some_and(|used| used.is_finite() && used >= 100.0) {
+                return Err(format!("CODEX_USAGE_LIMIT：Codex 当前额度已用完；恢复时间 {}，已完成步骤保留，暂不提交模型请求", window["resetsAt"]));
+            }
+        }
+    }
     Ok(())
 }
 pub async fn ensure_ready(settings: &Value, model: &str, reasoning: &str) -> Result<()> {
@@ -955,6 +966,23 @@ async fn begin_login(settings: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn known_quota_exhaustion_blocks_dispatch_but_unknown_limits_are_not_zero() {
+        let base = json!({"ready":true,"models":[{"id":"one","supportedReasoningEfforts":["medium"]}]});
+        assert!(validate_selection(&base,"one","medium").is_ok());
+        for key in ["primary", "secondary"] {
+            let mut status = base.clone();
+            status["limits"] = json!([{"id":"codex",key:{"usedPercent":100.0,"resetsAt":12345}}]);
+            assert!(validate_selection(&status,"one","medium").unwrap_err().contains("CODEX_USAGE_LIMIT"));
+            status["limits"][0][key]["usedPercent"] = Value::Null;
+            assert!(validate_selection(&status,"one","medium").is_ok());
+            status["limits"][0][key]["usedPercent"] = json!(99.9);
+            assert!(validate_selection(&status,"one","medium").is_ok());
+            status["limits"][0][key]["usedPercent"] = json!(100.0);
+            status["limits"][0]["credits"] = json!({"hasCredits":true});
+            assert!(validate_selection(&status,"one","medium").is_ok());
+        }
+    }
     #[test]
     fn model_capabilities_preserve_each_models_efforts_and_hide_internal_entries() {
         let models = normalize_models(

@@ -16,10 +16,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
+
+// Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
+const IMAGE_SUBMIT_WORKERS: usize = 8;
+const IMAGE_QUERY_WORKERS: usize = 8;
+const IMAGE_DOWNLOAD_WORKERS: usize = 4;
 
 fn image_stage_completion_state(output: &Value) -> &'static str {
     if output["blocked"]
@@ -55,6 +60,7 @@ pub struct Engine {
     // One shared channel slot alternates generation with original-ID recovery.
     // Restart defaults to recovery first; no durable submission state is changed.
     media_query_next: Mutex<HashMap<String, bool>>,
+    image_wake: (Mutex<bool>, Condvar),
     registry_mutex: Mutex<()>,
     // Serializes registry lifecycle changes with synchronous dispatch and worker reservations.
     lifecycle_mutex: Mutex<()>,
@@ -367,6 +373,7 @@ impl Engine {
             channels,
             active: Mutex::new(HashSet::new()),
             media_query_next: Mutex::new(HashMap::new()),
+            image_wake: (Mutex::new(false), Condvar::new()),
             registry_mutex: Mutex::new(()),
             lifecycle_mutex: Mutex::new(()),
             dreamina_sessions: Arc::new(DreaminaSessions::default()),
@@ -402,6 +409,7 @@ impl Engine {
     }
     fn register(&self, store: &Store) -> Result<()> {
         let _guard = self.registry_mutex.lock().map_err(|e| e.to_string())?;
+        let _file_lease = crate::project_library::lock(&self.home)?;
         let mut list = self.registry()?;
         let rows = list.as_array_mut().ok_or("项目索引损坏")?;
         let mut p = store.project()?;
@@ -464,6 +472,7 @@ impl Engine {
             .as_u64()
             .ok_or("缺少项目当前版本，请刷新后再操作")?;
         let _registry = self.registry_mutex.lock().map_err(|e| e.to_string())?;
+        let _file_lease = crate::project_library::lock(&self.home)?;
         let mut registry = self.registry()?;
         let rows = registry.as_array_mut().ok_or("项目索引损坏")?;
         let index = rows
@@ -642,7 +651,7 @@ impl Engine {
     }
     fn checked_account(&self, config: &ProviderConfig, fallback: &str) -> ProviderResult<String> {
         if self.live_accounts && config.kind == "dreamina" {
-            self.dreamina_sessions.fresh_identity(config)
+            self.dreamina_sessions.execution_identity(config)
         } else {
             Ok(fallback.to_owned())
         }
@@ -1076,11 +1085,8 @@ impl Engine {
                 self.spawn_foundation_choices(store.clone(), &request)?;
             }
             "workflows.resume" | "storyboard.decision.resolve" => {
-                if self.standard_native && !crate::execution_policy::creative_runtime_ready()
-                    && s(&store.job(s(&request,"workflowId"))?, "entityId") == "storyboard.run" {
-                    return Err("STAGE3_ADAPTER_PENDING: 最新 3008 运行装配尚未接入；原工作流和预算保留，未重发。".into());
-                }
-                self.resume_production(store.clone(), &request)?;
+                self.resume_production_checked(store.clone(), &request,
+                    crate::execution_policy::creative_runtime_ready())?;
             }
             "units.regenerate" => {
                 let unit = store.get("units", s(&request, "unitId"))?;
@@ -1315,6 +1321,7 @@ impl Engine {
                                 open_authorization(s(&account["authorization"], "verificationUrl"))
                             {
                                 store.event("", "operation_error", &json!({"message":error}))?;
+                                return Err(error);
                             }
                         }
                         account
@@ -1402,7 +1409,18 @@ impl Engine {
                 workspace["imageQueueReport"] = report;
                 return Ok(workspace);
             }
-            "foundation.run" | "images.design" | "images.produce" | "storyboard.run" => {
+            "storyboard.refinement.adopt" => {
+                let run = s(&request, "workflowId");
+                let old = store.job(run)?;
+                if old["entityId"] != "storyboard.refine" { return Err("请选择原导演精修记录".into()); }
+                let original = &old["snapshot"]["input"];
+                if old["snapshot"]["savedSettingsSha256"] != pipeline::digest(&store.settings()?.to_string()) { return Err("项目参数已变化，精修结果已保留，请核对后重新精修".into()); }
+                let mut current = refinement_input(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}))?;
+                // Execution identity is frozen by preflight, not editable project state.
+                current["settings"] = original["settings"].clone();
+                store.publish_storyboard_refinement(run, s(&request,"candidateSha256"), &current)?;
+            }
+            "foundation.run" | "images.design" | "images.produce" | "storyboard.run" | "storyboard.refine" => {
                 self.spawn_stage(store.clone(), request.clone())?;
             }
             "jobs.close_unknown" => {
@@ -1521,7 +1539,7 @@ impl Engine {
         if self.stop.load(Ordering::SeqCst) {
             return Err("客户端正在退出".into());
         }
-        if let Some(key) = keys.iter().find(|key| active.contains(*key)) {
+        if let Some(key) = keys.iter().find(|key| worker_key_conflicts(&active, key)) {
             let message = if let Some(provider) = key.strip_prefix("channel:") {
                 let name = match provider {
                     "dreamina" => "即梦",
@@ -1591,7 +1609,11 @@ impl Engine {
         std::thread::spawn(move || {
             while !engine.stop.load(Ordering::SeqCst) {
                 let _ = engine.tick();
-                std::thread::sleep(Duration::from_secs(5));
+                let (pending, signal) = &engine.image_wake;
+                let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut guard, _) = signal.wait_timeout_while(guard, Duration::from_secs(5), |wake| !*wake)
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = false;
             }
         });
     }
@@ -1662,6 +1684,12 @@ impl Engine {
                 ]
                 .contains(&state)
                 {
+                    continue;
+                }
+                // Image operations own independent, bounded local worker lanes.
+                // A cloud task waiting to finish consumes no local worker slot.
+                if s(&j, "kind") == "image" && provider == "dreamina" {
+                    self.schedule_image_operation(&store, &j)?;
                     continue;
                 }
                 if j["nextAttemptAt"].as_i64().unwrap_or(0) > chrono::Utc::now().timestamp()
@@ -1767,6 +1795,87 @@ impl Engine {
                 // the other class. Existing due/backoff checks remain above.
             }
         }
+        Ok(())
+    }
+    fn wake_images(&self) {
+        let (pending, signal) = &self.image_wake;
+        if let Ok(mut pending) = pending.lock() {
+            *pending = true;
+            signal.notify_one();
+        }
+    }
+    fn image_preflight_failed(store: &Store, key: &str, error: &ProviderError) -> Result<()> {
+        let job = store.job(key)?;
+        let attempts = job["queryAttempts"].as_u64().unwrap_or(0);
+        if !error.auth_required && error.code != "CLIENT_CLOSING"
+            && s(&job, "providerTaskId").is_empty()
+            && ["queued", "ready"].contains(&s(&job, "status")) && attempts < 2 {
+            // Only a read-only preflight failed: generation has not been entered.
+            // Two durable, delayed retries; unknown/accepted submissions never enter here.
+            store.event(key, "account_preflight_retry", &json!({"code":error.code,"attempt":attempts+1,"generationCalled":false}))?;
+            return store.update_job(key, s(&job, "status"), &json!({"error":error.message,"queryAttempts":attempts+1,"nextAttemptAt":chrono::Utc::now().timestamp()+10*(attempts as i64+1)}));
+        }
+        Self::account_preflight_failed(store, key, error)
+    }
+    fn schedule_image_operation(self: &Arc<Self>, store: &Store, job: &Value) -> Result<()> {
+        let state = s(job, "status");
+        if job["nextAttemptAt"].as_i64().unwrap_or(0) > chrono::Utc::now().timestamp() {
+            return Ok(());
+        }
+        let known = !s(job, "providerTaskId").is_empty();
+        let (lane, slots) = if !known && ["queued", "ready"].contains(&state) {
+            if job["snapshot"]["autoSubmit"].as_bool() != Some(true) { return Ok(()); }
+            ("submit", IMAGE_SUBMIT_WORKERS)
+        } else if known && state == "succeeded" {
+            ("download", IMAGE_DOWNLOAD_WORKERS)
+        } else if known {
+            ("query", IMAGE_QUERY_WORKERS)
+        } else { return Ok(()); };
+        let key = s(job, "id").to_owned();
+        let provider = s(job, "provider");
+        // Compact pending projections omit M2's frozen provider/settings fields.
+        // Reload the original job for every lane; current defaults never replace it.
+        let (config, fallback) = match self.generation_config(store, job) {
+            Ok(config) => config,
+            Err(error) => {
+                store.event(&key, "local_error", &json!({"message":error,"generationCalled":false}))?;
+                store.claim_job_fields(&key, state, state, &json!({"error":error,"nextAttemptAt":chrono::Utc::now().timestamp()+10}))?;
+                return Ok(());
+            }
+        };
+        let mut reservation = None;
+        for slot in 0..slots {
+            let keys = project_worker_keys(store, vec![format!("image:{provider}:{lane}:{slot}"), format!("job:{key}")])?;
+            if let Ok(guard) = self.acquire_keys(keys) { reservation = Some(guard); break; }
+        }
+        let Some(guard) = reservation else { return Ok(()); };
+        let engine = self.clone();
+        let store = store.clone();
+        let expected_state = state.to_owned();
+        std::thread::spawn(move || {
+            let _guard = guard; // Completion wakes the scheduler after all DB writes and unlocks.
+            let work = || -> Result<()> {
+                let current = store.job(&key)?;
+                if s(&current, "status") != expected_state { return Ok(()); }
+                let identity = if engine.live_accounts {
+                    engine.dreamina_sessions.image_execution_identity(&config)
+                } else { Ok(fallback.clone()) };
+                let account = match identity {
+                    Ok(account) => account,
+                    Err(error) => { Self::image_preflight_failed(&store, &key, &error)?; return Ok(()); }
+                };
+                match lane {
+                    "submit" => tasks::run_generation(&store, &key, &config, &account, engine.channels.as_ref()),
+                    "query" => tasks::resume_job(&store, &key, &config, &account, engine.channels.as_ref(), false),
+                    _ => tasks::download_saved_result(&store, &key, &config, &account, engine.channels.as_ref()),
+                }
+            };
+            if let Err(error) = work() {
+                let _ = store.event(&key, "local_error", &json!({"message":error}));
+                // Bound unexpected local failures instead of waking a tight retry loop.
+                let _ = store.conn().and_then(|c| c.execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2",rusqlite::params![chrono::Utc::now().timestamp()+10,key]).map(|_|()).map_err(|e|e.to_string()));
+            }
+        });
         Ok(())
     }
     fn refresh_due_dreamina(self: &Arc<Self>, store: &Store) -> Result<()> {
@@ -2150,7 +2259,7 @@ impl Engine {
                     return Err("客户端正在退出，未排入新的准备任务".into());
                 }
                 let key = "channel:dreamina".to_owned();
-                if active.contains(&key) {
+                if worker_key_conflicts(&active, &key) {
                     None
                 } else {
                     active.insert(key.clone());
@@ -2270,6 +2379,9 @@ impl Engine {
         {
             return Err("当前参数与保存的准备设置不一致，请先重新准备并核对素材".into());
         }
+        let source_projection = if !submit {
+            store.rebind_verified_source_projection(ids,&json!({"minDuration":capability.min_duration,"maxDuration":capability.max_duration,"imageLimit":capability.images,"allowedDurations":capability.allowed_durations}))?
+        } else { Value::Null };
         let jobs = store.job_summaries()?;
         let mut queued = Vec::new();
         let mut blocked = Vec::new();
@@ -2398,14 +2510,17 @@ impl Engine {
         preflight["model"] = json!(model);
         preflight["ratio"] = json!(ratio);
         preflight["resolution"] = json!(resolution);
+        preflight["sourceProjection"] = source_projection;
         Ok(
             json!({"queuedCount":queued.len()-reused,"reusedCount":reused,"blockedCount":blocked.len(),"queued":queued,"blocked":blocked,"preflight":preflight}),
         )
     }
     fn queue_images(&self, store: &Store, r: &Value) -> Result<Value> {
-        self.queue_images_with_account_check(store, r, |config, account| {
+        let result = self.queue_images_with_account_check(store, r, |config, account| {
             self.checked_account(config, account)
-        })
+        });
+        self.wake_images();
+        result
     }
     fn queue_images_with_account_check(
         &self,
@@ -2490,11 +2605,14 @@ impl Engine {
         if review && !approved && r["trial"].as_bool() != Some(true) {
             return Err("请先生成少量试稿并确认画风，再启动批量生成".into());
         }
-        let selected_count = assets
-            .iter()
-            .filter(|a| independent_image(a))
-            .filter(|a| selected.map(|l| l.contains(&a["id"])).unwrap_or(true))
-            .count();
+        let (order, closure_errors) = image_closure(store, &assets, selected);
+        let mut selected_count = 0;
+        for asset in assets.iter().filter(|a| order.contains(&s(a, "id").to_owned())) {
+            if selected.map(|ids| ids.contains(&asset["id"])).unwrap_or(true)
+                || store.adopted(s(asset, "id"), s(asset, "variantId"))?.is_none() {
+                selected_count += 1;
+            }
+        }
         if review && !approved && selected_count > 3 {
             return Err("未确认画风时试稿最多选择3个资产".into());
         }
@@ -2503,7 +2621,6 @@ impl Engine {
         let mut blocked = Vec::new();
         let mut queued = Vec::new();
         let mut reused = Vec::new();
-        let (order, closure_errors) = image_closure(store, &assets, selected);
         for issue in closure_errors {
             errors.push(format!("{}: {}", s(&issue, "assetId"), s(&issue, "reason")));
             blocked.push(issue);
@@ -2517,7 +2634,10 @@ impl Engine {
             .iter()
             .filter_map(|id| assets.iter().find(|a| s(a, "id") == id))
         {
-            if selected.map(|l| !l.contains(&a["id"])).unwrap_or(false) {
+            // Selecting a descendant also queues its missing ancestors. Existing
+            // ancestor images are reused unless that ancestor was explicitly selected.
+            if selected.map(|l| !l.contains(&a["id"])).unwrap_or(false)
+                && store.adopted(s(a, "id"), s(a, "variantId"))?.is_some() {
                 continue;
             }
             if !independent_image(a) {
@@ -2573,8 +2693,10 @@ impl Engine {
                         continue;
                     }
                     let chain = image_reference_chain(&assets, source)?;
+                    let mut has_source = false;
                     for dependency in chain {
                         if let Some(job) = dependency_jobs.get(s(dependency, "id")) {
+                            has_source = true;
                             if !dependency_job_ids.contains(job) {
                                 dependency_job_ids.push(job.clone());
                             }
@@ -2583,8 +2705,12 @@ impl Engine {
                             .adopted(s(dependency, "id"), s(dependency, "variantId"))?
                             .is_some()
                         {
+                            has_source = true;
                             break;
                         }
+                    }
+                    if !has_source {
+                        return Err(format!("来源形象「{}」没有当前图片且未能排入生成队列；请查看该形象的失败原因", s(source, "name")));
                     }
                 }
                 if !dependency_job_ids.is_empty() {
@@ -2616,6 +2742,8 @@ impl Engine {
         if queued.is_empty() && reused.is_empty() && !blocked.is_empty() {
             return Err(errors.join("；"));
         }
+        // One-click Stage2 also enters this frozen-settings path directly.
+        self.wake_images();
         Ok(
             json!({"queued":queued,"reused":reused,"blocked":blocked,"queuedCount":queued.len(),"reusedCount":reused.len(),"blockedCount":blocked.len(),"imageProductionPolicy":policy}),
         )
@@ -2668,10 +2796,10 @@ impl Engine {
     }
     fn spawn_production(self: &Arc<Self>, store: Store, request: Value) -> Result<()> {
         let stage = s(&request, "action");
-        let mut input = production_input(&store, &request)?;
+        let mut input = if stage == "storyboard.refine" { refinement_input(&store, &request)? } else { production_input(&store, &request)? };
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-        input["settings"] =
-            runtime.block_on(resolve_text_execution_settings(&input["settings"]))?;
+        let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
+            |settings| runtime.block_on(resolve_text_execution_settings(settings)))?;
         if stage == "foundation.run" {
             // Freeze the new transport on new runs only. Resuming an existing
             // workflow keeps its original input and accepted request identities.
@@ -2696,7 +2824,7 @@ impl Engine {
         if stage == "storyboard.run" {
             input["storyboardMethod"] = json!("authors-then-editor/v2");
         }
-        let rules = production_rules(stage);
+        let rules = if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
         let guard = crate::workflow::guard_from_input(&input);
         store.ensure_workflow_storage()?;
         {
@@ -2705,14 +2833,22 @@ impl Engine {
             crate::workflow::verify_guard(&tx, &guard)?;
         }
         let native_receipt=self.reserve_native_workflow(&request,&input["source"],&input["settings"])?;
-        let snapshot = json!({"runnerVersion":"desktop-runner/v1","foundationMethod":if stage=="foundation.run" {json!("foundation-delivery/v2")}else{Value::Null},"stage":stage,"sourceVersion":input["source"]["version"],"selection":input["selection"],"planningProfile":input["capabilities"],"input":input,"guard":guard,"rules":rules,"nativeAcceptance":native_receipt});
-        let job = if input["foundationPhase"] == "AUTO_INTERPRET" {
+        let snapshot = json!({"runnerVersion":"desktop-runner/v1","foundationMethod":if stage=="foundation.run" {json!("foundation-delivery/v2")}else{Value::Null},"stage":stage,"savedSettingsSha256":saved_settings_sha256,"sourceVersion":input["source"]["version"],"selection":input["selection"],"planningProfile":input["capabilities"],"input":input,"guard":guard,"rules":rules,"nativeAcceptance":native_receipt});
+        let job = if stage == "storyboard.refine" {
+            store.reserve_storyboard_refinement_workflow(&snapshot)?
+        } else if input["foundationPhase"] == "AUTO_INTERPRET" {
             store.reserve_foundation_auto_workflow(&snapshot)?
         } else {
             store.add_job("workflow", stage, "local", "local", &snapshot, "queued")?
         };
         self.bind_native_workflow(&store,&native_receipt,&job)?;
         self.execute_production(store, &job, snapshot)
+    }
+    fn resume_production_checked(self: &Arc<Self>, store: Store, request: &Value, creative_ready: bool) -> Result<()> {
+        if self.standard_native {
+            check_standard_workflow_resume(creative_ready, &store.job(s(request,"workflowId"))?)?;
+        }
+        self.resume_production(store, request)
     }
     fn resume_production(self: &Arc<Self>, store: Store, request: &Value) -> Result<()> {
         let id = s(request, "workflowId");
@@ -2806,6 +2942,14 @@ impl Engine {
             // or accepted checkpoints. Current requests still load current rules.
             store.event(id, "foundation_transport_rule_migration", &audit)?;
         }
+        if s(request, "action") == "workflows.resume" {
+            store.event(id, "text_workflow_resume_requested", &json!({
+                "version":"text-workflow-resume/v1",
+                "snapshotSha256":pipeline::digest(&snapshot.to_string()),
+                "previousStatus":job["status"],
+                "maximumQuotaAttempts":1
+            }))?;
+        }
         self.execute_production(store, id, snapshot)
     }
     fn execute_production(
@@ -2858,6 +3002,8 @@ impl Engine {
                         }
                     }
                     store.publish_foundation_with_source(&guard,output,assets,Some(&run),revised)
+                }else if stage=="storyboard.refine" {
+                    pipeline::run_storyboard_refinement(&input,&exec,model,reasoning).await
                 }else{
                     let history={
                         let connection=store.conn()?;
@@ -2888,7 +3034,7 @@ impl Engine {
     }
     fn spawn_stage(self: &Arc<Self>, store: Store, mut r: Value) -> Result<()> {
         let stage = s(&r, "action").to_owned();
-        if stage == "foundation.run" || stage == "storyboard.run" {
+        if stage == "foundation.run" || stage == "storyboard.run" || stage == "storyboard.refine" {
             return self.spawn_production(store, r);
         }
         let all_assets = store.values("assets")?;
@@ -3156,7 +3302,17 @@ impl Drop for ActiveGuard {
                 active.remove(key);
             }
         }
+        if self.keys.iter().any(|key| key.starts_with("image:")) {
+            self.engine.wake_images();
+        }
     }
+}
+// Account mutation and legacy exclusive operations still exclude all image
+// workers. Different image lanes can run concurrently; a job can have one owner.
+fn worker_key_conflicts(active: &HashSet<String>, key: &str) -> bool {
+    active.contains(key)
+        || key.strip_prefix("channel:").is_some_and(|provider| active.iter().any(|k| k.starts_with(&format!("image:{provider}:"))))
+        || key.strip_prefix("image:").and_then(|rest| rest.split(':').next()).is_some_and(|provider| active.contains(&format!("channel:{provider}")))
 }
 fn is_active_generation(state: &str) -> bool {
     [
@@ -3363,12 +3519,7 @@ fn open_authorization(value: &str) -> Result<()> {
     let url = authorization_url(value)?;
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("explorer.exe")
-            .arg(url)
-            .creation_flags(0x08000000)
-            .spawn()
-            .map_err(|_| "无法自动打开即梦授权页，请使用设置中的打开授权页按钮。".to_string())?;
+        open_authorization_windows(&url)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -3385,6 +3536,58 @@ fn open_authorization(value: &str) -> Result<()> {
             .map_err(|_| "无法打开即梦授权页".to_string())?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn shell_open_result(result: isize) -> Result<()> {
+    // ShellExecute returns an HINSTANCE-shaped status, not a process handle.
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(format!("无法调用默认浏览器（Windows 错误 {result}）。请复制授权链接到浏览器打开。"))
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn authorization_browser_errors_never_claim_a_page_opened() {
+    for code in [0, 2, 3, 5, 8, 26, 27, 28, 29, 30, 31, 32] {
+        let error = shell_open_result(code).unwrap_err();
+        assert!(error.contains("复制授权链接"));
+    }
+    assert!(shell_open_result(33).is_ok());
+    for target in ["C:/Users/Public/Documents", "file:///C:/Users", "https://evil.test/", "https://jimeng.jianying.com/?device_code=secret"] {
+        assert!(open_authorization(target).is_err());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_authorization_windows(url: &str) -> Result<()> {
+    // A URL is the shell target, never an Explorer argument or shell command.
+    // A dedicated STA thread also works when invoked from a Tokio/MTA worker.
+    let url: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+    std::thread::spawn(move || {
+        use std::{ffi::c_void, ptr};
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(window: *mut c_void, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> *mut c_void;
+        }
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32;
+            fn CoUninitialize();
+        }
+        let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        // COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE.
+        let initialized = unsafe { CoInitializeEx(ptr::null_mut(), 0x2 | 0x4) };
+        if initialized < 0 {
+            return Err("无法初始化默认浏览器调用，请复制授权链接到浏览器打开。".into());
+        }
+        // Both strings remain alive and nul terminated for the synchronous call.
+        let result = unsafe { ShellExecuteW(ptr::null_mut(), verb.as_ptr(), url.as_ptr(), ptr::null(), ptr::null(), 1) } as isize;
+        unsafe { CoUninitialize(); }
+        shell_open_result(result)
+    }).join().map_err(|_| "默认浏览器调用中断，请复制授权链接到浏览器打开。".to_string())?
 }
 fn import_user_media(store: &Store, request: &Value, path: &Path) -> Result<Value> {
     if s(request, "kind") == "image" {
@@ -3588,6 +3791,8 @@ fn image_closure(
     let mut order = Vec::new();
     let mut errors = Vec::new();
     for key in selected {
+        let completed_before = done.clone();
+        let order_before = order.len();
         if let Err(e) = visit(
             &key,
             store,
@@ -3596,6 +3801,10 @@ fn image_closure(
             &mut done,
             &mut order,
         ) {
+            // An invalid selected branch must not leak its partial ancestors
+            // into billable work; ancestors of other valid selections remain.
+            done = completed_before;
+            order.truncate(order_before);
             errors.push(json!({"assetId":key,"reason":e}));
         }
     }
@@ -3803,6 +4012,11 @@ fn production_rules(stage: &str) -> Value {
 // A previously started run keeps its actual rules and requests. It may finish or
 // resume its accepted steps; a new run uses the restored F2 → Q1 method.
 fn production_rules_for_snapshot(snapshot: &Value) -> Result<Value> {
+    if pipeline::stage3_pack::uses_profile(&snapshot["input"])? {
+        let mut checked = json!({});
+        pipeline::stage3_pack::attach_profile(&mut checked, &snapshot["input"])?;
+        return Ok(json!(pipeline::stage3_pack::rule_snapshots()?));
+    }
     if s(snapshot, "stage") != "foundation.run" {
         return Ok(production_rules(s(snapshot, "stage")));
     }
@@ -3887,13 +4101,14 @@ struct RevisionAcceptedStep {
     stage: String,
     snapshot: Value,
     result: Value,
+    raw_result: Value,
 }
 fn revision_accepted_steps(
     connection: &rusqlite::Connection,
     run: &str,
     episode: &str,
 ) -> Result<Vec<RevisionAcceptedStep>> {
-    let mut query = connection.prepare("SELECT j.id,w.request_hash,w.stage,j.snapshot,w.result,j.receipt FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.state='completed' AND w.stage IN ('storyboardPlan','storyboardCreate','storyboardFinish') AND COALESCE(json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'))=?2 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid)))").map_err(|e| e.to_string())?;
+    let mut query = connection.prepare("SELECT j.id,w.request_hash,w.stage,j.snapshot,w.result,j.receipt FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.state='completed' AND w.stage IN ('storyboardPlan','storyboardCreate','storyboardFinish','storyboardRefine') AND COALESCE(json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'))=?2 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid)))").map_err(|e| e.to_string())?;
     let rows = query
         .query_map(rusqlite::params![run, episode], |row| {
             Ok((
@@ -3919,6 +4134,7 @@ fn revision_accepted_steps(
         let skill = match stage.as_str() {
             "storyboardPlan" => "episode-emotion-planner",
             "storyboardCreate" => "unit-performance-director",
+            "storyboardRefine" => "director-refinement",
             _ => "episode-finishing-editor",
         };
         if pipeline::digest(&raw_snapshot) != hash
@@ -3934,12 +4150,16 @@ fn revision_accepted_steps(
                 "原节点身份、请求哈希或校验回执发生变化",
             ));
         }
+        let projected = if ["storyboardFinish", "storyboardRefine"].contains(&stage.as_str())
+            && result["materializedDraft"].is_object()
+        { result["materializedDraft"].clone() } else { result.clone() };
         steps.push(RevisionAcceptedStep {
             job_id,
             hash,
             stage,
             snapshot,
-            result,
+            result: projected,
+            raw_result: result,
         });
     }
     Ok(steps)
@@ -4055,6 +4275,9 @@ fn revision_context_for_origin(
     source_sha: &str,
     existing: &[Value],
 ) -> Result<Value> {
+    if snapshot["stage"] == "storyboard.refine" {
+        return revision_context_from_refinement(connection,run,snapshot,output,episode,source_sha,existing);
+    }
     let steps = revision_accepted_steps(connection, run, episode)?;
     let provenance = revision_plan_provenance(
         connection, run, snapshot, output, episode, source_sha, &steps,
@@ -4215,6 +4438,85 @@ fn revision_context_for_origin(
         json!({"version":STORYBOARD_REVISION_CONTEXT,"sourceSha256":source_sha,"episodeId":episode,"originWorkflowId":provenance["originWorkflowId"],"planJobId":provenance["planJobId"],"planRequestHash":provenance["planRequestHash"],"unitBindings":bindings,"plan":provenance["plan"],"selectedFantasy":candidates,"fantasyRealization":realized}),
     )
 }
+fn revision_context_from_refinement(
+    connection: &rusqlite::Connection,
+    run: &str,
+    snapshot: &Value,
+    projection: &Value,
+    episode: &str,
+    source_sha: &str,
+    existing: &[Value],
+) -> Result<Value> {
+    use rusqlite::OptionalExtension;
+    let candidate=&projection["refinementCandidate"];
+    let receipt=&projection["refinementAdoption"];
+    if receipt["version"]!="storyboard-refinement-adoption/v1" || receipt["workflowId"]!=run
+        || receipt["candidateSha256"]!=candidate["candidateSha256"] || receipt["sourceSha256"]!=source_sha
+        || receipt["episodeId"]!=episode || receipt["acceptedPlanContext"]!=candidate["acceptedContext"]
+        || receipt["domainRequestSha256"]!=candidate["domainRequestSha256"] || receipt["ruleReceipt"]!=candidate["ruleReceipt"]
+    {return Err(revision_origin_error("精修采用回执没有回绑原候选与规划"));}
+    let expected=pipeline::adopt_storyboard_refinement(&snapshot["input"],candidate)
+        .map_err(|_|revision_origin_error("精修候选不能重现原领域验证"))?;
+    if receipt["deliverySha256"]!=pipeline::digest(&expected.to_string()) {
+        return Err(revision_origin_error("精修采用作品与原差量不一致"));
+    }
+    let steps=revision_accepted_steps(connection,run,episode)?;
+    let accepted:Vec<_>=steps.iter().filter(|step|{
+        let request=serde_json::from_value::<pipeline::TextRequest>(step.snapshot.clone());
+        let mut raw=step.raw_result.clone();
+        if let Some(object)=raw.as_object_mut(){object.remove("materializedDraft");}
+        step.stage=="storyboardRefine" && raw==candidate["rawDelta"]
+            && step.snapshot["ruleSnapshot"]["creativePack"]==candidate["ruleReceipt"]
+            && request.is_ok_and(|request|pipeline::digest(&serde_json::to_string(&request).unwrap())==candidate["domainRequestSha256"])
+    }).collect();
+    if accepted.len()!=1 {return Err(revision_origin_error("精修没有唯一原文绑定的领域验收节点"));}
+    let original_event:Option<String>=connection.query_row("SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY rowid DESC LIMIT 1",
+        [&accepted[0].job_id],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+    let original_event:Value=original_event.as_deref().map(serde_json::from_str).transpose()
+        .map_err(|_|revision_origin_error("精修原回包事件无效"))?.unwrap_or(Value::Null);
+    if original_event["requestHash"]!=accepted[0].hash || original_event["value"]!=candidate["rawDelta"] {
+        return Err(revision_origin_error("精修采用丢失精确原回包事件"));
+    }
+    let mut inherited=snapshot.clone();
+    inherited["input"]["storyboardRevisionProfile"]=json!(STORYBOARD_REVISION_PROFILE);
+    inherited["input"]["revisionContexts"]=json!([receipt["acceptedPlanContext"]]);
+    let provenance=revision_plan_provenance(connection,run,&inherited,&expected,episode,source_sha,&steps)?;
+    let adopted=receipt["adoptedUnits"].as_array().ok_or_else(||revision_origin_error("精修采用缺少实际单位后像"))?;
+    let post_bindings=receipt["unitBindings"].as_array().ok_or_else(||revision_origin_error("精修采用缺少版本后像"))?;
+    let candidate_units=candidate["draft"]["units"].as_array().ok_or_else(||revision_origin_error("精修候选缺少全稿"))?;
+    let mut seen=HashSet::new();
+    if adopted.len()!=post_bindings.len() || adopted.len()!=candidate_units.len()
+        || adopted.iter().any(|unit|{
+            !seen.insert(s(unit,"id")) || unit["episodeId"]!=episode
+                || post_bindings.iter().filter(|binding|binding["unitId"]==unit["id"] && binding["unitVersion"]==unit["version"]
+                    && binding["unitSha256"]==pipeline::digest(&unit.to_string())).count()!=1
+                || candidate_units.iter().filter(|original|original["id"]==unit["id"]
+                    && adopted_unit_content(original)==adopted_unit_content(unit)).count()!=1
+        }) {return Err(revision_origin_error("精修采用单位、作品或版本后像无效"));}
+    let mut bindings=Vec::new();
+    for unit in existing.iter().filter(|unit|unit["episodeId"]==episode && unit["retired"]!=true) {
+        if adopted.iter().any(|original|original["id"]==unit["id"] && adopted_unit_content(original)==adopted_unit_content(unit)) {
+            bindings.push(json!({"unitId":unit["id"],"unitVersion":unit["version"],"unitSha256":pipeline::digest(&unit.to_string())}));
+        }
+    }
+    let bound:HashSet<_>=bindings.iter().map(|binding|s(binding,"unitId")).collect();
+    let formal=receipt["fantasyRealization"].as_array().ok_or_else(||revision_origin_error("精修采用缺少完整幻想兑现"))?;
+    if receipt["fantasyRealization"]!=candidate["draft"]["fantasyRealization"] {return Err(revision_origin_error("精修采用幻想不属于原验收作品"));}
+    let selected=receipt["acceptedPlanContext"]["selectedFantasy"].as_array().ok_or_else(||revision_origin_error("精修采用丢失原已选幻想"))?;
+    let mut realized=Vec::new();let mut candidates=Vec::new();
+    for record in formal {
+        let ids=record["unitIds"].as_array().filter(|ids|!ids.is_empty()).ok_or_else(||revision_origin_error("精修幻想缺少实际单位身份"))?;
+        if !ids.iter().any(|id|id.as_str().is_some_and(|id|bound.contains(id))) {continue;}
+        if ids.iter().any(|id|id.as_str().is_none_or(|id|!bound.contains(id))) {return Err(revision_origin_error("精修幻想关联组已不完整属于同一采用稿"));}
+        let matching:Vec<_>=selected.iter().filter(|candidate|candidate["id"]==record["candidateId"]).collect();
+        if matching.len()!=1 {return Err(revision_origin_error("精修幻想不属于原已选合同"));}
+        realized.push(record.clone());
+        if !candidates.iter().any(|candidate|candidate==matching[0]) {candidates.push(matching[0].clone());}
+    }
+    Ok(json!({"version":STORYBOARD_REVISION_CONTEXT,"sourceSha256":source_sha,"episodeId":episode,
+        "originWorkflowId":provenance["originWorkflowId"],"planJobId":provenance["planJobId"],"planRequestHash":provenance["planRequestHash"],
+        "unitBindings":bindings,"plan":provenance["plan"],"selectedFantasy":candidates,"fantasyRealization":realized}))
+}
 fn accepted_storyboard_revision_contexts(
     store: &Store,
     input: &Value,
@@ -4239,23 +4541,32 @@ fn accepted_storyboard_revision_contexts(
     if !has_steps {
         return Err(revision_origin_error("项目没有正式采用流程节点"));
     }
-    let mut query = connection.prepare("SELECT id,snapshot,result FROM jobs WHERE kind='workflow' AND entity_id='storyboard.run' AND result IS NOT NULL AND json_extract(result,'$.sourceSha256')=?1").map_err(|e|e.to_string())?;
+    let mut query = connection.prepare("SELECT id,snapshot,result,prepared,entity_id FROM jobs WHERE kind='workflow' AND entity_id IN ('storyboard.run','storyboard.refine') AND result IS NOT NULL AND json_extract(result,'$.sourceSha256')=?1 AND (entity_id='storyboard.run' OR (state='completed' AND json_extract(prepared,'$.refinementAdoption.version')='storyboard-refinement-adoption/v1')) ORDER BY COALESCE((SELECT MAX(e.id) FROM events e WHERE e.job_id=jobs.id AND e.type='storyboard_refinement_adopted'),0) DESC,jobs.rowid DESC").map_err(|e|e.to_string())?;
     let rows = query
         .query_map([source_sha], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     let mut origins = Vec::new();
     for row in rows {
-        let (id, snapshot, result) = row.map_err(|e| e.to_string())?;
+        let (id, snapshot, result, prepared, stage) = row.map_err(|e| e.to_string())?;
         let snapshot: Value =
             serde_json::from_str(&snapshot).map_err(|_| revision_origin_error("原流程快照无效"))?;
-        let result: Value =
+        let mut result: Value =
             serde_json::from_str(&result).map_err(|_| revision_origin_error("原流程采用稿无效"))?;
+        if stage=="storyboard.refine" {
+            let prepared:Value=prepared.as_deref().map(serde_json::from_str).transpose()
+                .map_err(|_|revision_origin_error("精修采用回执无效"))?.unwrap_or(Value::Null);
+            let receipt=&prepared["refinementAdoption"];
+            result=json!({"sourceSha256":result["sourceSha256"],"scope":"units","units":receipt["adoptedUnits"],
+                "fantasyRealization":receipt["fantasyRealization"],"refinementCandidate":result,"refinementAdoption":receipt});
+        }
         if snapshot["runnerVersion"] == "desktop-runner/v1"
             && snapshot["input"]["source"]["sha256"] == source_sha
         {
@@ -4295,12 +4606,17 @@ fn accepted_storyboard_revision_contexts(
                     })
             })
             .collect();
-        if matches.len() != 1 {
+        // A refinement adoption receipt freezes the full adopted episode,
+        // including unchanged units. Its newest actual adoption owns the
+        // continued context; older equal retained bodies remain historical.
+        let refinement=matches.iter().find(|(_,snapshot,_)|snapshot["stage"]=="storyboard.refine");
+        if matches.len() != 1 && refinement.is_none() {
             return Err(revision_origin_error(
                 "当前单元没有唯一逐值相等的正式采用流程",
             ));
         }
-        wanted.insert((matches[0].0.clone(), s(current, "episodeId").to_owned()));
+        let origin=refinement.map(|entry|*entry).unwrap_or(matches[0]);
+        wanted.insert((origin.0.clone(), s(current, "episodeId").to_owned()));
     }
     let mut wanted: Vec<_> = wanted.into_iter().collect();
     wanted.sort();
@@ -4356,6 +4672,80 @@ fn accepted_storyboard_revision_contexts(
     }
     Ok(contexts)
 }
+#[cfg(test)]
+mod refinement_lineage_tests {
+    use super::*;
+    use crate::pipeline::storyboard_refinement::tests::{fixture,saved_candidate,Model};
+
+    #[tokio::test]
+    async fn delta_finisher_and_refinement_adoption_keep_the_original_plan_for_further_work() {
+        let (_directory,store,mut input,origin)=fixture().await;
+        let selected:Vec<_>=input["existingUnits"].as_array().unwrap().iter().map(|unit|unit["id"].clone()).collect();
+        let original=accepted_storyboard_revision_contexts(&store,&input,&selected).unwrap();
+        assert_eq!(original.len(),1);assert_eq!(original[0]["originWorkflowId"],origin);
+        assert_eq!(original[0]["unitBindings"].as_array().unwrap().len(),3,"materialized delta finisher remains a proven adopted draft");
+        input["revisionContexts"]=json!(original);
+        let (run,candidate)=saved_candidate(&store,&input,"changed").await;
+        store.publish_storyboard_refinement(&run,s(&candidate,"candidateSha256"),&input).unwrap();
+        let receipt=store.job(&run).unwrap()["prepared"]["refinementAdoption"].clone();
+        input["existingUnits"]=receipt["adoptedUnits"].clone();
+        let ids:Vec<_>=input["existingUnits"].as_array().unwrap().iter().map(|unit|unit["id"].clone()).collect();
+        let inherited=accepted_storyboard_revision_contexts(&store,&input,&ids).unwrap();
+        assert_eq!(inherited.len(),1);assert_eq!(inherited[0]["originWorkflowId"],origin);
+        assert_eq!(inherited[0]["planJobId"],candidate["acceptedContext"]["planJobId"]);
+        assert_eq!(inherited[0]["planRequestHash"],candidate["acceptedContext"]["planRequestHash"]);
+        assert_eq!(inherited[0]["unitBindings"].as_array().unwrap().len(),3);
+        input["revisionContexts"]=json!(inherited);
+        let mut executor=Model::default();executor.mode="changed";
+        let next=pipeline::run_storyboard_refinement(&input,&executor,"offline-fixture-model","medium").await.unwrap();
+        assert_eq!(next["state"],"candidate","second refinement uses the new adopted base with the original Planner");
+        let local=accepted_storyboard_revision_contexts(&store,&input,&[ids[0].clone()]).unwrap();
+        assert_eq!(local[0]["originWorkflowId"],origin,"local remake also inherits the same accepted planning contract");
+        store.conn().unwrap().execute("UPDATE events SET data='{}' WHERE type='text_received_raw' AND job_id IN (SELECT text_job_id FROM workflow_steps WHERE workflow_id=?1)",[&run]).unwrap();
+        assert!(accepted_storyboard_revision_contexts(&store,&input,&ids).is_err(),"a missing original raw does not fall back to an older equal retained body");
+    }
+}
+fn check_standard_workflow_resume(creative_ready: bool, job: &Value) -> Result<()> {
+    if !creative_ready && matches!(s(job, "entityId"), "storyboard.run" | "storyboard.refine") {
+        return Err("STAGE3_ADAPTER_PENDING: 最新 3008 运行装配尚未接入；原工作流和预算保留，未重发。".into());
+    }
+    Ok(())
+}
+
+fn freeze_production_execution_settings(
+    store: &Store,
+    stage: &str,
+    input: &mut Value,
+    resolve: impl FnOnce(&Value) -> Result<Value>,
+) -> Result<String> {
+    // Bind the project settings that actually supplied this input, before a
+    // potentially blocking preflight adds the observed execution identity.
+    let saved_settings_sha256 = pipeline::digest(&input["settings"].to_string());
+    let execution_settings = resolve(&input["settings"])?;
+    if stage == "storyboard.refine"
+        && saved_settings_sha256 != pipeline::digest(&store.settings()?.to_string())
+    {
+        return Err("项目保存设置在精修预检期间变化；未创建任务或派发请求，请刷新后重新开始".into());
+    }
+    input["settings"] = execution_settings;
+    Ok(saved_settings_sha256)
+}
+
+fn refinement_input(store: &Store, request: &Value) -> Result<Value> {
+    let episode = s(request, "episodeId");
+    if episode.is_empty() { return Err("请先选择要精修的单集".into()); }
+    let mut input = production_input(store, &json!({"action":"storyboard.run","episodeIds":[episode]}))?;
+    let units: Vec<Value> = input["existingUnits"].as_array().into_iter().flatten()
+        .filter(|unit| s(unit,"episodeId")==episode && unit["retired"]!=true).map(|unit|unit["id"].clone()).collect();
+    if units.is_empty() { return Err("此集尚无已采用分镜，请先生成完整集稿".into()); }
+    input["revisionContexts"] = json!(accepted_storyboard_revision_contexts(store,&input,&units)?);
+    input["episodeId"] = json!(episode);
+    input["refinementScope"] = request.get("refinementScope").cloned().unwrap_or(json!({}));
+    input["reviewNotes"] = json!(s(request,"reviewNotes"));
+    input["preserveNotes"] = json!(s(request,"preserveNotes"));
+    input["productionDirection"] = input["foundation"]["productionDirection"].clone();
+    Ok(input)
+}
 fn production_input(store: &Store, request: &Value) -> Result<Value> {
     let mut request = request.clone();
     if let Some(selection) = request["options"]["selection"].as_object().cloned() {
@@ -4392,7 +4782,7 @@ fn production_input(store: &Store, request: &Value) -> Result<Value> {
     // Only freshly constructed whole-episode/partial-revision runs opt into the
     // compact transport. resume_production reads its saved snapshot directly.
     if s(&request, "action") == "storyboard.run" {
-        input["storyboardCreativeProfile"] = json!("original-production-contract/v1");
+        pipeline::stage3_pack::mark_input(&mut input)?;
         input["storyboardCarrierProfile"] = json!("integer-video-units/v1");
         input["storyboardAssetInputProfile"] = json!("asset-production-card/v2");
         input[pipeline::CONTEXT_INPUT_PROFILE_FIELD] = json!(pipeline::CONTEXT_INPUT_PROFILE);
@@ -5511,8 +5901,16 @@ mod account_tests {
 mod repair_tests;
 
 #[cfg(test)]
+#[path = "image_scheduler_tests.rs"]
+mod image_scheduler_tests;
+
+#[cfg(test)]
 #[path = "project_lifecycle_tests.rs"]
 mod project_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "engine_refinement_cas_tests.rs"]
+mod refinement_cas_tests;
 
 #[cfg(test)]
 mod production_input_transport_tests {

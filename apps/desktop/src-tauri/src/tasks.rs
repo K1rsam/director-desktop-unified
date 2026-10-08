@@ -535,6 +535,28 @@ fn persist_query_result(
     Ok(state)
 }
 
+/// Download a durable successful response without occupying a polling worker.
+/// Old/incomplete packets are queried by original ID, never submitted again.
+pub fn download_saved_result(store: &Store, key: &str, cfg: &ProviderConfig, account: &str, channels: &dyn Channels) -> Result<()> {
+    let job = store.job(key)?;
+    if !["succeeded", "download_failed"].contains(&s(&job, "status")) { return Ok(()); }
+    if s(&job, "accountId") != account {
+        store.update_job(key, "auth_required", &json!({"error":"账户身份已变化，请恢复原账户"}))?;
+        return Ok(());
+    }
+    let task = s(&job, "providerTaskId");
+    if task.is_empty() { return Err("没有已保存的渠道任务ID，不能下载或重新提交".into()); }
+    let saved = serde_json::from_value::<QueryResult>(job["result"].clone()).ok()
+        .filter(|result| result.task_id == task && result.status == "succeeded" && !result.result_urls.is_empty());
+    let saved = saved.or_else(|| serde_json::from_value::<SubmitReceipt>(job["receipt"].clone()).ok()
+        .filter(|receipt| receipt.task_id == task && receipt.status == "succeeded" && !receipt.result_urls.is_empty())
+        .map(|receipt| QueryResult { task_id: receipt.task_id, status: "succeeded".into(), result_urls: receipt.result_urls, error: None, actual_cost: None, raw: receipt.raw }));
+    match saved {
+        Some(result) => download_result(store, key, cfg, channels, &result),
+        None => resume_job(store, key, cfg, account, channels, false),
+    }
+}
+
 pub fn download_result(
     store: &Store,
     key: &str,

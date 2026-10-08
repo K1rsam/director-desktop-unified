@@ -1,38 +1,60 @@
-# Director Desktop Next
+# Director Desktop Unified
 
-独立的 Windows 和 macOS 四阶段导演桌面项目，使用一套 Rust 业务核心、共享界面和版本化创作规则。
+Windows 与 Mac 后续开发合并后的四阶段导演工作台。共享 Rust 核心、React 界面和版本化规则；后续在本仓库开发，原 Windows 工程与 Mac 交接版本继续保留。
 
-当前本机版本开放标准桌面的已实现渠道与第一、二阶段文字入口，保留源文、费用确认和未知提交保护；支持 App 内即梦 Canvas OAuth、账户和模型检查，额度保持未知。第二阶段美术合同、原文解析与官方SDK共享核心合成路径已经存在。最新3008的22份生产规则与旧两集采用稿已核实，但完整Stage3运行适配、生产SDK执行和Canvas生成桥仍未接入；即梦账户仍有真实授权失败记录。它不是已验收的完整生产版本。[本机修改与Windows合并说明](docs/handoff/LOCAL_STANDARD_EDITION.md)和[本机验收回执](docs/handoff/LOCAL_NATIVE_RECEIPT.json)分别记录来源、接线、实际点击结果和未验证项。
+## 本次整合
 
-本地工程执行代理使用 GPT-6.1 Sol、Max-Max；被测桌面应用内部 CLI 使用 GPT-6.1 Sol、medium，两层配置分别核实。原 director-web 及 Mac 参考工程只读；所有新实现属于本独立仓库和另一个新目录。本轮实现CLI＋官方SDK双入口，CLI保留；首轮真实验收仅走CLI，对核验同源的第1、2集生成文本并比较旧已采用终稿。SDK本轮不live，第三阶段不生成其他集、不自动多轮全稿重跑；第一/二阶段必要的完整10集上游文字工作可做；第二阶段仅少量经核验免费的即梦官方CLI5.0图片测试；不做真实视频测试。
+- 第一阶段保留完整原文、全剧本资产整理、来源覆盖和已有资产身份。阅读某一集不会自动缩小整理范围。
+- 第二阶段采用 Mac 资产美术提示词 **2.0.0**：读取剧本视觉事实，人物采用肖像与正、侧、背三视图设计；保留设计收据、最终提示词编译、冻结和恢复。合入 Windows 多层直接父资产、根资产并行、父图返回即唤醒后代、提交/查询/下载独立调度，以及当前图片和历史切换。
+- 第三阶段加载 Mac 最新 3008 的 **22 份原字节规则**，以兼容 Rust 适配器执行情绪统筹、完整主创、统一整编；另有整集取料的导演精修、候选预览、显式采用和保存重开。旧请求保留原规则与执行身份。此适配器是重建实现，不能等同于移入未交付正文的 42 个 Mac 运行文件；真实新旧成稿质量仍待同源比较。
+- 保留 Windows 项目归档/恢复、资产编辑/软删除/恢复、第四阶段手动配图、视频提交确认、未知提交保护及原回包。仅准备素材不会提交生成视频。
+- 即梦生成 CLI 与 Canvas OAuth 分开显示。现有生成链继续使用即梦生成 CLI；Canvas 图片生成桥尚未接入。官方 Codex SDK 薄桥和检查可用，真实 SDK 执行保持关闭。
 
-M3 只增加有界启动记录和单次诊断运行器，不推断或修复尚未定位的 Mac SIGABRT；[诊断范围与精确本地命令](docs/NATIVE_STARTUP_DIAGNOSTICS.md)。
+来源、19 个 Windows 后续提交、冲突处理及本轮实际验收见 [Windows/Mac 集成记录](docs/handoff/WINDOWS_MAC_INTEGRATION_20261008.md)。第三阶段合同见 [兼容适配说明](docs/handoff/STAGE3_COMPATIBLE_RUST_ADAPTER_20261008.md)。历史 Mac 测试记录保留原日期，不冒充本轮 Windows 结果。
 
-M5 增加独立的 Mac 开发构建签名命令：对新产物做 ad-hoc 签名、资源封装验证，并保留扩展属性；[构建与原生复验步骤](docs/MACOS_DEVELOPMENT_BUNDLE.md)。云端合成测试通过不等于 Mac 签名或启动已经通过，原 SIGABRT 原因仍待核验。
+## Windows 构建与启动
 
-M5.1 将扩展属性检查改为逐路径、名称和原始字节哈希比较，失败时保留脱敏证据；[证据与严格门禁](docs/MACOS_XATTR_EVIDENCE.md)。旧 M5 的签名前快照未保存，不能倒推原失败原因；新签名文件若带 provenance 等属性仍停下核验。
+需要 Rust MSVC 工具链、Node.js、npm 和 WebView2。首次在 `apps/desktop` 与 `sdk-bridge` 分别执行 `npm ci`。
 
-M6 在保留 M5.1 门禁的基础上增加独立的[即梦 Canvas 只读检查](docs/CANVAS_READINESS.md)：可选择程序，检查协议、账户和图片模型目录；与旧版即梦入口分开。额度与免费资格保持未知，尚未接入 Canvas 生成或执行真实图片任务；Mac/Windows 实际按钮与正式 CLI 兼容性待原生验收。
+```powershell
+cd apps/desktop
+npm run desktop:update -- -BuildOnly
+```
 
-M6.1 仅补充[新签名节点元数据的有界验收](docs/MACOS_XATTR_EVIDENCE.md)：两个精确新节点的 provenance 必须匹配本次签名前两个目录锚点，已有属性不变，并通过严格签名、资源和最终复查。它不改系统属性或设置，也不宣称继承关系、Gatekeeper 信任或原生启动已经通过。
+构建脚本输出候选 EXE 路径。验证后以同一脚本发布：
 
-M6.2 补充 [Canvas 标准错误流诊断](docs/CANVAS_FAILURE_DIAGNOSTICS.md)：识别已核验的授权范围不足与模型访问被拒绝，保留脱敏退出信息。它不自动登录、重试或更改网络配置；修复后的原生提示仍需同版本复验。
+```powershell
+npm run desktop:update -- -PublishOnly -CandidatePath <已验证候选EXE绝对路径>
+npm run desktop:launch
+```
 
-M6.3 增加折叠的 [Canvas 进程阶段诊断](docs/CANVAS_PROCESS_PHASES.md)，让超时失败仍保留启动、退出、输出管道与清理的观察结果。原超时和清理规则保持；实际 Mac 原因仍待一次同版本 GUI 检查确认。
+固定入口为 `apps/desktop/.local/client/director-desktop-next.exe`，只保留上一轮 `director-desktop-next-previous.exe`；SDK 资源按 EXE 哈希配对。发布目录与 Cargo 构建目录分开，BuildOnly 不触动当前版；程序在使用中会拒绝替换。正式构建内嵌界面，不依赖 localhost 开发服务。
 
-三项检查按安装、协议、账户、模型目录和真实生成分层展示，检查不提交模型请求；[连接检查合同与本地验收](docs/READINESS_CONTRACT.md)、[真正官方 SDK 的健康检查与打包](docs/SDK_READINESS.md)。
+新工程使用独立 `app.director.next` 数据目录，不自动改动旧工作台项目、账号文件或数据库。已有项目可通过项目包显式导入；导入后的项目是独立副本。旧项目目录保持原样。
 
-## 实施入口
+## 验证入口
 
-1. [完整任务书](docs/IMPLEMENTATION.md)：源码证据、实现顺序、第二阶段美术拟稿与完整验收
-2. [决定与真实阻塞](docs/DECISIONS.md)
-3. [来源索引](docs/SOURCE_INDEX.json)：固定提交与逐文件摘要
-4. [验收入口](docs/ACCEPTANCE.md)
-5. [云端实现进度与运行检查](docs/IMPLEMENTATION_PROGRESS.md)
-6. [官方 SDK 桥接状态与边界](docs/SDK_BRIDGE.md)
-7. [SDK 共享核心接线](docs/SDK_CORE_INTEGRATION.md)与[有界原生验收](docs/NATIVE_ACCEPTANCE.md)
-8. [规则版本与来源](reference-skills/README.md)：桌面初版29份、旧MacGit21份、实际Mac生产22份，原件及大小/SHA/运行角色分别保存
-9. [候选创作包](rules/stage3/manifest.json)：10份原版skill＋12份支持文件，逐字节保存，inactive；实际采用来源已核对，完整运行适配仍待单独授权的源码传递
-10. [Windows合并与本机修改过程](docs/handoff/LOCAL_STANDARD_EDITION.md)：已提交历史、本机修改、当前真实缺口、独立Git历史分支和平台复验步骤
+```powershell
+# 仓库根目录
+node scripts/verify-integration-lineage.mjs
+cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --tests
+# apps/desktop
+npm run test:frontend
+npm run build
+# sdk-bridge
+npm run verify
+```
 
-整合版 SKILL 和失败试验不作为生产基线。执行前先读 AGENTS.md 与完整任务书。当前继续完整运行适配和原生验收，不重复索取整体项目授权。
+Windows 文件/进程行为测试应从普通未打包终端执行；从 MSIX 宿主启动时使用 `scripts/windows_native_test_runner.rs` 对应的隔离运行器，检查其原生 receipt，不把宿主退出码当成测试结果。
+
+候选 EXE 的 `--verify-startup <绝对报告路径>` 使用独立离线项目，验证真实 WebView、IPC、原文、资产和项目生命周期。第二次在同一报告父目录运行会核对保存后重开。诊断模式不调用账户、模型或生成视频。
+
+## 保留资料与验收边界
+
+- [完整 Windows 合并指南](docs/handoff/WINDOWS_MERGE_GUIDE_20261008.md)、[独立历史交接](docs/handoff/WINDOWS_INTEGRATION_HISTORY.md)
+- [Mac 本机改动](docs/handoff/LOCAL_STANDARD_EDITION.md)、[Mac 原始验收回执](docs/handoff/LOCAL_NATIVE_RECEIPT.json)
+- [规则来源](reference-skills/README.md)：72 份参考快照；独立历史分支 65 份文件是另一口径。运行器只加载显式注册项。
+- [SDK 合同](docs/SDK_CORE_INTEGRATION.md)、[只读检查](docs/READINESS_CONTRACT.md)、[Canvas 诊断](docs/CANVAS_FAILURE_DIAGNOSTICS.md)
+- [Mac 签名及扩展属性验证](docs/MACOS_DEVELOPMENT_BUNDLE.md)
+
+本轮不提交真实视频、不执行 SDK live、不上传私有剧本、请求回包或凭据。Windows 合成与原生启动验收不替代真实文本质量、免费图片资格或 Mac 原生验收；具体通过项与缺口以本轮集成记录为准。

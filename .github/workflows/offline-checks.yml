@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -22,8 +24,12 @@ jobs:
             sdk-bridge/package-lock.json
       - name: Install Rust stable
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Verify inactive candidate bytes and fixture hygiene
+      - name: Verify frozen creative pack and fixture hygiene
         run: python scripts/verify_source_lock.py
+      - name: Test source-lock tamper rejection
+        run: node --test scripts/test_source_lock.mjs
+      - name: Verify Windows and Mac integration lineage
+        run: node scripts/verify-integration-lineage.mjs
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci

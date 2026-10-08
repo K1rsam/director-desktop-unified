@@ -156,6 +156,14 @@ fn request() -> TextRequest {
         rule_snapshot: json!({"id":"story-foundation","version":"1.1.0","content":"offline fixture rule"}),
     }
 }
+fn standalone_design_request() -> TextRequest {
+    let mut value = request();
+    value.stage = "assetDesign".into();
+    value.skill = "asset-art-director".into();
+    value.input = json!({"asset":{"id":"standalone-offline-asset","variantId":"base"},"sourceSha256":"a".repeat(64)});
+    value.rule_snapshot = json!({"primary":director_core::pipeline::rule_snapshot("asset-art-director").unwrap(),"methods":[]});
+    value
+}
 fn workflow(store: &Store) -> String {
     store
         .add_job(
@@ -189,6 +197,138 @@ fn step_state(store: &Store, run: &str) -> String {
             |row| row.get(0),
         )
         .unwrap()
+}
+
+#[tokio::test]
+async fn standalone_design_without_current_frozen_native_identity_never_dispatches() {
+    let fixture = Fixture::new().await;
+    let store = fixture.store();
+    let request = standalone_design_request();
+    for recorded_version in [None, Some("codex-cli stale-offline-version")] {
+        let mut executor = fixture.executor(&store, None);
+        if let Some(version) = recorded_version {
+            executor.settings["textCliVersion"] = json!(version);
+        } else {
+            executor
+                .settings
+                .as_object_mut()
+                .unwrap()
+                .remove("textCliVersion");
+        }
+        let error = executor.execute(request.clone()).await.unwrap_err();
+        assert!(
+            error.contains("CODEX_UNMANAGED_IDENTITY_CHANGED"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture.calls(),
+            0,
+            "readiness cannot upgrade an unfrozen standalone request into generation"
+        );
+        assert!(
+            text_jobs(&store).is_empty(),
+            "no attempt is allocated before identity is frozen"
+        );
+    }
+}
+
+#[tokio::test]
+async fn frozen_standalone_design_reopens_received_and_accepted_raw_without_extra_dispatch() {
+    let fixture = Fixture::new().await;
+    let store = fixture.store();
+    let executor = fixture.executor(&store, None);
+    let request = standalone_design_request();
+    let raw = executor.execute(request.clone()).await.unwrap();
+    assert_eq!(fixture.calls(), 1);
+    let job = text_jobs(&store)[0]["id"].as_str().unwrap().to_owned();
+    let frozen = store.job(&job).unwrap()["snapshot"].clone();
+    assert_eq!(
+        frozen["executorIdentity"]["version"],
+        fixture.settings["textCliVersion"]
+    );
+    assert_eq!(
+        frozen["executorIdentity"]["executable"],
+        fixture.settings["textCliExecutable"]
+    );
+    let original_event: String = store.conn().unwrap().query_row("SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1", [&job], |row| row.get(0)).unwrap();
+    let original_file =
+        std::fs::read(store.root.join("text-runs").join(&job).join("result.json")).unwrap();
+    let root = store.root.clone();
+    drop(executor);
+    drop(store);
+    let reopened = Store::open(root).unwrap();
+    let resumed = fixture.executor(&reopened, None);
+    assert_eq!(resumed.execute(request.clone()).await.unwrap(), raw);
+    let normalized = json!({"schemaVersion":"fixture/v1","draft":"trusted offline materialized design","validated":true});
+    resumed.accept(&request, &normalized).await.unwrap();
+    let accepted = text_jobs(&reopened);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0]["result"], normalized);
+    assert_eq!(
+        resumed.execute(request.clone()).await.unwrap(),
+        raw,
+        "standalone validation reuses original raw rather than the normalized cache value"
+    );
+    resumed.accept(&request, &normalized).await.unwrap();
+    assert_eq!(text_jobs(&reopened), accepted);
+    assert_eq!(fixture.calls(), 1);
+    assert_eq!(reopened.job(&job).unwrap()["snapshot"], frozen);
+    let event: String = reopened.conn().unwrap().query_row("SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1", [&job], |row| row.get(0)).unwrap();
+    assert_eq!(event, original_event);
+    assert_eq!(
+        std::fs::read(
+            reopened
+                .root
+                .join("text-runs")
+                .join(&job)
+                .join("result.json")
+        )
+        .unwrap(),
+        original_file
+    );
+}
+
+#[tokio::test]
+async fn changed_standalone_identity_or_unknown_attempt_preserves_old_request_and_holds_dispatch() {
+    let fixture = Fixture::new().await;
+    let store = fixture.store();
+    let executor = fixture.executor(&store, None);
+    let request = standalone_design_request();
+    executor.execute(request.clone()).await.unwrap();
+    let job = text_jobs(&store)[0]["id"].as_str().unwrap().to_owned();
+    let frozen = store.job(&job).unwrap();
+    let mut drift = fixture.executor(&store, None);
+    drift.settings["textCliVersion"] = json!("codex-cli changed-offline-version");
+    let error = drift.execute(request.clone()).await.unwrap_err();
+    assert!(
+        error.contains("CODEX_STANDALONE_ATTEMPT_UNRESOLVED"),
+        "{error}"
+    );
+    assert_eq!(
+        store.job(&job).unwrap(),
+        frozen,
+        "identity drift leaves the existing attempt intact"
+    );
+    store
+        .update_job(
+            &job,
+            "submission_unknown",
+            &json!({"error":"synthetic unresolved carrier"}),
+        )
+        .unwrap();
+    let unknown = store.job(&job).unwrap();
+    let error = executor.execute(request).await.unwrap_err();
+    assert!(
+        error.contains("CODEX_STANDALONE_ATTEMPT_UNRESOLVED"),
+        "{error}"
+    );
+    assert_eq!(store.job(&job).unwrap(), unknown);
+    assert_eq!(text_jobs(&store).len(), 1);
+    assert_eq!(
+        fixture.calls(),
+        1,
+        "neither changed identity nor unknown submission authorizes another request"
+    );
 }
 
 #[tokio::test]

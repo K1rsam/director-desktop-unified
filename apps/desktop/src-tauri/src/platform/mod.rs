@@ -8,6 +8,70 @@ pub const APPLICATION_ID: &str = "app.director.next";
 pub const CREDENTIAL_SERVICE: &str = "director-desktop-next";
 pub const HOME_MARKER: &str = "director-next-home.json";
 
+/// A portable Windows EXE and its retained predecessor each use resources
+/// bound to their own bytes. Tauri bundles keep their ordinary resource root.
+pub fn native_resource_root(bundled: PathBuf) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+        return client_resource_root(&bundled, &executable);
+    }
+    #[cfg(not(windows))]
+    Ok(bundled)
+}
+
+#[cfg(windows)]
+fn client_resource_root(bundled: &Path, executable: &Path) -> Result<PathBuf, String> {
+    let (sha256, _) = crate::store::hash_file(executable)?;
+    let directory = executable.parent().ok_or("客户端程序没有父目录")?;
+    let mut roots = vec![directory.to_path_buf()];
+    // Cargo's internal candidate executable lives in release/deps.
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        if let Some(parent) = directory.parent() { roots.push(parent.to_path_buf()); }
+    }
+    for root in roots {
+        let resources = root.join(".client-resources").join(&sha256);
+        if !resources.join("sdk-readiness/manifest.json").is_file() { continue; }
+        let physical_root = root.canonicalize().map_err(|e| e.to_string())?;
+        let physical_resources = resources.canonicalize().map_err(|e| e.to_string())?;
+        if !physical_resources.starts_with(physical_root.join(".client-resources")) {
+            return Err("客户端SDK资源越出已验证的发布目录".into());
+        }
+        return Ok(physical_resources);
+    }
+    Ok(bundled.to_path_buf())
+}
+
+#[cfg(all(test, windows))]
+mod client_resource_tests {
+    use super::*;
+    #[test]
+    fn retained_executables_select_only_their_own_resource_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("中文 目录/release");
+        fs::create_dir_all(release.join("deps")).unwrap();
+        let current = release.join("director-desktop-next.exe");
+        let previous = release.join("director-desktop-next-previous.exe");
+        let candidate = release.join("deps/director_desktop_next-candidate.exe");
+        fs::write(&current, b"current synthetic executable").unwrap();
+        fs::write(&previous, b"previous synthetic executable").unwrap();
+        fs::write(&candidate, b"current synthetic executable").unwrap();
+        let mut expected = vec![];
+        for executable in [&current, &previous] {
+            let (hash, _) = crate::store::hash_file(executable).unwrap();
+            let root = release.join(".client-resources").join(hash);
+            fs::create_dir_all(root.join("sdk-readiness")).unwrap();
+            fs::write(root.join("sdk-readiness/manifest.json"), b"{}").unwrap();
+            expected.push(root.canonicalize().unwrap());
+        }
+        assert_eq!(client_resource_root(&release, &current).unwrap(), expected[0]);
+        assert_eq!(client_resource_root(&release, &previous).unwrap(), expected[1]);
+        assert_eq!(client_resource_root(&release, &candidate).unwrap(), expected[0]);
+        fs::write(&current, b"changed executable").unwrap();
+        assert_eq!(client_resource_root(&release, &current).unwrap(), release);
+    }
+}
+
 /// Never adopt an older app's registry merely because a caller passes its directory.
 pub fn ensure_isolated_home(home: &Path) -> Result<(), String> {
     fs::create_dir_all(home).map_err(|e| e.to_string())?;

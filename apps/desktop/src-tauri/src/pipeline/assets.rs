@@ -8,6 +8,37 @@ use std::{
 
 const ASSET_DESIGN_CONCURRENCY: usize = 4;
 
+/// A program scope marker locates text; it is not the text itself. If A15 found
+/// no appearance facts, give C/D the exact named scene instead of only its title.
+/// Existing fact-backed requests stay byte-for-byte stable for recovery.
+fn empty_design_scene_context<'a>(
+    source: &'a LockedSource,
+    asset: &Value,
+    facts: &[Value],
+    evidence_ids: &HashSet<&str>,
+) -> Vec<&'a SourceRow> {
+    if !facts.is_empty()
+        || !has_program_source_scope(asset)
+        || source
+            .rows
+            .iter()
+            .any(|row| evidence_ids.contains(row.id.as_str()) && row.kind != "format")
+    {
+        return Vec::new();
+    }
+    let scenes: HashSet<_> = source
+        .rows
+        .iter()
+        .filter(|row| evidence_ids.contains(row.id.as_str()))
+        .filter_map(|row| row.scene_id.as_deref())
+        .collect();
+    source
+        .rows
+        .iter()
+        .filter(|row| row.scene_id.as_deref().is_some_and(|id| scenes.contains(id)))
+        .collect()
+}
+
 fn inline_asset(asset: &Value) -> bool {
     asset.pointer("/preparation/mode").and_then(Value::as_str) == Some("INLINE")
 }
@@ -96,6 +127,14 @@ fn direct_asset_dependency(assets: &[Value], asset: &Value) -> Result<Option<Str
     if let Some(parent) = parent {
         let id = resolve_reference(assets, asset, parent)?;
         return dependency_asset(assets, &id).map(|a| Some(text(a, "id").to_owned()));
+    }
+
+    // An explicit null in a current catalogue declares an independent form.
+    // Only legacy rows that omitted it may inherit the registered base.
+    if asset.get("sourceVariantId") == Some(&Value::Null)
+        && asset.pointer("/preparation/mode").and_then(Value::as_str) == Some("REFERENCE")
+    {
+        return Ok(None);
     }
 
     let identity = explicit_asset_identity(asset);
@@ -420,6 +459,12 @@ pub(super) fn automatic_design_stale(input: &Value, asset: &Value) -> bool {
                 .flatten()
                 .filter_map(Value::as_str),
         );
+    }
+    let scope_source = serde_json::from_value::<LockedSource>(input["source"].clone()).ok();
+    if let Some(source) = &scope_source {
+        for row in empty_design_scene_context(source, asset, &facts, &evidence) {
+            evidence.insert(row.id.as_str());
+        }
     }
     reusable_parent_design(
         input,
@@ -751,6 +796,10 @@ pub async fn run_asset_design(
                     }
                 }
             }
+            let scope_context = empty_design_scene_context(&source, asset, &facts, &evidence_ids);
+            for row in &scope_context {
+                evidence_ids.insert(row.id.as_str());
+            }
             if automatic || !explicitly_selected.contains(&id) {
                 let parent_redesigned = reference_parent.as_deref().is_some_and(|parent| {
                     designs
@@ -802,6 +851,9 @@ pub async fn run_asset_design(
             design_input["projectVisualStyle"] = json!(super::asset_design_contract::project_visual_style(&input["settings"]));
             design_input["imagePresentation"] = super::asset_design_contract::image_presentation(&input["settings"], asset);
             design_input["comparisonDesigns"] = json!(comparison_designs);
+            if !scope_context.is_empty() {
+                design_input["sourceScopeContext"] = json!({"version":"asset-scene-context/v1","instruction":"evidence包含SOURCE_SCOPE标记所定位场次的锁定原文，不再只提供场次标题。先在原文中确认当前主体及其物种/空间/物件身份；空facts仅表示尚无已登记外观约束，不表示原文没有该主体。仍按原C/D岗位区分原文依据与普通非剧情美术补足，补足写入freeDesignScope；不得把同场其它主体或后期状态移植给当前形象，也不得把整场原文标成该资产的外观事实。"});
+            }
             let frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
             if reference_parent.as_deref() != parent {
                 design_input["inlineReference"] = json!({"directAssetId":parent,"reusedDesignAssetId":reference_parent,"instruction":"直接来源为INLINE覆盖态，parentDesign复用其明确来源形象；referenceVariantIds仍按指定直接来源id输出，不新增独立INLINE图片。"});
@@ -842,6 +894,9 @@ pub async fn run_asset_design(
                     }
                     if fact_ids.contains(id) {
                         uses.push("VISUAL_FACT_REFERENCE");
+                    }
+                    if scope_context.iter().any(|row| row.id == id) {
+                        uses.push("SOURCE_CONTEXT");
                     }
                     row["evidenceUses"] = json!(uses);
                 }
@@ -986,6 +1041,20 @@ pub async fn run_asset_design(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scene_context_only_extends_empty_program_scope_packets() {
+        let source = prepare_source("第一集\n场景：湖边\n△一条变异鲟鱼游过。\n第二集\n场景：屋内\n△小王穿着红衣。\n").unwrap();
+        let marker = source.rows.iter().find(|row| row.kind == "format" && row.scene_id.is_some()).unwrap();
+        let body = source.rows.iter().find(|row| row.text.contains("鲟鱼")).unwrap();
+        let asset = json!({"sourceRefsPurpose":"SOURCE_SCOPE","sourceScope":{"kind":"PROGRAM_SCOPE","sourceSha256":source.sha256}});
+        let marker_only = HashSet::from([marker.id.as_str()]);
+        let rows = empty_design_scene_context(&source, &asset, &[], &marker_only);
+        assert!(rows.iter().any(|row| row.id == body.id));
+        assert!(rows.iter().all(|row| row.scene_id == marker.scene_id));
+        assert!(empty_design_scene_context(&source, &asset, &[json!({"value":"已登记事实"})], &marker_only).is_empty(), "fact-backed original requests must not gain new evidence");
+        assert!(empty_design_scene_context(&source, &asset, &[], &HashSet::from([body.id.as_str()])).is_empty(), "a packet already carrying locked body text remains unchanged");
+        assert!(empty_design_scene_context(&source, &json!({}), &[], &marker_only).is_empty(), "ordinary references never expand implicitly");
+    }
     fn empty_visual(request: &TextRequest) -> Value {
         json!({"schemaVersion":"asset-visual-facts-wire/v1","coveredPacketRef":request.input["coveredPacketRef"],"facts":[],"issues":[]})
     }
@@ -1299,6 +1368,19 @@ mod tests {
             .unwrap(),
             Some("李:base".into())
         );
+    }
+
+    #[test]
+    fn explicitly_parentless_reference_is_not_rebased_to_a_later_registered_form() {
+        let assets = vec![
+            json!({"id":"later","baseAssetId":"subject","variantId":"subject:base","isBase":true}),
+            json!({"id":"initial","baseAssetId":"subject","variantId":"subject_V_initial","sourceVariantId":null,"preparation":{"mode":"REFERENCE"}}),
+            json!({"id":"next","baseAssetId":"subject","variantId":"next","sourceVariantId":"subject_V_initial","preparation":{"mode":"DERIVE"}}),
+        ];
+        assert_eq!(resolve_asset_dependency(&assets, &assets[1]).unwrap(), None);
+        assert_eq!(resolve_asset_dependency(&assets, &assets[2]).unwrap(), Some("initial".into()));
+        let legacy = json!({"id":"legacy","baseAssetId":"subject","variantId":"subject_V_legacy","preparation":{"mode":"REFERENCE"}});
+        assert_eq!(resolve_asset_dependency(&assets, &legacy).unwrap(), Some("later".into()));
     }
 
     #[test]

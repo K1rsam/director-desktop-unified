@@ -4,6 +4,7 @@ export type AssetEditValues = {
   name: string;
   kind: string;
   sourceAssetId: string;
+  sourceError?: { value: string; message: string };
   episodeIds: string[];
   sceneIds: string[];
   sourceRefs: SourceRef[];
@@ -21,7 +22,29 @@ export type AssetUsage = {
   imageCount: number;
 };
 
-export function initialAssetEdit(asset: Asset): AssetEditValues {
+function directParentEdit(asset: Asset, assets?: Asset[]): Pick<AssetEditValues, 'sourceAssetId' | 'sourceError'> {
+  const explicit = typeof asset.sourceAssetId === 'string' ? asset.sourceAssetId : '';
+  const variant = typeof asset.sourceVariantId === 'string' ? asset.sourceVariantId : '';
+  const reference = explicit || variant;
+  if (!reference) return { sourceAssetId: '' };
+  const problem = (message: string) => ({ sourceAssetId: reference, sourceError: { value: reference, message } });
+  if (!assets) return explicit ? { sourceAssetId: explicit } : problem('尚未载入直接父形象目录，原来源关系已保留，请重新选择。');
+  const exact = assets.filter(candidate => candidate.id === reference);
+  let matches = exact;
+  if (!explicit && !exact.length) {
+    const variants = assets.filter(candidate => candidate.variantId === variant);
+    const sameSubject = variants.filter(candidate => !!asset.baseAssetId && candidate.baseAssetId === asset.baseAssetId);
+    matches = sameSubject.length ? sameSubject : variants;
+  }
+  if (!matches.length) return problem('原直接父形象已删除或无法定位，请重新选择；原来源关系已保留。');
+  if (matches.length > 1) return problem('原直接父形象有多个匹配，请明确选择具体形象；原来源关系已保留。');
+  const parent = matches[0];
+  if (parent.deletedAt) return problem('原直接父形象已删除，请恢复或重新选择；原来源关系已保留。');
+  if (parent.id === asset.id) return problem('直接父形象不能是当前形象，请重新选择；原来源关系已保留。');
+  return { sourceAssetId: parent.id };
+}
+
+export function initialAssetEdit(asset: Asset, assets?: Asset[]): AssetEditValues {
   const storedScope = asset.scope && typeof asset.scope === 'object' ? asset.scope as { kind?: string; scenes?: { episodeId?: string; sceneId?: string }[] } : undefined;
   const places = storedScope?.kind === 'SCENES' && Array.isArray(storedScope.scenes) ? storedScope.scenes : [];
   const episodes = asset.applicability?.episodes || asset.applicability?.episodeIds || [];
@@ -29,11 +52,25 @@ export function initialAssetEdit(asset: Asset): AssetEditValues {
   return {
     name: asset.name,
     kind: asset.kind || asset.type || 'character',
-    sourceAssetId: String(asset.sourceAssetId || ''),
+    ...directParentEdit(asset, assets),
     episodeIds: [...new Set(episodes.length ? episodes : places.map(place => place.episodeId).filter((id): id is string => !!id))],
     sceneIds: [...new Set(scenes.length ? scenes : places.map(place => place.sceneId).filter((id): id is string => !!id))],
     sourceRefs: [...(asset.sourceRefs || [])],
   };
+}
+
+/** Library filtering narrows the visible list; Rust still validates bindings. */
+export function assetMatchesEpisode(asset: Asset, episodeId: string, source?: Source | null): boolean {
+  if (episodeId === 'all') return true;
+  if (!source?.episodes?.some(episode => episode.id === episodeId)) return false;
+  const episodes = asset.applicability?.episodes || asset.applicability?.episodeIds || [];
+  const sceneIds = asset.applicability?.scenes || asset.applicability?.sceneIds || [];
+  if (episodes.length && !episodes.includes(episodeId)) return false;
+  if (sceneIds.length && !source.scenes?.some(scene => scene.episodeId === episodeId && sceneIds.includes(scene.id))) return false;
+  const scope = asset.scope && typeof asset.scope === 'object' ? asset.scope as { kind?: string; scenes?: { episodeId?: string; sceneId?: string }[] } : undefined;
+  if (scope?.kind === 'UNRESOLVED') return false;
+  if (scope?.kind === 'SCENES') return !!scope.scenes?.some(place => place.episodeId === episodeId && source.scenes?.some(scene => scene.id === place.sceneId && scene.episodeId === episodeId));
+  return true;
 }
 
 /** Editing labels and scope must never change the permanent binding identity. */
@@ -51,6 +88,7 @@ export function assetScopeProblems(values: AssetEditValues, scenes: Source['scen
 }
 
 export function assetEditPayload(asset: Asset, values: AssetEditValues, assets: Asset[], scenes: Source['scenes'] = []): Asset {
+  if (values.sourceAssetId && values.sourceError?.value === values.sourceAssetId) throw new Error(values.sourceError.message);
   const problems = assetScopeProblems(values, scenes);
   if (problems.length) throw new Error(problems.join(' '));
   const global = !values.episodeIds.length && !values.sceneIds.length;

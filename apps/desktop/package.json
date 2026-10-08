@@ -13,7 +13,9 @@
     "desktop:dev": "tauri dev --features desktop",
     "desktop:build": "tauri build --features desktop,custom-protocol",
     "desktop:build:mac-dev": "node ../../scripts/build_macos_dev.mjs",
-    "check": "npm run typecheck && npm run build"
+    "check": "npm run typecheck && npm run build",
+    "desktop:update": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/update-client.ps1",
+    "desktop:launch": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch-client.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.1",

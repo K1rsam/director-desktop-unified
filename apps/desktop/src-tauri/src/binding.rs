@@ -40,6 +40,9 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
             json!({"code":"MISSING_SOURCE","message":"请先导入源文档，为单元保存明确来源版本"}),
         );
     } else {
+        if unit["sourceVersion"].as_i64().is_some_and(|version|Some(version)!=source["version"].as_i64()) {
+            problems.push(json!({"code":"SOURCE_VERSION_MISMATCH","message":"单元仍绑定旧原文版本，须通过当前原文完整校验后重新准备。"}));
+        }
         let episode = s(unit, "episodeId");
         let scene = s(unit, "sceneId");
         if !source["episodes"]

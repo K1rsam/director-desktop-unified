@@ -1240,11 +1240,18 @@ fn account_snapshot(body: &Value) -> Value {
             })
             .filter(|x| x.is_finite() && *x >= 0.)
     };
+    // The official CLI returns this explicit anonymous account envelope after
+    // logout. An absent ID alone remains unknown; a real account with zero
+    // credits is still authenticated.
+    let logged_out = identity.is_none()
+        && matches!(data.get("user_id"), Some(Value::Number(id)) if id.as_u64() == Some(0))
+        && data.get("user_name").and_then(Value::as_str) == Some("")
+        && credit(data.get("total_credit")) == Some(0.);
     let mut result = json!({
-        "status":if identity.is_some(){"authenticated"}else{"unknown"},
+        "status":if identity.is_some(){"authenticated"}else if logged_out{"logged_out"}else{"unknown"},
         "ready":identity.is_some(),
         "identityVerified":identity.is_some(),
-        "message":if identity.is_some(){"即梦已登录，账户身份与积分已核对。"}else{"CLI 返回了积分信息，但没有可验证的账户身份；暂不能提交或恢复生成。"},
+        "message":if identity.is_some(){"即梦已登录，账户身份与积分已核对。"}else if logged_out{"即梦 CLI 尚未登录或授权已失效；请到渠道与设置完成官方 OAuth 登录，队列已暂停。"}else{"CLI 返回了积分信息，但没有可验证的账户身份；暂不能提交或恢复生成。"},
         "checkedAt":now(),
         "credits":{"total":credit(data.get("total_credit")),"member":credit(data.get("vip_credit")),"gift":credit(data.get("gift_credit")),"purchase":credit(data.get("purchase_credit"))}
     });
@@ -1335,7 +1342,7 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
     })();
     match account_result {
         Ok(account)=>{
-            result["authentication"]=json!({"state":if account["identityVerified"]==true{"authenticated"}else{"unknown"},"identityVerified":account["identityVerified"]==true});
+            result["authentication"]=json!({"state":if account["identityVerified"]==true{"authenticated"}else if account["status"]=="logged_out"{"not_logged_in"}else{"unknown"},"identityVerified":account["identityVerified"]==true});
             result["details"]["credits"]=account["credits"].clone();
             result["details"]["accountQueryCompleted"]=json!(true);
             messages.push("user_credit 已返回；未进行独立网络探测或真实模型请求。".into());
@@ -1414,18 +1421,22 @@ fn login_material(body: &Value) -> ProviderResult<Value> {
 }
 
 pub(super) fn begin_login(config: &ProviderConfig) -> ProviderResult<Value> {
-    match account(config) {
-        Ok(value) if value.get("ready").and_then(Value::as_bool) == Some(true) => return Ok(value),
-        Ok(_) => {
-            return Err(ProviderError::new(
-                "CLI_AUTH_IDENTITY",
-                "现有登录缺少可验证身份；请先刷新或由用户明确退出后重新登录。",
-            ))
-        }
-        Err(error) if error.auth_required => {}
-        Err(error) => return Err(error),
-    }
-    let output = execute(config, &["login".into(), "--headless".into()], false)?;
+    begin_login_with(
+        || account(config),
+        |fresh| execute(config, &[if fresh { "relogin" } else { "login" }.into(), "--headless".into()], false),
+    )
+}
+
+fn begin_login_with(
+    mut read_account: impl FnMut() -> ProviderResult<Value>,
+    mut start_login: impl FnMut(bool) -> ProviderResult<CliOutput>,
+) -> ProviderResult<Value> {
+    // This entry point is reached only by an explicit OAuth button click.
+    // Like SHUO's relogin action, request a fresh official challenge directly:
+    // a failed user_credit probe or a stale locally-valid token must not block
+    // the very action the user needs to repair their connection. Startup and
+    // queue polling use account(), never this credential-changing command.
+    let output = start_login(true)?;
     if !output.success {
         return Err(output_error(&output, false));
     }
@@ -1434,7 +1445,14 @@ pub(super) fn begin_login(config: &ProviderConfig) -> ProviderResult<Value> {
         && task_object(&body).get("deviceCode").is_none()
     {
         // Login can reuse an existing session; only user_credit proves which account it is.
-        return account(config);
+        let account = read_account()?;
+        if account["ready"] == true && account["identityVerified"] == true {
+            return Ok(account);
+        }
+        return Err(ProviderError::new(
+            "CLI_AUTH_CHALLENGE_MISSING",
+            "即梦 CLI 未返回有效授权链接，请点击 OAuth 登录重试。",
+        ));
     }
     login_material(&body)
 }
@@ -1490,7 +1508,8 @@ pub(super) fn check_login(config: &ProviderConfig, device_code: &str) -> Provide
             "login".into(),
             "checklogin".into(),
             format!("--device_code={device_code}"),
-            "--poll=0".into(),
+            // Return control to the desktop between bounded authorization checks.
+            "--poll=1".into(),
         ],
         false,
     )?;
@@ -4449,6 +4468,69 @@ mod tests {
             assert_eq!(snapshot["identityVerified"], false);
             assert!(snapshot.get("accountKey").is_none());
         }
+    }
+    #[test]
+    fn official_anonymous_account_is_logged_out_without_mistaking_zero_credit_accounts() {
+        let anonymous = account_snapshot(&json!({"data":{"user_id":0,"user_name":"","total_credit":0,"vip_level":""}}));
+        assert_eq!(anonymous["status"], "logged_out");
+        assert_eq!(anonymous["ready"], false);
+        assert!(anonymous.get("accountKey").is_none());
+        let real = account_snapshot(&json!({"user_id":123,"user_name":"","total_credit":0}));
+        assert_eq!(real["status"], "authenticated");
+        assert_eq!(real["ready"], true);
+        assert_eq!(account_snapshot(&json!({"total_credit":0}))["status"], "unknown");
+    }
+    #[test]
+    fn explicit_anonymous_login_requests_fresh_oauth_without_generation() {
+        let mut account_reads = 0;
+        let mut login_starts = 0;
+        let result = begin_login_with(
+            || {
+                account_reads += 1;
+                Ok(account_snapshot(&json!({"user_id":0,"user_name":"","total_credit":0})))
+            },
+            |fresh| {
+                assert!(fresh, "anonymous account must not reuse a stale local token");
+                login_starts += 1;
+                Ok(auth_output(true, json!({"device_code":"memory-only","verification_uri":"https://example.test/oauth","user_code":"ABCD","expires_in":600,"access_token":"must-not-escape"}), ""))
+            },
+        ).unwrap();
+        assert_eq!(account_reads, 0);
+        assert_eq!(login_starts, 1);
+        assert_eq!(result["device_code"], "memory-only");
+        assert_eq!(result["verification_uri"], "https://example.test/oauth");
+        assert!(!result.to_string().contains("must-not-escape"));
+    }
+    #[test]
+    fn explicit_oauth_is_independent_of_stale_or_unreachable_account_status() {
+        let result = begin_login_with(
+            || panic!("explicit OAuth must not depend on an account preflight"),
+            |fresh| {
+                assert!(fresh);
+                Ok(auth_output(true, json!({"device_code":"new-challenge","verification_uri":"https://jimeng.jianying.com/ai-tool/cli-auth"}), ""))
+            },
+        ).unwrap();
+        assert_eq!(result["device_code"], "new-challenge");
+    }
+    #[test]
+    fn login_without_challenge_rechecks_identity_instead_of_trusting_exit_success() {
+        let mut reads = 0;
+        let result = begin_login_with(
+            || {
+                reads += 1;
+                Ok(account_snapshot(&json!({"user_id":123,"total_credit":10})))
+            },
+            |_| Ok(auth_output(true, json!({"access_token":"must-not-escape"}), "")),
+        ).unwrap();
+        assert_eq!(reads, 1);
+        assert_eq!(result["ready"], true);
+        assert_eq!(result["credits"]["total"], 10.);
+        assert!(!result.to_string().contains("must-not-escape"));
+        let error = begin_login_with(
+            || Ok(account_snapshot(&json!({"user_id":0,"total_credit":0}))),
+            |_| Ok(auth_output(true, json!({}), "cached token reused")),
+        ).unwrap_err();
+        assert_eq!(error.code, "CLI_AUTH_CHALLENGE_MISSING");
     }
     #[test]
     fn oauth_material_is_strictly_allowlisted() {
