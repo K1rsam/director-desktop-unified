@@ -4,7 +4,7 @@ import { request } from './api';
 import { Button, Empty, formatDate, messageOf, Modal } from './components';
 import { productionDirection, records, sourceEpisodes, sourceEvidence, stageJobs, words } from './stageProduction';
 import { WorkflowProgress } from './WorkflowProgress';
-import type { Mutation, Unit, Workspace } from './types';
+import type { Job, Mutation, Unit, Workspace } from './types';
 import './stage-production.css';
 import { StoryboardRefinement } from './StoryboardRefinement';
 
@@ -16,6 +16,31 @@ export function storyboardEpisodeScope(episodes: { id: string }[], units: { epis
   const allEpisodesView = scope === 'all' || scope === 'empty';
   const selection = (scope === 'empty' ? emptyEpisodes : episodes.filter(item => scope === 'all' || item.id === scope)).map(item => item.id);
   return { emptyEpisodes, allEpisodesView, selection };
+}
+
+/** Summary-only UI hint. The engine verifies full source/range and original
+ * checkpoints before resuming; this hint never authorizes a new generation. */
+export function storyboardStartContinuation(workspace: Workspace, episodeIds: string[]): Job | null {
+  const ids = new Set(episodeIds), version = workspace.source?.version;
+  if (!ids.size || !version) return null;
+  let continuation: Job | null = null, superseded = false;
+  for (const job of workspace.jobs) {
+    const snapshot = job.snapshot && typeof job.snapshot === 'object' ? job.snapshot as Record<string, unknown> : {};
+    const input = snapshot.input && typeof snapshot.input === 'object' ? snapshot.input as Record<string, unknown> : {};
+    if (job.kind !== 'workflow' || job.entityId !== 'storyboard.run' || snapshot.runnerVersion !== 'desktop-runner/v1') continue;
+    const source = input.source && typeof input.source === 'object' ? input.source as Record<string, unknown> : {};
+    if ((source.version ?? snapshot.sourceVersion) !== version || source.sha256 && source.sha256 !== workspace.source?.sha256) continue;
+    const selection = (input.selection ?? snapshot.selection) as { episodeIds?: unknown; unitIds?: unknown } | undefined;
+    const selected = selection?.episodeIds;
+    if (!Array.isArray(selected) || selected.length !== ids.size || new Set(selected).size !== ids.size || selected.some(id => typeof id !== 'string' || !ids.has(id))) continue;
+    if (Array.isArray(selection?.unitIds) && selection.unitIds.length) continue;
+    // Finish scanning even after a newer completion: it cannot settle an older
+    // unknown submission. The backend independently checks uncapped history.
+    if (job.submissionUnknown || job.status === 'submission_unknown') return job;
+    if (['completed', 'cancelled', 'closed_by_user'].includes(job.status)) { superseded = true; continue; }
+    if (!superseded && !continuation && ['queued', 'running', 'failed', 'interrupted', 'waiting_decision', 'partially_blocked', 'blocked'].includes(job.status)) continuation = job;
+  }
+  return continuation;
 }
 
 type Version = { version: number; data: Unit; createdAt?: string };
@@ -41,15 +66,18 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
     return () => { active = false; };
   }, [workspace.project.id, selected?.id, selected?.version]);
   const creating = stageJobs(workspace, 'storyboard').some(job => ['queued', 'running'].includes(job.status));
+  const continuation = storyboardStartContinuation(workspace, selection), unknownContinuation = continuation?.submissionUnknown === true || continuation?.status === 'submission_unknown';
   const blocking = (workspace.source?.diagnostics || []).filter(issue => issue.blocking);
   const sourceRows = unit ? sourceEvidence(workspace, unit.sourceRefs) : [], shots = records(unit?.shots);
   const direction = productionDirection(workspace), title = unit?.title || '分镜单元';
   async function copy() { if (!unit?.prompt) return; try { await navigator.clipboard.writeText(unit.prompt); onNotice?.('完整单元提示词已复制。'); } catch { onError?.('复制失败，请在正文中手动选择。'); } }
   async function run() {
-    if (!writable || creating || startingRef.current) return;
+    if (!writable || creating || startingRef.current || unknownContinuation) return;
     if (!selection.length || blocking.length) { onError?.('请先在第一阶段确认原文集场，再选择创作范围。'); return; }
     startingRef.current = true; setStarting(true);
-    try { await mutate('storyboard.run', { options: { selection: { episodeIds: selection } }, episodeIds: selection }, '所选范围的分镜文字创作已启动。'); }
+    // Both new/continue intents use the guarded start entry. A summary alone
+    // cannot select a historical workflow or bypass the backend source check.
+    try { await mutate('storyboard.run', { options: { selection: { episodeIds: selection } }, episodeIds: selection }, continuation ? '已继续原范围的分镜流程，原请求与已核对步骤将保留复用。' : '所选范围的分镜文字创作已启动。'); }
     finally { startingRef.current = false; setStarting(false); }
   }
   async function edit() { if (!unit) return; const sequence = detailRequest.current; try { const value = await request<Unit>({ action: 'units.get', projectId: workspace.project.id, unitId: unit.id }); if (sequence !== detailRequest.current) return; if (value.id !== unit.id) throw new Error('完整文字与所选单元身份不一致，请刷新。'); setEditing(value); setPromptDraft(value.prompt); setTitleDraft(value.title || ''); } catch (error) { if (sequence === detailRequest.current) onError?.(messageOf(error)); } }
@@ -63,7 +91,8 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
   async function restore(version: Version) { if (!unit || version.data.id !== unit.id) { onError?.('版本记录与当前单元身份不一致。'); return; } const next = await mutate('units.version.restore', { unitId: unit.id, version: version.version, expectedVersion: unit.version }, '已恢复为新的当前版本，原版本和已提交任务保留。'); if (next) { setFull(null); setVersionPreview(null); setTab('prompt'); } }
   let offset = 0;
   return <div className="production-workbench stage-three-workbench">
-    <div className="stage-intro"><div><h2>生成每个分镜单元的完整文字提示词</h2><p>按原文创作，逐单元阅读、修改与复制；配图和视频制作在第四阶段完成。</p></div><div className="actions"><label className="production-range-label">创作范围<select aria-label="分镜创作范围" value={episode} onChange={event => { setEpisode(event.target.value); setTab('prompt'); }}><option value="all">全部已确认集数 · {episodes.length} 集</option><option value="empty">还没有分镜的集数 · {emptyEpisodes.length} 集</option>{episodes.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><Button executionAction="storyboard.run" variant="primary" icon="spark" disabled={!writable || !selection.length || !!blocking.length || creating || starting} onClick={() => void run()}>{creating || starting ? '正在创作提示词' : '生成分镜提示词'}</Button></div></div>
+    <div className="stage-intro"><div><h2>生成每个分镜单元的完整文字提示词</h2><p>按原文创作，逐单元阅读、修改与复制；配图和视频制作在第四阶段完成。</p></div><div className="actions"><label className="production-range-label">创作范围<select aria-label="分镜创作范围" value={episode} onChange={event => { setEpisode(event.target.value); setTab('prompt'); }}><option value="all">全部已确认集数 · {episodes.length} 集</option><option value="empty">还没有分镜的集数 · {emptyEpisodes.length} 集</option>{episodes.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><Button executionAction="storyboard.run" variant="primary" icon="spark" disabled={!writable || !selection.length || !!blocking.length || creating || starting || unknownContinuation} onClick={() => void run()}>{creating || starting ? '正在创作提示词' : unknownContinuation ? '保留原分镜任务' : continuation ? '继续原分镜流程' : '生成分镜提示词'}</Button></div></div>
+    {continuation && !creating && <p className="muted" role="status">{unknownContinuation ? '原范围有未知提交，请先核对原执行状态；不会另建或重发。' : '同范围的分镜尚未完成。此按钮继续原流程，已核对的步骤将复用。'}</p>}
     {episode === 'empty' && <p className="muted" role="status">仅创作当前零单元的 {emptyEpisodes.length} 集；已有单元的集数仍需各自核对是否完整。</p>}
     <WorkflowProgress workspace={workspace} stage="storyboard" writable={writable} mutate={mutate} onError={onError}/>
     {blocking.length > 0 && <div className="production-inline-warning">{blocking.map((item, index) => <p key={index}>{item.message}</p>)}<p>在第一阶段确认范围后，即可生成文字单元。</p></div>}

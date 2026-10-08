@@ -11,7 +11,7 @@ const ASSET_DESIGN_CONCURRENCY: usize = 4;
 /// A program scope marker locates text; it is not the text itself. If A15 found
 /// no appearance facts, give C/D the exact named scene instead of only its title.
 /// Existing fact-backed requests stay byte-for-byte stable for recovery.
-fn empty_design_scene_context<'a>(
+pub(super) fn empty_design_scene_context<'a>(
     source: &'a LockedSource,
     asset: &Value,
     facts: &[Value],
@@ -215,7 +215,7 @@ fn asset_identity(asset: &Value) -> &str {
 
 /// The old C/D input contract inherits only this subject's explicit version facts.
 /// A child replaces the same attribute, not another subject or a later state.
-fn design_facts(
+pub(super) fn design_facts(
     input: &Value,
     asset: &Value,
     by_id: &BTreeMap<&str, &Value>,
@@ -334,7 +334,7 @@ fn reference_design_card(asset: &Value, design: Option<&Value>) -> Value {
     })
 }
 
-fn reusable_parent_design<'a>(
+pub(super) fn reusable_parent_design<'a>(
     input: &Value,
     asset: &'a Value,
     assets: &[Value],
@@ -423,6 +423,10 @@ pub(super) fn automatic_design_stale(input: &Value, asset: &Value) -> bool {
     {
         return false;
     }
+    if input.get(super::asset_production_context::PROFILE_FIELD).is_some_and(|value| !value.is_null())
+        && asset["design"]["designReceipt"]["basis"]["assetProductionContext"]["version"] != super::asset_production_context::PROFILE {
+        return true; // New requests do not silently relabel old accepted receipts.
+    }
     let Some(assets) = input["assets"].as_array() else {
         return true;
     };
@@ -473,6 +477,15 @@ pub(super) fn automatic_design_stale(input: &Value, asset: &Value) -> bool {
             evidence.insert(row.id.as_str());
         }
     }
+    let production_evidence = match super::asset_production_context::context(input, asset) {
+        Ok(Some(context)) => {
+            let Some(source) = &scope_source else {return true;};
+            super::asset_production_context::evidence_rows(&context,source)
+        },
+        Ok(None) => Default::default(),
+        Err(_) => return true,
+    };
+    evidence.extend(production_evidence.iter().map(String::as_str));
     reusable_parent_design(
         input,
         asset,
@@ -641,6 +654,17 @@ pub async fn run_asset_design(
         design_basis["foundation"] = json!({});
     }
     design_basis["foundation"]["facts"] = visual["facts"].clone();
+    if input.get(super::asset_production_context::PROFILE_FIELD).is_some_and(|value| !value.is_null()) {
+        // Only the new local design basis receives fresh validated receipts.
+        // Original workflow/source bytes and A15 repair budgets stay untouched.
+        let mut receipts = input["foundation"]["visualFactBatches"].as_array().cloned().unwrap_or_default();
+        for receipt in visual["visualFactBatches"].as_array().into_iter().flatten() {
+            receipts.retain(|old| old["inputFingerprint"] != receipt["inputFingerprint"]);
+            receipts.push(receipt.clone());
+        }
+        design_basis["foundation"]["visualFactBatches"] = json!(receipts);
+    }
+    let prop_dependencies = super::asset_production_context::candidates(&design_basis)?;
     let mut pending: BTreeMap<_, _> = by_id
         .iter()
         .filter(|(key, asset)| wanted.contains(**key) && !inline_asset(asset))
@@ -784,6 +808,14 @@ pub async fn run_asset_design(
                     continue;
                 }
             };
+            // Shared-source prop candidates are text consistency inputs only.
+            // Wait for related original targets; never add targets or images.
+            // Manual/reused implicit drafts above keep their original handling.
+            if prop_dependencies.get(&id).is_some_and(|props| props.iter().any(|prop| {
+                prop["assetId"].as_str().is_some_and(|prop_id| pending.contains_key(prop_id) && !failed.contains(prop_id))
+            })) {
+                continue;
+            }
             let (facts, delta_facts) =
                 match design_facts(&design_basis, asset, &by_id, &parents, &known_rows) {
                     Ok(facts) => facts,
@@ -807,6 +839,14 @@ pub async fn run_asset_design(
             for row in &scope_context {
                 evidence_ids.insert(row.id.as_str());
             }
+            if design_basis.get(super::asset_production_context::PROFILE_FIELD).is_some() {
+                let mut unavailable: Vec<_> = failed.iter().cloned().collect();
+                unavailable.sort();
+                design_basis["stage2UnavailablePropAssetIds"] = json!(unavailable);
+            }
+            let production_context = super::asset_production_context::context(&design_basis, asset)?;
+            let production_evidence = production_context.as_ref().map(|context|super::asset_production_context::evidence_rows(context,&source)).unwrap_or_default();
+            for row in &production_evidence { evidence_ids.insert(row.as_str()); }
             if automatic || !explicitly_selected.contains(&id) {
                 let parent_redesigned = reference_parent.as_deref().is_some_and(|parent| {
                     designs
@@ -871,6 +911,10 @@ pub async fn run_asset_design(
                 design_input["sourceScopeContext"] = json!({"version":"asset-scene-context/v1","instruction":"evidence包含SOURCE_SCOPE标记所定位场次的锁定原文，不再只提供场次标题。先在原文中确认当前主体及其物种/空间/物件身份；空facts仅表示尚无已登记外观约束，不表示原文没有该主体。仍按原C/D岗位区分原文依据与普通非剧情美术补足，补足写入freeDesignScope；不得把同场其它主体或后期状态移植给当前形象，也不得把整场原文标成该资产的外观事实。"});
             }
             let mut frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
+            if let Some(context) = production_context {
+                design_input["assetProductionContext"] = context.clone();
+                frozen_context["assetProductionContext"] = context;
+            }
             for (card, key) in [("asset", "assetIdentityProductionMaterial"), ("parentAsset", "parentIdentityProductionMaterial")] {
                 if let Some(material) = design_input[card].get("identityProductionMaterial") {
                     frozen_context[key] = material.clone();
@@ -919,7 +963,7 @@ pub async fn run_asset_design(
                     if fact_ids.contains(id) {
                         uses.push("VISUAL_FACT_REFERENCE");
                     }
-                    if scope_context.iter().any(|row| row.id == id) {
+                    if scope_context.iter().any(|row| row.id == id) || production_evidence.contains(id) {
                         uses.push("SOURCE_CONTEXT");
                     }
                     row["evidenceUses"] = json!(uses);

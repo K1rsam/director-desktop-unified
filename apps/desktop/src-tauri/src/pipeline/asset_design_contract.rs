@@ -520,6 +520,7 @@ pub fn validate_resume_facts(
             }
         }
     }
+    super::asset_production_context::validate_resume(original, result, current)?;
     Ok(())
 }
 pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
@@ -552,6 +553,9 @@ pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
     if !scope_materials.is_empty() {
         basis["assetScopeProductionMaterialsSha256"] =
             json!(digest(&json!(scope_materials).to_string()));
+    }
+    if let Some(context) = super::asset_production_context::context(input, asset)? {
+        basis["assetProductionContext"] = super::asset_production_context::binding(&context);
     }
     Ok(json!({"version":DESIGN_PROFILE,"sha256":digest(&basis.to_string()),"basis":basis}))
 }

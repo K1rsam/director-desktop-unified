@@ -4463,6 +4463,15 @@ struct FrozenTextReplay {
     audit: Value,
 }
 
+#[path = "text_executor_scoped_shot_replay.rs"]
+mod scoped_shot_replay;
+#[path = "text_executor_sdk_foundation_replay.rs"]
+mod sdk_foundation_replay;
+pub(crate) use scoped_shot_replay::{
+    scoped_author_replay_audit_valid, scoped_author_replay_receipt_bound, scoped_author_replay_stage,
+    STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY,
+};
+
 struct ManagedFrozenNode {
     stage: String,
     hash: String,
@@ -5116,6 +5125,9 @@ impl TextExecutor for SavedTextExecutor {
         let mut snapshot = self.request_snapshot(&request)?;
         let mut hash = crate::pipeline::digest(&snapshot.to_string());
         let key = step_key(&request);
+        if let Some(raw) = self.scoped_author_replay_value(&request, &snapshot, &hash)? {
+            return Ok(raw);
+        }
         if s(&self.settings,"textProvider") == "codex_sdk" {
             return self.sdk_execute(&request, &snapshot).await;
         }
@@ -5399,6 +5411,9 @@ impl TextExecutor for SavedTextExecutor {
         let standalone = self.standalone_asset_received(request)?;
         let snapshot = self.result_snapshot(request)?;
         let hash = crate::pipeline::digest(&snapshot.to_string());
+        if self.accept_scoped_author_replay(request, &snapshot, &hash, value)? {
+            return Ok(());
+        }
         if let Some((job, raw, original_hash)) = standalone {
             if hash != original_hash {
                 return Err("资产设计回调的原快照绑定变化，未采用结果".into());
@@ -5542,6 +5557,9 @@ impl TextExecutor for SavedTextExecutor {
         let standalone = self.standalone_asset_received(request)?;
         let snapshot = self.result_snapshot(request)?;
         let hash = crate::pipeline::digest(&snapshot.to_string());
+        if self.reject_scoped_author_replay(request, &snapshot, &hash, value, reason)? {
+            return Ok(());
+        }
         if let Some((job, raw, original_hash)) = standalone {
             if hash != original_hash || raw != *value {
                 return Err("资产设计拒绝回调不是原快照/接收回包，原证据保留".into());
@@ -7166,6 +7184,11 @@ impl SavedTextExecutor {
                     {
                         &receipt["migrationAudit"]
                     }
+                    STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY
+                        if scoped_author_replay_stage(&request.stage,&request.skill,&request.input["storyboardCreativeProfile"]) =>
+                    {
+                        &receipt["migrationAudit"]
+                    }
                     FOUNDATION_Q1_POLICY
                         if request.stage == "foundation:Q1"
                             && request.skill == "foundation-finishing-editor" =>
@@ -7197,9 +7220,12 @@ impl SavedTextExecutor {
                         && audit["originalJobId"] == node.job.as_deref().unwrap_or_default()
                         && audit["originalSnapshotJson"] == snapshot_text
                         && audit["originalResultJson"] == raw_text
-                        && (policy != STORYBOARD_FINISH_COVERAGE_POLICY
+                        && (!matches!(policy, STORYBOARD_FINISH_COVERAGE_POLICY | STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY)
                             || (audit["originalRawEventId"] == event_id
                                 && audit["originalRawEventDataJson"] == event_text))
+                        && (policy != STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY
+                            || (scoped_author_replay_audit_valid(audit)
+                                && receipt["validatedResultSha256"] == crate::pipeline::digest(&accepted.to_string())))
                 };
                 if !bound
                     || receipt["acceptedRequestHash"] != node.hash
@@ -11294,7 +11320,8 @@ impl SavedTextExecutor {
             return Err(fail());
         }
         if job["status"] == "completed" {
-            if job["receipt"] != json!({"contract":"desktop-runner/v1","validation":"accepted"})
+            if (job["receipt"] != json!({"contract":"desktop-runner/v1","validation":"accepted"})
+                && !self.sdk_f2_migrated_receipt_bound(job, snapshot)?)
                 || prepared["sdkDomainResultSha256"]
                     != crate::pipeline::digest(&prepared["sdkDomainResult"].to_string())
                 || !job["error"].is_null()
@@ -11720,6 +11747,9 @@ impl SavedTextExecutor {
             return self.sdk_cached_checkpoint(request, &job, value, None);
         }
         if job["status"] == "rejected" {
+            if self.sdk_f2_replay_commit(request, &snapshot, &job, value, reason)? {
+                return Ok(());
+            }
             if reason != job["error"].as_str() || raw != *value {
                 return Err("SDK_REJECTED_RESULT_IMMUTABLE: 原拒绝不可变，不能直接采用".into());
             }

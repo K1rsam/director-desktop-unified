@@ -4643,10 +4643,11 @@ fn prefix_ids_preserving(
     preserved_shots: &HashSet<String>,
 ) -> Result<(), String> {
     let mut units_map = HashMap::new();
-    let mut shots_map = HashMap::new();
+    let mut unit_ids = HashSet::new();
+    let mut shot_owners: HashMap<String, Vec<String>> = HashMap::new();
     for unit in draft
-        .get_mut("units")
-        .and_then(Value::as_array_mut)
+        .get("units")
+        .and_then(Value::as_array)
         .ok_or("缺少单元")?
     {
         let old = text(unit, "id").to_string();
@@ -4655,33 +4656,80 @@ fn prefix_ids_preserving(
         } else {
             format!("{prefix}{old}")
         };
-        if units_map.insert(old, new.clone()).is_some() {
+        if units_map.insert(old.clone(), new.clone()).is_some() {
             return Err("模型单元 id 重复".into());
         }
-        unit["id"] = json!(new);
+        if !unit_ids.insert(new) {
+            return Err("规范化后单元 id 冲突；保留原回包".into());
+        }
+        let mut local_shots = HashSet::new();
         for shot in unit
-            .get_mut("shots")
-            .and_then(Value::as_array_mut)
+            .get("shots")
+            .and_then(Value::as_array)
             .ok_or("缺少镜表")?
         {
-            let old = text(shot, "id").to_string();
-            let new = if old.starts_with(prefix) || preserved_shots.contains(&old) {
-                old.clone()
-            } else {
-                format!("{prefix}{old}")
-            };
-            if shots_map.insert(old, new.clone()).is_some() {
+            let shot_id = text(shot, "id").to_string();
+            if !local_shots.insert(shot_id.clone()) {
                 return Err("模型镜号重复".into());
             }
-            shot["id"] = json!(new);
+            shot_owners.entry(shot_id).or_default().push(old.clone());
         }
     }
+    let mut shots_map: HashMap<(String, String), String> = HashMap::new();
+    let mut shot_ids = HashSet::new();
+    for (old_shot, owners) in &shot_owners {
+        // Keep the legacy mapping for globally unique IDs. If an accepted ID
+        // is reused by a fresh unit, only its unambiguous accepted owner keeps
+        // that ID; no adopted shot is silently renamed.
+        let preserved_owner = if owners.len() > 1 && preserved_shots.contains(old_shot) {
+            let found: Vec<_> = owners
+                .iter()
+                .filter(|owner| preserved_units.contains(*owner))
+                .collect();
+            if found.len() != 1 {
+                return Err("重复镜号不能唯一绑定已采用单元；保留原回包".into());
+            }
+            found.into_iter().next()
+        } else {
+            None
+        };
+        for old_unit in owners {
+            let new = if owners.len() == 1 || preserved_owner == Some(old_unit) {
+                if old_shot.starts_with(prefix) || preserved_shots.contains(old_shot) {
+                    old_shot.clone()
+                } else {
+                    format!("{prefix}{old_shot}")
+                }
+            } else {
+                let owner = &units_map[old_unit];
+                let namespace = if owner.starts_with(prefix) {
+                    owner.clone()
+                } else {
+                    format!("{prefix}{owner}")
+                };
+                format!("{namespace}:shot:{old_shot}")
+            };
+            if !shot_ids.insert(new.clone()) {
+                return Err("规范化后镜号冲突；保留原回包".into());
+            }
+            shots_map.insert((old_unit.clone(), old_shot.clone()), new);
+        }
+    }
+    // A local identifier is meaningful only with its owner. Build the whole
+    // mapping first and publish this clone only after every reference resolves.
+    let mut normalized = draft.clone();
     // Event packing's segment headers refer to generated shot IDs. Keep those
     // references aligned when a finished response introduced fresh local IDs;
     // remap only program-created header tokens, never source dialogue text.
-    for unit in draft["units"].as_array_mut().unwrap() {
+    for unit in normalized["units"].as_array_mut().unwrap() {
+        let old_unit = text(unit, "id").to_string();
+        unit["id"] = json!(units_map[&old_unit]);
+        for shot in unit["shots"].as_array_mut().unwrap() {
+            let old_shot = text(shot, "id").to_string();
+            shot["id"] = json!(shots_map[&(old_unit.clone(), old_shot)]);
+        }
         let mut headers = Vec::new();
-        if let Some(segments) = unit["segments"].as_array_mut() {
+        if let Some(segments) = unit.get_mut("segments").and_then(Value::as_array_mut) {
             for segment in segments {
                 let ids = segment["shotIds"].as_array_mut().ok_or("联排段缺少镜号")?;
                 let old: Vec<_> = ids
@@ -4690,7 +4738,7 @@ fn prefix_ids_preserving(
                     .collect::<Result<_, _>>()?;
                 for id in ids.iter_mut() {
                     *id = json!(shots_map
-                        .get(id.as_str().unwrap())
+                        .get(&(old_unit.clone(), id.as_str().unwrap().to_string()))
                         .ok_or("联排段引用未知镜号")?);
                 }
                 if let (Some(a), Some(b), Some(c), Some(d)) = (
@@ -4714,22 +4762,33 @@ fn prefix_ids_preserving(
             }
         }
     }
-    for realization in draft
+    for realization in normalized
         .get_mut("fantasyRealization")
         .and_then(Value::as_array_mut)
         .ok_or("缺少幻想兑现记录")?
     {
-        for (field, map) in [("unitIds", &units_map), ("shotIds", &shots_map)] {
-            for id in realization
-                .get_mut(field)
-                .and_then(Value::as_array_mut)
-                .ok_or("幻想记录引用不是数组")?
-            {
-                let old = id.as_str().ok_or("幻想记录 id 无效")?;
-                *id = json!(map.get(old).ok_or("幻想记录引用不存在单元/镜号")?);
+        let owners = strings(realization, "unitIds")?;
+        for id in realization["unitIds"].as_array_mut().unwrap() {
+            let old = id.as_str().ok_or("幻想记录 id 无效")?;
+            *id = json!(units_map.get(old).ok_or("幻想记录引用不存在单元/镜号")?);
+        }
+        for id in realization
+            .get_mut("shotIds")
+            .and_then(Value::as_array_mut)
+            .ok_or("幻想记录引用不是数组")?
+        {
+            let old_shot = id.as_str().ok_or("幻想记录 id 无效")?;
+            let candidates: HashSet<_> = owners
+                .iter()
+                .filter_map(|owner| shots_map.get(&(owner.clone(), old_shot.to_string())))
+                .collect();
+            if candidates.len() != 1 {
+                return Err("幻想记录镜号在声明单元中不存在或有歧义；保留原回包".into());
             }
+            *id = json!(candidates.into_iter().next().unwrap());
         }
     }
+    *draft = normalized;
     Ok(())
 }
 
@@ -9146,6 +9205,284 @@ mod production_contract_tests {
         let before = draft.clone();
         prefix_ids(&mut draft, "episode:batch:").unwrap();
         assert_eq!(draft, before);
+    }
+
+    #[test]
+    fn scoped_shot_ids_resolve_only_cross_unit_reuse_and_preserve_source_performance() {
+        let quote = json!([{"lineId":"locked","text":"原话含【S1—S2】，不可改。","quoteStart":4,"quoteEnd":20,"voiceStart":0.25,"voiceEnd":2.75}]);
+        let mut draft = json!({"units":[
+            {"id":"U1","unitDirection":"【S1—S2】起落。","lighting":"【S1—S2】侧光。","initialState":"【S1起承接】原站位。","segments":[{"shotIds":["S1","S2"]}],"shots":[{"id":"S1","duration":3.0,"dialogueParts":quote,"picture":"原动作一。"},{"id":"S2","duration":2.5,"dialogueParts":[],"picture":"原动作二。"}]},
+            {"id":"U2","unitDirection":"【S1—S2】回应。","segments":[{"shotIds":["S1","S2"]}],"shots":[{"id":"S1","duration":4.0,"dialogueParts":[],"picture":"回应。"},{"id":"S2","duration":2.0,"dialogueParts":[],"picture":"落点。"}]}
+        ],"fantasyRealization":[{"candidateId":"f1","unitIds":["U1"],"shotIds":["S1"],"entry":"U1/S1原入点。","exit":"原出点。","screenSeconds":1.5},{"candidateId":"f2","unitIds":["U2"],"shotIds":["S1","S2"],"entry":"U2/S1原入点。","exit":"原出点。","screenSeconds":2.5}]});
+        let raw = draft.clone();
+        prefix_ids(&mut draft, "episode:batch:").unwrap();
+        assert_eq!(
+            draft["units"][0]["shots"][0]["id"],
+            "episode:batch:U1:shot:S1"
+        );
+        assert_eq!(
+            draft["units"][1]["shots"][0]["id"],
+            "episode:batch:U2:shot:S1"
+        );
+        assert_eq!(
+            draft["units"][0]["segments"][0]["shotIds"],
+            json!(["episode:batch:U1:shot:S1", "episode:batch:U1:shot:S2"])
+        );
+        assert_eq!(
+            draft["units"][1]["segments"][0]["shotIds"],
+            json!(["episode:batch:U2:shot:S1", "episode:batch:U2:shot:S2"])
+        );
+        assert_eq!(
+            draft["fantasyRealization"][1]["unitIds"],
+            json!(["episode:batch:U2"])
+        );
+        assert_eq!(
+            draft["fantasyRealization"][1]["shotIds"],
+            json!(["episode:batch:U2:shot:S1", "episode:batch:U2:shot:S2"])
+        );
+        for (before, after) in raw["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(draft["units"].as_array().unwrap())
+        {
+            for (before, after) in before["shots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(after["shots"].as_array().unwrap())
+            {
+                let mut before = before.clone();
+                let mut after = after.clone();
+                before.as_object_mut().unwrap().remove("id");
+                after.as_object_mut().unwrap().remove("id");
+                assert_eq!(
+                    before, after,
+                    "source intervals, dialogue, voice windows and performance are untouched"
+                );
+            }
+        }
+        for i in 0..2 {
+            assert_eq!(
+                draft["fantasyRealization"][i]["entry"],
+                raw["fantasyRealization"][i]["entry"]
+            );
+            assert_eq!(
+                draft["fantasyRealization"][i]["exit"],
+                raw["fantasyRealization"][i]["exit"]
+            );
+        }
+        let once = draft.clone();
+        prefix_ids(&mut draft, "episode:batch:").unwrap();
+        assert_eq!(draft, once, "revalidation must not change normalized IDs");
+    }
+
+    #[test]
+    fn scoped_shot_ids_keep_unique_legacy_and_adopted_ids_unchanged() {
+        let mut draft = json!({"units":[{"id":"adopted-unit","shots":[{"id":"adopted-shot","duration":3.0,"dialogueParts":[]}]},{"id":"fresh-unit","shots":[{"id":"fresh-shot"},{"id":"episode:batch:already-prefixed"}]}],"fantasyRealization":[{"unitIds":["adopted-unit"],"shotIds":["adopted-shot"]}]});
+        let adopted = draft["units"][0].clone();
+        prefix_ids_preserving(
+            &mut draft,
+            "episode:batch:",
+            &HashSet::from(["adopted-unit".into()]),
+            &HashSet::from(["adopted-shot".into()]),
+        )
+        .unwrap();
+        assert_eq!(draft["units"][0], adopted);
+        assert_eq!(
+            draft["units"][1]["shots"][0]["id"],
+            "episode:batch:fresh-shot"
+        );
+        assert_eq!(
+            draft["units"][1]["shots"][1]["id"],
+            "episode:batch:already-prefixed"
+        );
+        assert_eq!(
+            draft["fantasyRealization"][0]["shotIds"],
+            json!(["adopted-shot"])
+        );
+    }
+
+    #[test]
+    fn scoped_shot_ids_do_not_rename_adopted_owner_when_fresh_unit_reuses_its_id() {
+        let mut draft = json!({"units":[{"id":"adopted-unit","shots":[{"id":"adopted-shot","duration":3.0}]},{"id":"fresh-unit","shots":[{"id":"adopted-shot","duration":2.0}]}],"fantasyRealization":[{"unitIds":["adopted-unit"],"shotIds":["adopted-shot"]},{"unitIds":["fresh-unit"],"shotIds":["adopted-shot"]}]});
+        let adopted = draft["units"][0].clone();
+        prefix_ids_preserving(
+            &mut draft,
+            "episode:batch:",
+            &HashSet::from(["adopted-unit".into()]),
+            &HashSet::from(["adopted-shot".into()]),
+        )
+        .unwrap();
+        assert_eq!(draft["units"][0], adopted);
+        assert_eq!(
+            draft["units"][1]["shots"][0]["id"],
+            "episode:batch:fresh-unit:shot:adopted-shot"
+        );
+        assert_eq!(
+            draft["fantasyRealization"][0]["shotIds"],
+            json!(["adopted-shot"])
+        );
+        assert_eq!(
+            draft["fantasyRealization"][1]["shotIds"],
+            json!(["episode:batch:fresh-unit:shot:adopted-shot"])
+        );
+    }
+
+    #[test]
+    fn scoped_shot_ids_reject_same_unit_duplicates_and_ambiguous_fantasy_atomically() {
+        let mut duplicate = json!({"units":[{"id":"U1","shots":[{"id":"S1"},{"id":"S1"}]}],"fantasyRealization":[]});
+        let raw = duplicate.clone();
+        assert_eq!(
+            prefix_ids(&mut duplicate, "p:").unwrap_err(),
+            "模型镜号重复"
+        );
+        assert_eq!(duplicate, raw);
+        let mut ambiguous = json!({"units":[{"id":"U1","shots":[{"id":"S1"}]},{"id":"U2","shots":[{"id":"S1"}]}],"fantasyRealization":[{"unitIds":["U1","U2"],"shotIds":["S1"]}]});
+        let raw = ambiguous.clone();
+        assert!(prefix_ids(&mut ambiguous, "p:")
+            .unwrap_err()
+            .contains("有歧义"));
+        assert_eq!(ambiguous, raw);
+        let mut missing = raw.clone();
+        missing["fantasyRealization"][0]["unitIds"] = json!(["outside-unit"]);
+        let raw = missing.clone();
+        assert!(prefix_ids(&mut missing, "p:").is_err());
+        assert_eq!(missing, raw);
+    }
+
+    #[test]
+    fn scoped_shot_ids_reject_cross_unit_segment_references_and_new_id_collisions() {
+        let mut cross_unit = json!({"units":[{"id":"U1","segments":[{"shotIds":["S2"]}],"shots":[{"id":"S1"}]},{"id":"U2","shots":[{"id":"S2"}]}],"fantasyRealization":[]});
+        let raw = cross_unit.clone();
+        assert_eq!(
+            prefix_ids(&mut cross_unit, "p:").unwrap_err(),
+            "联排段引用未知镜号"
+        );
+        assert_eq!(cross_unit, raw);
+        let mut collision = json!({"units":[{"id":"U1","shots":[{"id":"S1"}]},{"id":"U2","shots":[{"id":"S1"},{"id":"U1:shot:S1"}]}],"fantasyRealization":[]});
+        let raw = collision.clone();
+        assert!(prefix_ids(&mut collision, "p:")
+            .unwrap_err()
+            .contains("规范化后镜号冲突"));
+        assert_eq!(collision, raw);
+    }
+
+    #[test]
+    #[ignore = "explicit rejected author database COPY; read-only, zero model calls or adoption"]
+    fn readonly_rejected_author_scoped_shot_ids_revalidates_all_author_gates() {
+        let path = std::env::var("DIRECTOR_SHOT_ID_READONLY_DB")
+            .expect("explicit read-only isolated DB copy");
+        let workflow = std::env::var("DIRECTOR_SHOT_ID_READONLY_WORKFLOW")
+            .expect("explicit original workflow");
+        let job =
+            std::env::var("DIRECTOR_SHOT_ID_READONLY_JOB").expect("explicit original author job");
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN;")
+            .unwrap();
+        let (snapshot, raw, hash, event, workflow_snapshot): (String, String, String, String, String) = connection.query_row("SELECT j.snapshot,j.result,w.request_hash,e.data,parent.snapshot FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id JOIN jobs parent ON parent.id=w.workflow_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE j.id=?1 AND w.workflow_id=?2 AND j.kind='text' AND j.state='rejected' AND j.error='模型镜号重复' AND w.state='rejected' AND w.stage='storyboardCreate' AND w.error=j.error AND w.result=j.result AND json_extract(j.receipt,'$.validation')='rejected' AND json_extract(j.receipt,'$.contract')='desktop-runner/v1' AND parent.kind='workflow' AND parent.entity_id='storyboard.run'", rusqlite::params![job, workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        connection.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(digest(&snapshot), hash);
+        let request: TextRequest = serde_json::from_str(&snapshot).unwrap();
+        let raw: Value = serde_json::from_str(&raw).unwrap();
+        let event: Value = serde_json::from_str(&event).unwrap();
+        let run: Value = serde_json::from_str(&workflow_snapshot).unwrap();
+        assert_eq!(event["requestHash"], hash);
+        assert!(
+            event["value"] == raw,
+            "original receive event must equal rejected raw"
+        );
+        assert_eq!(request.stage, "storyboardCreate");
+        assert_eq!(request.skill, "unit-performance-director");
+        assert_eq!(request.input[creative::PROFILE_FIELD], creative::PROFILE);
+        let source: LockedSource = serde_json::from_value(run["input"]["source"].clone()).unwrap();
+        let source = upgrade_source_dialogues(&source).unwrap();
+        validate_source(&source).unwrap();
+        let assets = episode_assets(
+            run["input"]["assets"].as_array().unwrap(),
+            text(&request.input, "episodeId"),
+        );
+        let refs = strings(&request.input["executionBatch"], "sourceRefs").unwrap();
+        let prefix = format!(
+            "{}:{}:",
+            text(&request.input, "episodeId"),
+            text(&request.input["executionBatch"], "id")
+        );
+        let original = raw.clone();
+        let mut normalized = raw.clone();
+        prefix_ids(&mut normalized, &prefix).unwrap();
+        let normalized_units = normalized["units"].as_array().unwrap();
+        let unit_count = normalized_units.len();
+        let shot_count: usize = normalized_units
+            .iter()
+            .map(|unit| unit["shots"].as_array().unwrap().len())
+            .sum();
+        let once = normalized.clone();
+        prefix_ids(&mut normalized, &prefix).unwrap();
+        assert!(normalized == once, "ID normalization is idempotent");
+        let mut candidate = raw.clone();
+        let mut gate = "authored_source_asset_voice_coverage";
+        let result: Result<(), String> = (|| {
+            validate_authored(
+                &source,
+                &mut candidate,
+                &assets,
+                &request.input["capabilities"],
+                &refs,
+                text(&request.input["settings"], "visualStyle"),
+                &prefix,
+            )?;
+            gate = "event_bindings";
+            validate_event_bindings(&candidate, &request.input["plan"])?;
+            gate = "fantasy_profile";
+            validate_fantasy_profile(
+                &candidate,
+                request.input["selectedFantasy"].as_array().unwrap(),
+                true,
+            )?;
+            gate = "creative_delivery";
+            creative::add_delivery(
+                &mut candidate,
+                &source,
+                text(&request.input["settings"], "visualStyle"),
+                &assets,
+                true,
+            )?;
+            Ok(())
+        })();
+        assert!(
+            raw == original,
+            "revalidation cannot alter the original raw"
+        );
+        // This opt-in assertion describes an expected diagnostic from the full
+        // validator. It does not skip a gate or accept the rejected candidate.
+        let expected_rejection =
+            std::env::var("DIRECTOR_SHOT_ID_READONLY_EXPECT_REJECTION").unwrap_or_default();
+        let expected_known_rejection =
+            !expected_rejection.is_empty() && result.as_ref().err() == Some(&expected_rejection);
+        let diagnosis_matches = if expected_rejection.is_empty() {
+            result.is_ok()
+        } else {
+            expected_known_rejection
+        };
+        let evidence = json!({"version":"scoped-shot-id-revalidation/v1","readOnly":true,"workflowId":workflow,"originalJobId":job,"requestHash":hash,"sourceSha256":source.sha256,"units":unit_count,"shots":shot_count,"normalizationIdempotent":normalized==once,"allAuthorGatesPassed":result.is_ok(),"expectedKnownRejection":expected_known_rejection,"expectedRejection":if expected_rejection.is_empty(){Value::Null}else{json!(expected_rejection)},"diagnosisMatchesExpectation":diagnosis_matches,"firstRejectedGate":if result.is_ok(){Value::Null}else{json!(gate)},"error":result.as_ref().err(),"originalRawUnchanged":raw==original,"accepted":false,"modelCalls":0,"videoSubmissions":0});
+        if let Ok(report) = std::env::var("DIRECTOR_SHOT_ID_READONLY_REPORT") {
+            std::fs::write(report, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        }
+        println!("{evidence}");
+        assert!(
+            diagnosis_matches,
+            "subsequent author gate {gate}: actual {:?}, expected {:?}",
+            result.as_ref().err(),
+            if expected_rejection.is_empty() {
+                None
+            } else {
+                Some(expected_rejection.as_str())
+            }
+        );
     }
 
     #[test]

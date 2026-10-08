@@ -1315,8 +1315,10 @@ impl Store {
             "rejected" => false,
             _ => return Err("回放提交缺少明确的校验状态".into()),
         };
-        let storyboard_repair =
-            s(audit, "policy") == crate::text_executor::STORYBOARD_FINISH_COVERAGE_POLICY;
+        let author_shot_replay =
+            s(audit, "policy") == crate::text_executor::STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY;
+        let storyboard_repair = author_shot_replay
+            || s(audit, "policy") == crate::text_executor::STORYBOARD_FINISH_COVERAGE_POLICY;
         if s(receipt, "contract") != "desktop-runner/v1"
             || s(audit, "policy").is_empty()
             || !(matches!(s(audit, "stage"), "foundation:F2" | "foundation:Q1")
@@ -1342,7 +1344,24 @@ impl Store {
         // Only this named Finisher regression can cross the foundation-only
         // transaction boundary. Its canonical input and original raw response
         // cannot be changed or inferred from a new validator result.
-        let parent_entity = if storyboard_repair {
+        let parent_entity = if author_shot_replay {
+            // Independent policy: no extra errors or stages are granted to the
+            // older source-coverage replay policy above.
+            if !crate::text_executor::scoped_author_replay_audit_valid(audit)
+                || !fields.as_object().is_some_and(|fields| fields.len() == 2
+                    && fields.contains_key("error") && fields.contains_key("receipt"))
+                || !receipt.as_object().is_some_and(|fields| fields.len() == if accepted { 8 } else { 7 })
+                || receipt["revalidatedFrom"] != "rejected"
+                || receipt["previousValidationError"] != audit["previousError"]
+                || receipt["validatedResultSha256"] != crate::pipeline::digest(&validated_result.to_string())
+                || accepted && !fields["error"].is_null()
+                || !accepted && (s(fields, "error").is_empty()
+                    || serde_json::from_str::<Value>(s(audit, "originalResultJson")).ok().as_ref() != Some(validated_result))
+            {
+                return Err("主创镜号回放的独立政策、原包证据或规范化结果绑定不匹配".into());
+            }
+            "storyboard.run"
+        } else if storyboard_repair {
             let snapshot: Value = serde_json::from_str(s(audit, "originalSnapshotJson"))
                 .map_err(|_| "整编回放的原执行快照无效")?;
             let original: Value = serde_json::from_str(s(audit, "originalResultJson"))
@@ -1389,6 +1408,15 @@ impl Store {
         if !eligible {
             return Ok(false);
         }
+        if author_shot_replay {
+            // A newer raw event or workflow snapshot invalidates this proof even
+            // when the previously audited event still exists in the database.
+            let latest_bound: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs parent JOIN events e ON e.job_id=?1 WHERE parent.id=?2 AND parent.snapshot=?3 AND e.id=?4 AND e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=?1 AND x.type='text_received_raw') AND e.type='text_received_raw' AND e.data=?5)",
+                params![s(audit,"originalJobId"),s(audit,"workflowId"),s(audit,"originalWorkflowSnapshotJson"),audit["originalRawEventId"].as_i64(),s(audit,"originalRawEventDataJson")], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !latest_bound { return Ok(false); }
+        }
         let job = s(audit, "originalJobId");
         let state = if accepted { "completed" } else { "rejected" };
         if update_state(&tx, job, state, fields, Some("rejected"))? != 1 {
@@ -1403,14 +1431,17 @@ impl Store {
         if count != 1 {
             return Err("流程节点状态已变化，回放事务未提交".into());
         }
-        let event = match (s(audit, "stage"), accepted) {
+        let event = if author_shot_replay {
+            if accepted { "storyboard_author_shot_validation_replay_accepted" }
+            else { "storyboard_author_shot_validation_replay_rejected" }
+        } else { match (s(audit, "stage"), accepted) {
             ("storyboardFinish", true) => "storyboard_finish_validation_replay_accepted",
             ("storyboardFinish", false) => "storyboard_finish_validation_replay_rejected",
             ("foundation:Q1", true) => "q1_validation_replay_accepted",
             ("foundation:Q1", false) => "q1_validation_replay_rejected",
             (_, true) => "catalogue_migration_accepted",
             (_, false) => "catalogue_migration_rejected",
-        };
+        } };
         let mut event_data = json!({"requestHash":audit["newRequestHash"],"error":fields.get("error"),"validatedResult":validated_result,"originalEvidencePreserved":true});
         if storyboard_repair {
             event_data["policy"] = audit["policy"].clone();

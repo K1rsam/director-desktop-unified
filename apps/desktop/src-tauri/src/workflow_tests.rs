@@ -544,14 +544,24 @@ fn scope_resolution_fixture(two_attempts: bool) -> ScopeResolutionFixture {
         resolution_step(&store, &run, &author_node, &author, false, &raw, &raw);
     let author_domain = pipeline::digest(&serde_json::to_string(&author).unwrap());
     let raw_sha = pipeline::digest(&raw.to_string());
-    let base_hash = pipeline::digest("original-unadopted-base");
+    let mut base = draft.clone();
+    base["units"][0]["id"] = json!("scope-base-before-progress");
+    let base_hash = pipeline::finish_base_hash(&base);
+    // Freeze the actual delta schema against each attempt's own prior draft.
+    // A generic object schema cannot prove the production two-attempt contract.
+    let full_schema = json!({"type":"object","properties":{
+        "units":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"episodeId":{"type":"string"},"exitState":{"type":"string"}},"required":["id","episodeId","exitState"],"additionalProperties":false}},
+        "fantasyRealization":{"type":"array","items":{"type":"object","properties":{},"additionalProperties":false}},
+        "revisionNotes":{"type":"array","items":{"type":"string"}},
+        "unresolved":{"type":"array","items":{"type":"string"}}
+    },"required":["units","fantasyRealization","revisionNotes","unresolved"],"additionalProperties":false});
     let mut resolver = pipeline::TextRequest {
         stage: "storyboardFinish".into(),
         skill: "episode-finishing-editor".into(),
         model: "offline".into(),
         reasoning: "medium".into(),
-        input: json!({"episodeId":episode,"sourceRows":rows,"contextRows":[],"capabilities":{"maxDuration":30},"finishMode":"delta","baseDraftHash":base_hash,"executionBatch":{"version":"author-domain-repair/v1","id":"repair:1"},"authorRepair":{"version":"rejected-author-scope-repair/v1","maximumAttempts":2,"attempt":1,"sourceSha256":source["sha256"],"originDomainRequestSha256":author_domain,"originalAuthorRawSha256":raw_sha,"originExecutionBatch":author.input["executionBatch"],"baseDraftHash":base_hash},"storyboardCreativeProfile":"original-production-contract/v1"}),
-        schema: json!({"type":"object"}),
+        input: json!({"episodeId":episode,"sourceRows":rows,"contextRows":[],"capabilities":{"maxDuration":30},"finishMode":"delta","previousDraft":base,"baseDraftHash":base_hash,"executionBatch":{"version":"author-domain-repair/v1","id":"repair:1"},"authorRepair":{"version":"rejected-author-scope-repair/v1","maximumAttempts":2,"attempt":1,"sourceSha256":source["sha256"],"originDomainRequestSha256":author_domain,"originalAuthorRawSha256":raw_sha,"originExecutionBatch":author.input["executionBatch"],"baseDraftHash":base_hash},"storyboardCreativeProfile":"original-production-contract/v1"}),
+        schema: pipeline::scope_repair_delta_schema_for_test(&full_schema, &base),
         rule_snapshot: json!({"primary":{"id":"episode-finishing-editor","version":"original"}}),
     };
     let mut lineage = Vec::new();
@@ -567,9 +577,14 @@ fn scope_resolution_fixture(two_attempts: bool) -> ScopeResolutionFixture {
             &first_raw,
             &first_raw,
         );
-        let next_base = pipeline::digest("hard-validated-still-out-of-scope-draft");
+        let mut progressed = base.clone();
+        progressed["units"][0]["id"] = json!("scope-base-after-progress");
+        progressed["units"][0]["exitState"] = json!("合成第一轮已进展，仍待范围修订");
+        let next_base = pipeline::finish_base_hash(&progressed);
         lineage.push(json!({"attempt":1,"canonicalDomainRequestSha256":domain,"baseDraftHash":base_hash,"draftSha256":next_base,"result":"rejected-scope"}));
         resolver.input["baseDraftHash"] = json!(next_base);
+        resolver.input["previousDraft"] = progressed.clone();
+        resolver.schema = pipeline::scope_repair_delta_schema_for_test(&full_schema, &progressed);
         resolver.input["authorRepair"]["baseDraftHash"] = json!(next_base);
         resolver.input["authorRepair"]["attempt"] = json!(2);
         resolver.input["executionBatch"]["id"] = json!("repair:2");
@@ -660,6 +675,22 @@ fn workflow_progress_resolves_scope_author_by_domain_hash_and_keeps_all_original
 #[test]
 fn workflow_progress_resolves_rejected_first_scope_editor_only_with_the_second_verified_lineage() {
     let f = scope_resolution_fixture(true);
+    let first_snapshot: String = f.store.conn().unwrap().query_row(
+        "SELECT j.snapshot FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key='repair:attempt1'",
+        [&f.run], |row| row.get(0),
+    ).unwrap();
+    let first: pipeline::TextRequest = serde_json::from_str(&first_snapshot).unwrap();
+    assert_ne!(first.schema, f.resolver.schema);
+    for request in [&first, &f.resolver] {
+        let base = &request.input["previousDraft"];
+        let hash = pipeline::finish_base_hash(base);
+        let ids: Vec<_> = base["units"].as_array().unwrap().iter().map(|unit|unit["id"].clone()).collect();
+        assert_eq!(request.input["baseDraftHash"], hash);
+        assert_eq!(request.input["authorRepair"]["baseDraftHash"], hash);
+        assert_eq!(request.schema.pointer("/properties/baseDraftHash/enum"), Some(&json!([hash])));
+        assert_eq!(request.schema.pointer("/properties/retainedUnitIds/items/enum"), Some(&json!(ids)));
+        assert_eq!(request.schema.pointer("/properties/replacements/items/properties/replaces/items/enum"), Some(&json!(ids)));
+    }
     let before = resolution_records(&f.store, &f.run);
     let progress = f.store.workflow_progress().unwrap();
     let nodes = progress[0]["nodes"].as_array().unwrap();

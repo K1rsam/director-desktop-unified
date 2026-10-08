@@ -2800,7 +2800,31 @@ impl Engine {
     }
     fn spawn_production(self: &Arc<Self>, store: Store, request: Value) -> Result<()> {
         let stage = s(&request, "action");
+        // Serialize each foundation/Stage3 start before a workflow or preflight
+        // is reserved. The existing pipeline key still owns actual execution.
+        let _production_start = if ["foundation.run","storyboard.run"].contains(&stage) {
+            let key = if stage == "foundation.run" { "foundation-start" } else { "storyboard-start" };
+            Some(self.acquire_keys(vec![format!("{key}:{}", s(&store.project()?, "id"))])?)
+        } else { None };
         let mut input = if stage == "storyboard.refine" { refinement_input(&store, &request)? } else { production_input_for_new_workflow(&store, &request)? };
+        if stage == "foundation.run" {
+            match existing_foundation_start(&store, &input)? {
+                FoundationStartBoundary::New => {},
+                FoundationStartBoundary::Resume(run) => {
+                    return self.resume_production_checked(store, &json!({"action":"workflows.resume","workflowId":run}),crate::execution_policy::creative_runtime_ready());
+                },
+                FoundationStartBoundary::Hold(reason) => return Err(reason),
+            }
+        }
+        if stage == "storyboard.run" {
+            match existing_storyboard_start(&store, &input)? {
+                StoryboardStartBoundary::New => {},
+                StoryboardStartBoundary::Resume(run) => {
+                    return self.resume_production_checked(store, &json!({"action":"workflows.resume","workflowId":run}),crate::execution_policy::creative_runtime_ready());
+                },
+                StoryboardStartBoundary::Hold(reason) => return Err(reason),
+            }
+        }
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
             |settings| runtime.block_on(resolve_text_execution_settings(settings)))?;
@@ -3105,11 +3129,12 @@ impl Engine {
             // comparisons remain those captured by the original workflow.
             design_input["foundation"]["directionConfirmed"] = original_context["foundation"]["directionConfirmed"].clone();
             design_input["foundation"]["productionDirection"] = original_context["foundation"]["productionDirection"].clone();
-            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD] {
+            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD] {
                 if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
             }
         } else {
             pipeline::asset_design_contract::freeze_identity_production_materials(&mut design_input)?;
+            pipeline::asset_production_context::freeze(&mut design_input);
             let mut comparisons = json!({});
             for asset in &all_assets { comparisons[s(asset,"id")] = json!(pipeline::asset_design_contract::comparison_designs(&design_input,asset)); }
             design_input["comparisonDesignsByAssetId"] = comparisons;
@@ -3175,7 +3200,7 @@ impl Engine {
                         let policy=r["imageProductionPolicy"].as_str().filter(|p|["automatic","trialReview"].contains(p)).unwrap_or_else(||pipeline::image_production_policy(&settings));
                         let active_image_ids:Vec<_>=store.job_summaries()?.iter().filter(|j|s(j,"kind")=="image"&&is_active_generation(s(j,"status"))).map(|j|j["entityId"].clone()).collect();
                         let mut input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
-                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD] {
+                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD] {
                             if let Some(value) = stage2_context.get(key) { input[key] = value.clone(); }
                         }
                         let needs_design=all.iter().any(|a|wanted.iter().any(|id|id==s(a,"id"))&&pipeline::automatic_design_required(&input,a));
@@ -3403,6 +3428,465 @@ fn verified_dreamina_session(snapshot: &Value, refresh_due: bool) -> bool {
 }
 // Both ordinary preflight and the local-only entry use this same durable
 // fingerprint/version/time predicate. No second capability cache is created.
+#[derive(Debug, PartialEq)]
+enum StoryboardStartBoundary {
+    New,
+    Resume(String),
+    Hold(String),
+}
+
+fn storyboard_source_identity(value: &Value) -> Result<String> {
+    let source: pipeline::LockedSource = serde_json::from_value(value.clone())
+        .map_err(|_| "制作流程缺少可核验的锁定原文")?;
+    let source = pipeline::upgrade_source_dialogues(&source)?;
+    pipeline::validate_source(&source)?;
+    // LockedSource excludes storage version/id. Equal text alone is not enough:
+    // confirmed episode/scene boundaries and source rows must also agree.
+    Ok(pipeline::digest(&serde_json::to_string(&source).map_err(|e| e.to_string())?))
+}
+
+fn storyboard_scope_ids(selection: &Value, field: &str) -> Result<HashSet<String>> {
+    let Some(value) = selection.get(field).filter(|value| !value.is_null()) else {
+        return Ok(HashSet::new());
+    };
+    let values = value.as_array().ok_or("制作流程的冻结范围不是数组")?;
+    let mut ids = HashSet::new();
+    for value in values {
+        let id = value.as_str().filter(|id| !id.is_empty()).ok_or("制作流程范围缺少正式ID")?;
+        if !ids.insert(id.to_owned()) { return Err("制作流程范围ID重复".into()) }
+    }
+    Ok(ids)
+}
+
+/// Pure start policy. Workflows arrive newest first; completed newer deliveries
+/// may supersede stopped historical branches, never an unresolved submission.
+fn storyboard_start_boundary(workflows: &[Value], input: &Value) -> Result<StoryboardStartBoundary> {
+    let identity = storyboard_source_identity(&input["source"])?;
+    let episodes = storyboard_scope_ids(&input["selection"], "episodeIds")?;
+    let units = storyboard_scope_ids(&input["selection"], "unitIds")?;
+    if episodes.is_empty() { return Err("请明确分镜制作集范围".into()) }
+    let mut completed_episodes = HashSet::new();
+    let mut completed_units = HashSet::new();
+    let mut matches = Vec::new();
+    for job in workflows {
+        if job["kind"] != "workflow" || job["entityId"] != "storyboard.run" { continue; }
+        let snapshot = &job["snapshot"];
+        let original = &snapshot["input"];
+        if original["source"]["sha256"] != input["source"]["sha256"] { continue; }
+        let selection = original.get("selection").filter(|value|value.is_object()).unwrap_or(&snapshot["selection"]);
+        let old_episodes = storyboard_scope_ids(selection, "episodeIds")?;
+        let old_units = storyboard_scope_ids(selection, "unitIds")?;
+        if old_episodes.is_empty() { return Err("原分镜流程的冻结集范围缺失，不能通过新流程绕过".into()) }
+        if episodes.is_disjoint(&old_episodes) { continue; }
+        let same_source = match storyboard_source_identity(&original["source"]) {
+            Ok(old) => old == identity,
+            Err(_) => {
+                if original["source"]["sha256"] == input["source"]["sha256"] {
+                    return Ok(StoryboardStartBoundary::Hold(format!("原分镜流程 {} 的源绑定不能核验，保留记录且不另建相同来源任务", s(job,"id"))));
+                }
+                false
+            }
+        };
+        if !same_source { continue; }
+        let unknown = job["submissionUnknown"].as_bool() == Some(true);
+        if s(job,"status") == "completed" && !unknown {
+            if old_units.is_empty() { completed_episodes.extend(old_episodes); }
+            else { completed_units.extend(old_units); }
+            continue;
+        }
+        if ["cancelled", "closed_by_user"].contains(&s(job,"status")) && !unknown { continue; }
+        let published = &job["prepared"]["publishedEpisodes"];
+        let mut pending_episodes = old_episodes.clone();
+        // A published projection proves content availability, not the remote
+        // outcome of any unresolved text node. Unknown owns its original scope.
+        if old_units.is_empty() && !unknown {
+            pending_episodes.retain(|id| {
+                let proof = &published[id];
+                !(proof["version"] == "complete-episode-publication/v1"
+                    && proof["episodeId"] == id.as_str()
+                    && proof["sourceSha256"] == input["source"]["sha256"]
+                    && proof["episodeDeliverySha256"].as_str().is_some_and(|sha| sha.len()==64)
+                    && proof["unitIds"].as_array().is_some_and(|ids| !ids.is_empty()))
+            });
+        }
+        if !unknown { pending_episodes.retain(|id| !completed_episodes.contains(id)); }
+        let mut pending_units = old_units.clone();
+        if !unknown { pending_units.retain(|id| !completed_units.contains(id)); }
+        if !old_units.is_empty() && pending_units.is_empty() { continue; }
+        let overlaps = !episodes.is_disjoint(&pending_episodes)
+            && (old_units.is_empty() || units.is_empty() || !units.is_disjoint(&pending_units));
+        if !overlaps { continue; }
+        let id = s(job,"id");
+        if unknown {
+            return Ok(StoryboardStartBoundary::Hold(format!("原分镜流程 {id} 存在未知提交；先核对原执行，不另建重叠范围或重发")));
+        }
+        if old_episodes != episodes || old_units != units {
+            return Ok(StoryboardStartBoundary::Hold(format!("所选范围与未完成分镜流程 {id} 重叠；请继续原流程，不通过缩小或扩大范围重发")));
+        }
+        if !units.is_empty() && original["revisionInstruction"] != input["revisionInstruction"] {
+            return Ok(StoryboardStartBoundary::Hold(format!("单元范围已有未完成分镜流程 {id}，修改要求与原任务不同；先处理原流程，未忽略新要求或重发")));
+        }
+        let original_version=original["source"].get("version").filter(|value|!value.is_null()).unwrap_or(&snapshot["sourceVersion"]);
+        if *original_version != input["source"]["version"] {
+            return Ok(StoryboardStartBoundary::Hold(format!("原分镜流程 {id} 的原文内容与范围相同但保存版本已变化；保留原请求，先核对来源版本绑定")));
+        }
+        if snapshot["runnerVersion"] != "desktop-runner/v1"
+            || !["failed","interrupted","waiting_decision","partially_blocked","blocked"].contains(&s(job,"status")) {
+            return Ok(StoryboardStartBoundary::Hold(format!("原分镜流程 {id} 仍在执行或缺少可恢复身份，不另建同范围任务")));
+        }
+        matches.push(id.to_owned());
+    }
+    match matches.len() {
+        0 => Ok(StoryboardStartBoundary::New),
+        1 => Ok(StoryboardStartBoundary::Resume(matches.remove(0))),
+        _ => Ok(StoryboardStartBoundary::Hold("相同来源与范围有多个未完成分镜流程，请从原记录选择继续；未新建或重发".into())),
+    }
+}
+
+fn existing_storyboard_start(store: &Store, input: &Value) -> Result<StoryboardStartBoundary> {
+    store.ensure_workflow_storage()?;
+    let connection = store.conn()?;
+    let mut query = connection.prepare(r#"SELECT j.id,j.state,
+        json_object('runnerVersion',json_extract(j.snapshot,'$.runnerVersion'),
+            'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),
+            'selection',json_extract(j.snapshot,'$.selection'),
+            'input',json_object('source',json_extract(j.snapshot,'$.input.source'),
+                'selection',json_extract(j.snapshot,'$.input.selection'),
+                'revisionInstruction',json_extract(j.snapshot,'$.input.revisionInstruction'))),
+        COALESCE(json_extract(j.prepared,'$.publishedEpisodes'),'{}'),
+        EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs t ON t.id=w.text_job_id
+            WHERE w.workflow_id=j.id AND t.state='submission_unknown') OR j.state='submission_unknown'
+        FROM jobs j WHERE j.kind='workflow' AND j.entity_id='storyboard.run'
+            AND json_extract(j.snapshot,'$.input.source.sha256')=?1
+        ORDER BY j.created_at DESC,j.rowid DESC"#).map_err(|e|e.to_string())?;
+    let records = query.query_map([s(&input["source"],"sha256")],|row| {
+        Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,
+            row.get::<_,String>(3)?,row.get::<_,bool>(4)?))
+    }).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let workflows: Vec<Value> = records.into_iter().map(|(id,status,snapshot,published,unknown)| {
+        Ok(json!({"id":id,"kind":"workflow","entityId":"storyboard.run","status":status,
+            "snapshot":serde_json::from_str::<Value>(&snapshot).map_err(|e|e.to_string())?,
+            "prepared":{"publishedEpisodes":serde_json::from_str::<Value>(&published).map_err(|e|e.to_string())?},
+            "submissionUnknown":unknown}))
+    }).collect::<Result<_>>()?;
+    storyboard_start_boundary(&workflows,input)
+}
+
+
+#[derive(Debug, PartialEq)]
+enum FoundationStartBoundary {
+    New,
+    Resume(String),
+    Hold(String),
+}
+
+/// Foundation has no per-episode publication proof. Only a newer completed
+/// workflow with the exact frozen scope supersedes an older stopped branch.
+/// Unknown submissions keep their original scope even after such a completion.
+fn foundation_start_boundary(workflows: &[Value], input: &Value) -> Result<FoundationStartBoundary> {
+    let identity = storyboard_source_identity(&input["source"])?;
+    let episodes = storyboard_scope_ids(&input["selection"], "episodeIds")?;
+    if episodes.is_empty() { return Err("请明确制作基础的集范围".into()) }
+    let mut completed_scopes = Vec::new();
+    let mut matches = Vec::new();
+    for job in workflows {
+        if job["kind"] != "workflow" || job["entityId"] != "foundation.run" { continue; }
+        let snapshot = &job["snapshot"];
+        let original = &snapshot["input"];
+        if original["source"]["sha256"] != input["source"]["sha256"] { continue; }
+        let selection = original.get("selection").filter(|value| value.is_object()).unwrap_or(&snapshot["selection"]);
+        let old_episodes = storyboard_scope_ids(selection, "episodeIds")?;
+        if old_episodes.is_empty() {
+            return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {} 缺少冻结集范围，保留记录且不另建相同来源任务", s(job,"id"))));
+        }
+        if episodes.is_disjoint(&old_episodes) { continue; }
+        let same_source = match storyboard_source_identity(&original["source"]) {
+            Ok(old) => old == identity,
+            Err(_) => return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {} 的源绑定不能核验，保留记录且不另建相同来源任务", s(job,"id")))),
+        };
+        if !same_source { continue; }
+        let unknown = job["submissionUnknown"].as_bool() == Some(true) || s(job,"status") == "submission_unknown";
+        if s(job,"status") == "completed" && !unknown {
+            completed_scopes.push(old_episodes);
+            continue;
+        }
+        if ["cancelled", "closed_by_user"].contains(&s(job,"status")) && !unknown { continue; }
+        if !unknown && completed_scopes.iter().any(|scope| scope == &old_episodes) { continue; }
+        let id = s(job,"id");
+        if unknown {
+            return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {id} 存在未知提交；先核对原执行，不另建重叠范围或重发")));
+        }
+        if old_episodes != episodes {
+            return Ok(FoundationStartBoundary::Hold(format!("所选范围与未完成制作基础流程 {id} 重叠；请继续原流程，不通过缩小或扩大范围重发")));
+        }
+        let original_version = original["source"].get("version").filter(|value| !value.is_null()).unwrap_or(&snapshot["sourceVersion"]);
+        if *original_version != input["source"]["version"] {
+            return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {id} 的原文内容与范围相同但保存版本已变化；保留原请求，先核对来源版本绑定")));
+        }
+        if snapshot["runnerVersion"] != "desktop-runner/v1" || snapshot["stage"] != "foundation.run"
+            || !["failed","interrupted","waiting_decision","partially_blocked","blocked"].contains(&s(job,"status")) {
+            return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {id} 仍在执行或缺少可恢复身份，不另建同范围任务")));
+        }
+        matches.push(id.to_owned());
+    }
+    match matches.len() {
+        0 => Ok(FoundationStartBoundary::New),
+        1 => Ok(FoundationStartBoundary::Resume(matches.remove(0))),
+        _ => Ok(FoundationStartBoundary::Hold("相同来源与范围有多个未完成制作基础流程，请从原记录选择继续；未新建或重发".into())),
+    }
+}
+
+fn existing_foundation_start(store: &Store, input: &Value) -> Result<FoundationStartBoundary> {
+    store.ensure_workflow_storage()?;
+    let connection = store.conn()?;
+    let mut query = connection.prepare(r#"SELECT j.id,j.state,
+        json_object('runnerVersion',json_extract(j.snapshot,'$.runnerVersion'),
+            'stage',json_extract(j.snapshot,'$.stage'),
+            'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),
+            'selection',json_extract(j.snapshot,'$.selection'),
+            'input',json_object('source',json_extract(j.snapshot,'$.input.source'),
+                'selection',json_extract(j.snapshot,'$.input.selection'))),
+        EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs t ON t.id=w.text_job_id
+            WHERE w.workflow_id=j.id AND t.state='submission_unknown') OR j.state='submission_unknown'
+        FROM jobs j WHERE j.kind='workflow' AND j.entity_id='foundation.run'
+            AND json_extract(j.snapshot,'$.input.source.sha256')=?1
+        ORDER BY j.created_at DESC,j.rowid DESC"#).map_err(|e|e.to_string())?;
+    let records = query.query_map([s(&input["source"],"sha256")],|row| {
+        Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,bool>(3)?))
+    }).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let workflows: Vec<Value> = records.into_iter().map(|(id,status,snapshot,unknown)| {
+        Ok(json!({"id":id,"kind":"workflow","entityId":"foundation.run","status":status,
+            "snapshot":serde_json::from_str::<Value>(&snapshot).map_err(|e|e.to_string())?,"submissionUnknown":unknown}))
+    }).collect::<Result<_>>()?;
+    foundation_start_boundary(&workflows,input)
+}
+
+#[cfg(test)]
+mod foundation_start_boundary_tests {
+    use super::*;
+
+    fn input() -> Value {
+        let mut source = json!(pipeline::prepare_source("第一集\n场景：门口\n甲：开门。\n第二集\n场景：院内\n乙：回头。\n第三集\n场景：小路\n甲：走吧。\n").unwrap());
+        source["version"] = json!(1);
+        json!({"selection":{"episodeIds":source["episodes"].as_array().unwrap().iter().map(|ep|&ep["id"]).collect::<Vec<_>>()},"source":source})
+    }
+    fn job(input: &Value, status: &str) -> Value {
+        json!({"id":"original","kind":"workflow","entityId":"foundation.run","status":status,
+            "snapshot":{"runnerVersion":"desktop-runner/v1","stage":"foundation.run","sourceVersion":input["source"]["version"],"selection":input["selection"],"input":input},"submissionUnknown":false})
+    }
+    fn episode(input: &Value, index: usize) -> Value {
+        let mut next = input.clone();next["selection"]["episodeIds"] = json!([input["source"]["episodes"][index]["id"]]);next
+    }
+
+    #[test]
+    fn same_failed_scope_continues_frozen_original_instead_of_creating_a_new_workflow() {
+        let current = input();
+        for status in ["failed","interrupted","partially_blocked","blocked","waiting_decision"] {
+            let original = job(&current,status);let before = original.to_string();
+            assert_eq!(foundation_start_boundary(&[original.clone()],&current).unwrap(),FoundationStartBoundary::Resume("original".into()));
+            assert_eq!(original.to_string(),before);
+        }
+    }
+
+    #[test]
+    fn unknown_keeps_its_whole_scope_after_newer_completion_without_storyboard_proofs() {
+        let current = input();let mut unknown = job(&current,"partially_blocked");unknown["submissionUnknown"] = json!(true);
+        assert!(matches!(foundation_start_boundary(&[job(&current,"completed"),unknown.clone()],&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("未知提交")));
+        assert!(matches!(foundation_start_boundary(&[unknown.clone()],&episode(&current,1)).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("未知提交")));
+        unknown["status"] = json!("submission_unknown");unknown["submissionUnknown"] = json!(false);
+        assert!(matches!(foundation_start_boundary(&[unknown],&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("未知提交")));
+    }
+
+    #[test]
+    fn overlapping_rescope_is_held_but_disjoint_episode_scope_is_distinct() {
+        let current = input();let first = episode(&current,0);
+        assert!(matches!(foundation_start_boundary(&[job(&current,"failed")],&first).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("重叠")));
+        assert!(matches!(foundation_start_boundary(&[job(&first,"failed")],&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("重叠")));
+        assert_eq!(foundation_start_boundary(&[job(&first,"failed")],&episode(&current,2)).unwrap(),FoundationStartBoundary::New);
+    }
+
+    #[test]
+    fn real_source_change_is_new_but_identical_text_and_catalogue_version_change_is_held() {
+        let current = input();let original = job(&current,"failed");
+        let mut changed = current.clone();changed["source"] = json!(pipeline::prepare_source("第一集\n场景：门口\n甲：不同的原话。\n").unwrap());changed["source"]["version"] = json!(2);changed["selection"]["episodeIds"] = json!([changed["source"]["episodes"][0]["id"]]);
+        assert_eq!(foundation_start_boundary(&[original.clone()],&changed).unwrap(),FoundationStartBoundary::New);
+        let mut version_only = current.clone();version_only["source"]["version"] = json!(2);
+        assert!(matches!(foundation_start_boundary(&[original.clone()],&version_only).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("版本")));
+        let source: pipeline::LockedSource = serde_json::from_value(current["source"].clone()).unwrap();let range = &source.rows.iter().find(|row|row.kind=="body").unwrap().range;
+        let decision: pipeline::BoundaryDecision = serde_json::from_value(json!({"start":range.start,"end":range.end,"kind":"body","episodeNumber":1,"sceneTitle":"正式确认的新场地","reason":"合成测试确认范围"})).unwrap();
+        changed = current.clone();changed["source"] = json!(pipeline::apply_boundary_decisions(&source,&[decision]).unwrap());changed["source"]["version"] = json!(2);
+        assert_eq!(changed["source"]["sha256"],current["source"]["sha256"]);
+        assert_eq!(foundation_start_boundary(&[original],&changed).unwrap(),FoundationStartBoundary::New);
+    }
+
+    #[test]
+    fn completion_allows_explicit_regeneration_and_only_supersedes_exact_frozen_scope() {
+        let current = input();
+        assert_eq!(foundation_start_boundary(&[job(&current,"completed")],&current).unwrap(),FoundationStartBoundary::New);
+        assert_eq!(foundation_start_boundary(&[job(&current,"completed"),job(&current,"failed")],&current).unwrap(),FoundationStartBoundary::New);
+        assert_eq!(foundation_start_boundary(&[job(&current,"failed"),job(&current,"completed")],&current).unwrap(),FoundationStartBoundary::Resume("original".into()));
+        assert_eq!(foundation_start_boundary(&[job(&episode(&current,0),"completed"),job(&current,"failed")],&current).unwrap(),FoundationStartBoundary::Resume("original".into()));
+    }
+
+    #[test]
+    fn stage_identity_ambiguity_and_running_records_cannot_be_reused_as_foundation() {
+        let current = input();let mut other = job(&current,"failed");other["entityId"] = json!("storyboard.run");
+        assert_eq!(foundation_start_boundary(&[other],&current).unwrap(),FoundationStartBoundary::New);
+        let mut second = job(&current,"failed");second["id"] = json!("second");
+        assert!(matches!(foundation_start_boundary(&[second,job(&current,"interrupted")],&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("多个")));
+        assert!(matches!(foundation_start_boundary(&[job(&current,"running")],&current).unwrap(),FoundationStartBoundary::Hold(_)));
+        let mut wrong_stage = job(&current,"failed");wrong_stage["snapshot"]["stage"] = json!("storyboard.run");
+        assert!(matches!(foundation_start_boundary(&[wrong_stage],&current).unwrap(),FoundationStartBoundary::Hold(_)));
+    }
+
+    #[test]
+    fn sqlite_lookup_uses_only_foundation_history_and_keeps_sdk_unknown_before_new_preflight() {
+        let temp = tempfile::tempdir().unwrap();let store = Store::open(temp.path().join("project")).unwrap();store.create("offline foundation start boundary","synthetic").unwrap();store.ensure_workflow_storage().unwrap();
+        let current = input();let snapshot = job(&current,"failed")["snapshot"].clone();
+        let run = store.add_job("workflow","foundation.run","local","local",&snapshot,"partially_blocked").unwrap();
+        for _ in 0..105 {store.add_job("workflow","storyboard.run","local","local",&snapshot,"completed").unwrap();}
+        let child = store.add_job("text","foundation:F2","codex_sdk","local",&json!({}),"rejected").unwrap();
+        store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'original-f2','foundation:F2','synthetic','rejected',?2,?3)",rusqlite::params![run,child,now()]).unwrap();
+        assert_eq!(existing_foundation_start(&store,&current).unwrap(),FoundationStartBoundary::Resume(run.clone()));
+        let before = store.job(&run).unwrap()["snapshot"].to_string();
+        store.update_job(&child,"submission_unknown",&json!({})).unwrap();
+        let count: i64 = store.conn().unwrap().query_row("SELECT COUNT(*) FROM jobs",[],|row|row.get(0)).unwrap();
+        assert!(matches!(existing_foundation_start(&store,&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("未知提交")));
+        assert_eq!(store.job(&run).unwrap()["snapshot"].to_string(),before);
+        assert_eq!(store.job(&child).unwrap()["status"],"submission_unknown");
+        assert_eq!(store.conn().unwrap().query_row("SELECT COUNT(*) FROM jobs",[],|row|row.get::<_,i64>(0)).unwrap(),count);
+    }
+}
+
+#[cfg(test)]
+mod storyboard_start_boundary_tests {
+    use super::*;
+
+    fn input() -> Value {
+        let mut source = json!(pipeline::prepare_source("第一集\n场景：門口\n甲：开门。\n第二集\n场景：院内\n乙：回头。\n第三集\n场景：小路\n甲：走吧。\n").unwrap());
+        source["version"] = json!(1);
+        json!({"selection":{"episodeIds":source["episodes"].as_array().unwrap().iter().map(|ep|&ep["id"]).collect::<Vec<_>>()},"source":source})
+    }
+    fn job(input: &Value, status: &str) -> Value {
+        json!({"id":"original","kind":"workflow","entityId":"storyboard.run","status":status,
+            "snapshot":{"runnerVersion":"desktop-runner/v1","sourceVersion":input["source"]["version"],"selection":input["selection"],"input":input},
+            "prepared":{"publishedEpisodes":{}},"submissionUnknown":false})
+    }
+    fn episode(input: &Value, index: usize) -> Value {
+        let mut next = input.clone();
+        next["selection"]["episodeIds"] = json!([input["source"]["episodes"][index]["id"]]);
+        next
+    }
+
+    #[test]
+    fn unfinished_exact_scope_continues_original_without_mutating_frozen_inputs() {
+        let current = input();
+        for status in ["failed","interrupted","partially_blocked","blocked","waiting_decision"] {
+            let original = job(&current,status);
+            let before = original.to_string();
+            assert_eq!(storyboard_start_boundary(&[original.clone()],&current).unwrap(),StoryboardStartBoundary::Resume("original".into()));
+            assert_eq!(original.to_string(),before);
+        }
+    }
+
+    #[test]
+    fn unknown_is_held_even_when_a_newer_completed_branch_exists() {
+        let current = input();
+        let mut unknown = job(&current,"partially_blocked");
+        unknown["submissionUnknown"] = json!(true);
+        assert!(matches!(storyboard_start_boundary(&[job(&current,"completed"),unknown],&current).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("未知提交")));
+    }
+
+    #[test]
+    fn published_all_episode_proofs_cannot_disarm_an_unknown_original_scope() {
+        let current = input();
+        let mut unknown = job(&current,"partially_blocked");
+        unknown["submissionUnknown"] = json!(true);
+        for episode in current["source"]["episodes"].as_array().unwrap() {
+            let id=s(episode,"id");
+            unknown["prepared"]["publishedEpisodes"][id]=json!({"version":"complete-episode-publication/v1","episodeId":id,"sourceSha256":current["source"]["sha256"],"episodeDeliverySha256":"a".repeat(64),"unitIds":[format!("{id}-accepted")]});
+        }
+        for state in ["partially_blocked","completed"] {
+            unknown["status"]=json!(state);
+            for selected in [&current,&episode(&current,0)] {
+                assert!(matches!(storyboard_start_boundary(&[job(&current,"completed"),unknown.clone()],selected).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("未知提交")));
+            }
+        }
+        let mut changed=current.clone();changed["source"]=json!(pipeline::prepare_source("第一集\n场景：门口\n甲：真实不同的原文。\n").unwrap());changed["source"]["version"]=json!(2);changed["selection"]["episodeIds"]=json!([changed["source"]["episodes"][0]["id"]]);
+        assert_eq!(storyboard_start_boundary(&[unknown],&changed).unwrap(),StoryboardStartBoundary::New);
+    }
+
+    #[test]
+    fn partial_publication_allows_completed_and_disjoint_ranges_but_holds_pending_overlap() {
+        let current = input();
+        let mut original = job(&current,"partially_blocked");
+        let completed = s(&current["source"]["episodes"][0],"id");
+        original["prepared"]["publishedEpisodes"][completed] = json!({"version":"complete-episode-publication/v1","episodeId":completed,"sourceSha256":current["source"]["sha256"],"episodeDeliverySha256":"a".repeat(64),"unitIds":["accepted-unit"]});
+        assert_eq!(storyboard_start_boundary(&[original.clone()],&episode(&current,0)).unwrap(),StoryboardStartBoundary::New);
+        assert!(matches!(storyboard_start_boundary(&[original.clone()],&episode(&current,1)).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("重叠")));
+        assert_eq!(storyboard_start_boundary(&[original],&current).unwrap(),StoryboardStartBoundary::Resume("original".into()));
+        let isolated = job(&episode(&current,0),"failed");
+        assert_eq!(storyboard_start_boundary(&[isolated],&episode(&current,2)).unwrap(),StoryboardStartBoundary::New);
+    }
+
+    #[test]
+    fn actual_source_changes_are_distinct_but_version_only_change_cannot_reset_a_task() {
+        let current = input();
+        let original = job(&current,"failed");
+        let mut changed_text = current.clone();
+        changed_text["source"] = json!(pipeline::prepare_source("第一集\n场景：门口\n甲：另一句。\n").unwrap());
+        changed_text["source"]["version"] = json!(2);
+        changed_text["selection"]["episodeIds"] = json!([changed_text["source"]["episodes"][0]["id"]]);
+        assert_eq!(storyboard_start_boundary(&[original.clone()],&changed_text).unwrap(),StoryboardStartBoundary::New);
+        let mut version_only = current.clone();version_only["source"]["version"] = json!(2);
+        assert!(matches!(storyboard_start_boundary(&[original.clone()],&version_only).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("版本")));
+        let parsed: pipeline::LockedSource=serde_json::from_value(current["source"].clone()).unwrap();
+        let range=&parsed.rows.iter().find(|row|row.kind=="body").unwrap().range;
+        let decision: pipeline::BoundaryDecision=serde_json::from_value(json!({"start":range.start,"end":range.end,"kind":"body","episodeNumber":1,"sceneTitle":"已确认另一场地","reason":"合成用户明确调整场范围"})).unwrap();
+        let mut changed_catalogue = current.clone();changed_catalogue["source"]=json!(pipeline::apply_boundary_decisions(&parsed,&[decision]).unwrap());changed_catalogue["source"]["version"]=json!(2);
+        assert_eq!(changed_catalogue["source"]["sha256"],current["source"]["sha256"]);
+        assert_eq!(storyboard_start_boundary(&[original],&changed_catalogue).unwrap(),StoryboardStartBoundary::New);
+    }
+
+    #[test]
+    fn unit_scopes_are_not_conflated_and_changed_revision_instruction_is_not_ignored() {
+        let mut current = episode(&input(),0);
+        current["selection"]["unitIds"] = json!(["u1"]);current["revisionInstruction"] = json!("保留全部原话，改善动作。");
+        let original = job(&current,"interrupted");
+        assert_eq!(storyboard_start_boundary(&[original.clone()],&current).unwrap(),StoryboardStartBoundary::Resume("original".into()));
+        let mut different = current.clone();different["selection"]["unitIds"] = json!(["u2"]);
+        assert_eq!(storyboard_start_boundary(&[original.clone()],&different).unwrap(),StoryboardStartBoundary::New);
+        different=current.clone();different["revisionInstruction"] = json!("采用不同的具体演法。");
+        assert!(matches!(storyboard_start_boundary(&[original],&different).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("要求")));
+    }
+
+    #[test]
+    fn completed_regeneration_is_allowed_but_ambiguous_or_running_origins_are_held() {
+        let current = input();
+        assert_eq!(storyboard_start_boundary(&[job(&current,"completed"),job(&current,"failed")],&current).unwrap(),StoryboardStartBoundary::New);
+        let mut second = job(&current,"failed");second["id"] = json!("second");
+        assert!(matches!(storyboard_start_boundary(&[second,job(&current,"interrupted")],&current).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("多个")));
+        assert!(matches!(storyboard_start_boundary(&[job(&current,"running")],&current).unwrap(),StoryboardStartBoundary::Hold(_)));
+        assert_eq!(storyboard_start_boundary(&[],&current).unwrap(),StoryboardStartBoundary::New);
+    }
+
+    #[test]
+    fn sqlite_lookup_keeps_unknown_and_history_beyond_workspace_summary_limit() {
+        let temp=tempfile::tempdir().unwrap();let store=Store::open(temp.path().join("project")).unwrap();store.create("offline start boundary","synthetic").unwrap();
+        store.ensure_workflow_storage().unwrap();
+        let current=input();let snapshot=job(&current,"failed")["snapshot"].clone();
+        let run=store.add_job("workflow","storyboard.run","local","local",&snapshot,"partially_blocked").unwrap();
+        for _ in 0..105 {store.add_job("workflow","foundation.run","local","local",&json!({}),"completed").unwrap();}
+        assert_eq!(existing_storyboard_start(&store,&current).unwrap(),StoryboardStartBoundary::Resume(run.clone()));
+        let child=store.add_job("text","storyboardCreate","codex","local",&json!({}),"submission_unknown").unwrap();
+        store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'original-author','storyboardCreate','synthetic','failed',?2,?3)",rusqlite::params![run,child,now()]).unwrap();
+        let before=store.job(&run).unwrap()["snapshot"].to_string();
+        assert!(matches!(existing_storyboard_start(&store,&current).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("未知提交")));
+        assert_eq!(store.job(&run).unwrap()["snapshot"].to_string(),before);
+        assert_eq!(store.job(&child).unwrap()["status"],"submission_unknown");
+    }
+}
+
 fn cached_video_capabilities(
     store: &Store,
     provider: &str,

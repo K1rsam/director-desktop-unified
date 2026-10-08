@@ -1,6 +1,7 @@
 //! Source-bound production pipeline. Models author decisions; Rust copies and validates evidence.
 pub mod asset_visual_facts;
 pub mod asset_design_contract;
+pub mod asset_production_context;
 mod assets;
 pub mod foundation_delivery;
 pub(crate) mod foundation_wire;
@@ -23,6 +24,10 @@ use serde_json::{json, Value};
 pub use source::*;
 use std::collections::{HashMap, HashSet};
 pub(crate) use storyboard::{finish_base_hash, validate_episode_delivery, CONTEXT_INPUT_PROFILE_FIELD, CONTEXT_INPUT_PROFILE};
+#[cfg(test)]
+pub(crate) fn scope_repair_delta_schema_for_test(full: &Value, base: &Value) -> Value {
+    storyboard::finish_delta_schema(full, base)
+}
 pub use storyboard::{
     compile_reference_template, render_legacy_unit, run_storyboard, validate_storyboard,
 };

@@ -267,6 +267,30 @@ fn validate_cached_packet<'a>(
     Ok(facts)
 }
 
+/// Read-only evidence for Stage2 shared-object candidates. Reuses the exact
+/// adopted packet validator; a free-standing foundation fact is not a receipt.
+pub(crate) fn accepted_source_facts(input: &Value, source: &LockedSource) -> Result<Vec<Value>, String> {
+    let assets = input["assets"].as_array().ok_or("已采用视觉证据缺少资产目录")?;
+    let registry = input["assetRegistry"].as_array().unwrap_or(assets);
+    let current_rule = rule_snapshot("asset-visual-facts-extractor")?["sha256"].as_str().ok_or("视觉规则摘要缺失")?.to_owned();
+    let mut accepted = Vec::new();
+    for cache in input["foundation"]["visualFactBatches"].as_array().into_iter().flatten() {
+        let identities = if let Some(previous) = cache.get("identityCards").or_else(||cache.pointer("/repairProvenance/identityCards")).and_then(Value::as_array) {
+            cached_identity_subset(input,registry,previous,source,cache)
+        } else { Ok(identity_cards(input,registry)) };
+        let Ok(identities) = identities else { continue; };
+        let Ok(rows) = cached_rows(source,cache) else { continue; };
+        let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+        let Ok(facts) = validate_cached_packet(cache,source,&identities,&ids,&current_rule) else { continue; };
+        for fact in facts.iter().filter(|fact| fact["claim"] == "SOURCE") {
+            let mut normalized = fact.clone();
+            normalized.as_object_mut().unwrap().remove("quotes");
+            if !accepted.contains(&normalized) { accepted.push(normalized); }
+        }
+    }
+    Ok(accepted)
+}
+
 struct PacketWire {
     input: Value,
     row_ids: Vec<String>,

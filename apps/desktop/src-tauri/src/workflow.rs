@@ -26,6 +26,7 @@ struct ProgressStep {
     raw: Value,
     receipt: Value,
     event: Value,
+    scoped_author_replay_verified: bool,
 }
 
 struct RefinementAdoption<'a> {
@@ -142,6 +143,9 @@ fn progress_step(c: &Connection, run: &str, node: &str) -> Result<Option<Progres
             .unwrap_or(Value::Null)
     };
     let receipt = parse_field("receipt");
+    let scoped_author_replay_verified = receipt["migrationPolicy"]
+        == crate::text_executor::STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY
+        && crate::text_executor::scoped_author_replay_receipt_bound(c, run, node)?;
     let accepted = row["status"] == "accepted"
         && row["jobStatus"] == "completed"
         && row["error"].is_null()
@@ -174,6 +178,7 @@ fn progress_step(c: &Connection, run: &str, node: &str) -> Result<Option<Progres
         raw: parse_field("raw"),
         receipt,
         event: parse_field("event"),
+        scoped_author_replay_verified,
     }))
 }
 
@@ -241,7 +246,7 @@ fn author_scope_resolution(origin: &ProgressStep, resolver: &ProgressStep, sourc
         && origin.request.stage == "storyboardCreate"
         && origin.request.skill == "unit-performance-director"
         && origin.request.input["storyboardCreativeProfile"] == "original-production-contract/v1"
-        && origin.receipt["migrationPolicy"].is_null()
+        && (origin.receipt["migrationPolicy"].is_null() || origin.scoped_author_replay_verified)
         && origin.result == origin.raw
         && origin.event["requestHash"] == origin.hash
         && origin.event["value"] == origin.raw
@@ -299,6 +304,56 @@ fn author_scope_resolution(origin: &ProgressStep, resolver: &ProgressStep, sourc
         && origin.request.input["capabilities"] == request["capabilities"]
 }
 
+// Delta repair schemas freeze the current draft's hash and ordered unit IDs.
+// A second, source-identical attempt has a new base after actual progress; only
+// these three enums may change, and each must equal its own frozen input.
+fn author_scope_attempt_schemas_bound(
+    origin: &crate::pipeline::TextRequest,
+    resolver: &crate::pipeline::TextRequest,
+) -> bool {
+    let normalize = |request: &crate::pipeline::TextRequest| -> Option<Value> {
+        let base = &request.input["previousDraft"];
+        let units = base["units"].as_array().filter(|units| !units.is_empty())?;
+        if base["schemaVersion"] != "storyboard-draft/v2" {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let ids: Vec<Value> = units
+            .iter()
+            .map(|unit| {
+                let id = unit["id"].as_str().filter(|id| !id.is_empty())?;
+                seen.insert(id).then(|| json!(id))
+            })
+            .collect::<Option<_>>()?;
+        let hash = crate::pipeline::finish_base_hash(base);
+        if request.input["baseDraftHash"] != hash
+            || request.input["authorRepair"]["baseDraftHash"] != hash
+        {
+            return None;
+        }
+        let mut schema = request.schema.clone();
+        for (path, expected) in [
+            ("/properties/baseDraftHash/enum", json!([hash])),
+            ("/properties/retainedUnitIds/items/enum", json!(ids)),
+            (
+                "/properties/replacements/items/properties/replaces/items/enum",
+                json!(ids),
+            ),
+        ] {
+            let value = schema.pointer_mut(path)?;
+            if *value != expected {
+                return None;
+            }
+            *value = Value::Null;
+        }
+        Some(schema)
+    };
+    match (normalize(origin), normalize(resolver)) {
+        (Some(origin), Some(resolver)) => origin == resolver,
+        _ => false,
+    }
+}
+
 fn author_scope_attempt_resolution(
     origin: &ProgressStep,
     resolver: &ProgressStep,
@@ -322,7 +377,7 @@ fn author_scope_attempt_resolution(
         || resolver.request.input["authorRepair"]["attempt"] != 2
         || origin.request.model != resolver.request.model
         || origin.request.reasoning != resolver.request.reasoning
-        || origin.request.schema != resolver.request.schema
+        || !author_scope_attempt_schemas_bound(&origin.request, &resolver.request)
         || origin.request.rule_snapshot != resolver.request.rule_snapshot
         || origin.request.input["capabilities"] != resolver.request.input["capabilities"]
         || origin.snapshot["executorIdentity"] != resolver.snapshot["executorIdentity"]
@@ -983,6 +1038,10 @@ impl Store {
         for proposal in proposals {
             let receipt = &proposal["design"]["designReceipt"];
             if receipt.is_object() {
+                crate::pipeline::asset_production_context::validate_consumed_prop_designs(
+                    &proposal["design"],
+                    &effective,
+                )?;
                 let basis = &receipt["basis"];
                 if receipt["sha256"] != crate::pipeline::digest(&basis.to_string())
                     || basis["assetSemanticVersion"]
@@ -1107,7 +1166,10 @@ impl Store {
     /// Reserve a fresh refinement only while its original project settings and
     /// complete publication preimage still match. Preflight execution identity
     /// is frozen separately and never substituted for this settings guard.
-    pub(crate) fn reserve_storyboard_refinement_workflow(&self, snapshot: &Value) -> Result<String> {
+    pub(crate) fn reserve_storyboard_refinement_workflow(
+        &self,
+        snapshot: &Value,
+    ) -> Result<String> {
         if snapshot["stage"] != "storyboard.refine"
             || snapshot["runnerVersion"] != "desktop-runner/v1"
             || snapshot["guard"] != guard_from_input(&snapshot["input"])
@@ -1118,10 +1180,11 @@ impl Store {
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        if snapshot["savedSettingsSha256"]
-            != crate::pipeline::digest(&self.settings()?.to_string())
+        if snapshot["savedSettingsSha256"] != crate::pipeline::digest(&self.settings()?.to_string())
         {
-            return Err("项目保存设置在精修创建前变化；未创建任务或派发请求，请刷新后重新开始".into());
+            return Err(
+                "项目保存设置在精修创建前变化；未创建任务或派发请求，请刷新后重新开始".into(),
+            );
         }
         verify_guard(&tx, &snapshot["guard"])?;
         let run = crate::store::id();
@@ -1375,7 +1438,7 @@ impl Store {
             {
                 let next = row.map_err(|e| e.to_string())?;
                 if !scoped.contains(&next) && !published.contains(&next) {
-                    external_successors.insert(next);
+                    external_successors.insert((next, s(old, "episodeId").to_owned()));
                 }
             }
             if !published.contains(id) {
@@ -1408,6 +1471,19 @@ impl Store {
                     .or(prior);
             }
         }
+        let source_episodes: Vec<_> = input["source"]["episodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|episode| s(episode, "id"))
+            .collect();
+        let mut prior_episode = prior.as_deref().and_then(|id| {
+            current
+                .iter()
+                .find(|unit| s(unit, "id") == id)
+                .map(|unit| s(unit, "episodeId").to_owned())
+        });
+        let mut published_tails = BTreeMap::new();
         for unit in units {
             let mut value = unit.clone();
             value["retired"] = json!(false);
@@ -1421,7 +1497,16 @@ impl Store {
                 tx.execute("DELETE FROM unit_dependencies WHERE unit_id=?1", [uid])
                     .map_err(|e| e.to_string())?;
                 if let Some(ref previous) = prior {
-                    if previous != uid {
+                    // Completing multiple selected episodes must preserve the
+                    // per-episode boundary already used by incremental publish.
+                    // Skipped source episodes cannot become creative predecessors.
+                    let adjacent = prior_episode.as_deref().is_some_and(|episode| {
+                        episode == s(&saved, "episodeId")
+                            || source_episodes.windows(2).any(|pair| {
+                                pair[0] == episode && pair[1] == s(&saved, "episodeId")
+                            })
+                    });
+                    if previous != uid && adjacent {
                         tx.execute(
                             "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
                             params![uid, previous],
@@ -1431,21 +1516,30 @@ impl Store {
                 }
             }
             prior = Some(uid.to_owned());
+            prior_episode = Some(s(&saved, "episodeId").to_owned());
+            published_tails.insert(s(&saved, "episodeId").to_owned(), uid.to_owned());
         }
-        if let Some(last) = prior.as_deref().filter(|_| adoption.is_none()) {
-            for next in external_successors {
-                for old in &scoped {
+        if adoption.is_none() {
+            for (next, episode) in external_successors {
+                let Some(last) = published_tails.get(&episode) else {
+                    continue;
+                };
+                for old in current.iter().filter(|old| {
+                    in_scope(old) && s(old, "episodeId") == episode
+                }) {
                     tx.execute(
                         "DELETE FROM unit_dependencies WHERE unit_id=?1 AND dependency_id=?2",
-                        params![next, old],
+                        params![next, s(old, "id")],
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                tx.execute(
-                    "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
-                    params![next, last],
-                )
-                .map_err(|e| e.to_string())?;
+                if &next != last {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO unit_dependencies VALUES(?1,?2)",
+                        params![next, last],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
         for impact in output["continuityImpacts"].as_array().into_iter().flatten() {

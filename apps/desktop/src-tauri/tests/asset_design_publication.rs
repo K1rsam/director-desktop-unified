@@ -47,3 +47,140 @@ fn invalid_cache_or_concurrent_edit_cannot_partially_replace_design() {
     assert_eq!(store.get("assets", "a").unwrap()["prompt"], "用户编辑");
     assert!(store.foundation().unwrap().is_null());
 }
+
+#[test]
+fn changed_out_of_scope_prop_rolls_back_character_and_fact_publication() {
+    let (_temp, store, source, asset) = fixture();
+    let prop = store
+        .save_asset(json!({
+            "id":"watch", "baseAssetId":"watch-identity", "variantId":"base",
+            "kind":"PROP", "name":"腕表", "sourceRefs":[source["rows"][2]["id"]],
+            "prompt":"蓝色皮带腕表", "design":{"sourceSha256":source["sha256"],
+                "designReceipt":{"sha256":"original-prop-receipt","basis":{"sourceChain":[]}}}
+        }))
+        .unwrap();
+    let context = json!({
+        "version":pipeline::asset_production_context::PROFILE,
+        "sourceSha256":source["sha256"],
+        "instructions":pipeline::asset_production_context::INSTRUCTIONS,
+        "instructionsSha256":pipeline::digest(pipeline::asset_production_context::INSTRUCTIONS),
+        "applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[],
+        "relatedProps":[{"assetId":prop["id"],"identityId":"watch-identity",
+            "variantId":prop["variantId"],
+            "assetSemanticVersion":pipeline::digest(&pipeline::asset_design_contract::asset_semantics(&prop).to_string()),
+            "sharedSourceRefs":[source["rows"][2]["id"]],
+            "acceptedDesign":{"designVersion":pipeline::digest(&json!({"prompt":prop["prompt"],"receipt":prop["design"]["designReceipt"]}).to_string()),
+                "designReceiptSha256":"original-prop-receipt"}}]
+    });
+    let relation = &context["relatedProps"][0];
+    let binding = json!({"version":pipeline::asset_production_context::PROFILE,
+        "instructionsSha256":context["instructionsSha256"],
+        "sceneContextSha256":pipeline::digest(&json!({"applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[]}).to_string()),
+        "relatedPropsSha256":pipeline::digest(&context["relatedProps"].to_string()),
+        "consumedPropDesigns":[{"assetId":prop["id"],"identityId":"watch-identity","variantId":prop["variantId"],
+            "assetSemanticVersion":relation["assetSemanticVersion"],"sourceSha256":source["sha256"],
+            "sharedSourceRefs":relation["sharedSourceRefs"],"designVersion":relation["acceptedDesign"]["designVersion"],
+            "designReceiptSha256":"original-prop-receipt"}]});
+    let mut result = output(&source, &asset);
+    let proposal = &mut result["assets"][0];
+    let basis = json!({
+        "assetSemanticVersion":pipeline::digest(&pipeline::asset_design_contract::asset_semantics(proposal).to_string()),
+        "sourceChain":pipeline::asset_design_contract::source_chain(&[asset.clone(),prop.clone()],proposal).unwrap(),
+        "assetProductionContext":binding
+    });
+    proposal["design"] = json!({"frozenContext":{"assetProductionContext":context},
+        "designReceipt":{"sha256":pipeline::digest(&basis.to_string()),"basis":basis}});
+    pipeline::asset_production_context::validate_consumed_prop_designs(
+        &proposal["design"],
+        &[asset.clone(), prop.clone()],
+    )
+    .unwrap();
+    let mut edited = prop;
+    edited["prompt"] = json!("用户改成银色金属腕表");
+    store.save_asset(edited).unwrap();
+    let error = store.publish_asset_design(1, 0, &result).unwrap_err();
+    assert!(error.contains("道具源/形象/设计版本已变化"), "{error}");
+    assert_eq!(store.get("assets", "a").unwrap()["prompt"], "旧文字");
+    assert_eq!(
+        store.get("assets", "watch").unwrap()["prompt"],
+        "用户改成银色金属腕表"
+    );
+    assert!(store.foundation().unwrap().is_null());
+}
+
+#[test]
+fn consumed_outside_prop_ancestor_edit_rolls_back_character_publication() {
+    let (_temp, store, source, asset) = fixture();
+    let base_basis = json!({"sourceChain":[]});
+    let base = store
+        .save_asset(json!({
+            "id":"watch-base","baseAssetId":"watch-identity","variantId":"base",
+            "kind":"PROP","name":"独立物件基础形象","sourceRefs":[source["rows"][2]["id"]],
+            "prompt":"基础物件固定材质",
+            "design":{"sourceSha256":source["sha256"],"designReceipt":{
+                "sha256":pipeline::digest(&base_basis.to_string()),"basis":base_basis}}
+        }))
+        .unwrap();
+    let mut child = json!({
+        "id":"watch-child","baseAssetId":"watch-identity","variantId":"damaged",
+        "kind":"PROP","name":"同一物件破损形象","sourceAssetId":"watch-base",
+        "sourceRefs":[source["rows"][2]["id"]],"prompt":"继承基础物件的破损稿"
+    });
+    let child_basis = json!({"sourceChain":pipeline::asset_design_contract::source_chain(&[base.clone(),child.clone()],&child).unwrap()});
+    child["design"] = json!({"sourceSha256":source["sha256"],"designReceipt":{
+        "sha256":pipeline::digest(&child_basis.to_string()),"basis":child_basis}});
+    let child = store.save_asset(child).unwrap();
+    let context = json!({
+        "version":pipeline::asset_production_context::PROFILE,"sourceSha256":source["sha256"],
+        "instructions":pipeline::asset_production_context::INSTRUCTIONS,
+        "instructionsSha256":pipeline::digest(pipeline::asset_production_context::INSTRUCTIONS),
+        "applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[],
+        "relatedProps":[{"assetId":child["id"],"identityId":"watch-identity","variantId":child["variantId"],
+            "assetSemanticVersion":pipeline::digest(&pipeline::asset_design_contract::asset_semantics(&child).to_string()),
+            "sharedSourceRefs":[source["rows"][2]["id"]],
+            "acceptedDesign":{"designVersion":pipeline::digest(&json!({"prompt":child["prompt"],"receipt":child["design"]["designReceipt"]}).to_string()),
+                "designReceiptSha256":child["design"]["designReceipt"]["sha256"]}}]
+    });
+    let relation = &context["relatedProps"][0];
+    let binding = json!({
+        "version":pipeline::asset_production_context::PROFILE,"instructionsSha256":context["instructionsSha256"],
+        "sceneContextSha256":pipeline::digest(&json!({"applicableScenes":[],"factEvidenceScenes":[],"factEvidenceScopes":[],"readSceneIds":[]}).to_string()),
+        "relatedPropsSha256":pipeline::digest(&context["relatedProps"].to_string()),
+        "consumedPropDesigns":[{"assetId":child["id"],"identityId":"watch-identity","variantId":child["variantId"],
+            "assetSemanticVersion":relation["assetSemanticVersion"],"sourceSha256":source["sha256"],
+            "sharedSourceRefs":relation["sharedSourceRefs"],"designVersion":relation["acceptedDesign"]["designVersion"],
+            "designReceiptSha256":child["design"]["designReceipt"]["sha256"]}]
+    });
+    let mut result = output(&source, &asset);
+    let proposal = &mut result["assets"][0];
+    let basis = json!({
+        "assetSemanticVersion":pipeline::digest(&pipeline::asset_design_contract::asset_semantics(proposal).to_string()),
+        "sourceChain":pipeline::asset_design_contract::source_chain(&[asset.clone(),base.clone(),child.clone()],proposal).unwrap(),
+        "assetProductionContext":binding
+    });
+    proposal["design"] = json!({"frozenContext":{"assetProductionContext":context},
+        "designReceipt":{"sha256":pipeline::digest(&basis.to_string()),"basis":basis}});
+    pipeline::asset_production_context::validate_consumed_prop_designs(
+        &proposal["design"],
+        &[asset.clone(), base.clone(), child.clone()],
+    )
+    .unwrap();
+
+    let frozen_child = store.get("assets", "watch-child").unwrap();
+    let previous_character = store.get("assets", "a").unwrap();
+    let previous_foundation = store.foundation().unwrap();
+    let mut changed_base = base;
+    changed_base["expectedVersion"] = changed_base["version"].clone();
+    changed_base["prompt"] = json!("用户仅改变基础物件材质");
+    store.save_asset_user(changed_base).unwrap();
+    assert_eq!(store.get("assets", "watch-child").unwrap(), frozen_child);
+    let error = store.publish_asset_design(1, 0, &result).unwrap_err();
+    assert!(error.contains("道具祖先设计版本已变化"), "{error}");
+    assert_eq!(store.get("assets", "a").unwrap(), previous_character);
+    assert_eq!(store.get("assets", "watch-child").unwrap(), frozen_child);
+    assert_eq!(store.foundation().unwrap(), previous_foundation);
+    assert_eq!(
+        store.get("assets", "watch-base").unwrap()["prompt"],
+        "用户仅改变基础物件材质"
+    );
+}

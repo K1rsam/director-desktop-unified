@@ -2483,6 +2483,32 @@ fn places(
     }
     Ok(result)
 }
+
+/// Nonempty, proved scene usage is authoritative. Episode IDs are redundant
+/// transport metadata, so derive them without editing the saved model reply.
+/// Catalogue/reference-only entries still retain their episode-only contract.
+fn projected_usage_episodes(
+    source: &LockedSource,
+    batch: &Batch,
+    episode_ids: Option<Vec<String>>,
+    pairs: Option<&Vec<Vec<String>>>,
+) -> Result<Option<Vec<String>>, String> {
+    if pairs.is_none_or(|pairs| pairs.is_empty()) {
+        return Ok(episode_ids);
+    }
+    // Validate exact source, batch and supplied scene rows before projecting;
+    // a listed episode never creates or broadens a scene reference.
+    let proved = places(source, batch, &[], None, pairs)?;
+    Ok(Some(
+        batch
+            .scope
+            .iter()
+            .filter(|episode| proved.iter().any(|place| &place.episode_id == *episode))
+            .cloned()
+            .collect(),
+    ))
+}
+
 fn scope_value(
     raw: Option<&WireScope>,
     places: Vec<Applicability>,
@@ -2693,7 +2719,13 @@ fn build_asset(
     if wire.key.is_some() && old.is_none() {
         return Err("未知资产key不可由模型猜测；新对象须省略key由程序编号".into());
     }
-    let scope_episodes = wire.episodes.clone().or_else(|| {
+    let supplied_episodes = projected_usage_episodes(
+        source,
+        batch,
+        wire.episodes.clone(),
+        wire.scene_refs.as_ref(),
+    )?;
+    let scope_episodes = supplied_episodes.clone().or_else(|| {
         old.and_then(|a| a.metadata.get("usageEpisodes"))
             .and_then(Value::as_array)
             .map(|v| {
@@ -2833,7 +2865,7 @@ fn build_asset(
     asset
         .metadata
         .insert("catalogName".into(), json!(catalog_name));
-    if let Some(episodes) = &wire.episodes {
+    if let Some(episodes) = &supplied_episodes {
         update_usage(&mut asset.metadata, episodes, batch, patch);
     }
     if !matches!(kind.as_str(), "CH" | "BEAST") {
@@ -2852,7 +2884,7 @@ fn build_asset(
                 source,
                 batch,
                 refs,
-                wire.episodes.as_ref(),
+                supplied_episodes.as_ref(),
                 wire.scene_refs.as_ref(),
             )?
         } else {
@@ -3016,7 +3048,13 @@ fn build_asset(
             if vid == bid && !patch && name != existing.unwrap().name {
                 return Err("基础形象身份不能在形象差异中隐式改名".into());
             }
-            let scope_episodes = v.episodes.clone().or_else(|| {
+            let supplied_episodes = projected_usage_episodes(
+                source,
+                batch,
+                v.episodes.clone(),
+                v.scene_refs.as_ref(),
+            )?;
+            let scope_episodes = supplied_episodes.clone().or_else(|| {
                 existing
                     .and_then(|v| v.metadata.get("usageEpisodes"))
                     .and_then(Value::as_array)
@@ -3062,7 +3100,7 @@ fn build_asset(
                         source,
                         batch,
                         refs,
-                        v.episodes.as_ref(),
+                        supplied_episodes.as_ref(),
                         v.scene_refs.as_ref(),
                     )?,
                     refs,
@@ -3130,7 +3168,7 @@ fn build_asset(
                 v.note.as_ref(),
             )?);
             mark_scope(&mut variant.metadata, source);
-            if let Some(episodes) = &v.episodes {
+            if let Some(episodes) = &supplied_episodes {
                 update_usage(&mut variant.metadata, episodes, batch, patch || vid == bid && batch.fragment.is_none());
             }
             if existing.is_none() && v.preparation.is_none() {
@@ -5975,6 +6013,92 @@ mod tests {
     }
     fn empty_edit(source: &LockedSource, batch: &Batch) -> Value {
         json!({"format":"ASSET_OPTIMIZATION_DESKTOP_V2","sourceSha256":source.sha256,"coverage":batch.scope,"changes":{}})
+    }
+
+    fn episode_usage_projection_fixture() -> (LockedSource, Batch, FoundationProposal, Value, Value) {
+        let source = prepare_source(concat!(
+            "第一集\n场景：室内\n△甲穿靴。\n",
+            "第二集\n场景：门外\n△甲继续穿靴。\n",
+            "第三集\n场景：码头\n△甲仍穿靴。\n",
+        )).unwrap();
+        let scope: Vec<_> = source.episodes.iter().map(|episode| episode.id.clone()).collect();
+        let batch = Batch { pieces: whole_rows(&source, &scope), scope, fragment: None };
+        let prior = empty_foundation(&source);
+        let pairs: Vec<_> = source.scenes.iter().map(|scene| json!([scene.episode_id,scene.id])).collect();
+        let mut raw = empty_catalogue(&source, &batch);
+        raw["assets"] = json!([{
+            "name":"甲｜常服","type":"CH","episodes":[batch.scope[0],batch.scope[0]],
+            "sceneRefs":[pairs[0],pairs[2]],"preparation":{"mode":"REFERENCE"},
+            "variants":[{"name":"穿靴","episodes":[batch.scope[0],batch.scope[1]],
+                "sceneRefs":[pairs[1],pairs[2]],"preparation":{"mode":"DERIVE"}}]
+        }]);
+        let input = input_for("F2", &source, &batch, &prior, &json!({}), 0, 1, false, &[]);
+        (source,batch,prior,input,raw)
+    }
+
+    #[test]
+    fn scene_usage_episodes_project_base_and_variant_without_changing_raw() {
+        let (source,batch,prior,input,raw) = episode_usage_projection_fixture();
+        let frozen = raw.to_string();
+        let next = apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap();
+        let asset = &next.assets[0];
+        let base = &asset.variants[0];
+        let child = &asset.variants[1];
+        assert_eq!(asset.metadata["usageEpisodes"],json!([batch.scope[0],batch.scope[2]]));
+        assert_eq!(base.metadata["usageEpisodes"],asset.metadata["usageEpisodes"]);
+        assert_eq!(child.metadata["usageEpisodes"],json!([batch.scope[1],batch.scope[2]]));
+        assert_eq!(base.scope.scenes.len(),2);
+        assert_eq!(child.scope.scenes.len(),2);
+        assert_eq!(child.source_variant_id.as_deref(),Some(base.id.as_str()));
+        assert!(next.facts.is_empty(),"usage projection never invents appearance facts");
+        assert_eq!(raw.to_string(),frozen,"original model reply stays byte-identical");
+        let projected = super::super::flatten_foundation_assets(&next);
+        let child_row = projected.iter().find(|row|row["variantId"]==child.id).unwrap();
+        assert_eq!(child_row["applicability"]["episodes"],json!([batch.scope[1],batch.scope[2]]));
+        assert_eq!(child_row["sourceVariantId"],base.id);
+    }
+
+    #[test]
+    fn scene_usage_episode_projection_cannot_bypass_source_batch_or_reference_guards() {
+        let (source,batch,prior,input,raw) = episode_usage_projection_fixture();
+        for failure in ["unknown_scene","wrong_episode","duplicate_scene","unprovided_scene","invalid_source_ref"] {
+            let mut damaged = raw.clone();
+            let mut current_batch = batch.clone();
+            match failure {
+                "unknown_scene" => damaged["assets"][0]["sceneRefs"][0][1] = json!("scene:unknown"),
+                "wrong_episode" => damaged["assets"][0]["sceneRefs"][0][0] = json!(batch.scope[1]),
+                "duplicate_scene" => damaged["assets"][0]["sceneRefs"][1] = damaged["assets"][0]["sceneRefs"][0].clone(),
+                "unprovided_scene" => current_batch.pieces.retain(|piece| !source.rows.iter().any(|row|row.id==piece.row_id && row.scene_id.as_deref()==Some(source.scenes[2].id.as_str()))),
+                "invalid_source_ref" => damaged["assets"][0]["sourceRefs"] = json!(["row:unprovided"]),
+                _ => unreachable!(),
+            }
+            assert!(apply_catalogue(&damaged,&source,&current_batch,&input,&prior,None,&HashSet::new()).is_err(),"{failure}");
+        }
+        let mut narrow_batch = batch.clone();
+        narrow_batch.scope = batch.scope[..2].to_vec();
+        narrow_batch.pieces = whole_rows(&source,&narrow_batch.scope);
+        let mut outside = raw;
+        outside["coverage"] = json!(narrow_batch.scope);
+        let narrow_input = input_for("F2",&source,&narrow_batch,&prior,&json!({}),0,1,false,&[]);
+        assert!(apply_catalogue(&outside,&source,&narrow_batch,&narrow_input,&prior,None,&HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn episode_only_reference_catalogue_preserves_usage_without_inventing_scenes() {
+        let (source,batch,prior,input,mut raw) = episode_usage_projection_fixture();
+        raw["assets"][0]["variants"] = json!([]);
+        raw["assets"][0]["episodes"] = json!([batch.scope[0],batch.scope[2]]);
+        raw["assets"][0]["sceneRefs"] = json!([]);
+        let frozen = raw.to_string();
+        let next = apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap();
+        let asset = &next.assets[0];
+        assert_eq!(asset.metadata["usageEpisodes"],raw["assets"][0]["episodes"]);
+        assert_eq!(asset.variants[0].scope.kind,"UNRESOLVED");
+        assert!(asset.variants[0].applicability.is_empty());
+        assert!(asset.variants[0].scope.scenes.is_empty());
+        assert_eq!(raw.to_string(),frozen);
+        raw["assets"][0]["episodes"] = json!(["episode:unprovided"]);
+        assert!(apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).is_err());
     }
 
     #[test]
