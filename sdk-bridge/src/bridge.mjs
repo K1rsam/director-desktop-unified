@@ -27,6 +27,16 @@ function preTurnDiagnostic(event) {
   return Object.keys(event).sort().join(',') === 'item,type'
     && Object.keys(item).sort().join(',') === 'id,message,type';
 }
+// Official runtime JSONL emits a retry notice as top-level error while its
+// turn remains Running (rust-v0.162.0-alpha.2); SDK run() waits for turn.failed.
+// Keep only this bounded reconnect diagnostic on the ORIGINAL stream. Other
+// errors remain fatal. This never creates/resumes a thread or proves completion.
+function streamReconnectDiagnostic(event) {
+  if (event.type !== 'error' || Object.keys(event).sort().join(',') !== 'message,type'
+    || typeof event.message !== 'string' || Buffer.byteLength(event.message) > 4096) return false;
+  const match = /^Reconnecting\.\.\. ([1-9][0-9]?)\/([1-9][0-9]?) \(stream disconnected before completion: [^\r\n]+\)$/.exec(event.message);
+  return match !== null && Number(match[1]) <= Number(match[2]) && Number(match[2]) <= 10;
+}
 function receiptPayload(value) { const { receiptEnvelopeSha256, ...payload } = value; return payload; }
 async function atomicJson(file, value) {
   const payload = receiptPayload(value);
@@ -41,6 +51,10 @@ async function atomicJson(file, value) {
 }
 
 /** Real official SDK adapter. No mock SDK object, resume, alternate model or provider. */
+function supportedFrozenFormat(attempt) {
+  return object(attempt) && ((attempt.version === 'text-attempt/v2' && !Object.hasOwn(attempt, 'compiledInputFormat'))
+    || (attempt.version === 'text-attempt/v3' && attempt.compiledInputFormat === 'rules-first-json/v1'));
+}
 export class OfficialSdkBridge {
   constructor({ stateDirectory, emit = () => {}, offlineFixture = null, nativeRuntime = null, limits = {} }) {
     requireThat(path.isAbsolute(stateDirectory), 'INVALID_DIRECTORY', 'stateDirectory must be absolute and dedicated to this worker');
@@ -98,7 +112,7 @@ export class OfficialSdkBridge {
         }
         requireThat(record.receiptEnvelopeSha256 === sha256(JSON.stringify(receiptPayload(record))), 'CORRUPT_RECEIPT', 'Receipt envelope hash mismatch; do not resend');
         requireThat(record.attempt?.attemptId === entry.name && record.protocolVersion === PROTOCOL_VERSION, 'CORRUPT_RECEIPT', 'Receipt identity/version mismatch; do not resend');
-        requireThat(record.attempt.version === 'text-attempt/v2' && record.attempt.backend === 'codex_sdk' && record.attempt.state === 'prepared', 'CORRUPT_RECEIPT', 'Frozen attempt changed; do not resend');
+        requireThat(supportedFrozenFormat(record.attempt) && record.attempt.backend === 'codex_sdk' && record.attempt.state === 'prepared', 'CORRUPT_RECEIPT', 'Frozen attempt changed; do not resend');
         requireThat(record.frozenAttemptSha256 === sha256(JSON.stringify(record.attempt)) && record.requestSnapshotSha256 === sha256(JSON.stringify(record.attempt.request)), 'CORRUPT_RECEIPT', 'Frozen attempt/request snapshot hash mismatch; do not resend');
         requireThat(typeof record.compiledPrompt === 'string' && typeof record.compiledSchema === 'string' && record.compiledPromptSha256 === sha256(record.compiledPrompt) && record.compiledSchemaSha256 === sha256(record.compiledSchema), 'CORRUPT_RECEIPT', 'Compiled input hash mismatch; do not resend');
         requireThat(record.rawResult === null ? record.rawResultSha256 === null : record.rawResultSha256 === sha256(JSON.stringify(record.rawResult)), 'CORRUPT_RECEIPT', 'Raw result hash mismatch; do not resend');
@@ -146,7 +160,7 @@ export class OfficialSdkBridge {
       sdk: { package: '@openai/codex-sdk', version: SDK_VERSION, transport: 'exec --experimental-json' },
       runtime: { version: this.fixture ? 'synthetic-fixture' : this.nativeRuntime?.identity.runtimePackageVersion ?? null, verified: !!this.nativeRuntime },
       available: !!this.nativeRuntime, liveCallsAllowed: !!this.nativeRuntime, offlineFixtureAvailable: !!this.fixture,
-      capabilities: { execute: this.fixture ? 'offline_fixture_only' : this.nativeRuntime ? 'verified_native_text_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: this.nativeRuntime ? 'AbortSignal_with_native_supervisor' : 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
+      capabilities: { compiledInputFormats: ['legacy-json/v1', 'rules-first-json/v1'], execute: this.fixture ? 'offline_fixture_only' : this.nativeRuntime ? 'verified_native_text_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: this.nativeRuntime ? 'AbortSignal_with_native_supervisor' : 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
       blockers: this.nativeRuntime ? ['Pinned SDK has no passive remote observation or turn ID; interrupted submission remains unknown'] : ['SDK live execution needs verified native supervision', 'Native runtime isolation and process-tree ownership are required'],
       limits: this.limits,
     };
@@ -181,7 +195,7 @@ export class OfficialSdkBridge {
     requireThat(this.fixture || this.nativeRuntime, 'SDK_LIVE_DISABLED', 'Live SDK execution is disabled; no fallback or runtime was started');
     requireThat(!this.active && ![...this.records.values()].some(r => UNRESOLVED.has(r.state)), 'WORKER_OCCUPIED', 'An active or unknown attempt still owns this worker budget');
     const { attempt, compiledPrompt, compiledSchema, compiledPromptSha256, compiledSchemaSha256 } = message.params ?? {};
-    requireThat(object(attempt) && attempt.version === 'text-attempt/v2' && attempt.backend === 'codex_sdk' && attempt.state === 'prepared' && attempt.threadId === null && attempt.turnId === null && attempt.lastSequence === 0 && attempt.rawResult === null, 'FROZEN_ATTEMPT', 'Expected a prepared text-attempt/v2 frozen to codex_sdk');
+    requireThat(supportedFrozenFormat(attempt) && attempt.backend === 'codex_sdk' && attempt.state === 'prepared' && attempt.threadId === null && attempt.turnId === null && attempt.lastSequence === 0 && attempt.rawResult === null, 'FROZEN_ATTEMPT', 'Expected a prepared legacy v2 or rules-first v3 attempt frozen to codex_sdk');
     requireThat(attempt.attemptId === message.attemptId && validId(attempt.attemptId), 'ATTEMPT_ID', 'Envelope and frozen attempt identities must match');
     requireThat(!this.records.has(attempt.attemptId), 'ATTEMPT_EXISTS', 'Attempt already exists; use observe, never execute again');
     requireThat(this.records.size < this.limits.attempts, 'ATTEMPT_LIMIT', 'Worker history limit reached');
@@ -279,6 +293,9 @@ export class OfficialSdkBridge {
         } else if (event.type === 'turn.completed') {
           requireThat(active.turnStarted && active.finalItem && object(event.usage), 'OUT_OF_ORDER', 'Completion lacks prior final text or usage');
           active.completed = true; record.usage = event.usage;
+        } else if (active.threadStarted && active.turnStarted && streamReconnectDiagnostic(event)) {
+          // Raw event is already durable; wait for the official runtime's
+          // terminal event within the existing execution deadline. No retry here.
         } else if (event.type === 'turn.failed' || event.type === 'error') {
           throw new BridgeError('SDK_TURN_FAILED', event.error?.message ?? event.message ?? 'SDK reported failure');
         } else throw new BridgeError('UNSUPPORTED_EVENT', `Unknown SDK event type: ${String(event.type)}`);

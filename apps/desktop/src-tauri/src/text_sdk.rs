@@ -26,6 +26,9 @@ pub const POLICY: &str = "sdk-text-only-offline/v1";
 pub const NATIVE_POLICY: &str = "sdk-text-only-native/v1";
 #[path = "sdk_native.rs"]
 mod native;
+#[path = "text_sdk_passive.rs"]
+mod passive;
+pub(crate) use passive::historical_receipt;
 pub use native::{enable_native_execution, native_execution_enabled, run_runtime_wrapper};
 const FRAME_LIMIT: usize = 1_048_576;
 const EVENT_LIMIT: usize = 2048;
@@ -69,6 +72,19 @@ pub struct SdkIdentity {
     pub codex_home: Option<String>,
 }
 impl SdkIdentity {
+    /// Historical evidence is not execution capability. Only the bridge content
+    /// pin may differ; original identity bytes remain frozen and unmodified.
+    pub(crate) fn validate_receipt(&self) -> Result<()> {
+        if self.bridge_sha256.len() != 64
+            || !self.bridge_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("SDK_IDENTITY_MISMATCH: 历史桥哈希无效".into());
+        }
+        let mut structural = self.clone();
+        structural.bridge_sha256 = if self.version == "official-sdk-identity/v2" {
+            compiled_native_bridge_sha()
+        } else { compiled_bridge_sha() };
+        structural.validate()
+    }
     pub fn validate(&self) -> Result<()> {
         if !["official-sdk-identity/v1", "official-sdk-identity/v2"]
             .contains(&self.version.as_str())
@@ -133,6 +149,22 @@ pub fn identity(settings: &Value) -> Result<Value> {
         serde_json::from_value(value.clone()).map_err(|e| format!("SDK_IDENTITY_MISMATCH: {e}"))?;
     identity.validate()?;
     Ok(value.clone())
+}
+/// Snapshot/readback only. Config and every new dispatch still call identity().
+pub(crate) fn receipt_identity(settings: &Value) -> Result<Value> {
+    let value = settings.get("textSdkIdentity").ok_or("SDK_IDENTITY_MISSING")?;
+    let identity: SdkIdentity = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    identity.validate_receipt()?;
+    Ok(value.clone())
+}
+pub(crate) fn supervisor_handoff_receipt_identity_bound(old: &Value, new: &Value) -> bool {
+    let (Ok(mut a), Ok(mut b)) = (serde_json::from_value::<SdkIdentity>(old.clone()),
+        serde_json::from_value::<SdkIdentity>(new.clone())) else { return false; };
+    if a.validate_receipt().is_err() || b.validate_receipt().is_err()
+        || a.bridge_sha256 != b.bridge_sha256 { return false; }
+    a.bridge_sha256 = compiled_native_bridge_sha();
+    b.bridge_sha256 = compiled_native_bridge_sha();
+    native::supervisor_handoff_identity_bound(&json!(a), &json!(b))
 }
 /// This DTO is safe even before Node has been installed. No runtime, account or model probe.
 pub async fn status(settings: &Value) -> Value {
@@ -635,7 +667,7 @@ impl OfficialSdkTransport {
         receipt: &Value,
         last_sdk: u64,
     ) -> Result<Observation> {
-        let compiled = crate::text_executor::compile_codex_input(&attempt.request)?;
+        let compiled = crate::text_executor::compile_sdk_attempt_input(attempt)?;
         if receipt["semanticRequestHash"] != attempt.semantic_request_hash
             || receipt["executionFingerprint"] != attempt.execution_fingerprint
             || receipt["attemptEnvelopeHash"] != attempt.attempt_envelope_hash
@@ -701,7 +733,7 @@ impl TextTransport for OfficialSdkTransport {
         {
             return Err("SDK_ATTEMPT_IDENTITY".into());
         }
-        let compiled = crate::text_executor::compile_codex_input(&attempt.request)?;
+        let compiled = crate::text_executor::compile_sdk_attempt_input(attempt)?;
         {
             let mut active = self.active_attempt.lock().map_err(|e| e.to_string())?;
             if active.is_some() {
@@ -1142,4 +1174,54 @@ mod tests {
         assert!(identity(&extra).is_err());
         assert!(identity(&json!({"textSdkIdentity":{"provider":"codex","executable":"/some/cli","version":"codex-cli 0.160.1"}})).is_err());
     }
+    #[tokio::test]
+    async fn sdk_input_format_legacy_and_new_success_replay_exact_bytes_without_another_execute() {
+        sdk_input_format_restart_contract("happy", ObservationKind::Completed).await;
+    }
+    #[tokio::test]
+    async fn sdk_input_format_legacy_and_new_unknown_remain_unknown_with_zero_restart_dispatch() {
+        sdk_input_format_restart_contract("configuration-notice-only", ObservationKind::SubmissionUnknown).await;
+    }
+    async fn sdk_input_format_restart_contract(scenario: &str, expected: ObservationKind) {
+        for rules_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap(); let settings = offline_settings(scenario);
+            let config = Config::from_settings(&settings, temp.path()).unwrap();
+            let transport = OfficialSdkTransport::new(config, Arc::new(|_, _| Ok(())));
+            let request = crate::pipeline::TextRequest {
+                stage: "fixture".into(), skill: "fixture".into(), model: "gpt-6.1-sol".into(), reasoning: "medium".into(),
+                input: json!({"source":"合成原文完整保留\n😀"}), schema: json!({"type":"object"}),
+                rule_snapshot: json!({"completeRule":"完整规则，不截断"}),
+            };
+            let mut attempt = if rules_first {
+                FrozenAttempt::prepare_sdk_rules_first("format_fixture", "workflow_fixture", "node_fixture", request, &settings["textSdkIdentity"])
+            } else {
+                FrozenAttempt::prepare("format_fixture", "workflow_fixture", "node_fixture", Backend::CodexSdk, request, &settings["textSdkIdentity"])
+            }.unwrap();
+            let compiled = crate::text_executor::compile_sdk_attempt_input(&attempt).unwrap();
+            let result = transport.execute(&attempt).await.unwrap();
+            assert_eq!(result.kind, expected);
+            transport.close().await.unwrap();
+            attempt.begin_dispatch(Backend::CodexSdk).unwrap(); attempt.observe(result.clone()).unwrap();
+            let frozen = temp.path().join("sdk-attempt.json"); attempt.persist(&frozen).unwrap();
+            let directory = temp.path().join("sdk-worker/format_fixture");
+            let invocation = std::fs::read(directory.join("fixture-invocation.json")).unwrap();
+            let captured: Value = serde_json::from_slice(&invocation).unwrap();
+            assert_eq!(captured["prompt"], compiled.prompt);
+            assert!(compiled.prompt.starts_with(if rules_first {"{\"rules\":"} else {"{\"input\":"}));
+            let events = std::fs::read(directory.join("events.ndjson")).unwrap();
+            let frozen_bytes = std::fs::read(&frozen).unwrap();
+            let config = Config::from_settings(&settings, temp.path()).unwrap();
+            let resumed = OfficialSdkTransport::new(config, Arc::new(|_, _| Ok(())));
+            let reopened = FrozenAttempt::load(&frozen).unwrap();
+            let recovered = resumed.reconcile(&reopened).await.unwrap();
+            resumed.close().await.unwrap();
+            assert_eq!(recovered.kind, expected);
+            assert_eq!(recovered.raw_result, result.raw_result);
+            assert_eq!(std::fs::read(directory.join("fixture-invocation.json")).unwrap(), invocation);
+            assert_eq!(std::fs::read(directory.join("events.ndjson")).unwrap(), events);
+            assert_eq!(std::fs::read(&frozen).unwrap(), frozen_bytes);
+            assert_eq!(std::fs::read_dir(temp.path().join("sdk-worker")).unwrap().flatten().filter(|item| item.path().join("fixture-invocation.json").is_file()).count(), 1);
+        }
+    }
+
 }

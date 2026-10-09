@@ -54,7 +54,7 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
         && settings["textProvider"] == "codex_sdk"
         && settings["textModel"] == request.model
         && settings["reasoning"] == request.reasoning
-        && crate::text_sdk::supervisor_handoff_identity_bound(
+        && crate::text_sdk::supervisor_handoff_receipt_identity_bound(
             &proof["originalIdentity"],
             &snapshot["executorIdentity"],
         )

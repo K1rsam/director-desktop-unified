@@ -26,7 +26,20 @@ if (scenario === 'rust-domain') {
 const text = { type: 'item.completed', item: { id: 'synthetic-item-1', type: 'agent_message', text: scenario === 'invalid-text-json' ? '{not repaired' : fixtureText } };
 const complete = { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 1 } };
 const configurationNotice = { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `tools.view_image` is ignored.' } };
-if (scenario === 'configuration-notice') { event(thread); event(configurationNotice); event(start); event(text); event(complete); }
+const reconnect = { type: 'error', message: 'Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)' };
+if (scenario.startsWith('reconnect-') || scenario === 'fatal-error-during-turn') {
+  event(thread);
+  if (scenario !== 'reconnect-before-turn') event(start);
+  event(scenario === 'reconnect-invalid-counter' ? { ...reconnect, message: reconnect.message.replace('2/5', '6/5') }
+    : scenario === 'reconnect-extra-field' ? { ...reconnect, command: 'synthetic-unexecuted-command' }
+    : scenario === 'reconnect-too-long' ? { ...reconnect, message: 'Reconnecting... 2/5 (stream disconnected before completion: ' + 'x'.repeat(4096) + ')' }
+    : scenario === 'fatal-error-during-turn' ? { type: 'error', message: 'Synthetic unrecoverable error' }
+    : reconnect);
+  if (scenario === 'reconnect-failed') event({ type: 'turn.failed', error: { message: 'Retries exhausted; synthetic terminal failure' } });
+  else if (scenario === 'reconnect-hang') setTimeout(() => process.exit(0), 30_000);
+  else if (scenario === 'reconnect-recovered') { event(text); event(complete); }
+}
+else if (scenario === 'configuration-notice') { event(thread); event(configurationNotice); event(start); event(text); event(complete); }
 else if (scenario === 'unstable-feature-notice') { event(thread); event({ ...configurationNotice, item: { ...configurationNotice.item, message: 'Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in synthetic config.toml.' } }); event(start); event(text); event(complete); }
 else if (scenario === 'ordinary-error-item') { event(thread); event({ ...configurationNotice, item: { ...configurationNotice.item, message: 'A non-fatal diagnostic unrelated to configuration, 保留原始诊断。' } }); event(start); event(text); event(complete); }
 else if (scenario === 'notice-missing-id') { event(thread); event({ ...configurationNotice, item: { type: 'error', message: 'A diagnostic without its required identity' } }); event(start); event(text); event(complete); }

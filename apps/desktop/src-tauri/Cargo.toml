@@ -24,7 +24,7 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 base64 = "0.22"

@@ -39,6 +39,8 @@ pub struct FrozenAttempt {
     pub execution_fingerprint: String,
     pub runtime_identity: Value,
     pub attempt_envelope_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled_input_format: Option<String>,
     pub dispatch_started: bool,
     pub state: AttemptState,
     pub thread_id: Option<String>,
@@ -86,6 +88,7 @@ impl FrozenAttempt {
             execution_fingerprint,
             runtime_identity: runtime_identity.clone(),
             attempt_envelope_hash: digest(&envelope.to_string()),
+            compiled_input_format: None,
             dispatch_started: false,
             request,
             state: AttemptState::Prepared,
@@ -94,6 +97,40 @@ impl FrozenAttempt {
             last_sequence: 0,
             raw_result: None,
         })
+    }
+    /// Only a newly allocated SDK node chooses this format. Existing attempts
+    /// keep the exact legacy serializer and envelope without a format field.
+    pub fn prepare_sdk_rules_first(
+        attempt_id: &str, workflow_id: &str, logical_node_id: &str,
+        request: TextRequest, runtime_identity: &Value,
+    ) -> Result<Self> {
+        let mut attempt = Self::prepare(attempt_id, workflow_id, logical_node_id,
+            Backend::CodexSdk, request, runtime_identity)?;
+        attempt.version = "text-attempt/v3".into();
+        attempt.compiled_input_format = Some("rules-first-json/v1".into());
+        attempt.attempt_envelope_hash = digest(&json!({
+            "version":"attempt-identity/v2", "attemptId":attempt_id,
+            "workflowId":workflow_id, "logicalNodeId":logical_node_id,
+            "semanticRequestHash":attempt.semantic_request_hash,
+            "executionFingerprint":attempt.execution_fingerprint,
+            "compiledInputFormat":attempt.compiled_input_format,
+        }).to_string());
+        Ok(attempt)
+    }
+    pub fn sdk_bridge_uses_rules_first(inspect: &Value) -> bool {
+        inspect["capabilities"]["compiledInputFormats"].as_array()
+            .is_some_and(|formats| formats.iter().any(|format| format == "rules-first-json/v1"))
+    }
+    /// Old frozen bridge packages omit this capability and keep the v2 wire.
+    pub fn prepare_sdk_for_bridge(
+        attempt_id: &str, workflow_id: &str, logical_node_id: &str,
+        request: TextRequest, runtime_identity: &Value, inspect: &Value,
+    ) -> Result<Self> {
+        if Self::sdk_bridge_uses_rules_first(inspect) {
+            Self::prepare_sdk_rules_first(attempt_id, workflow_id, logical_node_id, request, runtime_identity)
+        } else {
+            Self::prepare(attempt_id, workflow_id, logical_node_id, Backend::CodexSdk, request, runtime_identity)
+        }
     }
     pub fn persist(&self, path: &Path) -> Result<()> {
         self.validate_identity()?;
@@ -118,18 +155,22 @@ impl FrozenAttempt {
         }
         let value: Self =
             serde_json::from_value(record["payload"].clone()).map_err(|e| e.to_string())?;
+        if value.version == "text-attempt/v2" && record["payload"].get("compiledInputFormat").is_some() {
+            return Err("SDK_COMPILED_FORMAT_UNSUPPORTED: v2原冻结包不得注入编译格式字段".into());
+        }
         value.validate_identity()?;
         Ok(value)
     }
     pub fn validate_identity(&self) -> Result<()> {
-        let expected = Self::prepare(
-            &self.attempt_id,
-            &self.workflow_id,
-            &self.logical_node_id,
-            self.backend.clone(),
-            self.request.clone(),
-            &self.runtime_identity,
-        )?;
+        let expected = match self.compiled_input_format.as_deref() {
+            None => Self::prepare(&self.attempt_id, &self.workflow_id,
+                &self.logical_node_id, self.backend.clone(), self.request.clone(),
+                &self.runtime_identity)?,
+            Some("rules-first-json/v1") if self.backend == Backend::CodexSdk =>
+                Self::prepare_sdk_rules_first(&self.attempt_id, &self.workflow_id,
+                    &self.logical_node_id, self.request.clone(), &self.runtime_identity)?,
+            _ => return Err("SDK_COMPILED_FORMAT_UNSUPPORTED: 未知冻结编译格式，未派发或重编原请求".into()),
+        };
         if self.version != expected.version
             || self.semantic_request_hash != expected.semantic_request_hash
             || self.execution_fingerprint != expected.execution_fingerprint
@@ -254,3 +295,7 @@ pub trait TextTransport: Send + Sync {
     async fn reconcile(&self, attempt: &FrozenAttempt) -> Result<Observation>;
     async fn cancel(&self, attempt: &FrozenAttempt) -> Result<Observation>;
 }
+
+#[cfg(test)]
+#[path = "text_transport_format_tests.rs"]
+mod input_format_tests;

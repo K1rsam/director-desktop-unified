@@ -457,3 +457,51 @@ for (const field of ['threadId', 'state', 'usage', 'error', 'lastSequence', 'dom
     await assert.rejects(restarted.initialize(), { code: 'CORRUPT_RECEIPT' });
   });
 }
+
+test('official reconnect diagnostic stays on one original SDK stream until completion and survives local replay', async t => {
+  const { bridge, dir, events } = await fixture(t, 'reconnect-recovered');
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'transport_completed');
+  assert.equal(receipt.rawResult.rawText, '{"ok":true,"text":"合成测试"}');
+  assert.equal(receipt.threadId, 'synthetic-thread-1');
+  assert.equal(receipt.domainAccepted, false);
+  const raw = events.filter(event => event.type === 'sdk_event');
+  assert.deepEqual(raw.map(event => event.rawEvent.type), ['thread.started', 'turn.started', 'error', 'item.completed', 'turn.completed']);
+  assert.deepEqual(raw.map(event => event.sequence), [1, 2, 3, 4, 5]);
+  assert.match(raw[2].rawEvent.message, /Reconnecting\.\.\. 2\/5/);
+  const invocation = await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8');
+  assert.equal(JSON.parse(invocation).args.includes('resume'), false);
+  await assert.rejects(bridge.handle(executeCommand()), { code: 'ATTEMPT_EXISTS' });
+  await bridge.disconnect();
+  const restarted = new OfficialSdkBridge({ stateDirectory: dir }); await restarted.initialize();
+  try {
+    assert.equal(restarted.observe('attempt_1').state, 'transport_completed');
+    assert.equal(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'), invocation);
+    assert.equal(JSON.parse((await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8')).split('\n')[2]).rawEvent.type, 'error');
+  } finally { await restarted.disconnect(); }
+});
+
+for (const [scenario, expected] of [
+  ['reconnect-only', 'INCOMPLETE_STREAM'], ['reconnect-failed', 'SDK_TURN_FAILED'],
+  ['fatal-error-during-turn', 'SDK_TURN_FAILED'], ['reconnect-before-turn', 'SDK_TURN_FAILED'],
+  ['reconnect-invalid-counter', 'SDK_TURN_FAILED'], ['reconnect-extra-field', 'SDK_TURN_FAILED'],
+  ['reconnect-too-long', 'SDK_TURN_FAILED'],
+]) test(`${scenario} never fabricates completion or authorizes another dispatch`, async t => {
+  const { bridge, dir } = await fixture(t, scenario);
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'submission_unknown'); assert.equal(receipt.error.code, expected);
+  assert.equal(receipt.rawResult, null); assert.equal(receipt.usage, null); assert.equal(receipt.domainAccepted, false);
+  const original = await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8');
+  await assert.rejects(bridge.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });
+  assert.equal(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'), original);
+});
+
+test('reconnect diagnostics do not extend the existing execution deadline', async t => {
+  const { bridge, events } = await fixture(t, 'reconnect-hang', { limits: { executionMs: 1000 } });
+  const start = Date.now(); const { receipt } = await completed(bridge);
+  assert.ok(Date.now() - start < 5000);
+  assert.ok(events.some(event => event.rawEvent?.type === 'error' && event.rawEvent.message.startsWith('Reconnecting...')));
+  assert.equal(receipt.state, 'submission_unknown'); assert.equal(receipt.error.code, 'CANCEL_UNCONFIRMED');
+  assert.equal(receipt.rawResult, null); assert.equal(receipt.processTreeStopProven, false);
+  await assert.rejects(bridge.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });
+});

@@ -1,8 +1,11 @@
 /** Director private protocol; these are NOT official Codex SDK protocol types. */
 export type ProtocolVersion = 'director-sdk-bridge/v1';
 export type BridgeMethod = 'hello' | 'inspect' | 'execute' | 'observe' | 'cancel' | 'shutdown';
-export interface FrozenAttempt {
-  version: 'text-attempt/v2';
+export type FrozenAttempt = FrozenAttemptFields & (
+  { version: 'text-attempt/v2'; compiledInputFormat?: never }
+  | { version: 'text-attempt/v3'; compiledInputFormat: 'rules-first-json/v1' }
+);
+interface FrozenAttemptFields {
   attemptId: string;
   workflowId: string;
   logicalNodeId: string;
