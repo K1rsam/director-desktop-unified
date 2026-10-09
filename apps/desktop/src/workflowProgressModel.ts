@@ -78,6 +78,12 @@ export function secondsLabel(value: number): string {
   const total = Math.max(0, Math.floor(value));
   return total < 60 ? `${total} 秒` : `${Math.floor(total / 60)} 分 ${total % 60} 秒`;
 }
+function reconnectLabel(execution: Node): string {
+  const retry = record(execution.reconnect), attempt = retry.attempt, limit = retry.limit;
+  return retry.version === 'stream-reconnect-progress/v1' && Number.isSafeInteger(attempt) && Number.isSafeInteger(limit)
+    && typeof attempt === 'number' && typeof limit === 'number' && attempt >= 1 && attempt <= limit && limit <= 10
+    ? `原请求重连 ${attempt}/${limit}，等待返回` : '';
+}
 export function executionSummary(node: Node, now = Date.now(), readFailed = false): string {
   if (words(node.status) !== 'running') return '';
   const execution = record(node.execution);
@@ -87,16 +93,17 @@ export function executionSummary(node: Node, now = Date.now(), readFailed = fals
       : Number.isFinite(started) && Number.isFinite(now) ? Math.max(0, (now - started) / 1000) : NaN;
     if (!Number.isFinite(elapsed)) return readFailed ? 'SDK 执行状态待刷新' : '正在读取 SDK 本批开始时间';
     const phase = words(execution.phase), event = words(execution.lastEventType), eventAt = Date.parse(words(execution.lastEventAt));
+    const reconnect = !readFailed && phase === 'executing' && event === 'error' ? reconnectLabel(execution) : '';
     const eventLabels: Record<string, string> = { 'thread.started': '会话已开始', 'turn.started': '本轮已开始', 'turn.completed': '本轮已结束', 'turn.failed': '本轮失败', 'item.started': '输出项开始', 'item.updated': '输出项更新', 'item.completed': '输出项完成', error: '执行错误记录', 'sdk.observation': '传输终态记录' };
     const label = readFailed ? 'SDK 执行状态待刷新 · 上次记录' : phase === 'output_received' ? 'SDK 已收到返回，正在核对'
       : phase === 'unknown' ? 'SDK 提交状态待核对，请查看任务记录'
       : event === 'turn.failed' || phase === 'failed' ? 'SDK 本轮执行失败，请查看任务记录'
-        : event === 'turn.completed' ? 'SDK 本轮已结束，结果待核对' : '等待 SDK 返回';
+        : event === 'turn.completed' ? 'SDK 本轮已结束，结果待核对' : reconnect || '等待 SDK 返回';
     let result = label + ' · 已用时 ' + secondsLabel(elapsed);
     if (eventLabels[event] && Number.isFinite(eventAt)) {
-      result += ' · 最后执行事件：' + eventLabels[event] + (readFailed ? '' : `（${secondsLabel(Math.max(0, (now - eventAt) / 1000))}前）`);
+      result += ' · 最后执行事件：' + (reconnect ? '原请求重连提示' : eventLabels[event]) + (readFailed ? '' : `（${secondsLabel(Math.max(0, (now - eventAt) / 1000))}前）`);
     } else result += ' · 尚无可核对的执行事件记录';
-    if (!readFailed && phase === 'executing' && !['turn.completed', 'turn.failed', 'error'].includes(event)
+    if (!readFailed && phase === 'executing' && (!['turn.completed', 'turn.failed', 'error'].includes(event) || !!reconnect)
       && (now - (Number.isFinite(eventAt) ? eventAt : started)) / 1000 >= 120) {
       result += ' · 较长时间未收到新执行事件，可查看任务记录';
     }
@@ -108,6 +115,7 @@ export function executionSummary(node: Node, now = Date.now(), readFailed = fals
   const alive = execution.processAlive === true || execution.processAlive === 1;
   const phase = words(execution.phase), fresh = !readFailed && age <= 90;
   const event = words(execution.lastEventType), turnCompleted = event === 'turn.completed', turnFailed = event === 'turn.failed';
+  const reconnect = fresh && alive && phase === 'executing' && !turnCompleted && !turnFailed ? reconnectLabel(execution) : '';
   const failure = turnFailed ? 'CLI 本轮执行失败，请查看任务错误记录' : phase === 'failed' ? 'CLI 本地执行失败，请查看任务错误记录' : '';
   if (!fresh) return '执行状态暂未更新' + (failure ? ' · 最后记录：' + failure : '') + ' · 最后记录用时 ' + secondsLabel(elapsed);
   // A terminal turn event is stronger evidence than a historical stderr label.
@@ -117,7 +125,7 @@ export function executionSummary(node: Node, now = Date.now(), readFailed = fals
       : turnCompleted ? 'CLI 本轮已完成，正在核对结果'
         : phase === 'writing_stdin' ? '正在发送制作资料'
           : phase === 'read_result' ? '正在读取 CLI 结果'
-            : phase === 'draining' || !alive ? 'CLI 已退出，结果尚待核对' : '等待 CLI 返回');
+            : phase === 'draining' || !alive ? 'CLI 已退出，结果尚待核对' : reconnect || (event === 'error' ? 'CLI 有执行错误记录，等待原请求结果核对' : '等待 CLI 返回'));
   const liveAge = alive ? age : 0;
   const waiting = alive && phase === 'executing' && !turnCompleted && !turnFailed;
   const eventAge = execution.lastEventAgeSeconds, hasEventAge = typeof eventAge === 'number' && Number.isFinite(eventAge) && eventAge >= 0;
@@ -125,7 +133,7 @@ export function executionSummary(node: Node, now = Date.now(), readFailed = fals
   const quietAge = hasEventAge ? eventAge : quiet;
   const diagnosis = waiting && (execution.needsDiagnosis === true || execution.needsDiagnosis === 1 || Number.isFinite(quietAge) && quietAge + liveAge >= 120);
   const diagnosticLabels: Record<string, string> = { NETWORK_RETRY: 'CLI 报告网络重连', NETWORK_TRANSPORT: 'CLI 报告网络连接异常', TIMEOUT: 'CLI 日志含超时提示（来源待核对）', RATE_LIMIT: 'CLI 报告请求限流', AUTHENTICATION: 'CLI 报告鉴权异常', CLI_ERROR: 'CLI 有运行错误记录' };
-  const diagnostic = waiting ? diagnosticLabels[words(execution.stderrCategory)] : '';
+  const diagnostic = waiting && !reconnect ? diagnosticLabels[words(execution.stderrCategory)] : '';
   return label + ' · 已用时 ' + secondsLabel(elapsed + liveAge) + (diagnostic ? ' · ' + diagnostic : '') + (diagnosis ? ` · 较长时间未收到新${hasEventAge ? '执行事件' : '输出'}，执行监控持续跟踪` : '');
 }
 

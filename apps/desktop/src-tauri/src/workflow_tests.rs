@@ -437,7 +437,7 @@ fn workflow_progress_reads_only_attached_active_cli_safe_heartbeat_fields() {
         )
         .unwrap();
     store.event(&text,"codex_heartbeat",&json!({"phase":"executing","elapsedSeconds":120,"outputQuietSeconds":119,"processAlive":true,"needsDiagnosis":false,"pid":42,"privatePrompt":"must not leak","path":"private"})).unwrap();
-    store.event(&text,"codex_heartbeat",&json!({"phase":"executing","elapsedSeconds":150,"outputQuietSeconds":149,"processAlive":true,"needsDiagnosis":true,"pid":42,"privatePrompt":"must not leak","path":"private"})).unwrap();
+    store.event(&text,"codex_heartbeat",&json!({"phase":"executing","elapsedSeconds":150,"outputQuietSeconds":149,"processAlive":true,"needsDiagnosis":true,"lastEventType":"turn.completed","lastEventAgeSeconds":3,"pid":42,"privatePrompt":"must not leak","path":"private"})).unwrap();
     store
         .event(
             &other,
@@ -451,6 +451,8 @@ fn workflow_progress_reads_only_attached_active_cli_safe_heartbeat_fields() {
     assert_eq!(execution["outputQuietSeconds"], 149);
     assert_eq!(execution["needsDiagnosis"], 1);
     assert_eq!(execution["phase"], "executing");
+    assert_eq!(execution["lastEventType"], "turn.completed");
+    assert_eq!(execution["lastEventAgeSeconds"], 3);
     assert!(execution.get("observedAt").is_some());
     assert!(execution.get("pid").is_none());
     assert!(execution.get("privatePrompt").is_none());
@@ -468,6 +470,44 @@ fn workflow_progress_reads_only_attached_active_cli_safe_heartbeat_fields() {
         )
         .unwrap();
     assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
+}
+
+#[test]
+fn workflow_progress_projects_only_bound_original_reconnect_without_changing_jobs() {
+    for (provider, kind) in [("codex", "codex_event"), ("codex_sdk", "sdk_event")] {
+        let (_dir, store) = project();
+        store.ensure_workflow_storage().unwrap();
+        let run = store.add_job("workflow", "storyboard.run", "local", "local", &json!({"runnerVersion":"desktop-runner/v1"}), "running").unwrap();
+        let text = store.add_job("text", "step", provider, "local", &json!({"input":{"episodeId":"ep1"}}), "submitting").unwrap();
+        store.checkpoint(&run,"plan:ep1","storyboardPlan","hash","running",Some(&text),None,None).unwrap();
+        let save = |raw: Value| {
+            store.event(&text,kind,&if provider == "codex_sdk" {json!({"rawEvent":raw})} else {raw}).unwrap();
+        };
+        let heartbeat = |event: &str| {
+            store.event(&text,"codex_heartbeat",&json!({"phase":"executing","elapsedSeconds":150,"outputQuietSeconds":149,"processAlive":true,"lastEventType":event,"lastEventAgeSeconds":149})).unwrap();
+        };
+        save(json!({"type":"thread.started","thread_id":"original"}));
+        save(json!({"type":"turn.started"}));
+        save(json!({"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: PRIVATE_URL)"}));
+        heartbeat("error");
+        let before: (String,i64) = store.conn().unwrap().query_row("SELECT snapshot,(SELECT COUNT(*) FROM events) FROM jobs WHERE id=?1",[&text],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        for _ in 0..2 {
+            let progress = store.workflow_progress().unwrap();
+            assert_eq!(progress[0]["nodes"][0]["execution"]["reconnect"],json!({"version":"stream-reconnect-progress/v1","attempt":2,"limit":5}));
+            assert!(!serde_json::to_string(&progress).unwrap().contains("PRIVATE_URL"));
+        }
+        let after: (String,i64) = store.conn().unwrap().query_row("SELECT snapshot,(SELECT COUNT(*) FROM events) FROM jobs WHERE id=?1",[&text],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(before,after,"read-only projection cannot change requests or events");
+        save(json!({"type":"error","message":"unrecognized real error"}));
+        let execution=store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].clone();
+        assert!(execution.get("reconnect").is_none());
+        assert_eq!(execution["lastEventType"],"error");
+        save(json!({"type":"turn.failed","error":{"message":"real terminal failure"}}));
+        heartbeat("turn.failed");
+        let execution=store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].clone();
+        assert!(execution.get("reconnect").is_none());
+        assert_eq!(execution["lastEventType"],"turn.failed");
+    }
 }
 
 fn resolution_snapshot(request: &pipeline::TextRequest) -> Value {

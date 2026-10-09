@@ -327,6 +327,19 @@ pub(super) fn contract(stage: &str, delta: bool) -> Result<Value, String> {
     )
 }
 
+const JOINT_SPEAKER_REQUIREMENTS: &str = "共同说者合同 source-dialogue-members/v1：源 dialogue.speaker 是原始联合标签，dialogue.speakers 中每个 text/range 是原文明确名单中的独立说者，不是新人物、合并身份或互为别名。分别用本集正式资产目录中的各自身份/形象；实际入画才绑定图片，纯画外成员不强制露脸。共同一句沿同一 lineId 只覆盖并发声一次，不按人数复制台词或叠加总时长；可跨镜连续承接原话，画内成员按同一句声窗表演。模型仍只选 quoteStart/quoteEnd，不输出或重写 speakers；Rust按锁定来源物化原标签和成员。";
+
+fn attach_joint_speaker_contract(contract: &mut Value, input: &Value) {
+    let joint = ["sourceRows", "contextRows"].iter().any(|key| input[*key].as_array().into_iter().flatten()
+        .any(|row| row.pointer("/dialogue/speakers").and_then(Value::as_array).is_some_and(|m| !m.is_empty())));
+    if joint {
+        let content = format!("{}\n\n{JOINT_SPEAKER_REQUIREMENTS}", text(contract, "content"));
+        contract["jointSpeakerProfile"] = json!("source-dialogue-members/v1");
+        contract["content"] = json!(content);
+        contract["sha256"] = json!(digest(text(contract, "content")));
+    }
+}
+
 fn restore_fantasy_schema(schema: &mut Value) {
     match schema {
         Value::Object(map) => {
@@ -379,6 +392,7 @@ pub(in crate::pipeline) fn prepare_request(
         request.rule_snapshot["runtimeContract"] =
             super::super::stage3_pack::runtime_contract("storyboardRefine", true)?;
         attach_scene_contract(&mut request.rule_snapshot["runtimeContract"], unit_scene);
+        attach_joint_speaker_contract(&mut request.rule_snapshot["runtimeContract"], &request.input);
         request
             .input
             .as_object_mut()
@@ -649,6 +663,7 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
+    attach_joint_speaker_contract(&mut runtime_contract, &request.input);
     request.rule_snapshot["runtimeContract"] = runtime_contract;
     if author_repair
         && request.input["validationIssues"]
@@ -1220,6 +1235,59 @@ pub(in crate::pipeline) fn add_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joint_speaker_contract_is_source_bound_idempotent_and_keeps_old_roles_exact() {
+        let source=super::super::super::prepare_source("第一集\n场景：门口\n人物：林川、周航\n林川&周航：真的来了！\n").unwrap();
+        for (stage,skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),("storyboardFinish","episode-finishing-editor"),("storyboardRefine","director-refinement")] {
+            let mut input=json!({PROFILE_FIELD:PROFILE,"sourceRows":[source.rows[3]],"contextRows":[],"settings":{"fantasyMode":"off"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":2},"previousDraft":{"units":[]}});
+            input["capacityBrief"]=super::super::original::capacity_brief(&input["capabilities"],Some(&input["previousDraft"]),None,&[]);
+            super::super::super::stage3_pack::mark_input(&mut input).unwrap();
+            let request=TextRequest{stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),input,schema:json!({}),rule_snapshot:super::super::super::stage3_pack::snapshot(skill,&[]).unwrap()};
+            let prepared=prepare_request(request.clone()).unwrap();
+            assert_eq!(prepared.rule_snapshot["runtimeContract"]["jointSpeakerProfile"],"source-dialogue-members/v1");
+            assert_eq!(text(&prepared.rule_snapshot["runtimeContract"],"content").matches(JOINT_SPEAKER_REQUIREMENTS).count(),1);
+            assert_eq!(prepared.rule_snapshot["primary"],request.rule_snapshot["primary"]);
+            assert_eq!(prepared.rule_snapshot["methods"],request.rule_snapshot["methods"]);
+            assert_eq!(serde_json::to_vec(&prepare_request(prepared.clone()).unwrap()).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            let mut old=request.clone(); old.input["sourceRows"][0]["dialogue"].as_object_mut().unwrap().remove("speakers");
+            let old_prepared=prepare_request(old.clone()).unwrap();
+            assert!(old_prepared.rule_snapshot["runtimeContract"].get("jointSpeakerProfile").is_none());
+            assert_eq!(serde_json::to_vec(&prepare_request(old).unwrap()).unwrap(),serde_json::to_vec(&old_prepared).unwrap());
+        }
+    }
+
+    #[test]
+    fn joint_asset_coverage_both_contracts_survive_role_wrappers_and_final_compilers() {
+        let source=super::super::super::prepare_source("第一集\n场景：门口\n人物：林川、周航\n林川&周航：真的来了！\n").unwrap();
+        for (stage,skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),("storyboardFinish","episode-finishing-editor"),("storyboardRefine","director-refinement")] {
+            let mut input=json!({PROFILE_FIELD:PROFILE,"sourceRows":[source.rows[3]],"contextRows":[],"settings":{"fantasyMode":"off"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":2},"previousDraft":{"units":[]}});
+            input["capacityBrief"]=super::super::original::capacity_brief(&input["capabilities"],Some(&input["previousDraft"]),None,&[]);
+            super::super::super::stage3_pack::mark_input(&mut input).unwrap();
+            super::super::super::asset_coverage::freeze_new(&mut input).unwrap();
+            let request=TextRequest{stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),input,schema:json!({}),rule_snapshot:super::super::super::stage3_pack::snapshot(skill,&[]).unwrap()};
+            let prepared=prepare_request(request).unwrap();
+            let canonical=serde_json::to_vec(&prepared).unwrap();
+            let direct=super::super::super::stage3_pack::prepare_request(prepared.clone()).unwrap();
+            let again=prepare_request(direct).unwrap();
+            assert_eq!(serde_json::to_vec(&again).unwrap(),canonical,"role wrapper rebuilds both contracts without dropping either or adding a duplicate");
+            let runtime=&again.rule_snapshot["runtimeContract"];
+            assert_eq!(runtime["sha256"],digest(text(runtime,"content")));
+            assert_eq!(text(runtime,"content").matches(JOINT_SPEAKER_REQUIREMENTS).count(),1);
+            let asset_instruction="实际入画素材核对：";
+            assert_eq!(text(runtime,"content").matches(asset_instruction).count(),usize::from(stage!="storyboardPlan"));
+            let cli=crate::text_executor::compile_codex_input(&again).unwrap();
+            let attempt=crate::text_transport::FrozenAttempt::prepare_sdk_rules_first("joint-asset-compile","synthetic-workflow","synthetic-node",again.clone(),&json!({"synthetic":true})).unwrap();
+            let sdk=crate::text_executor::compile_sdk_attempt_input(&attempt).unwrap();
+            for prompt in [&cli.prompt,&sdk.prompt] {
+                assert_eq!(prompt.matches("共同说者合同 source-dialogue-members/v1：").count(),1);
+                assert_eq!(prompt.matches(asset_instruction).count(),usize::from(stage!="storyboardPlan"));
+                assert!(prompt.contains("speakers"));
+            }
+            assert_eq!(serde_json::to_vec(&again).unwrap(),canonical,"compiling never mutates the frozen domain request");
+        }
+    }
+
     #[test]
     fn unit_scene_profile_is_opt_in_and_all_role_wrappers_preserve_scene_data() {
         for (stage,skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),

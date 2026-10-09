@@ -1,5 +1,6 @@
 //! Source-bound production pipeline. Models author decisions; Rust copies and validates evidence.
 pub mod asset_visual_facts;
+pub(crate) mod asset_coverage;
 pub mod asset_design_contract;
 pub mod asset_production_context;
 mod assets;
@@ -35,6 +36,7 @@ pub(crate) use storyboard_transport::{
     compile_legacy_finish_grouping_transport, compile_storyboard_dispatch_transport,
     compile_storyboard_transport, storyboard_transport_rule, CompiledStoryboardTransport,
     STORYBOARD_LOSSLESS_INPUT_RULE, STORYBOARD_TRANSPORT_LIMIT,
+    attach_repetition_transport_profile, REPETITION_TRANSPORT_PROFILE_FIELD, REPETITION_TRANSPORT_PROFILE,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,6 +556,23 @@ fn check_refs(list: &[String], known: &HashSet<&str>, allow_empty: bool) -> Resu
     Ok(())
 }
 
+// A joint source label denotes several explicitly named speakers, never a new
+// canonical identity. This guard is a no-op for v1-v7 and all non-joint rows.
+fn validate_joint_speaker_asset_identities(source: &LockedSource, proposal: &FoundationProposal) -> Result<(), String> {
+    for q in source.rows.iter().filter_map(|r| r.dialogue.as_ref()).filter(|q| !q.speakers.is_empty()) {
+        for asset in &proposal.assets {
+            let name = asset.name.split(['|', '｜']).next().unwrap_or("").trim();
+            if name == q.speaker || asset.aliases.iter().any(|a| a == &q.speaker) {
+                return Err(format!("共同说者「{}」是成员标签，不能作为一个资产或别名；请分别沿用成员身份", q.speaker));
+            }
+            if q.speakers.iter().filter(|member| name == member.text || asset.aliases.contains(&member.text)).count() > 1 {
+                return Err(format!("共同说者「{}」的多个成员被归并为同一资产别名，请分别保留身份", q.speaker));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_foundation(
     source: &LockedSource,
     proposal: &FoundationProposal,
@@ -562,6 +581,7 @@ pub fn validate_foundation(
     if proposal.schema_version != "foundation/v1" || proposal.source_sha256 != source.sha256 {
         return Err("制作基础版本与锁定源不一致".into());
     }
+    validate_joint_speaker_asset_identities(source, proposal)?;
     let known: HashSet<_> = source.rows.iter().map(|r| r.id.as_str()).collect();
     let mut ids = HashSet::new();
     let mut variants = HashMap::new();

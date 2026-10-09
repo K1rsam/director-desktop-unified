@@ -7,6 +7,24 @@ use std::collections::HashMap;
 mod schema_projection;
 
 pub(crate) const STORYBOARD_TRANSPORT_LIMIT: usize = 200_000;
+// Frozen only on new workflows. Missing markers preserve the historical wire.
+pub(crate) const REPETITION_TRANSPORT_PROFILE_FIELD: &str = "storyboardRepetitionTransportProfile";
+pub(crate) const REPETITION_TRANSPORT_PROFILE: &str = "gain-gated-finish-repetitions/v1";
+
+fn uses_repetition_transport_profile(input: &Value) -> Result<bool, String> {
+    match input.get(REPETITION_TRANSPORT_PROFILE_FIELD) {
+        None => Ok(false),
+        Some(Value::String(value)) if value == REPETITION_TRANSPORT_PROFILE => Ok(true),
+        _ => Err("分镜重复资料运输版本未知；保留冻结请求，未调用模型".into()),
+    }
+}
+
+pub(crate) fn attach_repetition_transport_profile(input: &mut Value, frozen: &Value) -> Result<(), String> {
+    if uses_repetition_transport_profile(frozen)? {
+        input[REPETITION_TRANSPORT_PROFILE_FIELD] = json!(REPETITION_TRANSPORT_PROFILE);
+    }
+    Ok(())
+}
 const PROFILE: &str = "storyboard-lossless-finish/v1";
 const THREE_ROLE_PROFILE: &str = "storyboard-lossless-input/v1";
 // Frozen deployed v1 envelope, used only to preserve an unmarked workflow's
@@ -150,7 +168,10 @@ fn known_locked_row(value: &Value) -> bool {
 }
 
 fn encode_row(value: &Value) -> Value {
-    if !known_locked_row(value) {
+    // Joint members carry exact source-label intervals. Preserve the full row
+    // instead of extending a frozen seven-column historical dialogue tuple.
+    if !known_locked_row(value) || value.pointer("/dialogue/speakers")
+        .and_then(Value::as_array).is_some_and(|members| !members.is_empty()) {
         return value.clone();
     }
     let range = |value: &Value| json!([value["start"], value["end"]]);
@@ -814,8 +835,8 @@ pub(super) fn compile_dispatch_before_finish_repetitions(
     compile_dispatch_transport(request, false)
 }
 
-/// Only the oversized outgoing editor may share these additional exact copies.
-/// Canonical hashes, historical accepted grouping and existing fitting wires stay unchanged.
+/// The oversized editor, or an explicitly opted-in new editor with a proven
+/// net saving, may share exact copies. Canonical hashes and grouping stay fixed.
 fn compact_finish_repetitions(input: &mut Value, canonical: &Value) {
     fn references_plan_unit(value: &Value) -> bool {
         match value {
@@ -876,13 +897,15 @@ fn compile_dispatch_transport(
     request: &TextRequest,
     finish_repetitions: bool,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
+    let gain_gated = uses_repetition_transport_profile(&request.input)?;
     if finish_repetitions && request.stage == "storyboardFinish" {
         // Measure the old compiler's final selected wire, not an intermediate
-        // candidate with an extra instruction. Fitting frozen SDK bytes stay exact.
+        // candidate with an extra instruction. Unmarked frozen fitting bytes stay exact;
+        // only the versioned new-workflow marker removes the whole-wire size gate.
         let original = compile_dispatch_transport(request, false)?;
         let (old_input, old_schema) = original.as_ref()
             .map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
-        if crate::text_executor::codex_wire_characters(request, old_input, old_schema) <= STORYBOARD_TRANSPORT_LIMIT
+        if (!gain_gated && crate::text_executor::codex_wire_characters(request, old_input, old_schema) <= STORYBOARD_TRANSPORT_LIMIT)
             || !supported_request(request) || has_notation(&request.input)
             || request.input.get("losslessInputRule").is_some()
         { return Ok(original); }
@@ -1061,6 +1084,29 @@ fn compile_transport(
 mod tests {
     use super::*;
 
+    #[test]
+    fn joint_speaker_rows_stay_literal_and_all_metadata_roundtrips() {
+        let source=super::super::prepare_source("第一集\n场景：码头\n人物：林川、周航\n林川&周航：真的来了！\n林川：听见了。\n").unwrap();
+        let joint=serde_json::to_value(&source.rows[3]).unwrap();
+        let single=serde_json::to_value(&source.rows[4]).unwrap();
+        assert!(joint["dialogue"]["speakers"].as_array().unwrap().len()==2);
+        assert!(single["dialogue"].get("speakers").is_none());
+        assert!(known_locked_row(&joint));
+        assert_eq!(encode_row(&joint),joint);
+        assert_eq!(decode_row(&encode_row(&single)).unwrap(),single);
+        let canonical=json!({"sourceRows":[joint.clone(),single],"contextRows":[]});
+        let mut projected=canonical.clone(); compact_source_rows(&mut projected,&canonical); compact_shared_source_rows(&mut projected,&canonical);
+        assert_eq!(catalog_rows(&projected,"sourceRows").unwrap(),canonical["sourceRows"]);
+        assert_eq!(expand(&projected,&projected).unwrap(),canonical);
+        let mut request=fixture(); request.input["sourceRows"]=canonical["sourceRows"].clone();
+        let frozen=serde_json::to_vec(&request).unwrap();
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        let mut normalized=wire.input.clone(); normalized.as_object_mut().unwrap().remove("losslessInputRule");
+        assert_eq!(expand(&normalized,&normalized).unwrap(),request.input);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),frozen);
+    }
+
+
     fn finish_repetition_fixture(padding: usize) -> TextRequest {
         let mut request = dispatch_fixture();
         let unit = json!({"id":"accepted-original-tail","shots":[{"picture":"完整已采用表演🙂".repeat(2_000)}],"exitState":"原连续态"});
@@ -1076,6 +1122,75 @@ mod tests {
         let wire = compile_dispatch_transport(request, extra).unwrap();
         let (input,schema) = wire.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
         crate::text_executor::codex_wire_characters(request,input,schema)
+    }
+
+    #[test]
+    fn gain_gated_fitting_finish_restores_every_value_and_keeps_frozen_grouping() {
+        let mut request = finish_repetition_fixture(0);
+        request.input[REPETITION_TRANSPORT_PROFILE_FIELD] = json!(REPETITION_TRANSPORT_PROFILE);
+        let frozen = serde_json::to_vec(&request).unwrap();
+        let before = compile_dispatch_before_finish_repetitions(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request,&before.input,&before.schema) < STORYBOARD_TRANSPORT_LIMIT);
+        let grouping = compile_storyboard_transport(&request).unwrap().map(|wire|json!([wire.input,wire.schema]));
+        let legacy_grouping = compile_legacy_finish_grouping_transport(&request).unwrap().map(|wire|json!([wire.input,wire.schema]));
+        let after = compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(after.input["plan"]["acceptedContinuity"]["unit"],json!({"$same":"#/acceptedContinuity/unit"}));
+        assert_eq!(after.input["acceptedContinuity"],request.input["acceptedContinuity"]);
+        assert_eq!(after.input["previousDraft"],request.input["previousDraft"]);
+        assert_eq!(expand_storyboard_input(&after.input).unwrap(),request.input);
+        assert_eq!(expand_storyboard_schema(&after.schema).unwrap(),request.schema);
+        let before_chars=crate::text_executor::transport_payload_characters(&request,&before.input,&before.schema);
+        let after_chars=crate::text_executor::transport_payload_characters(&request,&after.input,&after.schema);
+        assert!(before_chars-after_chars>=2_048);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),frozen);
+        assert_eq!(compile_storyboard_transport(&request).unwrap().map(|wire|json!([wire.input,wire.schema])),grouping);
+        assert_eq!(compile_legacy_finish_grouping_transport(&request).unwrap().map(|wire|json!([wire.input,wire.schema])),legacy_grouping);
+    }
+
+    #[test]
+    fn gain_gated_small_saving_or_different_value_keeps_the_original_wire() {
+        for picture in ["小量重复🙂".repeat(50),"完整长稿🙂".repeat(2_000)] {
+            let unit=json!({"id":"tail","picture":picture});
+            let mut request=TextRequest {stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:"offline".into(),reasoning:"medium".into(),
+                input:json!({"finishMode":"delta","acceptedContinuity":{"unit":unit},"plan":{"acceptedContinuity":{"unit":unit,"executionBatchId":"original"}},"previousDraft":{"units":[]}}),
+                schema:json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),rule_snapshot:json!({"primary":{"content":"完整原规则"}})};
+            request.input[REPETITION_TRANSPORT_PROFILE_FIELD]=json!(REPETITION_TRANSPORT_PROFILE);
+            if picture.len()>2_048 { request.input["plan"]["acceptedContinuity"]["unit"]["distinct"]=json!(true); }
+            let wire_bytes=|wire:Option<CompiledStoryboardTransport>| serde_json::to_vec(&wire.map(|wire|json!([wire.input,wire.schema]))).unwrap();
+            assert_eq!(wire_bytes(compile_storyboard_dispatch_transport(&request).unwrap()),wire_bytes(compile_dispatch_before_finish_repetitions(&request).unwrap()));
+        }
+    }
+
+    #[test]
+    fn gain_gated_keeps_existing_alias_targets_complete() {
+        let mut request=finish_repetition_fixture(180_000);
+        request.input[REPETITION_TRANSPORT_PROFILE_FIELD]=json!(REPETITION_TRANSPORT_PROFILE);
+        let refs=json!((0..16).map(|index|format!("prior-row-{index}-{}","x".repeat(32))).collect::<Vec<_>>());
+        request.input["acceptedContinuity"]["unit"]["sourceRefs"]=refs.clone();
+        request.input["plan"]["acceptedContinuity"]["unit"]["sourceRefs"]=refs.clone();
+        request.input["plan"]["events"]=json!([{"sourceRefs":refs}]);
+        let old=compile_dispatch_before_finish_repetitions(&request).unwrap().unwrap();
+        let new=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(old.input["plan"]["events"][0]["sourceRefs"],json!({"$same":"#/plan/acceptedContinuity/unit/sourceRefs"}));
+        assert_eq!(new.input["plan"]["acceptedContinuity"]["unit"],old.input["plan"]["acceptedContinuity"]["unit"]);
+        assert_eq!(expand_storyboard_input(&new.input).unwrap(),request.input);
+    }
+
+    #[test]
+    fn gain_gated_profile_is_explicit_inherited_and_unknown_versions_fail_closed() {
+        let empty=json!({}); let mut target=json!({"original":"unchanged"}); let bytes=target.to_string();
+        attach_repetition_transport_profile(&mut target,&empty).unwrap(); assert_eq!(target.to_string(),bytes);
+        let mut frozen=json!({}); frozen[REPETITION_TRANSPORT_PROFILE_FIELD]=json!(REPETITION_TRANSPORT_PROFILE);
+        attach_repetition_transport_profile(&mut target,&frozen).unwrap();
+        assert_eq!(target[REPETITION_TRANSPORT_PROFILE_FIELD],REPETITION_TRANSPORT_PROFILE);
+        for invalid in [Value::Null,json!(false),json!(0),json!(""),json!("unknown/v99")] {
+            frozen[REPETITION_TRANSPORT_PROFILE_FIELD]=invalid.clone(); let before=target.to_string();
+            assert!(attach_repetition_transport_profile(&mut target,&frozen).is_err()); assert_eq!(target.to_string(),before);
+            for stage in ["storyboardPlan","storyboardCreate","storyboardFinish"] {
+                let mut request=finish_repetition_fixture(0); request.stage=stage.into(); request.input[REPETITION_TRANSPORT_PROFILE_FIELD]=invalid.clone();
+                assert!(compile_storyboard_dispatch_transport(&request).is_err());
+            }
+        }
     }
 
     #[test]

@@ -922,6 +922,10 @@ fn materialize_dialogue(
                 part["quoteEnd"] = json!(selected.end);
                 part["text"] = json!(body);
                 part["speaker"] = json!(quote.speaker);
+                if let Some(supplied) = part.get("speakers") {
+                    if supplied != &json!(quote.speakers) { return Err("共同说者成员被改写".into()); }
+                }
+                if !quote.speakers.is_empty() { part["speakers"] = json!(quote.speakers); }
                 part["channel"] = json!(quote.channel);
             }
         }
@@ -1602,6 +1606,10 @@ fn validate_storyboard_repair_scope(
                 if text(part, "speaker") != quote.speaker || text(part, "channel") != quote.channel
                 {
                     return Err("说者或声道被改写".into());
+                }
+                if (!quote.speakers.is_empty() && part.get("speakers") != Some(&json!(quote.speakers)))
+                    || part.get("speakers").is_some_and(|members| members != &json!(quote.speakers)) {
+                    return Err("共同说者成员与锁定来源不一致".into());
                 }
                 if !source_refs.iter().any(|r| {
                     source
@@ -2377,6 +2385,7 @@ pub async fn run_storyboard(
             creative::mark_input(&mut plan_input, creative_enabled);
             creative::attach_carrier_profile(&mut plan_input, input)?;
             creative::attach_scene_profile(&mut plan_input, input)?;
+            attach_repetition_transport_profile(&mut plan_input, input)?;
             super::stage3_pack::attach_profile(&mut plan_input, input)?;
             if !continuity_revision.is_null(){plan_input["continuityRevision"]=continuity_revision.clone();}
             attach_author_decisions(&mut plan_input, scoped_decisions.as_ref());
@@ -2485,6 +2494,7 @@ pub async fn run_storyboard(
                 creative::mark_input(&mut author_input, creative_enabled);
                 creative::attach_carrier_profile(&mut author_input, input)?;
                 creative::attach_scene_profile(&mut author_input, input)?;
+                attach_repetition_transport_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
                 if !continuity_revision.is_null(){author_input["continuityRevision"]=continuity_revision.clone();}
                 if creative_enabled { author_input["settings"]["fantasyEnabled"] = json!(!candidates.is_empty()); }
@@ -4672,6 +4682,7 @@ async fn run_storyboard_revision(
             creative::mark_input(&mut author_input, creative_enabled);
             creative::attach_carrier_profile(&mut author_input, input)?;
             creative::attach_scene_profile(&mut author_input, input)?;
+            attach_repetition_transport_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
             if let Some(context) = &accepted_context {
                 author_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
@@ -4698,6 +4709,7 @@ async fn run_storyboard_revision(
             creative::mark_input(&mut finish_input, creative_enabled);
             creative::attach_carrier_profile(&mut finish_input, input)?;
             creative::attach_scene_profile(&mut finish_input, input)?;
+            attach_repetition_transport_profile(&mut finish_input, input)?;
             super::stage3_pack::attach_profile(&mut finish_input, input)?;
             if accepted_context.is_some() {
                 finish_input[creative::REVISION_PROFILE_FIELD]=json!(creative::REVISION_PROFILE);
@@ -5149,6 +5161,37 @@ fn validate_fantasy(draft: &Value, selected: &[Value]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn joint_speaker_three_roles_keep_two_assets_and_one_utterance() {
+        let s=prepare_source("第一集\n场景：门口\n人物：林川、周航\n林川&周航：（二人惊讶对视）真的来了！\n").unwrap();
+        let refs:Vec<_>=s.rows.iter().filter(|r|r.kind=="body").map(|r|r.id.clone()).collect();
+        let row=&s.rows[3]; let q=row.dialogue.as_ref().unwrap();let eid=&s.episodes[0].id;let sid=&s.scenes[0].id;
+        let assets:Vec<_>=[("林川","person-a:base"),("周航","person-b:base")].iter().map(|(name,id)|json!({"id":id,"name":name,"variantId":"base","applicability":{"episodes":[eid],"scenes":[sid]}})).collect();
+        let caps=json!({"minDuration":0,"maxDuration":15,"imageLimit":2});
+        let draft=json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"U1","episodeId":eid,"eventId":"E1","sceneId":sid,"title":"回头","unitDirection":"两人听见动静，同时回头。","participants":["林川","周航"],"props":[],"boundaryBefore":{"kind":"episode_start","reason":"本集开始"},"scene":"门口","initialState":"两人面向门内。","exitState":"两人回头望向门口。","lighting":"门外侧光","sourceRefs":refs,"assetRefs":assets.iter().enumerate().map(|(i,a)|json!({"assetId":a["id"],"variantId":"base","order":i+1,"use":"character","sourceRefs":refs})).collect::<Vec<_>>(),"shots":[{"id":"S1","duration":3.0,"camera":"中近景容纳两人","picture":"两人同时回头，惊讶对视。","lighting":"门外侧光","sound":"共同惊呼一次，环境声压低。","transition":"切出","sourceRefs":refs,"contextRefs":[],"dialogueParts":[{"lineId":q.id,"text":spoken_text(q),"presentation":"画内","voiceStart":0.1,"voiceEnd":2.5,"delivery":"两人同时惊呼"}]}]}],"fantasyRealization":[],"revisionNotes":[],"unresolved":[]});
+        let emotion=json!({"subject":"林川和周航","contextTone":"惊讶","audienceEffect":"共同发现可读","change":"从等待到惊讶","landing":"共同回头","retain":["原话"]});
+        let plan=json!({"schemaVersion":"storyboard-plan/v2","emotionArc":"发现","events":[{"id":"E1","sceneId":sid,"sourceRefs":refs,"boundaryBefore":{"kind":"episode_start","reason":"本集开始"},"emotionContract":emotion}],"workPackages":[{"id":"W1","eventId":"E1","sourceRefs":refs,"contextRefs":[],"entryFactIds":[],"dependsOn":[],"emotionContract":emotion,"scenarioKeys":[]}],"entryFacts":[],"fantasyCandidates":[],"unitPackingPolicy":"event-first-v1","provisionalUnits":[{"id":"P1","packageId":"W1","sourceRefs":refs,"secondsRange":[2,3]}]});
+        let exec=Authored{plan,draft,stages:tokio::sync::Mutex::new(vec![])};
+        let output=run_storyboard(&json!({"source":s,"assets":assets,"capabilities":caps,"settings":{"fantasyMode":"off","visualStyle":"16:9真人"},"episodeId":eid}),&exec,"offline","medium").await.unwrap();
+        assert!(output["blocked"].as_array().unwrap().is_empty(), "{}", output["blocked"]);
+        assert_eq!(*exec.stages.lock().await,vec!["storyboardPlan","storyboardCreate","storyboardFinish"]);
+        let unit=&output["units"][0]; let part=&unit["shots"][0]["dialogueParts"][0];
+        assert_eq!(unit["assetRefs"].as_array().unwrap().len(),2);
+        assert_eq!(part["speaker"],"林川&周航");assert_eq!(part["speakers"],json!(q.speakers));
+        assert_eq!(part["text"],"真的来了！");
+        assert_eq!(unit["shots"][0]["dialogueParts"].as_array().unwrap().len(),1);
+        assert_eq!(unit["duration"],3.0);
+        let mut duplicated=exec.draft.clone();
+        materialize_dialogue(&s,&mut duplicated,true).unwrap();
+        let same=duplicated["units"][0]["shots"][0]["dialogueParts"][0].clone();
+        duplicated["units"][0]["shots"][0]["dialogueParts"].as_array_mut().unwrap().push(same);
+        assert!(materialize_dialogue(&s,&mut duplicated,false).unwrap_err().contains("重复"));
+        let mut forged=exec.draft.clone(); materialize_dialogue(&s,&mut forged,true).unwrap();
+        forged["units"][0]["shots"][0]["dialogueParts"][0]["speakers"][0]["text"]=json!("新人物");
+        assert!(validate_storyboard(&s,&forged,&assets,&caps).unwrap_err().contains("共同说者"));
+    }
+
     fn fixture() -> (LockedSource, Value, Vec<Value>, Value) {
         let source = prepare_source("第一集\n场景：门口\n小王OS：“先走，别回头😀。”\n").unwrap();
         let row = &source.rows[2];
@@ -6454,6 +6497,25 @@ mod production_contract_tests {
             );
             assert_eq!(exec.calls.lock().await.len(),before,"resume must replay the original rejected Finish and the accepted repair, without new model calls");
         }
+    }
+
+    #[tokio::test]
+    async fn gain_gated_profile_survives_all_roles_and_bounded_repair_reopen_without_new_calls() {
+        let (_,mut frozen)=author_scope_input(1);
+        super::super::stage3_pack::mark_input(&mut frozen).unwrap();
+        frozen[REPETITION_TRANSPORT_PROFILE_FIELD]=json!(REPETITION_TRANSPORT_PROFILE);
+        let before=serde_json::to_vec(&frozen).unwrap();
+        let exec=Recorded {finish_scope_response:Some("TIMING_FIX"),..Default::default()};
+        let output=run_storyboard(&frozen,&exec,"offline","medium").await.unwrap();
+        assert_eq!(output["status"],"completed","{}",output["blocked"]);
+        let calls=exec.calls.lock().await.clone();
+        assert_eq!(calls.len(),4,"planner, author, editor, bounded editor repair");
+        for call in &calls { assert_eq!(call.input[REPETITION_TRANSPORT_PROFILE_FIELD],REPETITION_TRANSPORT_PROFILE,"{}",call.stage); }
+        for _ in 0..2 {
+            assert_eq!(run_storyboard(&frozen,&exec,"offline","medium").await.unwrap()["units"],output["units"]);
+            assert_eq!(exec.calls.lock().await.len(),calls.len(),"reopen reuses frozen role requests");
+        }
+        assert_eq!(serde_json::to_vec(&frozen).unwrap(),before);
     }
 
     #[tokio::test]

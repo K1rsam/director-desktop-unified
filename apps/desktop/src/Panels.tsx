@@ -75,7 +75,7 @@ export function DreaminaAccountCard({ account: suppliedAccount, workspace, writa
       <Button executionAction={authorizing ? "dreamina.open_authorization" : "dreamina.login"} variant="primary" disabled={!writable || busy || !componentsReady} onClick={() => void mutate(authorizing ? 'dreamina.open_authorization' : 'dreamina.login', {}, '已调用默认浏览器，请在即梦官方网页确认授权。')}>{authorizing ? '打开授权页' : authenticated ? '重新登录' : 'OAuth 登录'}</Button>
       {authorizing && account?.authorization?.verificationUrl && <Button icon="copy" onClick={() => void navigator.clipboard.writeText(account.authorization!.verificationUrl).catch(() => onError?.('复制失败，请点击打开授权页重试。'))}>复制授权链接</Button>}
       {(authenticated || authorizing) && <Button disabled={!writable || busy} onClick={() => setConfirmLogout(true)}>退出登录</Button>}
-      <Button executionAction="dreamina.status" icon="refresh" disabled={!writable || busy || !componentsReady} onClick={() => void mutate('dreamina.status', {}, '正在刷新即梦登录状态和积分。')}>刷新登录状态</Button>
+      <Button executionAction="dreamina.status" icon="refresh" disabled={!writable || busy || !componentsReady} onClick={() => void mutate('dreamina.status', {}, '已刷新即梦登录状态，请查看账户信息。')}>刷新登录状态</Button>
       {readiness && <Button executionAction="readiness.check" data-readiness-provider="dreamina" icon="refresh" disabled={!writable || busy || !componentsReady || !!readiness.blocked} title={readiness.blocked || undefined} onClick={() => void readiness.check()}>{setupBusy && componentsReady ? '正在检查…' : '检查账户与模型'}</Button>}
     </div>
     {setupBusy && <p className="control-hint" role="status">{componentsReady ? '正在读取账户与模型…' : '正在安装官方组件，请稍候。'}</p>}

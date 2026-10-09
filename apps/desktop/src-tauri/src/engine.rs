@@ -2861,6 +2861,7 @@ impl Engine {
         // resume returns above and saved-snapshot recovery keep their exact input.
         if matches!(stage, "storyboard.run" | "storyboard.refine") {
             pipeline::freeze_scene_input_profile(&mut input)?;
+            pipeline::asset_coverage::freeze_new(&mut input)?;
         }
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
@@ -2869,6 +2870,7 @@ impl Engine {
             // Freeze the new transport on new runs only. Resuming an existing
             // workflow keeps its original input and accepted request identities.
             input["foundationModelInputProfile"] = json!(pipeline::foundation_wire::PROFILE);
+            pipeline::asset_coverage::freeze_new(&mut input)?;
             input["projectId"] = store.project()?["id"].clone();
             input["sourceVersion"] = input["source"]["version"].clone();
             input["foundationDecisionPolicy"] =
@@ -3041,7 +3043,8 @@ impl Engine {
                 let model=s(&settings,"textModel");let reasoning=s(&settings,"reasoning");
                 if stage=="foundation.run" {
                     let source:pipeline::LockedSource=serde_json::from_value(input["source"].clone()).map_err(|e|e.to_string())?;
-                    let context=json!({"foundation":input["foundation"],"assets":input["assets"],"selection":input["selection"],"foundationModelInputProfile":input["foundationModelInputProfile"],"foundationPhase":input["foundationPhase"],"confirmedDecisions":input["confirmedDecisions"],"projectId":input["projectId"],"sourceVersion":input["sourceVersion"],"foundationDecisionPolicy":input["foundationDecisionPolicy"],"automaticDecisions":input["automaticDecisions"],"userReviewRequirements":input["userReviewRequirements"],"settings":{"confirmedDirection":input["foundation"]["productionDirection"]}});
+                    let mut context=json!({"foundation":input["foundation"],"assets":input["assets"],"selection":input["selection"],"foundationModelInputProfile":input["foundationModelInputProfile"],"foundationPhase":input["foundationPhase"],"confirmedDecisions":input["confirmedDecisions"],"projectId":input["projectId"],"sourceVersion":input["sourceVersion"],"foundationDecisionPolicy":input["foundationDecisionPolicy"],"automaticDecisions":input["automaticDecisions"],"userReviewRequirements":input["userReviewRequirements"],"settings":{"confirmedDirection":input["foundation"]["productionDirection"]}});
+                    pipeline::asset_coverage::inherit(&mut context, &input)?;
                     let (mut proposal,applied)=if input["foundationPhase"]=="APPLY_DECISION" {
                         if snapshot["foundationMethod"]!=pipeline::foundation_delivery::METHOD_VERSION {return Err("制作选择采用流程版本无效，未重新提取F2".into())}
                         pipeline::foundation_delivery::run_foundation_choice_application(&source,&context,&exec,model,reasoning).await?
@@ -3608,6 +3611,13 @@ fn storyboard_start_boundary(workflows: &[Value], input: &Value) -> Result<Story
         let old_units = storyboard_scope_ids(selection, "unitIds")?;
         if old_episodes.is_empty() { return Err("原分镜流程的冻结集范围缺失，不能通过新流程绕过".into()) }
         if episodes.is_disjoint(&old_episodes) { continue; }
+        // A parser/metadata upgrade does not settle an upstream submission.
+        // Same raw source and overlapping frozen scope still belong to the old
+        // attempt; decide this before the stronger interpretation identity.
+        let unknown = job["submissionUnknown"].as_bool() == Some(true) || s(job,"status") == "submission_unknown";
+        if unknown && (old_units.is_empty() || units.is_empty() || !units.is_disjoint(&old_units)) {
+            return Ok(StoryboardStartBoundary::Hold(format!("原分镜流程 {} 存在未知提交；先核对原执行，不另建重叠范围或重发", s(job,"id"))));
+        }
         let same_source = match storyboard_source_identity(&original["source"]) {
             Ok(old) => old == identity,
             Err(_) => {
@@ -3618,7 +3628,6 @@ fn storyboard_start_boundary(workflows: &[Value], input: &Value) -> Result<Story
             }
         };
         if !same_source { continue; }
-        let unknown = job["submissionUnknown"].as_bool() == Some(true);
         if s(job,"status") == "completed" && !unknown {
             if old_units.is_empty() { completed_episodes.extend(old_episodes); }
             else { completed_units.extend(old_units); }
@@ -3730,12 +3739,16 @@ fn foundation_start_boundary(workflows: &[Value], input: &Value) -> Result<Found
             return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {} 缺少冻结集范围，保留记录且不另建相同来源任务", s(job,"id"))));
         }
         if episodes.is_disjoint(&old_episodes) { continue; }
+        // Re-recognizing identical text must not bypass a pending upstream result.
+        let unknown = job["submissionUnknown"].as_bool() == Some(true) || s(job,"status") == "submission_unknown";
+        if unknown {
+            return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {} 存在未知提交；先核对原执行，不另建重叠范围或重发", s(job,"id"))));
+        }
         let same_source = match storyboard_source_identity(&original["source"]) {
             Ok(old) => old == identity,
             Err(_) => return Ok(FoundationStartBoundary::Hold(format!("原制作基础流程 {} 的源绑定不能核验，保留记录且不另建相同来源任务", s(job,"id")))),
         };
         if !same_source { continue; }
-        let unknown = job["submissionUnknown"].as_bool() == Some(true) || s(job,"status") == "submission_unknown";
         if s(job,"status") == "completed" && !unknown {
             completed_scopes.push(old_episodes);
             continue;
@@ -5427,6 +5440,7 @@ fn production_input_with_capabilities(store: &Store, request: &Value,capabilitie
         pipeline::stage3_pack::mark_input(&mut input)?;
         input["storyboardCarrierProfile"] = json!("integer-video-units/v1");
         input["storyboardAssetInputProfile"] = json!("asset-production-card/v2");
+        input[pipeline::REPETITION_TRANSPORT_PROFILE_FIELD] = json!(pipeline::REPETITION_TRANSPORT_PROFILE);
         input[pipeline::CONTEXT_INPUT_PROFILE_FIELD] = json!(pipeline::CONTEXT_INPUT_PROFILE);
         input[pipeline::storyboard_dependencies::PROFILE_FIELD] =
             json!(pipeline::storyboard_dependencies::PROFILE);
@@ -6615,6 +6629,7 @@ mod production_input_transport_tests {
         let legacy = storyboard_input(&store, &json!({"episodeId":episode})).unwrap();
         assert!(legacy.get("storyboardCreativeProfile").is_none());
         assert!(legacy.get("storyboardAssetInputProfile").is_none());
+        assert!(legacy.get(pipeline::REPETITION_TRANSPORT_PROFILE_FIELD).is_none());
         assert!(legacy
             .get(pipeline::storyboard_dependencies::PROFILE_FIELD)
             .is_none());
@@ -6634,6 +6649,7 @@ mod production_input_transport_tests {
             "original-production-contract/v1"
         );
         assert_eq!(whole["storyboardCarrierProfile"], "integer-video-units/v1");
+        assert_eq!(whole[pipeline::REPETITION_TRANSPORT_PROFILE_FIELD], pipeline::REPETITION_TRANSPORT_PROFILE);
         assert_eq!(
             whole[pipeline::storyboard_dependencies::PROFILE_FIELD],
             pipeline::storyboard_dependencies::PROFILE
@@ -6671,6 +6687,7 @@ mod production_input_transport_tests {
         )
         .unwrap();
         assert!(foundation.get("storyboardAssetInputProfile").is_none());
+        assert!(foundation.get(pipeline::REPETITION_TRANSPORT_PROFILE_FIELD).is_none());
         assert!(foundation
             .get(pipeline::storyboard_dependencies::PROFILE_FIELD)
             .is_none());
@@ -6689,3 +6706,82 @@ async fn resolve_text_execution_settings(settings:&Value)->Result<Value> {
 #[cfg(test)]
 #[path = "readiness_engine_tests.rs"]
 mod readiness_engine_tests;
+
+#[cfg(test)]
+mod joint_unknown_boundary_tests {
+    use super::*;
+
+    fn sources() -> (Value, Value) {
+        let next = pipeline::prepare_source("第一集\n场景：门口\n人物：林川、周航\n林川&周航：同声。\n第二集\n场景：院内\n周航：走吧。\n").unwrap();
+        assert_eq!(next.parser_version,"source-parser/v8");
+        let mut old = json!(next); old["parserVersion"] = json!("source-parser/v7");
+        for row in old["rows"].as_array_mut().unwrap() {
+            if row["dialogue"]["speakers"].is_array() { row["dialogue"] = Value::Null; }
+        }
+        pipeline::validate_source(&serde_json::from_value(old.clone()).unwrap()).unwrap();
+        let reparsed = pipeline::reparse_source(&serde_json::from_value(old.clone()).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&reparsed).unwrap(),json!(next));
+        let mut new=json!(reparsed); old["version"]=json!(1);new["version"]=json!(2);
+        (old,new)
+    }
+    fn input(source: &Value, episode: usize) -> Value {
+        let mut value=json!({"source":source,"selection":{"episodeIds":[source["episodes"][episode]["id"]]}});
+        pipeline::asset_coverage::freeze_new(&mut value).unwrap();value
+    }
+    fn job(stage: &str, input: &Value, state: &str, unknown: bool) -> Value {
+        json!({"id":"original","kind":"workflow","entityId":stage,"status":state,"submissionUnknown":unknown,
+            "snapshot":{"runnerVersion":"desktop-runner/v1","stage":stage,"sourceVersion":input["source"]["version"],"input":input},"prepared":{"publishedEpisodes":{}}})
+    }
+    #[test]
+    fn joint_unknown_parser_upgrade_and_coverage_cannot_cross_frozen_source_scope() {
+        let (old,new)=sources();let original=input(&old,0);let current=input(&new,0);
+        assert_eq!(old["sha256"],new["sha256"]);assert_ne!(storyboard_source_identity(&old).unwrap(),storyboard_source_identity(&new).unwrap());
+        for stage in ["foundation.run","storyboard.run"] {
+            for (state,unknown) in [("partially_blocked",true),("completed",true),("submission_unknown",false),("closed_by_user",true)] {
+                let record=job(stage,&original,state,unknown);let before=record.to_string();
+                if stage=="foundation.run" {assert!(matches!(foundation_start_boundary(&[record.clone()],&current).unwrap(),FoundationStartBoundary::Hold(reason) if reason.contains("未知提交")));}
+                else {assert!(matches!(storyboard_start_boundary(&[record.clone()],&current).unwrap(),StoryboardStartBoundary::Hold(reason) if reason.contains("未知提交")));}
+                assert_eq!(record.to_string(),before);
+            }
+            for state in ["completed","failed"] {
+                let record=job(stage,&original,state,false);
+                if stage=="foundation.run" {assert_eq!(foundation_start_boundary(&[record],&current).unwrap(),FoundationStartBoundary::New);}
+                else {assert_eq!(storyboard_start_boundary(&[record],&current).unwrap(),StoryboardStartBoundary::New);}
+            }
+            let unrelated=input(&new,1);let record=job(stage,&original,"partially_blocked",true);
+            if stage=="foundation.run" {assert_eq!(foundation_start_boundary(&[record],&unrelated).unwrap(),FoundationStartBoundary::New);}
+            else {assert_eq!(storyboard_start_boundary(&[record],&unrelated).unwrap(),StoryboardStartBoundary::New);}
+        }
+        let mut old_unit=original.clone();old_unit["selection"]["unitIds"]=json!(["u1"]);
+        let mut other_unit=current.clone();other_unit["selection"]["unitIds"]=json!(["u2"]);
+        assert_eq!(storyboard_start_boundary(&[job("storyboard.run",&old_unit,"partially_blocked",true)],&other_unit).unwrap(),StoryboardStartBoundary::New);
+        other_unit["selection"]["unitIds"]=json!(["u1"]);
+        assert!(matches!(storyboard_start_boundary(&[job("storyboard.run",&old_unit,"partially_blocked",true)],&other_unit).unwrap(),StoryboardStartBoundary::Hold(_)));
+        let changed=json!(pipeline::prepare_source("第一集\n场景：别处\n甲：真正不同的原文。\n").unwrap());let changed=input(&changed,0);
+        assert_eq!(storyboard_start_boundary(&[job("storyboard.run",&original,"partially_blocked",true)],&changed).unwrap(),StoryboardStartBoundary::New);
+        assert_eq!(foundation_start_boundary(&[job("foundation.run",&original,"partially_blocked",true)],&changed).unwrap(),FoundationStartBoundary::New);
+    }
+    #[test]
+    fn joint_unknown_real_start_keeps_jobs_receipts_budgets_and_zero_reservation_after_reparse() {
+        for stage in ["foundation.run","storyboard.run"] {
+            let temp=tempfile::tempdir().unwrap();let engine=Engine::new_offline_verification(temp.path().join("isolated-app")).unwrap();
+            let store=Store::open(temp.path().join("project")).unwrap();store.create("synthetic unknown parser migration","synthetic").unwrap();store.ensure_workflow_storage().unwrap();
+            let (old,new)=sources();let old=store.save_source(old).unwrap();
+            let original=input(&old,0);let mut snapshot=job(stage,&original,"partially_blocked",true)["snapshot"].clone();
+            snapshot["input"].as_object_mut().unwrap().remove(pipeline::asset_coverage::FIELD);
+            let run=store.add_job("workflow",stage,"local","local",&snapshot,"partially_blocked").unwrap();
+            let child=store.add_job("text","original-node","codex_sdk","synthetic",&json!({"originalFrozenRequest":true}),"submission_unknown").unwrap();
+            store.update_job(&child,"submission_unknown",&json!({"receipt":{"attemptId":"original-attempt","state":"submission_unknown"},"result":{"retainedRaw":"synthetic original fragment"}})).unwrap();
+            store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,result,error,updated_at) VALUES(?1,'original-node',?2,'original-hash','blocked',?3,'{\"revisionBudgetUsed\":1}','original unknown',?4)",rusqlite::params![run,stage,child,now()]).unwrap();
+            let current=store.save_reparsed_source_if_current(new,old["version"].as_i64().unwrap()).unwrap();
+            let counts=||store.conn().unwrap().query_row("SELECT (SELECT COUNT(*) FROM jobs),(SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM workflow_steps)",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap();
+            let before=counts();let parent=store.job(&run).unwrap();let original_child=store.job(&child).unwrap();
+            let step:String=store.conn().unwrap().query_row("SELECT result FROM workflow_steps WHERE workflow_id=?1",[&run],|r|r.get(0)).unwrap();
+            let error=engine.spawn_production(store.clone(),json!({"action":stage,"episodeIds":[current["episodes"][0]["id"]]})).unwrap_err();
+            assert!(error.contains("未知提交"),"{stage}: {error}");
+            assert_eq!(counts(),before,"the real engine must hold before reserving a workflow, preflight or model node");
+            assert_eq!(store.job(&run).unwrap(),parent);assert_eq!(store.job(&child).unwrap(),original_child);
+            assert_eq!(store.conn().unwrap().query_row("SELECT result FROM workflow_steps WHERE workflow_id=?1",[&run],|r|r.get::<_,String>(0)).unwrap(),step);
+        }
+    }
+}

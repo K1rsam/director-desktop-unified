@@ -20,7 +20,7 @@ export function TextExecutionSummary({ settings, onConfigure, stage }: { setting
     && policy.allowedActions?.includes(action) === true;
   const sdkAvailable = settings.textProvider === 'codex_sdk' && hasSdkExecutionCapability(policy) && policy.allowedActions?.includes(action) === true;
   const label = enabled ? policy.mode === 'standard_native' ? '标准版 CLI 已开放' : '受控 CLI 验收' : sdkAvailable ? '标准版 SDK · 执行前核验' : '当前关闭';
-  return <div className="text-execution-summary"><span>{stage === 'images' ? '提示词设计' : '文本执行'}（{label}）：{settings.textProvider === 'api' ? '文本 API' : settings.textProvider === 'codex_sdk' ? sdkAvailable ? '官方 Codex SDK' : '官方 Codex SDK（离线核验）' : 'Codex CLI'} · {settings.textModel || '未选择模型'}{settings.textProvider !== 'api' ? ` · ${settings.reasoning || 'medium'}` : ''}{stage === 'images' ? '；图片按出图渠道生成' : ''}</span><Button variant="ghost" icon="settings" onClick={onConfigure}>调整执行设置</Button></div>;
+  return <div className="text-execution-summary"><span>{stage === 'images' ? '新提示词任务设置' : '新文本任务设置'}（{label}）：{settings.textProvider === 'api' ? '文本 API' : settings.textProvider === 'codex_sdk' ? sdkAvailable ? '官方 Codex SDK' : '官方 Codex SDK（离线核验）' : 'Codex CLI'} · {settings.textModel || '未选择模型'}{settings.textProvider !== 'api' ? ` · ${settings.reasoning || 'medium'}` : ''}{stage === 'images' ? '；图片按出图渠道生成' : ''}；继续原流程时沿用原渠道与模型。</span><Button variant="ghost" icon="settings" onClick={onConfigure}>调整执行设置</Button></div>;
 }
 
 function windowText(window?: TextCliLimitWindow | null): string | undefined {

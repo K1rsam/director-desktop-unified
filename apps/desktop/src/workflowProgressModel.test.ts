@@ -379,3 +379,31 @@ test('只有正式末态变化证明才将旧分支移出当前计数，后续�
   workspace.workflowProgress![0].nodes = [{ ...old, resolution: undefined }, current];
   assert.equal(selectWorkflowProgress(workspace, 'storyboard').completed, 2, 'without provenance, history is not inferred from completion or titles');
 });
+
+test('原请求官方重连只显示已核验次数，真实或未知错误不归为重连且终态优先', () => {
+  const proof = { version: 'stream-reconnect-progress/v1', attempt: 2, limit: 5 };
+  const cli = node('storyboardCreate', 'running', 'B02');
+  const current = cli.execution as Record<string, unknown>;
+  Object.assign(current, { phase: 'executing', processAlive: true, lastEventType: 'error', reconnect: proof });
+  const sdk = sdkNode({ phase: 'executing', lastEventType: 'error', reconnect: proof });
+  for (const value of [cli, sdk]) {
+    const before = JSON.stringify(value), shown = executionSummary(value, stamp + 5000);
+    assert.match(shown, /原请求重连 2\/5/);
+    assert.doesNotMatch(shown, /执行失败|执行错误记录|tls|PRIVATE/);
+    assert.equal(JSON.stringify(value), before);
+    const state = value.execution as Record<string, unknown>;
+    for (const malformed of [null, { ...proof, attempt: 6 }, { ...proof, limit: 11 }, { ...proof, attempt: '2' }, { ...proof, version: 'unknown' }]) {
+      state.reconnect = malformed;
+      assert.doesNotMatch(executionSummary(value, stamp + 5000), /原请求重连/);
+      assert.match(executionSummary(value, stamp + 5000), /执行错误记录/);
+    }
+    state.reconnect = proof; state.lastEventType = 'turn.failed';
+    assert.match(executionSummary(value, stamp + 5000), /执行失败/);
+    assert.doesNotMatch(executionSummary(value, stamp + 5000), /原请求重连/);
+    state.lastEventType = 'turn.completed';
+    assert.doesNotMatch(executionSummary(value, stamp + 5000), /原请求重连|执行失败/);
+    state.lastEventType = 'error';
+    assert.doesNotMatch(executionSummary(value, stamp + 5000, true), /原请求重连 2\/5/);
+  }
+  assert.doesNotMatch(executionSummary(cli, stamp + 180000), /原请求重连/);
+});

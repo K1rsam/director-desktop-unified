@@ -730,7 +730,7 @@ fn evidence(source: &LockedSource, batch: &Batch, foundation: &FoundationProposa
         .rows
         .iter()
         .filter_map(|r| r.dialogue.as_ref())
-        .map(|d| d.speaker.clone())
+        .flat_map(|d| dialogue_speaker_names(d).into_iter().map(str::to_owned))
         .collect();
     for asset in &foundation.assets {
         names.insert(asset.name.clone());
@@ -1245,6 +1245,19 @@ fn input_for(
         input["transportInstructions"]=json!(format!("{guide} APPLY_DECISION沿原Q1采用已确认制作解释，appliedDecisions须含本批每个已提供决定的准确id/note；不重复询问已确认问题，不再提取F2。"));
         input["seriesDirectionPreparation"] = json!(null);
     }
+    super::asset_coverage::foundation_input(stage, &mut input, context);
+    // New source metadata only; legacy sources have no joint members and their
+    // complete frozen input remains byte-identical.
+    let allowed = allowed_refs(&input);
+    let groups: Vec<_> = source.rows.iter().filter(|row| allowed.contains(&row.id))
+        .filter_map(|row| row.dialogue.as_ref().filter(|q| !q.speakers.is_empty())
+            .map(|q| json!({"rowId":row.id,"lineId":q.id,"speaker":q.speaker,"speakers":q.speakers}))).collect();
+    if !groups.is_empty() {
+        input["jointSpeakerProfile"] = json!("source-dialogue-members/v1");
+        input["jointSpeakers"] = json!(groups);
+        let guide = input["transportInstructions"].as_str().unwrap_or("").to_owned();
+        input["transportInstructions"] = json!(format!("{guide} jointSpeakers是程序根据原文明确人物名单识别的共同说者：speaker完整保留原标签，speakers各text与range是分别登记的原文成员，不是一个新人物、群像资产或互为别名。按每个成员分别识别并沿用正式身份、适用形象及历史资料，不按连接标签创建或合并资产；共同的一句原话保持一次，不按成员人数复制。"));
+    }
     if context["foundationModelInputProfile"] != super::foundation_wire::PROFILE {
         return input; // Frozen tasks and accepted cache retain their original wire.
     }
@@ -1509,6 +1522,7 @@ fn prepare_capacity_batch(
     index: usize,
     signals: &[Value],
 ) -> Result<(Batch, Value), String> {
+    super::asset_coverage::enabled(context)?;
     if pending.is_empty() {
         return Err("容量规划没有待处理批次".into());
     }
@@ -3442,6 +3456,20 @@ fn apply_catalogue(
     }
     materialize_foundation(source, &mut next)?;
     validate_foundation(source, &next)?;
+    // Require each explicitly named co-speaker in this delivered source batch
+    // to resolve separately. Do not guess aliases or silently invent assets.
+    let batch_rows = batch.row_ids();
+    for row in source.rows.iter().filter(|row| batch_rows.contains(row.id.as_str())) {
+        for q in row.dialogue.iter().filter(|q| !q.speakers.is_empty()) {
+            for member in &q.speakers {
+                let matches = next.assets.iter().filter(|asset| ["CH", "GROUP", "BEAST"].contains(&asset.kind.as_str()) &&
+                    (asset.name.split(['|', '｜']).next().unwrap_or("").trim() == member.text || asset.aliases.contains(&member.text))).count();
+                if matches != 1 {
+                    return Err(format!("共同说者成员「{}」须分别对应唯一正式资产；当前匹配 {} 项，请依据原文名单修正目录身份或别名", member.text, matches));
+                }
+            }
+        }
+    }
     Ok(next)
 }
 fn scene_todos(
@@ -5632,8 +5660,97 @@ pub(crate) mod synthetic {
 }
 
 #[cfg(test)]
+mod asset_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn asset_coverage_f2_q1_frozen_profile_reaches_full_source_and_compiled_wire_only_on_new_runs() {
+        let source=prepare_source("第一集\n场景：摊位\n△顾客甲接过包裹，再递还卖主。\n顾客甲：先让我看看。\n△卖主放下手电，拿起铲子。\n").unwrap();
+        let selected:Vec<_>=source.episodes.iter().map(|episode|episode.id.clone()).collect();
+        let batch=plan_batches(&source,&selected).unwrap().remove(0);
+        let foundation=empty_foundation(&source);
+        let old_context=json!({"foundationModelInputProfile":super::super::foundation_wire::PROFILE});
+        let mut frozen=old_context.clone();
+        super::super::asset_coverage::freeze_new(&mut frozen).unwrap();
+        let frozen:Value=serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
+        let mut context=old_context.clone();
+        super::super::asset_coverage::inherit(&mut context,&frozen).unwrap();
+        for stage in ["F2","Q1"] {
+            let old=input_for(stage,&source,&batch,&foundation,&old_context,0,1,true,&[]);
+            let mut new=input_for(stage,&source,&batch,&foundation,&context,0,1,true,&[]);
+            assert_eq!(new[super::super::asset_coverage::FIELD],super::super::asset_coverage::PROFILE);
+            let schema=delivery_schema(stage,&new);
+            let compiled=super::super::foundation_wire::compile(&format!("foundation:{stage}"),&new,&schema).unwrap();
+            assert_eq!(compiled.input[super::super::asset_coverage::FIELD],super::super::asset_coverage::PROFILE);
+            assert!(compiled.input["transportInstructions"].as_str().unwrap().contains("必要素材闭环核对"));
+            assert_ne!(digest(&old.to_string()),digest(&new.to_string()),"new contract participates in request identity");
+            new.as_object_mut().unwrap().remove(super::super::asset_coverage::FIELD);
+            new["transportInstructions"]=old["transportInstructions"].clone();
+            assert_eq!(new,old,"all source, registered identities and scope remain exactly unchanged");
+            assert!(old.get(super::super::asset_coverage::FIELD).is_none());
+        }
+    }
+
+    #[test]
+    fn asset_coverage_unknown_foundation_profile_fails_before_consuming_pending_work() {
+        let source=prepare_source("第一集\n场景：大厅\n小王：开始。\n").unwrap();
+        let selected:Vec<_>=source.episodes.iter().map(|episode|episode.id.clone()).collect();
+        let mut pending=plan_batches(&source,&selected).unwrap();
+        let count=pending.len();
+        let context=json!({super::super::asset_coverage::FIELD:"unknown"});
+        assert!(prepare_capacity_batch("F2",&source,&mut pending,&empty_foundation(&source),&context,0,&[]).is_err());
+        assert_eq!(pending.len(),count);
+    }
+
+    #[test]
+    fn asset_coverage_restricted_editor_phases_do_not_gain_catalogue_edit_authority() {
+        let context=json!({super::super::asset_coverage::FIELD:super::super::asset_coverage::PROFILE});
+        for phase in ["AUTO_INTERPRET","APPLY_DECISION","REPAIR"] {
+            let mut input=json!({"delivery":{"phase":phase},"transportInstructions":"original bounded authority"});
+            super::super::asset_coverage::foundation_input("Q1",&mut input,&context);
+            assert_eq!(input["transportInstructions"],"original bounded authority");
+            assert_eq!(input[super::super::asset_coverage::FIELD],super::super::asset_coverage::PROFILE);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joint_speaker_f1_retrieves_members_keeps_two_assets_and_roundtrips_wire() {
+        let source = prepare_source("第一集\n场景：码头\n△林川右手受伤。\n△周航穿着雨衣。\n第二集\n场景：门口\n人物：林川、周航\n林川&周航：（同时回头）真的来了！\n").unwrap();
+        let scope = vec![source.episodes[1].id.clone()];
+        let batch = Batch { pieces:whole_rows(&source,&scope),scope,fragment:None };
+        let prior = empty_foundation(&source);
+        let input = input_for("F2",&source,&batch,&prior,&json!({"foundationModelInputProfile":super::super::foundation_wire::PROFILE}),0,1,false,&[]);
+        assert_eq!(input["jointSpeakerProfile"],"source-dialogue-members/v1");
+        assert_eq!(input["jointSpeakers"][0]["speakers"][0]["text"],"林川");
+        assert_eq!(input["jointSpeakers"][0]["speakers"][1]["text"],"周航");
+        let evidence = expand_history(&input["evidence"]["historicalEvidenceCandidates"]).unwrap();
+        assert!(evidence.to_string().contains("林川右手受伤"));
+        assert!(evidence.to_string().contains("周航穿着雨衣"));
+        let wire = super::super::foundation_wire::compile("foundation:F2",&input,&delivery_schema("F2",&input)).unwrap();
+        let mut restored = wire.input.clone(); wire.restore(&mut restored).unwrap();
+        assert_eq!(restored["jointSpeakers"], input["jointSpeakers"]);
+        let scene=&source.scenes[1];
+        let mut raw=empty_catalogue(&source,&batch);
+        raw["assets"]=json!(["林川","周航"].iter().map(|name|json!({"name":name,"type":"CH","episodes":batch.scope,"sceneRefs":[[scene.episode_id,scene.id]],"preparation":{"mode":"REFERENCE"},"variants":[]})).collect::<Vec<_>>());
+        let raw_before=raw.to_string();
+        let next=apply_catalogue(&raw,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap();
+        assert_eq!(next.assets.len(),2);
+        assert_ne!(next.assets[0].id,next.assets[1].id);
+        assert_eq!(raw.to_string(),raw_before);
+        validate_foundation(&source,&next).unwrap();
+        let mut missing=raw.clone();missing["assets"].as_array_mut().unwrap().pop();
+        assert!(apply_catalogue(&missing,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap_err().contains("共同说者成员"));
+        let mut combined=raw.clone(); combined["assets"][0]["name"]=json!("林川&周航");
+        assert!(apply_catalogue(&combined,&source,&batch,&input,&prior,None,&HashSet::new()).unwrap_err().contains("共同说者"));
+        let mut merged=next.clone(); merged.assets[0].aliases=vec!["林川".into(),"周航".into()];
+        assert!(validate_foundation(&source,&merged).unwrap_err().contains("共同说者"));
+    }
+
     use std::sync::Mutex;
 
     struct CopiedProjectLiveExecutor {

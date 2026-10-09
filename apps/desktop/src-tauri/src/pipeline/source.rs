@@ -20,6 +20,9 @@ pub struct SourceRange {
 pub struct SourceDialogue {
     pub id: String,
     pub speaker: String,
+    /// Explicit joint-label members; absent on every historical source dialect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speakers: Vec<SourceSegment>,
     pub channel: String,
     pub quote: String,
     pub range: SourceRange,
@@ -34,6 +37,11 @@ pub struct SourceDialogue {
 pub struct SourceSegment {
     pub text: String,
     pub range: SourceRange,
+}
+
+pub fn dialogue_speaker_names(dialogue: &SourceDialogue) -> Vec<&str> {
+    if dialogue.speakers.is_empty() { vec![dialogue.speaker.as_str()] }
+    else { dialogue.speakers.iter().map(|member| member.text.as_str()).collect() }
 }
 
 pub fn spoken_text(dialogue: &SourceDialogue) -> String {
@@ -279,9 +287,10 @@ const STRUCTURAL_PARSER_VERSION: &str = "source-parser/v4";
 const DISPLAY_PARSER_VERSION: &str = "source-parser/v5";
 const FIDELITY_PARSER_VERSION: &str = "source-parser/v6";
 const MULTILINE_DISPLAY_PARSER_VERSION: &str = "source-parser/v7";
+const JOINT_SPEAKER_PARSER_VERSION: &str = "source-parser/v8";
 
 fn uses_fidelity_rules(version: &str) -> bool {
-    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION].contains(&version)
+    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION].contains(&version)
 }
 
 fn display_block_header(text: &str) -> bool {
@@ -335,7 +344,7 @@ fn display_enclosure_field(line: &str) -> Option<&str> {
 /// of speakers: the same labels outside that exact enclosure remain dialogue.
 /// Incomplete enclosures and explicit speech cues never grant an exemption.
 fn multiline_display_row_ids(source: &LockedSource, named: &HashSet<String>) -> HashSet<String> {
-    if source.parser_version != MULTILINE_DISPLAY_PARSER_VERSION {
+    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION].contains(&source.parser_version.as_str()) {
         return HashSet::new();
     }
     let mut ids = HashSet::new();
@@ -430,6 +439,7 @@ fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
+        JOINT_SPEAKER_PARSER_VERSION,
     ]
     .contains(&source.parser_version.as_str())
     {
@@ -513,7 +523,7 @@ fn prior_fresh_parser_version(text: &str) -> &'static str {
 
 // Compare complete deterministic projections so unaffected inputs retain their
 // established contract. Saved sources never pass through this opt-in selector.
-fn fresh_parser_version(text: &str) -> &'static str {
+fn prior_display_parser_version(text: &str) -> &'static str {
     let mut prior = prior_fresh_parser_version(text);
     if let (Ok(old), Ok(new)) = (
         parse_source(text, prior),
@@ -544,6 +554,23 @@ fn fresh_parser_version(text: &str) -> &'static str {
         if old != new {
             return MULTILINE_DISPLAY_PARSER_VERSION;
         }
+    }
+    prior
+}
+
+// Joint speech is a new import / explicit re-recognition contract. Never
+// reinterpret an already frozen v1-v7 source during load or recovery.
+fn fresh_parser_version(text: &str) -> &'static str {
+    let prior = prior_display_parser_version(text);
+    static JOINT_HEAD: OnceLock<Regex> = OnceLock::new();
+    let possible = JOINT_HEAD.get_or_init(|| Regex::new(r"^\s*[\p{L}\p{M}\p{N}·・_]{1,24}\s*[&＆、与和][^:：\r\n]*[：:]").unwrap());
+    if !raw_lines(text).iter().any(|line| possible.is_match(line)) { return prior; }
+    if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, JOINT_SPEAKER_PARSER_VERSION)) {
+        let mut old = serde_json::to_value(old).unwrap();
+        let mut new = serde_json::to_value(new).unwrap();
+        old.as_object_mut().unwrap().remove("parserVersion");
+        new.as_object_mut().unwrap().remove("parserVersion");
+        if old != new { return JOINT_SPEAKER_PARSER_VERSION; }
     }
     prior
 }
@@ -775,6 +802,10 @@ fn parse_dialogue(
     row_id: &str,
     parser_version: &str,
 ) -> Option<SourceDialogue> {
+    parse_dialogue_with_label(text, start, row_id, parser_version, None)
+}
+
+fn parse_dialogue_with_label(text: &str, start: usize, row_id: &str, parser_version: &str, joint_label: Option<&str>) -> Option<SourceDialogue> {
     let line = text.trim_end_matches(['\r', '\n']);
     // Only an explicit leading label is a lexical speaker; no colon inference inside a sentence.
     let mut depth = 0_i32;
@@ -803,8 +834,13 @@ fn parse_dialogue(
     } else {
         re
     };
-    let captures = re.captures(head)?;
-    let label = captures.get(1)?.as_str();
+    let captures;
+    let (label, tail) = if let Some(label) = joint_label {
+        (label, head.strip_prefix(label)?)
+    } else {
+        captures = re.captures(head)?;
+        (captures.get(1)?.as_str(), captures.get(2).map(|m| m.as_str()).unwrap_or(""))
+    };
     if !label.chars().any(char::is_alphabetic) {
         return None;
     }
@@ -825,7 +861,6 @@ fn parse_dialogue(
     {
         return None;
     }
-    let tail = captures.get(2).map(|m| m.as_str()).unwrap_or("");
     let mut hint = String::new();
     let mut channel_text = String::new();
     let mut hint_depth = 0_i32;
@@ -849,6 +884,7 @@ fn parse_dialogue(
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
+        JOINT_SPEAKER_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let (channel_text, channel_label) = if current_voice_rules {
@@ -876,11 +912,11 @@ fn parse_dialogue(
     }
     let suffix = channel_text;
     static HAN: OnceLock<Regex> = OnceLock::new();
-    let attached_cue = !uses_fidelity_rules(parser_version)
+    let attached_cue = joint_label.is_none() && (!uses_fidelity_rules(parser_version)
         || label.char_indices().rev().nth(2).is_some_and(|(_, ch)| {
             HAN.get_or_init(|| Regex::new(r"^\p{Han}$").unwrap())
                 .is_match(&ch.to_string())
-        });
+        }));
     let (speaker, channel) =
         if attached_cue && channel_label.ends_with("OS") && label.chars().count() > 2 {
             (&label[..label.len() - 2], "OS")
@@ -921,9 +957,92 @@ fn parse_dialogue(
         range,
         spoken_segments,
         performance_segments,
+        speakers: vec![],
     };
     system_message_segments(&mut dialogue);
     Some(dialogue)
+}
+
+// Exact explicit cast declarations provide lexical
+// name evidence. A conjunction inside narrative prose is not a new speaker.
+struct JointSpeakerGrammar { names: HashSet<String>, grammar: Option<Regex>, member: Option<Regex> }
+
+fn joint_speaker_grammar(source: &LockedSource) -> JointSpeakerGrammar {
+    let names = declared_speaker_names(source);
+    let mut ordered: Vec<_> = names.iter().filter(|name| !name.is_empty() && name.chars().count() <= 24).collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let atom = ordered.iter().map(|name| regex::escape(name)).collect::<Vec<_>>().join("|");
+    let grammar = if ordered.is_empty() || ordered.len() > 1024 { None } else {
+        Regex::new(&format!(r"^((?:{})(?:\s*[&＆、与和]\s*(?:{})){{1,7}})(.*)$", atom, atom)).ok()
+    };
+    let member = grammar.as_ref().and_then(|_| Regex::new(&format!(r"^(?:{})", atom)).ok());
+    JointSpeakerGrammar { names, grammar, member }
+}
+
+// Some(None) marks an explicit but unproved joint-label shape: do not fall
+// back to the older permissive single-label rule and read narrative as speech.
+fn joint_row_dialogue(row: &SourceRow, evidence: &JointSpeakerGrammar) -> Option<Option<SourceDialogue>> {
+    let names = &evidence.names;
+    let line = row.text.trim_end_matches(['\r', '\n']);
+    let trimmed = line.trim_start();
+    let mut depth = 0_i32;
+    let mut colon = None;
+    for (byte, ch) in trimmed.char_indices() {
+        match ch {
+            '（' | '(' | '[' | '【' => depth += 1,
+            '）' | ')' | ']' | '】' => depth -= 1,
+            ':' | '：' if depth == 0 => { colon = Some(byte); break; }
+            _ => {}
+        }
+        if depth < 0 || byte > 256 { return None; }
+    }
+    let head = trimmed[..colon?].trim();
+    if names.contains(head) { return None; }
+    let explicit = head.contains(['&', '＆', '、']);
+    let conjunction = head.contains(['与', '和']);
+    if !explicit && !conjunction { return None; }
+    // Only a head starting with an evidenced name and a join operator can
+    // opt into the joint-speech grammar. A delta/action prefix stays narrative.
+    let starts_joint = names.iter().any(|name| head.strip_prefix(name).is_some_and(|rest|
+        rest.trim_start().starts_with(['&', '＆', '、', '与', '和'])));
+    if !starts_joint { return None; }
+    let Some(grammar) = &evidence.grammar else { return Some(None); };
+    let Some(captures) = grammar.captures(head) else { return Some(None); };
+    let label = captures.get(1)?.as_str();
+    // Existing grammar parses the remaining whole-group channel and performance cues.
+    let Some(mut dialogue) = parse_dialogue_with_label(line, row.range.start, &row.id, JOINT_SPEAKER_PARSER_VERSION, Some(label)) else { return Some(None); };
+    let member = evidence.member.as_ref()?;
+    let label_origin = line.len() - trimmed.len();
+    let mut cursor = 0;
+    let mut seen = HashSet::new();
+    while cursor < label.len() {
+        let Some(found) = member.find(&label[cursor..]) else { return Some(None); };
+        let name = found.as_str();
+        if !seen.insert(name) { return Some(None); }
+        let start = label_origin + cursor;
+        let end = start + name.len();
+        dialogue.speakers.push(SourceSegment { text: name.into(), range: SourceRange {
+            start: row.range.start + line[..start].encode_utf16().count(),
+            end: row.range.start + line[..end].encode_utf16().count(),
+        }});
+        cursor += name.len();
+        if cursor == label.len() { break; }
+        let rest = &label[cursor..]; cursor += rest.len() - rest.trim_start().len();
+        let Some(separator) = label[cursor..].chars().next() else { return Some(None); };
+        if !['&', '＆', '、', '与', '和'].contains(&separator) { return Some(None); }
+        cursor += separator.len_utf8();
+        let rest = &label[cursor..]; cursor += rest.len() - rest.trim_start().len();
+    }
+    if dialogue.speakers.len() < 2 { return Some(None); }
+    Some(Some(dialogue))
+}
+
+fn apply_joint_dialogues(source: &mut LockedSource) {
+    if source.parser_version != JOINT_SPEAKER_PARSER_VERSION { return; }
+    let names = joint_speaker_grammar(source);
+    for row in source.rows.iter_mut().filter(|row| row.kind == "body") {
+        if let Some(dialogue) = joint_row_dialogue(row, &names) { row.dialogue = dialogue; }
+    }
 }
 
 pub fn prepare_source(text: &str) -> Result<LockedSource, String> {
@@ -944,6 +1063,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
+        JOINT_SPEAKER_PARSER_VERSION,
     ]
     .contains(&parser_version)
     {
@@ -954,6 +1074,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         DISPLAY_PARSER_VERSION,
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
+        JOINT_SPEAKER_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let fidelity = uses_fidelity_rules(parser_version);
@@ -1347,6 +1468,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         });
         offset = end;
     }
+    apply_joint_dialogues(&mut source);
     let display_ids = display_only_row_ids(&source);
     for row in &mut source.rows {
         if display_ids.contains(&row.id) {
@@ -1578,6 +1700,7 @@ fn migrate_scene_edits(
 
 fn validate_integrity(source: &LockedSource) -> Result<(), String> {
     let display_ids = display_only_row_ids(source);
+    let joint_names = (source.parser_version == JOINT_SPEAKER_PARSER_VERSION).then(|| joint_speaker_grammar(source));
     if source.schema_version != "locked-source/v1"
         || source.coordinate_system != "utf16"
         || source.sha256 != digest(&source.text)
@@ -1597,7 +1720,7 @@ fn validate_integrity(source: &LockedSource) -> Result<(), String> {
             return Err("来源行存在遗漏、重叠、错序或回读不一致".into());
         }
         let expected_dialogue = if row.kind == "body" && !display_ids.contains(&row.id) {
-            row_dialogue(&row.text, row.range.start, &row.id, &source.parser_version)
+            joint_names.as_ref().and_then(|names| joint_row_dialogue(row, names)).unwrap_or_else(|| row_dialogue(&row.text, row.range.start, &row.id, &source.parser_version))
         } else {
             None
         };
@@ -1982,6 +2105,7 @@ fn apply_decisions_inner(
         }
     }
     out.boundary_decisions = decisions.to_vec();
+    apply_joint_dialogues(&mut out);
     validate_integrity(&out)?;
     Ok(out)
 }
@@ -2795,3 +2919,7 @@ mod m2_tests;
 #[cfg(test)]
 #[path = "source_display_tests.rs"]
 mod display_tests;
+
+#[cfg(test)]
+#[path="source_joint_tests.rs"]
+mod joint_tests;
