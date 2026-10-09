@@ -66,7 +66,7 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
     return () => { active = false; };
   }, [workspace.project.id, selected?.id, selected?.version]);
   const creating = projectProductionBusy(workspace);
-  const continuation = storyboardStartContinuation(workspace, selection), unknownContinuation = continuation?.submissionUnknown === true || continuation?.status === 'submission_unknown';
+  const continuation = storyboardStartContinuation(workspace, selection), unknownContinuation = continuation?.submissionUnknown === true || continuation?.status === 'submission_unknown' || workspace.jobs.some(job => job.cliSubmissionUnknown === true);
   const blocking = (workspace.source?.diagnostics || []).filter(issue => issue.blocking);
   const sourceRows = unit ? sourceEvidence(workspace, unit.sourceRefs) : [], shots = records(unit?.shots);
   const direction = productionDirection(workspace), title = unit?.title || '分镜单元';
@@ -92,7 +92,7 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
   let offset = 0;
   return <div className="production-workbench stage-three-workbench">
     <div className="stage-intro"><div><h2>生成每个分镜单元的完整文字提示词</h2><p>按原文创作，逐单元阅读、修改与复制；配图和视频制作在第四阶段完成。</p></div><div className="actions"><label className="production-range-label">创作范围<select aria-label="分镜创作范围" value={episode} onChange={event => { setEpisode(event.target.value); setTab('prompt'); }}><option value="all">全部已确认集数 · {episodes.length} 集</option><option value="empty">还没有分镜的集数 · {emptyEpisodes.length} 集</option>{episodes.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><Button executionAction="storyboard.run" variant="primary" icon="spark" disabled={!writable || !selection.length || !!blocking.length || creating || starting || unknownContinuation} onClick={() => void run()}>{creating ? '本项目正在制作' : starting ? '正在启动创作' : unknownContinuation ? '保留原分镜任务' : continuation ? '继续原分镜流程' : '生成分镜提示词'}</Button></div></div>
-    {continuation && !creating && <p className="muted" role="status">{unknownContinuation ? '原范围有未知提交，请先核对原执行状态；不会另建或重发。' : '同范围的分镜尚未完成。此按钮继续原流程，已核对的步骤将复用。'}</p>}
+    {(continuation || unknownContinuation) && !creating && <p className="muted" role="status">{unknownContinuation ? '本项目有原提交待核对，请先核对原结果；原提交仍未知时不会另建或重发。' : '同范围的分镜尚未完成。此按钮继续原流程，已核对的步骤将复用。'}</p>}
     {episode === 'empty' && <p className="muted" role="status">仅创作当前零单元的 {emptyEpisodes.length} 集；已有单元的集数仍需各自核对是否完整。</p>}
     <WorkflowProgress workspace={workspace} stage="storyboard" writable={writable} mutate={mutate} onError={onError}/>
     {blocking.length > 0 && <div className="production-inline-warning">{blocking.map((item, index) => <p key={index}>{item.message}</p>)}<p>在第一阶段确认范围后，即可生成文字单元。</p></div>}

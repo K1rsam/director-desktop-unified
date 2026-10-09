@@ -19,6 +19,9 @@ static CHILDREN: OnceLock<Arc<CliChildren>> = OnceLock::new();
 static TEXT_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 const STANDALONE_RECEIVED_INTERRUPTED: &str =
     "文字步骤中断或尚未校验；继续原流程时重新执行，原回包保留";
+#[path = "text_cli_unknown.rs"]
+mod cli_unknown;
+pub(crate) use cli_unknown::{check_cli_unknown_hold, cli_unknown_jobs};
 
 #[derive(Default)]
 struct CliChildren {
@@ -418,6 +421,9 @@ async fn supervise_cli(
         let stderr = child.stderr.take().ok_or("无法读取CLI错误")?;
         #[cfg(not(windows))]
         let stdin = child.stdin.take().ok_or("无法打开文本输入")?;
+        // Persist possible dispatch before stdin can reach the CLI. A local
+        // process exit never proves that a started remote turn was cancelled.
+        observer("codex_dispatch_started", &json!({"version":"codex-dispatch-started/v1","pid":pid}))?;
         heartbeat("writing_stdin", true)?;
         let stdout = drain_cli_stdout(stdout, progress.clone(), observer.clone());
         let stderr = drain_cli_stderr(stderr, progress.clone(), observer.clone());
@@ -3964,6 +3970,42 @@ fn main() {
             exactly_one_fixture_spawn(&counter);
         }
     }
+    #[tokio::test]
+    async fn cli_unknown_real_supervision_timeout_and_close_persist_unknown_without_transport_retry() {
+        offline_cli_fixture(); // Do not charge Rust fixture compilation to runtime.
+        for closing in [false, true] {
+            let (_directory, executor, request, job, snapshot, _) = managed_installation_resume_tests::stopped_text_fixture();
+            executor.store.update_job(&job,"submitting",&json!({"error":null})).unwrap();
+            let hash=crate::pipeline::digest(&snapshot.to_string());
+            executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(),&step_key(&request),&request.stage,&hash,"running",Some(&job),None,None).unwrap();
+            let output=executor.store.root.join("never-produced.json");
+            let counter=executor.store.root.join("fixture-spawns");
+            let registry=Arc::new(CliChildren::default());
+            let stopping=registry.clone();let store=executor.store.clone();let observed_job=job.clone();
+            let observer:CliObserver=Arc::new(move|kind,value|{
+                store.event(&observed_job,kind,value)?;
+                if closing && kind=="codex_event" && value["type"]=="turn.started" {stopping.shutdown_with(|_|{});}
+                Ok(())
+            });
+            let mut policy=offline_policy();policy.overall=Duration::from_millis(1200);
+            let error=supervise_cli(&mut offline_command("long-wait",&output,&counter),&registry,b"synthetic full input".to_vec(),&output,"storyboardCreate",policy,observer).await.unwrap_err();
+            assert!(error.contains(if closing{"正在关闭"}else{"完整运行超时"}),"{error}");
+            exactly_one_fixture_spawn(&counter);
+            let error=executor.record_text_execution_failure(&request,&job,&hash,&error).unwrap();
+            assert!(error.contains("CLI_SUBMISSION_UNKNOWN"));
+            if closing {assert!(!error.contains("未启动新的文本任务"),"a dispatched close must not claim no dispatch");}
+            assert_eq!(executor.store.job(&job).unwrap()["status"],"submission_unknown");
+            let step_state:String=executor.store.conn().unwrap().query_row("SELECT state FROM workflow_steps WHERE text_job_id=?1",[&job],|row|row.get(0)).unwrap();
+            assert_eq!(step_state,"submission_unknown");
+            let before=executor.store.jobs().unwrap();
+            let restored=Store::open(executor.store.root.clone()).unwrap();restored.recover_interrupted().unwrap();
+            assert_eq!(restored.jobs().unwrap(),before,"restart does not wash unknown");
+            let prepared=executor.prepare_transport_request(request.clone()).await.unwrap();
+            assert!(prepared.input.get("textTransportRetry").is_none());
+            assert!(check_cli_unknown_hold(&restored).unwrap_err().contains("CLI_SUBMISSION_UNKNOWN"));
+            assert_eq!(restored.jobs().unwrap(),before);
+        }
+    }
     #[test]
     fn native_kill_helper_itself_is_bounded_and_registry_lock_is_released() {
         let directory = tempfile::tempdir().unwrap();
@@ -5273,6 +5315,7 @@ impl TextExecutor for SavedTextExecutor {
             return Ok(value);
         }
         self.check_cli_allocation_boundary(&request, &snapshot)?;
+        check_cli_unknown_hold(&self.store)?;
         self.check_sdk_unresolved_hold()?;
         self.sdk_revision_budget(&request)?;
         let _permit = TEXT_SLOTS
@@ -5361,6 +5404,7 @@ impl TextExecutor for SavedTextExecutor {
             self.check_managed_node_resume_boundary(&request)?;
         }
         self.check_api_finish_submission_boundary(&request)?;
+        check_cli_unknown_hold(&self.store)?;
         let (job, cli_allocation) = if s(&self.settings, "textProvider") == "codex" {
             let allocation = self.allocate_cli_text_job(&request, &snapshot)?;
             (allocation.job.clone(), Some(allocation))
@@ -5410,21 +5454,7 @@ impl TextExecutor for SavedTextExecutor {
                 Ok(value)
             }
             Err(error) => {
-                self.store
-                    .update_job(&job, "failed", &json!({"error":error}))?;
-                if let Some(run) = &self.workflow_id {
-                    self.store.checkpoint(
-                        run,
-                        &key,
-                        &request.stage,
-                        &hash,
-                        "failed",
-                        Some(&job),
-                        None,
-                        Some(&error),
-                    )?;
-                }
-                Err(error)
+                Err(self.record_text_execution_failure(&request, &job, &hash, &error)?)
             }
         }
     }
@@ -7779,7 +7809,7 @@ impl SavedTextExecutor {
         if s(&self.settings, "textProvider") != "codex" {
             return Ok(());
         }
-        self.validate_transport_retry(request)?;
+        self.validate_transport_retry_for_dispatch(request)?;
         require_unallocated_cli_node(&self.store.conn()?, self.workflow_id.as_deref(), request, snapshot)
     }
 
@@ -7787,7 +7817,8 @@ impl SavedTextExecutor {
         if s(&self.settings, "textProvider") != "codex" {
             return Err("CLI_NEW_DISPATCH_UNPROVEN: 新CLI任务分配不能用于其他渠道".into());
         }
-        self.validate_transport_retry(request)?;
+        self.validate_transport_retry_for_dispatch(request)?;
+        check_cli_unknown_hold(&self.store)?;
         let retry_origin = request.input.get("textTransportRetry").map(|proof| {
             Ok::<_, String>((
                 proof["originJobId"].as_str().filter(|value| !value.is_empty()).ok_or("CLI_RETRY_ORIGIN_UNBOUND")?.to_owned(),
@@ -7820,6 +7851,8 @@ impl SavedTextExecutor {
     }
 
     fn validate_cli_dispatch_allocation(&self, request: &TextRequest, job: &str, allocation: &CliDispatchAllocation) -> Result<()> {
+        self.validate_transport_retry_for_dispatch(request)?;
+        check_cli_unknown_hold(&self.store)?;
         let held = || "CLI_NEW_DISPATCH_UNPROVEN: 新CLI任务/节点/冻结请求绑定不匹配，未派发".to_string();
         if job != allocation.job || allocation.workflow != self.workflow_id || allocation.node != step_key(request) {
             return Err(held());
@@ -8732,10 +8765,12 @@ mod managed_installation_resume_tests {
     }
 
     #[tokio::test]
-    async fn stopped_text_transport_recovers_once_under_a_new_key_and_keeps_the_original_evidence() {
+    async fn stopped_text_transport_historical_accepted_timeout_replays_without_new_dispatch() {
         let (_directory, executor, request, job, frozen, raw) = stopped_text_fixture();
         let original = executor.store.job(&job).unwrap();
         let retry = executor.prepare_transport_request(request.clone()).await.unwrap();
+        assert!(executor.validate_transport_retry_for_dispatch(&retry).unwrap_err().contains("CLI_TIMEOUT_RETRY_HELD"));
+        assert!(check_cli_unknown_hold(&executor.store).is_err());
         let proof = &retry.input["textTransportRetry"];
         assert_eq!(proof["originJobId"],job);
         assert_eq!(proof["attempt"],1);
@@ -8754,6 +8789,7 @@ mod managed_installation_resume_tests {
         assert_eq!(executor.execute(resumed.clone()).await.unwrap(),raw);
         executor.accept(&resumed,&raw).await.unwrap();
         assert!(accepted_transport_retry_proof(&executor.store,executor.workflow_id.as_deref().unwrap(),&resumed).unwrap());
+        check_cli_unknown_hold(&executor.store).unwrap();
         let progress=executor.store.workflow_progress().unwrap();
         let origin=progress[0]["nodes"].as_array().unwrap().iter().find(|node|node["id"]==step_key(&request)).unwrap();
         assert_eq!(origin["status"],"failed");
@@ -10759,6 +10795,12 @@ mod carrier_continuity_key_tests {
             for valid in [false, true] {
                 let (_temporary, exec, request, job, raw) =
                     carrier_attempt_fixture("received", true);
+                // Even with another old timeout held project-wide, this exact
+                // received packet may be locally validated without a dispatch.
+                exec.store.event(&job,"codex_event",&json!({"type":"turn.completed"})).unwrap();
+                let held=exec.store.add_job("text","synthetic old timeout","codex","local",&json!({"frozen":"unrelated original"}),"failed").unwrap();
+                exec.store.event(&held,"codex_event",&json!({"type":"turn.started"})).unwrap();
+                assert!(check_cli_unknown_hold(&exec.store).is_err());
                 if recovered {
                     exec.store.recover_interrupted().unwrap();
                 }
@@ -11804,6 +11846,7 @@ impl SavedTextExecutor {
             return self.sdk_receive(request, snapshot, s(&job, "id"), &attempt);
         }
         self.check_sdk_unresolved_hold()?;
+        check_cli_unknown_hold(&self.store)?;
         let new_node_snapshot = self.sdk_new_node_snapshot(request, snapshot).await?;
         let snapshot = &new_node_snapshot;
         // Reuse the domain-specific global attempt guards before allocating a
@@ -12554,6 +12597,21 @@ mod sdk_core_tests {
             .await
             .unwrap();
         assert_eq!(calls(&resumed), 1);
+    }
+    #[tokio::test]
+    async fn cli_unknown_blocks_new_sdk_execution_before_inspect_or_attempt_allocation() {
+        let (_temp, executor, request) = fixture("completed");
+        let original=executor.store.add_job("text","synthetic prior CLI","codex","local",&json!({"frozen":"original CLI"}),"failed").unwrap();
+        executor.store.event(&original,"codex_event",&json!({"type":"turn.started"})).unwrap();
+        executor.store.event(&original,"codex_heartbeat",&json!({"format":"codex-runtime-heartbeat/v1","phase":"failed","processAlive":false,"pid":123,"stdinBytes":100,"stdinTotalBytes":100,"resultBytes":0})).unwrap();
+        let before=executor.store.jobs().unwrap();
+        assert!(executor.execute(request.clone()).await.unwrap_err().contains("CLI_SUBMISSION_UNKNOWN"));
+        assert!(!executor.store.root.join("sdk-worker").exists(), "blocked before even creating an SDK worker directory");
+        assert_eq!(executor.store.jobs().unwrap(),before);
+        let restarted=restart(&executor);
+        assert!(restarted.execute(request).await.unwrap_err().contains("CLI_SUBMISSION_UNKNOWN"));
+        assert!(!restarted.store.root.join("sdk-worker").exists());
+        assert_eq!(restarted.store.jobs().unwrap(),before);
     }
     #[tokio::test]
     async fn sdk_core_disconnect_unknown_blocks_restart_new_workflow_and_cli_without_more_executions(
@@ -13326,6 +13384,9 @@ fn main() {
         // Reuse the established managed retry fixture. Its native package path
         // is deliberately absent and is never created, resolved or executed.
         let (directory, executor, request, job, snapshot, _) = managed_installation_resume_tests::stopped_text_fixture();
+        // Only a server-rejected quota attempt permits a new transport attempt.
+        // Historical timeout-origin bytes remain covered by read-only replay.
+        managed_installation_resume_tests::save_quota_failure(&executor, &request, &job, &snapshot);
         let native = offline_native(directory.path());
         let origin = CliDispatchAllocation { job, request_hash:crate::pipeline::digest(&snapshot.to_string()), workflow:executor.workflow_id.clone(), node:step_key(&request), retry_origin:None };
         let compiled = compile_codex_input(&request).unwrap();
@@ -13464,7 +13525,8 @@ fn main() {
                 "received" | "unknown" => { executor.store.update_job(&allocation.job, if mutation == "received" { "received" } else { "submission_unknown" }, &json!({})).unwrap(); },
                 _ => unreachable!(),
             }
-            assert!(executor.cli(&request, &allocation.job, &native, &allocation).await.unwrap_err().contains("CLI_NEW_DISPATCH_UNPROVEN"), "{mutation}");
+            let expected=if mutation=="unknown" {"CLI_SUBMISSION_UNKNOWN"} else {"CLI_NEW_DISPATCH_UNPROVEN"};
+            assert!(executor.cli(&request, &allocation.job, &native, &allocation).await.unwrap_err().contains(expected), "{mutation}");
             assert!(!executor.store.root.join("text-runs").exists(), "{mutation}: held before artifact writes");
             assert!(!native.with_extension("executed").exists(), "{mutation}: zero dispatch");
         }

@@ -1242,14 +1242,35 @@ impl Store {
         // Legacy projects may not have created checkpoint storage yet. Reading
         // summaries must not create tables or alter an original task record.
         let has_steps: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+        // Historical CLI failures remain untouched on disk. Project the same
+        // evidence-based hold used before dispatch, including old hidden rows.
+        let mut cli_unknown: std::collections::BTreeMap<String, String> =
+            crate::text_executor::cli_unknown_jobs(self)?.into_iter().collect();
+        if has_steps && !cli_unknown.is_empty() {
+            let ids = json!(cli_unknown.keys().collect::<Vec<_>>()).to_string();
+            let mut parents = c.prepare("SELECT workflow_id,text_job_id FROM workflow_steps WHERE text_job_id IN (SELECT value FROM json_each(?1)) ORDER BY rowid").map_err(|e|e.to_string())?;
+            let links = parents.query_map([ids], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+            for link in links {
+                let (parent, child) = link.map_err(|e|e.to_string())?;
+                if let Some(reason) = cli_unknown.get(&child).cloned() {
+                    cli_unknown.entry(parent).or_insert(reason);
+                }
+            }
+        }
+        let cli_ids = json!(cli_unknown.keys().collect::<Vec<_>>()).to_string();
         let unknown = if has_steps { JOB_SUMMARY_UNKNOWN_COLUMN } else { "j.state='submission_unknown'" };
-        let query=format!("SELECT {JOB_SUMMARY_COLUMNS},{unknown} AS summary_submission_unknown FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR ({unknown}) OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
+        let query=format!("SELECT {JOB_SUMMARY_COLUMNS},{unknown} AS summary_submission_unknown FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR ({unknown}) OR j.id IN (SELECT value FROM json_each(?1)) OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
         let mut q = c.prepare(&query).map_err(|e| e.to_string())?;
-        let rows = q.query_map([], |row| Ok((read_job(row)?,row.get::<_,bool>(18)?))).map_err(|e| e.to_string())?;
+        let rows = q.query_map([cli_ids], |row| Ok((read_job(row)?,row.get::<_,bool>(18)?))).map_err(|e| e.to_string())?;
         rows.map(|row| {
             let (raw,unknown) = row.map_err(|e|e.to_string())?;
             let mut job = finish_job(raw)?;
             job["submissionUnknown"] = json!(unknown);
+            if let Some(reason) = cli_unknown.get(s(&job, "id")) {
+                job["submissionUnknown"] = json!(true);
+                job["cliSubmissionUnknown"] = json!(true);
+                job["submissionUnknownReason"] = json!(reason);
+            }
             Ok(job)
         }).collect()
     }
@@ -3382,6 +3403,53 @@ mod tests {
         assert!(summaries.iter().any(|job|job["id"]==child));
         assert_eq!(summaries.len(),102,"only the two unresolved identities extend the 100-record text/workflow window");
         assert!(summaries.iter().filter(|job|job["id"]!=parent && job["id"]!=child).all(|job|job["submissionUnknown"]==false));
+        assert_eq!(store.job(&parent).unwrap(),before_parent);assert_eq!(store.job(&child).unwrap(),before_child);
+    }
+    #[test]
+    fn cli_unknown_summary_projects_legacy_failure_without_mutating_or_hiding_original_rows() {
+        let (_temp,store) = fixture();store.ensure_workflow_storage().unwrap();
+        let parent = store.add_job("workflow","storyboard.run","local","local",&json!({"runnerVersion":"desktop-runner/v1","stage":"storyboard.run","selection":{"episodeIds":["e1"]}}),"partially_blocked").unwrap();
+        let child = store.add_job("text","frozen-node","codex","local",&json!({"private":"SYNTHETIC_PRIVATE_REQUEST"}),"failed").unwrap();
+        store.update_job(&child,"failed",&json!({"error":"original timeout","result":{"retained":"SYNTHETIC_PRIVATE_RAW"},"prepared":{"budget":1},"receipt":{"original":true}})).unwrap();
+        store.event(&child,"codex_event",&json!({"type":"turn.started"})).unwrap();
+        store.conn().unwrap().execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,updated_at) VALUES(?1,'frozen-node','storyboardCreate','synthetic','failed',?2,?3)",params![parent,child,now()]).unwrap();
+        for _ in 0..105 {store.add_job("text","unrelated-history","local","local",&json!({}),"completed").unwrap();}
+        let before_parent = store.job(&parent).unwrap();let before_child = store.job(&child).unwrap();
+        let count = || store.conn().unwrap().query_row("SELECT COUNT(*) FROM events",[],|row|row.get::<_,i64>(0)).unwrap();
+        let events_before = count();
+        let stored_bytes = || {
+            let c = store.conn().unwrap();
+            let mut q = c.prepare("SELECT json_array(id,state,snapshot,prepared,receipt,result,error,updated_at) FROM jobs WHERE id IN (?1,?2) ORDER BY id").unwrap();
+            let rows = q.query_map(params![parent,child],|row|row.get::<_,String>(0)).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+            rows
+        };
+        let bytes_before = stored_bytes();
+        let (_other_temp,other) = fixture();
+        let unrelated = other.add_job("workflow","storyboard.run","local","local",&json!({}),"failed").unwrap();
+        for _ in 0..2 {
+            let summaries = store.job_summaries().unwrap();
+            assert_eq!(summaries.len(),102,"old unknown CLI and its workflow survive the history cap");
+            for (key, status) in [(&parent,"partially_blocked"),(&child,"failed")] {
+                let summary = summaries.iter().find(|job|job["id"]==*key).unwrap();
+                assert_eq!(summary["status"],status,"stored historical status remains readable");
+                assert_eq!(summary["submissionUnknown"],true);
+                assert_eq!(summary["cliSubmissionUnknown"],true);
+                assert!(!s(summary,"submissionUnknownReason").is_empty());
+                assert!(!summary.to_string().contains("SYNTHETIC_PRIVATE_"));
+            }
+            assert!(summaries.iter().filter(|job|job["id"]!=parent && job["id"]!=child).all(|job|job["submissionUnknown"]==false && job["cliSubmissionUnknown"].is_null()));
+            assert_eq!(store.job(&parent).unwrap(),before_parent);assert_eq!(store.job(&child).unwrap(),before_child);
+            assert_eq!(stored_bytes(),bytes_before,"raw snapshot/result/receipt serialization and timestamps stay byte-identical");
+            assert_eq!(count(),events_before,"projection writes no events or recovery state");
+            let other_summary = other.job_summaries().unwrap().into_iter().find(|job|job["id"]==unrelated).unwrap();
+            assert_eq!(other_summary["submissionUnknown"],false,"another project's production remains independent");
+            assert!(other_summary["cliSubmissionUnknown"].is_null());
+        }
+        // A real terminal event removes only the projection; no fake state migration.
+        store.event(&child,"codex_event",&json!({"type":"turn.completed"})).unwrap();
+        let summaries = store.job_summaries().unwrap();
+        assert_eq!(summaries.len(),100);
+        assert!(summaries.iter().all(|job|job["submissionUnknown"]==false));
         assert_eq!(store.job(&parent).unwrap(),before_parent);assert_eq!(store.job(&child).unwrap(),before_child);
     }
     #[test]

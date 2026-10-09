@@ -55,7 +55,7 @@ test('different source/units do not masquerade as continuation and known unknown
     const html = renderToStaticMarkup(createElement(Stage3Panel, { workspace, writable: true, mutate: async () => { mutations++; return workspace; } }));
     const held = (html.match(/<button\b[^>]*>[\s\S]*?<\/button>/g) || []).find(button => button.includes('保留原分镜任务'));
     assert.ok(held); assert.match(held, /^<button[^>]*disabled=""/);
-    assert.match(html, /原范围有未知提交/);
+    assert.match(html, /本项目有原提交待核对/);
     assert.equal(mutations, 0);
   } finally { await server.close(); }
 });

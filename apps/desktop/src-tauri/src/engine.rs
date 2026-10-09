@@ -2799,6 +2799,7 @@ impl Engine {
     }
     fn spawn_foundation_choices(self: &Arc<Self>, store: Store, request: &Value) -> Result<()> {
         let pipeline_lease = self.acquire_pipeline(&store)?;
+        crate::text_executor::check_cli_unknown_hold(&store)?;
         let view = store.foundation_choices()?;
         if request["expectedSourceVersion"] != view["sourceVersion"]
             || request["expectedFoundationVersion"] != view["foundationVersion"]
@@ -2854,6 +2855,10 @@ impl Engine {
         let refinement_lease = if stage == "storyboard.refine" {
             Some(self.acquire_pipeline(&store)?)
         } else { None };
+        // New production cannot hide a dispatched but unacknowledged CLI turn
+        // behind a different workflow, episode selection, or text provider.
+        // Original resume remains a separate path able to read saved results.
+        crate::text_executor::check_cli_unknown_hold(&store)?;
         // Serialize each foundation/Stage3 start before a workflow or preflight
         // is reserved. The existing pipeline key still owns actual execution.
         let _production_start = if ["foundation.run","storyboard.run"].contains(&stage) {
@@ -2887,6 +2892,7 @@ impl Engine {
             Some(lease) => lease,
             None => self.acquire_pipeline(&store)?,
         };
+        crate::text_executor::check_cli_unknown_hold(&store)?;
         // Only a genuinely new writer/refinement gets the scene contract. The
         // resume returns above and saved-snapshot recovery keep their exact input.
         if matches!(stage, "storyboard.run" | "storyboard.refine") {
@@ -3142,6 +3148,7 @@ impl Engine {
         self.reserve_asset_stage_owned(store, r, pipeline_lease)
     }
     fn reserve_asset_stage_owned(self: &Arc<Self>, store: Store, mut r: Value, pipeline_lease: ActiveGuard) -> Result<()> {
+        crate::text_executor::check_cli_unknown_hold(&store)?;
         let stage = s(&r, "action").to_owned();
         let all_assets = store.values("assets")?;
         let (wanted, _) = image_closure(&store, &all_assets, r["assetIds"].as_array());
@@ -6617,6 +6624,9 @@ mod project_lifecycle_tests;
 #[cfg(test)]
 #[path = "engine_refinement_cas_tests.rs"]
 mod refinement_cas_tests;
+#[cfg(test)]
+#[path = "engine_cli_unknown_tests.rs"]
+mod cli_unknown_tests;
 
 #[cfg(test)]
 mod production_input_transport_tests {
