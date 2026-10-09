@@ -168,6 +168,7 @@ fn basis(input: &Value) -> Result<Basis, String> {
     if creative::uses_scene_profile(input)? {
         binding[creative::SCENE_PROFILE_FIELD] = input[creative::SCENE_PROFILE_FIELD].clone();
     }
+    super::asset_use_binding::inherit(&mut binding, input)?;
     let input_binding = digest(&binding.to_string());
     Ok(Basis {
         source,
@@ -229,6 +230,10 @@ fn creative_body(units: &[Value]) -> Value {
 }
 
 fn validate_delta(input: &Value, basis: &Basis, raw: &Value) -> Result<(Value, Value), String> {
+    let mut material = json!({"assets":basis.assets,"sourceRows":basis.rows});
+    super::asset_use_binding::inherit(&mut material, input)?;
+    let projected = super::asset_use_binding::materialize(&material, raw)?;
+    let raw = &projected;
     let groups = raw["replacements"].as_array().ok_or("精修缺少差量替换组")?;
     let decisions = raw["reviewDecisions"]
         .as_array()
@@ -819,6 +824,33 @@ pub(crate) mod tests {
             .update_job(&run, "completed", &json!({"result":candidate}))
             .unwrap();
         (run, candidate)
+    }
+
+    #[tokio::test]
+    async fn asset_use_binding_new_three_roles_and_refinement_reopen_keep_raw_and_retained() {
+        use super::super::asset_use_binding as binding;
+        let source=super::super::prepare_source("第一集\n场景：门口\n△小王推门。\n").unwrap();
+        let mut fresh=json!({"source":source,"assets":[],"foundation":{"facts":[]},"settings":{"fantasyMode":"off","visualStyle":"16:9真人"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":0},"selection":{"episodeIds":[source.episodes[0].id]}});
+        stage3_pack::mark_input(&mut fresh).unwrap();binding::freeze_new(&mut fresh).unwrap();
+        let model=Model::default();let output=storyboard::run_storyboard(&fresh,&model,"offline","medium").await.unwrap();
+        assert_eq!(output["status"],"completed","{}",output["blocked"]);
+        let calls=model.calls.lock().await;assert_eq!(calls.len(),3);
+        for request in calls.iter(){assert_eq!(request.input[binding::FIELD],binding::PROFILE);assert_eq!(request.rule_snapshot["runtimeContract"][binding::FIELD],binding::PROFILE);}
+        assert!(output["units"].as_array().unwrap().iter().all(|u|u[binding::FIELD]==binding::PROFILE));
+        drop(calls);
+
+        let (directory,store,mut input,_origin)=fixture().await;
+        binding::freeze_new(&mut input).unwrap();
+        let retained=input["existingUnits"][1].clone();let (run,candidate)=saved_candidate(&store,&input,"scattered").await;
+        assert!(candidate["rawDelta"]["replacements"][0]["units"][0].get(binding::FIELD).is_none());
+        assert_eq!(candidate["validatedDelta"]["replacements"][0]["units"][0][binding::FIELD],binding::PROFILE);
+        let raw=candidate["rawDelta"].clone();let original=store.job(&run).unwrap()["result"].clone();
+        let reopened=Store::open(directory.path().join("isolated-source")).unwrap();
+        reopened.publish_storyboard_refinement(&run,text(&candidate,"candidateSha256"),&input).unwrap();
+        assert_eq!(reopened.job(&run).unwrap()["result"],original);
+        assert_eq!(reopened.get("units",text(&retained,"id")).unwrap(),retained);
+        assert_eq!(reopened.job(&run).unwrap()["result"]["rawDelta"],raw);
+        reopened.publish_storyboard_refinement(&run,text(&candidate,"candidateSha256"),&input).unwrap();
     }
 
     #[tokio::test]

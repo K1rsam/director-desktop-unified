@@ -34,6 +34,24 @@ export function projectWorkspaceView(workspace: Workspace | null, appSettings: A
   return { ...workspace, settings, providers: appSettings.providers, dreaminaAccount: appSettings.dreaminaAccount };
 }
 
+type DreaminaRefresh = { schemaVersion: 'dreamina-refresh/v1'; refreshState: 'pending' | 'completed'; settingsRevision: number; configuredPath?: string | null; afterCheckedAt?: string | null; afterStatus?: string; authorizationExpiresAt?: string | null; accountKey?: string | null; message: string };
+function dreaminaRefreshResult(value: unknown): value is DreaminaRefresh {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<DreaminaRefresh>;
+  return item.schemaVersion === 'dreamina-refresh/v1' && ['pending', 'completed'].includes(item.refreshState || '') && typeof item.settingsRevision === 'number' && typeof item.message === 'string';
+}
+function completedDreaminaRefresh(receipt: DreaminaRefresh, settings: AppSettings): boolean {
+  if (settings.revision !== receipt.settingsRevision || (settings.settings.dreaminaPath || '') !== (receipt.configuredPath || '')) throw new Error('等待期间即梦连接设置已变化，请按当前设置刷新。');
+  const account = settings.dreaminaAccount;
+  if (receipt.accountKey && account?.accountKey && receipt.accountKey !== account.accountKey) throw new Error('等待期间即梦登录账户已切换，请按当前账户刷新。');
+  if (account?.status === 'authorizing') {
+    if (receipt.afterStatus !== 'authorizing' || (account.authorization?.expiresAt || '') !== (receipt.authorizationExpiresAt || '')) throw new Error('等待期间即梦授权流程已切换，请按当前账户继续。');
+    return false;
+  }
+  const checked = Date.parse(account?.checkedAt || ''), previous = Date.parse(receipt.afterCheckedAt || '');
+  return Number.isFinite(checked) && (!Number.isFinite(previous) || checked > previous);
+}
+
 export default function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]), [storedWorkspace, setWorkspace] = useState<Workspace | null>(null);
   const [page, setPage] = useState<Page>('projects'), [busy, setBusy] = useState(''), [loading, setLoading] = useState(true), [notice, setNotice] = useState(''), [error, setError] = useState('');
@@ -89,11 +107,29 @@ export default function App() {
         ++globalSequence.current; globalBusyRef.current = action; setSettingsBusy(action);
         setError(''); setNotice('');
         const result = await request<unknown>({ ...values, action, scope: 'global' });
-        const next = isAppSettings(result) ? result : await request<unknown>({ action: 'settings.global.get' });
-        if (!isAppSettings(next)) throw new Error('软件连接状态读取结果无效，请刷新重试。');
+        const initial = isAppSettings(result) ? result : await request<unknown>({ action: 'settings.global.get' });
+        if (!isAppSettings(initial)) throw new Error('软件连接状态读取结果无效，请刷新重试。');
+        let next: AppSettings = initial;
+        let message = action === 'dreamina.status' && result && typeof result === 'object' && 'message' in result && typeof result.message === 'string' ? result.message : success;
+        if (action === 'dreamina.status' && dreaminaRefreshResult(result)) {
+          // The busy request never retries a CLI check. Poll only the in-memory
+          // account projection, with the original settings/account binding.
+          let completed = completedDreaminaRefresh(result, next);
+          for (let attempt = 0; !completed && attempt < 45; attempt++) {
+            if (!mounted.current || viewRevision !== globalViewRevision.current) return null;
+            setAppSettings(next); setNotice(result.message);
+            await new Promise<void>(resolve => window.setTimeout(resolve, 1000));
+            if (!mounted.current || viewRevision !== globalViewRevision.current) return null;
+            const snapshot = await request<unknown>({ action: 'settings.global.get' });
+            if (!isAppSettings(snapshot)) throw new Error('软件连接状态读取结果无效，请刷新重试。');
+            next = snapshot;
+            completed = completedDreaminaRefresh(result, next);
+          }
+          message = completed ? next.dreaminaAccount?.message || '已读取已有操作完成后的最新账户状态。' : '本次尚未取得新的即梦账户检查结果；已有操作仍可继续，请稍后查看账户状态。';
+        }
         if (mounted.current) {
           setAppSettings(next);
-          if (viewRevision === globalViewRevision.current) setNotice(success);
+          if (viewRevision === globalViewRevision.current) setNotice(message);
         }
         return next;
       } catch (reason) { if (mounted.current && viewRevision === globalViewRevision.current) setError(messageOf(reason)); return null; }

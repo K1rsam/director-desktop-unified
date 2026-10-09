@@ -224,6 +224,7 @@ pub fn pack_sha256() -> Result<String, String> {
 
 pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> {
     super::asset_coverage::inherit(target, frozen)?;
+    super::asset_use_binding::inherit(target, frozen)?;
     let rhythm = uses_rhythm_profile(frozen)?;
     if uses_profile(frozen)? {
         let hash = pack_sha256()?;
@@ -332,6 +333,8 @@ pub(super) fn runtime_contract(stage: &str, delta: bool) -> Result<Value, String
 }
 
 pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, String> {
+    let asset_use = super::asset_use_binding::enabled(&request.input)?;
+    if asset_use && !uses_profile(&request.input)? { return Err("素材使用绑定缺少冻结生产规则".into()); }
     let asset_coverage = super::asset_coverage::enabled(&request.input)?;
     if asset_coverage && !uses_profile(&request.input)? {
         return Err("素材核对合同缺少冻结的第三阶段规则包".into());
@@ -372,6 +375,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
     if rhythm {
         super::storyboard::original::rhythm::attach(&mut request)?;
     }
+    super::asset_use_binding::prepare_request(&mut request)?;
     Ok(request)
 }
 

@@ -1441,6 +1441,7 @@ impl Engine {
                 let original = &old["snapshot"]["input"];
                 if old["snapshot"]["savedSettingsSha256"] != pipeline::digest(&store.settings()?.to_string()) { return Err("项目参数已变化，精修结果已保留，请核对后重新精修".into()); }
                 let mut current = refinement_input_with_capabilities(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}),original.get("capabilities"))?;
+                pipeline::asset_use_binding::inherit(&mut current, original)?;
                 // Execution identity is frozen by preflight, not editable project state.
                 current["settings"] = original["settings"].clone();
                 store.publish_storyboard_refinement(run, s(&request,"candidateSha256"), &current)?;
@@ -2839,6 +2840,7 @@ impl Engine {
         } else { None };
         let planning=if matches!(stage,"storyboard.run"|"storyboard.refine"){self.global_planning_capabilities(&store)?}else{None};
         let mut input = if stage == "storyboard.refine" { refinement_input_with_capabilities(&store, &request,planning.as_ref())? } else { production_input_for_new_workflow_with_capabilities(&store, &request,planning.as_ref())? };
+        if stage == "storyboard.refine" { pipeline::asset_use_binding::freeze_new(&mut input)?; }
         if stage == "foundation.run" {
             match existing_foundation_start(&store, &input)? {
                 FoundationStartBoundary::New => {},
@@ -5461,6 +5463,7 @@ fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<V
 fn production_input_for_new_workflow_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
     let mut input = production_input_with_capabilities(store, request,capabilities)?;
     if s(request, "action") == "storyboard.run" {
+        pipeline::asset_use_binding::freeze_new(&mut input)?;
         let projection = store.foundation_context_for_new_workflow()?;
         input["foundation"] = projection.foundation;
         input["foundationReasonProjection"] = projection.diagnostic;

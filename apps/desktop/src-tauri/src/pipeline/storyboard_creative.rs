@@ -479,6 +479,7 @@ pub(in crate::pipeline) fn prepare_request(
     } else {
         false
     };
+    let asset_use_profile = super::super::asset_use_binding::enabled(&request.input)?;
     let finish_repair = if let Some(proof) = request.input.get("finishRepair") {
         if author_repair
             || proof["version"] != FINISH_SCOPE_REPAIR_PROFILE
@@ -509,6 +510,7 @@ pub(in crate::pipeline) fn prepare_request(
                         || issues.iter().any(|issue| {
                             issue["code"] != "ASSET_SCENE_SCOPE"
                                 && issue["code"] != "SHOT_DURATION"
+                                && !(asset_use_profile && matches!(text(issue,"code"),"SHOT_SOURCE_SCOPE" | "ASSET_SOURCE_SCOPE"))
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
                         })
@@ -649,14 +651,14 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
-    if author_repair && request.input["validationIssues"].as_array().is_some_and(|issues| {
+    if (author_repair || (finish_repair && asset_use_profile)) && request.input["validationIssues"].as_array().is_some_and(|issues| {
         issues.iter().any(|issue| issue["code"] == "SHOT_SOURCE_SCOPE")
     }) {
         let content = format!("{}\n\n{SHOT_SOURCE_REPAIR_EXECUTION}", text(&runtime_contract, "content"));
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
-    if author_repair && request.input["validationIssues"].as_array().is_some_and(|issues| {
+    if (author_repair || (finish_repair && asset_use_profile)) && request.input["validationIssues"].as_array().is_some_and(|issues| {
         issues.iter().any(|issue| issue["code"] == "ASSET_SOURCE_SCOPE" && issue.get("ownerUnitIds").is_some())
     }) {
         let content = format!("{}\n\n{PACKAGE_ASSET_SOURCE_REPAIR_EXECUTION}", text(&runtime_contract, "content"));

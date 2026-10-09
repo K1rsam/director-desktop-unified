@@ -14,6 +14,7 @@ pub(crate) mod storyboard_refinement;
 pub use storyboard_refinement::{run_storyboard_refinement, adopt_storyboard_refinement};
 pub(crate) mod storyboard_dependencies;
 mod storyboard_transport;
+pub mod asset_use_binding;
 
 pub use assets::{
     automatic_design_required, image_production_policy, resolve_asset_dependency, run_asset_design, validate_asset_visual_gate,

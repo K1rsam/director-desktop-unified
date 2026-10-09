@@ -480,7 +480,8 @@ pub(super) fn pack_event_units(
                         .map(|s| s["duration"].as_f64().unwrap_or(f64::INFINITY))
                         .sum::<f64>()
                 };
-                text(prior, "eventId") == text(&next, "eventId")
+                prior[super::super::asset_use_binding::FIELD] == next[super::super::asset_use_binding::FIELD]
+                    && text(prior, "eventId") == text(&next, "eventId")
                     && ["continuous", "capacity"].contains(&text(&next["boundaryBefore"], "kind"))
                     && text(prior, "scene") == text(&next, "scene")
                     && text(prior, "sceneId") == text(&next, "sceneId")
@@ -597,6 +598,7 @@ pub(super) fn pack_event_units(
                 if text(old, "use") != text(reference, "use") {
                     return Err("合并同一资产形象时素材用途冲突，须实际联修".into());
                 }
+                super::super::asset_use_binding::merge_reference(old, reference)?;
                 old["sourceRefs"] = json!(unique(
                     old["sourceRefs"]
                         .as_array()
@@ -618,6 +620,16 @@ pub(super) fn pack_event_units(
             reference["order"] = json!(index + 1);
         }
         prior["assetRefs"] = json!(references);
+        if super::super::asset_use_binding::enabled(prior)? {
+            let mut sounds = prior["soundSources"].as_array().cloned().unwrap_or_default();
+            for sound in next["soundSources"].as_array().into_iter().flatten() {
+                if let Some(old) = sounds.iter_mut().find(|old| old["assetId"] == sound["assetId"] && old["variantId"] == sound["variantId"]) {
+                    super::super::asset_use_binding::merge_reference(old, sound)?;
+                    old["sourceRefs"] = json!(unique(old["sourceRefs"].as_array().cloned().unwrap_or_default().into_iter().chain(sound["sourceRefs"].as_array().cloned().unwrap_or_default())));
+                } else { sounds.push(sound.clone()); }
+            }
+            prior["soundSources"] = json!(sounds);
+        }
         prior["shots"]
             .as_array_mut()
             .unwrap()

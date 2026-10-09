@@ -55,6 +55,79 @@ function hookRenderer() {
 function content(host: Host | string): string { return typeof host === 'string' ? host : host.children.map(content).join(''); }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+test('a busy Dreamina refresh waits only for local snapshots, with bounded and view-bound feedback', async t => {
+for (const mode of ['already-completed', 'pending-completed', 'timeout', 'leave', 'unmount', 'changed-settings', 'changed-account', 'changed-authorization', 'direct-error']) await t.test(mode, async () => {
+  const calls: any[] = [], timeouts: (() => void)[] = [], intervals = new Map<number, () => void>(); let timer = 0;
+  const prior = '2026-10-10T00:00:00Z', fresh = '2026-10-10T00:00:01Z';
+  let software: any = { schemaVersion: 'app-settings/v1', revision: 4, settings: { textProvider: 'codex_cli', dreaminaPath: '/auto/dreamina' }, providers: [], rules: [], dreaminaAccount: { status: 'authenticated', ready: true, identityVerified: true, accountKey: 'synthetic-account', checkedAt: prior, credits: { total: 10 }, message: '旧状态' } };
+  const complete = () => { software = { ...software, dreaminaAccount: { ...software.dreaminaAccount, checkedAt: fresh, credits: { total: 20 }, message: '已有检查已完成，账户身份与积分已核对。' } }; };
+  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: ['projects.list', 'settings.global.get', 'settings.global.save', 'runtime.status', 'chrome.status', 'dreamina.status'], readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'dreamina'], generationAllowed: false }, textBackends: [{ id: 'codex_cli', status: 'enabled' }] };
+  const respond = async (input: any) => {
+    calls.push(input);
+    if (input.action === 'getExecutionPolicy') return policy;
+    if (input.action === 'projects.list') return [];
+    if (input.action === 'settings.global.get') return structuredClone(software);
+    assert.equal(input.scope, 'global'); assert.equal(input.projectId, undefined);
+    if (input.action === 'chrome.status') return { schemaVersion: 'chrome-setup/v1', installed: false, configured: false, status: 'unconfigured', message: '尚未安装', clients: 0, usableClients: 0 };
+    if (input.action === 'runtime.status') {
+      const id = input.provider === 'dreamina' ? 'dreamina' : 'codex', key = id === 'dreamina' ? 'dreaminaPath' : 'codexPath';
+      return { schemaVersion: 'runtime-status/v1', provider: input.provider, installed: true, installSupported: true, checkedAt: prior, settings: { [key]: '/auto/' + id }, components: [{ id, name: id, state: 'installed', version: 'synthetic', path: '/auto/' + id }] };
+    }
+    if (input.action === 'settings.global.save') { assert.equal(input.expectedRevision, software.revision); software = { ...software, revision: software.revision + 1, settings: input.settings }; return structuredClone(software); }
+    if (input.action === 'dreamina.status') {
+      if (mode === 'direct-error') { software = { ...software, dreaminaAccount: { status: 'error', ready: false, identityVerified: false, checkedAt: fresh, message: '账户检查网络中断，请稍后重试。' } }; return software.dreaminaAccount; }
+      if (mode === 'already-completed') complete();
+      return { schemaVersion: 'dreamina-refresh/v1', refreshState: mode === 'already-completed' ? 'completed' : 'pending', settingsRevision: software.revision, configuredPath: software.settings.dreaminaPath, accountKey: 'synthetic-account', afterStatus: 'authenticated', afterCheckedAt: prior, account: software.dreaminaAccount, message: mode === 'already-completed' ? software.dreaminaAccount.message : '即梦已有操作正在进行，正在等待最新账户状态；不会重复发起检查。' };
+    }
+    throw new Error(`Unexpected action: ${input.action}`);
+  };
+  Object.assign(globalThis, { isTauri: true, location: { search: '' }, document: { hidden: false, addEventListener() {}, removeEventListener() {} }, window: { addEventListener() {}, removeEventListener() {}, setInterval(callback: () => void) { intervals.set(++timer, callback); return timer; }, clearInterval(id: number) { intervals.delete(id); }, setTimeout(callback: () => void, ms: number) { assert.equal(ms, 1000); timeouts.push(callback); return ++timer; }, __TAURI_INTERNALS__: { invoke: async (_command: string, args: { request: any }) => respond(args.request) } } });
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom' }), view = hookRenderer();
+  try {
+    const { default: App } = await server.ssrLoadModule('/src/App.tsx'); const element = React.createElement(App);
+    const rendered = async () => { view.render(element); await settle(); return view.render(element); };
+    let nodes = await rendered();
+    nodes.find(node => node.type === 'button' && content(node) === '软件设置')!.props.onClick(); nodes = await rendered(); nodes = await rendered();
+    const refresh = nodes.find(node => node.type === 'button' && content(node) === '刷新登录状态'); assert.ok(refresh); assert.equal(refresh.props.disabled, false);
+    refresh.props.onClick(); nodes = await rendered(); nodes = await rendered(); nodes = await rendered();
+    assert.equal(calls.filter(input => input.action === 'dreamina.status').length, 1);
+    const callsAfterStatus = calls.findIndex(input => input.action === 'dreamina.status') + 1;
+    if (!['already-completed', 'direct-error'].includes(mode)) {
+      assert.ok(nodes.map(content).join(' ').includes('正在等待最新账户状态'));
+      assert.equal(timeouts.length, 1);
+      if (mode === 'leave' || mode === 'unmount') {
+        const reads = calls.filter(input => input.action === 'settings.global.get').length;
+        if (mode === 'leave') { nodes.find(node => node.type === 'button' && content(node).startsWith('所有项目'))!.props.onClick(); nodes = await rendered(); }
+        else view.unmount();
+        complete(); timeouts.shift()!(); await settle();
+        assert.equal(calls.filter(input => input.action === 'settings.global.get').length, reads, 'leaving cancels unstarted snapshot reads');
+        assert.equal(timeouts.length, 0);
+        if (mode === 'leave') { nodes = view.render(element); assert.ok(!nodes.map(content).join(' ').includes('账户身份与积分已核对')); }
+      } else {
+        if (mode === 'pending-completed' || mode === 'changed-account') complete();
+        if (mode === 'changed-settings') software = { ...software, revision: software.revision + 1, settings: { ...software.settings, dreaminaPath: '/other/dreamina' } };
+        if (mode === 'changed-account') software.dreaminaAccount.accountKey = 'other-synthetic-account';
+        if (mode === 'changed-authorization') software.dreaminaAccount = { status: 'authorizing', ready: false, identityVerified: false, checkedAt: fresh, authorization: { expiresAt: '2026-10-10T00:10:00Z' } };
+        const limit = mode === 'timeout' ? 45 : 1;
+        for (let count = 0; count < limit; count++) { assert.equal(timeouts.length, 1); timeouts.shift()!(); nodes = await rendered(); }
+        assert.equal(timeouts.length, 0, 'waiting has a fixed bound');
+      }
+    }
+    if (mode.includes('completed')) {
+      assert.ok(nodes.map(content).join(' ').includes('账户身份与积分已核对'));
+      assert.equal(software.dreaminaAccount.checkedAt, fresh);
+    }
+    if (mode === 'timeout') { assert.ok(nodes.map(content).join(' ').includes('尚未取得新的即梦账户检查结果')); assert.equal(software.dreaminaAccount.checkedAt, prior); }
+    if (mode.startsWith('changed-')) assert.ok(nodes.some(node => node.props.role === 'alert' && /等待期间即梦/.test(content(node))), 'a different config/account never satisfies the old refresh');
+    if (mode === 'direct-error') assert.ok(nodes.map(content).join(' ').includes('账户检查网络中断'));
+    assert.ok(!nodes.map(content).join(' ').includes('已刷新即梦登录状态'), 'fixed success must not replace pending/error/actual result');
+    assert.ok(calls.slice(callsAfterStatus).every(input => input.action === 'settings.global.get' || input.action === 'projects.list'), 'waiting performs only local reads, no second status/readiness/login/generation');
+    assert.equal(calls.filter(input => input.action === 'dreamina.status').length, 1);
+    assert.ok(!calls.some(input => ['readiness.check', 'runtime.prepare', 'dreamina.login', 'images.run', 'videos.submit', 'workspace.get'].includes(input.action)));
+  } finally { view.unmount(); await server.close(); }
+});
+});
+
 test('App software settings preserve the whole save/check chain without a project', async t => {
 for (const mode of ['ordinary', 'poll', 'leave-while-queued']) await t.test(mode === 'ordinary' ? 'ordinary SDK save does not revoke its own permissions' : mode === 'poll' ? 'SDK check waits for an existing Dreamina account poll, then completes' : 'leaving settings cancels a save queued behind an account poll', async () => {
   const concurrentPoll = mode !== 'ordinary';

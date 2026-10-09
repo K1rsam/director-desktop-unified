@@ -465,13 +465,21 @@ fn expand(value: &Value, input: &Value) -> Result<Value, String> {
                         && field == "design/prompt"
                 })
             });
+            let metadata_kind = [("/facts/", "sourceSha256"), ("/assets/", "scope")].into_iter().find_map(|(prefix, field)| {
+                let (index, tail) = pointer.strip_prefix(prefix)?.split_once('/')?;
+                (index.parse::<usize>().is_ok_and(|n| n.to_string() == index) && tail == field).then_some(field)
+            });
             let continuity_unit = pointer == "/acceptedContinuity/unit";
             let continuity_field = pointer.starts_with("/acceptedContinuity/unit/");
             if !pointer.starts_with("/plan/") && pointer != "/acceptedContinuity"
-                && !continuity_unit && !continuity_field && !asset_prompt {
+                && !continuity_unit && !continuity_field && !asset_prompt && metadata_kind.is_none() {
                 return Err("整编无损运输引用越出完整规划目录".into());
             }
             let target = input.pointer(pointer).ok_or("整编无损运输引用目标不存在")?;
+            if metadata_kind == Some("sourceSha256") && !target.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err("共享源身份必须为完整 SHA256".into());
+            }
+            if metadata_kind == Some("scope") && !target.is_object() { return Err("共享适用范围必须为完整对象".into()); }
             if continuity_field && input.pointer("/acceptedContinuity/unit")
                 .is_none_or(|unit| !unit.is_object() || has_notation(unit)) {
                 return Err("整编前稿子字段必须来自完整无引用单元".into());
@@ -830,6 +838,35 @@ pub(crate) fn compile_storyboard_transport(
 pub(crate) fn compile_storyboard_dispatch_transport(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
+    let original = compile_dispatch_before_metadata(request)?;
+    let (old_input, old_schema) = original.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+    // Every already dispatchable historical wire, including partial continuity,
+    // remains byte-exact. Compose lossless candidates only after that boundary.
+    if request.stage != "storyboardFinish" || !supported_request(request)
+        || crate::text_executor::codex_wire_characters(request, old_input, old_schema) <= STORYBOARD_TRANSPORT_LIMIT
+        || has_notation(&request.input) || request.input.get("losslessInputRule").is_some() {
+        return Ok(original);
+    }
+    let mut input = old_input.clone();
+    input.as_object_mut().ok_or("整编输入不是对象")?.remove("losslessInputRule");
+    compact_finish_repetitions(&mut input, &request.input);
+    compact_partial_continuity(&mut input, &request.input);
+    compact_shared_source_rows(&mut input, &request.input);
+    compact_metadata_copies(&mut input, &request.input);
+    if expand(&input, &input)? != request.input { return Err("整编共享元数据未完整还原原输入；未派发请求".into()); }
+    input["losslessInputRule"] = json!(shared_row_rule());
+    let before = crate::text_executor::transport_payload_characters(request, old_input, old_schema);
+    let after = crate::text_executor::transport_payload_characters(request, &input, old_schema);
+    if before.checked_sub(after).is_none_or(|saving| saving < 2_048)
+        || crate::text_executor::codex_wire_characters(request, &input, old_schema) > STORYBOARD_TRANSPORT_LIMIT {
+        return Ok(original);
+    }
+    Ok(Some(CompiledStoryboardTransport { profile: PROFILE, input, schema: old_schema.clone() }))
+}
+
+pub(super) fn compile_dispatch_before_metadata(
+    request: &TextRequest,
+) -> Result<Option<CompiledStoryboardTransport>, String> {
     let original = compile_dispatch_transport(request, true)?;
     let (old_input, old_schema) = original.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
     // Only recover a previously undispatchable editor. Every fitting historical
@@ -863,6 +900,32 @@ pub(super) fn compile_dispatch_before_finish_repetitions(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
     compile_dispatch_transport(request, false)
+}
+
+// Hash and applicability metadata only. Both the source and every replacement
+// must equal the canonical field. Earlier aliases protect their literal targets.
+fn compact_metadata_copies(input: &mut Value, canonical: &Value) {
+    fn targets(value: &Value, out: &mut Vec<String>) {
+        if let Some(path) = value.get("$same").and_then(Value::as_str).and_then(|p| p.strip_prefix('#')) { out.push(path.into()); }
+        match value { Value::Object(map) => map.values().for_each(|v| targets(v, out)), Value::Array(items) => items.iter().for_each(|v| targets(v, out)), _ => {} }
+    }
+    fn within(path: &str, ancestor: &str) -> bool { path == ancestor || path.strip_prefix(ancestor).is_some_and(|suffix| suffix.starts_with('/')) }
+    let mut protected = Vec::new(); targets(input, &mut protected);
+    for (catalog, field) in [("facts", "sourceSha256"), ("assets", "scope")] {
+        let mut literals: Vec<(Value, String)> = Vec::new();
+        for (index, item) in canonical[catalog].as_array().into_iter().flatten().enumerate() {
+            let Some(value) = item.get(field) else { continue; };
+            if has_notation(value) || (field == "sourceSha256" && !value.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())))
+                || (field == "scope" && !value.is_object()) { continue; }
+            let local = format!("/{catalog}/{index}/{field}");
+            if input.pointer(&local) != Some(value) { continue; }
+            if let Some((_, target)) = literals.iter().find(|(old, _)| old == value) {
+                if !protected.iter().any(|path| within(&local, path) || within(path, &local)) {
+                    *input.pointer_mut(&local).unwrap() = reference_if_shorter(value, target);
+                }
+            } else { literals.push((value.clone(), local)); }
+        }
+    }
 }
 
 /// Share only unchanged parts of two independently preserved continuity units.
@@ -1201,6 +1264,57 @@ mod tests {
         let wire = compile_dispatch_transport(request, extra).unwrap();
         let (input,schema) = wire.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
         crate::text_executor::codex_wire_characters(request,input,schema)
+    }
+
+
+    fn metadata_fixture(target:usize)->TextRequest {
+        let mut request=finish_repetition_fixture(150_000);
+        request.input["acceptedContinuity"]=Value::Null;request.input["plan"]["acceptedContinuity"]=Value::Null;
+        request.input["facts"]=json!((0..39).map(|i|json!({"id":format!("fact-{i}"),"sourceSha256":"ab".repeat(32),"literal":"source fact untouched"})).collect::<Vec<_>>());
+        request.input["assets"]=json!((0..13).map(|i|json!({"id":format!("asset-{i}"),"scope":{"episodes":["episode-a"],"scenes":[{"episodeId":"episode-a","sceneId":"scene-1","literalUnknownMetadata":"exact metadata🙂".repeat(12)}]}})).collect::<Vec<_>>());
+        for _ in 0..3 {let wire=compile_dispatch_before_metadata(&request).unwrap().unwrap();let chars=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);let n=request.input["previousDraft"]["units"][0]["unitDirection"].as_str().unwrap().encode_utf16().count();request.input["previousDraft"]["units"][0]["unitDirection"]=json!("全".repeat((n as isize+target as isize-chars as isize) as usize));}
+        request
+    }
+
+    #[test]
+    fn overflow_metadata_composes_exact_candidates_and_keeps_creative_fields_literal() {
+        let request=metadata_fixture(203_826);let frozen=serde_json::to_vec(&request).unwrap();
+        let old=compile_dispatch_before_metadata(&request).unwrap().unwrap();assert_eq!(crate::text_executor::codex_wire_characters(&request,&old.input,&old.schema),203_826);
+        let new=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();assert!(crate::text_executor::codex_wire_characters(&request,&new.input,&new.schema)<=200_000);
+        assert_eq!(new.input["facts"][1]["sourceSha256"],json!({"$same":"#/facts/0/sourceSha256"}));assert_eq!(new.input["assets"][1]["scope"],json!({"$same":"#/assets/0/scope"}));
+        for field in ["previousDraft","acceptedContinuity","nextBoundary","settings","productionDirection"] {assert_eq!(new.input[field],old.input[field]);}
+        assert_eq!(new.schema,old.schema);assert_eq!(expand_storyboard_schema(&new.schema).unwrap(),request.schema);assert_eq!(expand_storyboard_input(&new.input).unwrap(),request.input);assert_eq!(serde_json::to_vec(&request).unwrap(),frozen);
+    }
+
+    #[test]
+    fn overflow_metadata_preserves_all_fitting_old_wires_and_fails_closed_when_still_large() {
+        for size in [190_000,199_999,200_000,260_000] {
+            let request=metadata_fixture(size);let old=compile_dispatch_before_metadata(&request).unwrap().unwrap();let new=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+            assert_eq!(serde_json::to_vec(&json!([old.profile,old.input,old.schema])).unwrap(),serde_json::to_vec(&json!([new.profile,new.input,new.schema])).unwrap());
+        }
+        let request=partial_continuity_fixture(208_543);let old=compile_dispatch_before_metadata(&request).unwrap().unwrap();assert!(crate::text_executor::codex_wire_characters(&request,&old.input,&old.schema)<=200_000);let new=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(serde_json::to_vec(&json!([old.input,old.schema])).unwrap(),serde_json::to_vec(&json!([new.input,new.schema])).unwrap());
+    }
+
+    #[test]
+    fn metadata_duplicates_keep_incoming_targets_and_different_values() {
+        let scope=json!({"episodes":["episode-a"],"scenes":[],"future":"exact unknown extension🙂".repeat(10)});
+        let canonical=json!({"facts":[{"sourceSha256":"ab".repeat(32)},{"sourceSha256":"ab".repeat(32)},{"sourceSha256":"cd".repeat(32)}],"assets":[{"scope":scope},{"scope":scope},{"scope":{"episodes":["other"],"scenes":[]}}],"keepHash":"ab".repeat(32),"keepScope":scope});
+        let mut input=canonical.clone();input["keepHash"]=json!({"$same":"#/facts/1/sourceSha256"});input["keepScope"]=json!({"$same":"#/assets/1/scope"});compact_metadata_copies(&mut input,&canonical);
+        assert_eq!(input["facts"][1],canonical["facts"][1]);assert_eq!(input["assets"][1],canonical["assets"][1]);assert_eq!(input["facts"][2],canonical["facts"][2]);assert_eq!(input["assets"][2],canonical["assets"][2]);assert_eq!(expand(&input,&input).unwrap(),canonical);
+    }
+
+    #[test]
+    fn metadata_decoder_rejects_wrong_shapes_indices_fields_and_chained_targets() {
+        for target in [json!(null),json!(false),json!(0),json!("ab".repeat(31)),json!("xz".repeat(32)),json!({"$same":"#/facts/1/sourceSha256"})] {
+            let input=json!({"facts":[{"sourceSha256":target}],"local":{"$same":"#/facts/0/sourceSha256"}});assert!(expand(&input,&input).is_err());
+        }
+        for target in [json!(null),json!(false),json!([]),json!("scope"),json!({"nested":{"$same":"#/plan/value"}}),json!({"nested":{"$rowIds":[]}})] {
+            let input=json!({"assets":[{"scope":target}],"local":{"$same":"#/assets/0/scope"}});assert!(expand(&input,&input).is_err());
+        }
+        for pointer in ["#/facts/00/sourceSha256","#/facts/1/sourceSha256","#/facts/0/sourceSha256/","#/facts/0/id","#/assets/00/scope","#/assets/1/scope","#/assets/0/scope/episodes"] {
+            let input=json!({"facts":[{"sourceSha256":"ab".repeat(32),"id":"never authorized"}],"assets":[{"scope":{"episodes":[]}}],"local":{"$same":pointer}});assert!(expand(&input,&input).is_err(),"invalid metadata pointer: {pointer}");
+        }
     }
 
     fn partial_continuity_fixture(target:usize)->TextRequest {

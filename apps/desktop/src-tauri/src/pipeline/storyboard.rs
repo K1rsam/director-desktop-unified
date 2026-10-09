@@ -1287,6 +1287,7 @@ fn validate_storyboard_repair_scope(
     let mut spoken: HashMap<&str, String> = HashMap::new();
     let mut prior_dialogue_order = 0;
     for unit in units {
+        super::asset_use_binding::validate_unit_for_repair(unit, assets, defer_shot_source)?;
         let uid = text(unit, "id");
         if uid.is_empty() || !unit_ids.insert(uid) {
             return Err("分镜单元 id 为空或重复".into());
@@ -2516,9 +2517,11 @@ pub async fn run_storyboard(
                         author_input.clone(),
                         schema.clone(),&methods,|value| {
                             let raw=value.clone();
+                            *value=super::asset_use_binding::materialize(&author_input, &raw)?;
+                            let candidate_raw=value.clone();
                             if let Err(reason)=validate_authored(&source,value,&current_assets,caps,&batch.source_refs,style,&prefix) {
                                 if creative_enabled && crate::text_executor::author_repairable_rejection(&reason) {
-                                    let (candidate,issues)=author_validation_candidate(&source,&raw,&current_assets,caps,&batch.source_refs,style,&prefix,&plan,&candidates,&reason)?;
+                                    let (candidate,issues)=author_validation_candidate(&source,&candidate_raw,&current_assets,caps,&batch.source_refs,style,&prefix,&plan,&candidates,&reason)?;
                                     if issues.is_empty(){return Err("主创待修原包没有可证实的适用范围问题；保留原拒绝，不重发".into());}
                                     repair_candidate=Some((raw,candidate,issues));
                                 }
@@ -2602,7 +2605,9 @@ pub async fn run_storyboard(
                     let mut response=executor.execute(request.clone()).await?;
                     let original_response=response.clone();
                     let validated=(|| {
-                        let mut draft=apply_finish_delta(&base,&response)?;
+                        let projected=super::asset_use_binding::materialize(&request.input,&original_response)?;
+                        let mut draft=apply_finish_delta(&base,&projected)?;
+                        for unit in draft["units"].as_array().unwrap() { super::asset_use_binding::validate_unit(unit,&current_assets)?; }
                         let preserved_units:HashSet<_>=base["units"].as_array().unwrap().iter().map(|unit|text(unit,"id").to_string()).collect();
                         let preserved_shots:HashSet<_>=base["units"].as_array().unwrap().iter().flat_map(|unit|unit["shots"].as_array().unwrap()).map(|shot|text(shot,"id").to_string()).collect();
                         prefix_ids_preserving(&mut draft,&new_prefix,&preserved_units,&preserved_shots)?;
@@ -2618,17 +2623,21 @@ pub async fn run_storyboard(
                         Ok(draft)=>{executor.accept(&request,&response).await?;Ok(draft)},
                         Err(reason)=>{
                             executor.reject(&request,&original_response,&reason).await?;
-                            if !creative_enabled || ![crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION,crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION].contains(&reason.as_str()) {return Err(reason);}
+                            let new_use_source_repair=super::asset_use_binding::enabled(&request.input)? && reason==crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION;
+                            if !creative_enabled || (!new_use_source_repair && ![crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION,crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION].contains(&reason.as_str())) {return Err(reason);}
                             // The editor can reintroduce a reference rejected in
                             // an author. The original coordinator routes either
                             // unadopted role back to the same bounded editor.
-                            let mut candidate=apply_finish_delta(&base,&original_response)?;
+                            let projected=super::asset_use_binding::materialize(&request.input,&original_response)?;
+                            let mut candidate=apply_finish_delta(&base,&projected)?;
                             let preserved_units:HashSet<_>=base["units"].as_array().unwrap().iter().map(|unit|text(unit,"id").to_string()).collect();
                             let preserved_shots:HashSet<_>=base["units"].as_array().unwrap().iter().flat_map(|unit|unit["shots"].as_array().unwrap()).map(|shot|text(shot,"id").to_string()).collect();
                             prefix_ids_preserving(&mut candidate,&new_prefix,&preserved_units,&preserved_shots)?;
-                            original::pack_event_units(&mut candidate,&plan,caps["maxDuration"].as_f64().unwrap())?;
+                            if !new_use_source_repair { original::pack_event_units(&mut candidate,&plan,caps["maxDuration"].as_f64().unwrap())?; }
                             let validation_caps=carrier_validation_caps(&candidate,caps,true);
-                            let (candidate,issues)=if reason==crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
+                            let (candidate,issues)=if new_use_source_repair {
+                                author_shot_source_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
+                            } else if reason==crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
                                 author_duration_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
                             } else {
                                 author_scope_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates,true)?
@@ -2903,7 +2912,8 @@ fn materialize_asset_references(draft: &mut Value, assets: &[Value]) -> Result<(
                 if refs.is_empty() || refs.iter().any(|r| !owned.contains(r)) {
                     return Err("声音源引用越出本单元原文".into());
                 }
-                let sound = json!({"assetId":reference["assetId"],"variantId":reference["variantId"],"sourceRefs":reference["sourceRefs"],"materialStatus":"SOURCE_ONLY"});
+                let mut sound = json!({"assetId":reference["assetId"],"variantId":reference["variantId"],"sourceRefs":reference["sourceRefs"],"materialStatus":"SOURCE_ONLY"});
+                if super::asset_use_binding::enabled(unit)? { super::asset_use_binding::copy_sound_fields(&mut sound, &reference); }
                 if !sound_sources.contains(&sound) {
                     sound_sources.push(sound);
                 }
@@ -3605,7 +3615,8 @@ async fn repair_author_scope(
                     );
                 }
             }
-            let mut draft = apply_finish_delta(&base, &raw)?;
+            let projected = super::asset_use_binding::materialize(&request.input, &raw)?;
+            let mut draft = apply_finish_delta(&base, &projected)?;
             let preserved_units: HashSet<_> = base["units"]
                 .as_array()
                 .unwrap()
@@ -4047,7 +4058,8 @@ async fn repair_video_carrier(
                     );
                 }
             }
-            let mut next = apply_finish_delta(&base, &raw)?;
+            let projected = super::asset_use_binding::materialize(&request.input, &raw)?;
+            let mut next = apply_finish_delta(&base, &projected)?;
             if next["units"][0]["initialState"] != base["units"][0]["initialState"]
                 || next["units"].as_array().unwrap().last().unwrap()["exitState"]
                     != base["units"].as_array().unwrap().last().unwrap()["exitState"]
@@ -4696,8 +4708,9 @@ async fn run_storyboard_revision(
             let revision_provenance=author_input["revisionProvenance"].clone();
             attach_author_decisions(&mut author_input,scoped_decisions.as_ref());
             let authored = call_validated(executor,"storyboardCreate","unit-performance-director",model,reasoning,
-                author_input,
+                author_input.clone(),
                 draft_schema(&rows,&context,&current_assets,&event_ids,&episode.id),&methods,|value| {
+                    *value=super::asset_use_binding::materialize(&author_input,value)?;
                     validate_authored(source,value,&current_assets,caps,&refs,style,&format!("{prefix}create:"))?;
                     validate_event_bindings(value,&plan)?;
                     validate_fantasy_profile(value,&candidates,creative_enabled)?;
@@ -4723,8 +4736,10 @@ async fn run_storyboard_revision(
             let finish_schema=draft_schema(&rows,&context,&current_assets,&event_ids,&episode.id);
             let finish_request=creative::prepare_request(TextRequest{stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:model.into(),reasoning:reasoning.into(),input:finish_input.clone(),schema:finish_schema.clone(),rule_snapshot:snapshot("episode-finishing-editor",&finish_methods)?})?;
             let finished = call_validated(executor,"storyboardFinish","episode-finishing-editor",model,reasoning,
-                finish_input,
+                finish_input.clone(),
                 finish_schema,&finish_methods,|value| {
+                    *value=super::asset_use_binding::materialize(&finish_input,value)?;
+                    for unit in value["units"].as_array().unwrap() { super::asset_use_binding::validate_unit(unit,&current_assets)?; }
                     original::pack_event_units(value,&plan,caps["maxDuration"].as_f64().unwrap())?;
                     let validation_caps=carrier_validation_caps(value,caps,creative_enabled);
                     validate_authored(source,value,&current_assets,&validation_caps,&refs,style,&prefix)?;
@@ -5033,6 +5048,7 @@ fn prefix_ids_preserving(
     // remap only program-created header tokens, never source dialogue text.
     for unit in normalized["units"].as_array_mut().unwrap() {
         let old_unit = text(unit, "id").to_string();
+        super::asset_use_binding::remap_unit(unit, &old_unit, &shots_map)?;
         unit["id"] = json!(units_map[&old_unit]);
         for shot in unit["shots"].as_array_mut().unwrap() {
             let old_shot = text(shot, "id").to_string();
@@ -5041,6 +5057,7 @@ fn prefix_ids_preserving(
         let mut headers = Vec::new();
         if let Some(segments) = unit.get_mut("segments").and_then(Value::as_array_mut) {
             for segment in segments {
+                super::asset_use_binding::remap_unit(segment, &old_unit, &shots_map)?;
                 let ids = segment["shotIds"].as_array_mut().ok_or("联排段缺少镜号")?;
                 let old: Vec<_> = ids
                     .iter()
@@ -6094,6 +6111,99 @@ mod production_contract_tests {
         let mut reordered = raw.clone();
         reordered["units"].as_array_mut().unwrap().swap(1,2);
         assert!(check(&reordered).is_err(),"source speech order stays hard");
+    }
+
+    #[test]
+    fn asset_use_binding_wrong_same_package_shot_keeps_bounded_repair_and_hard_gates() {
+        use super::super::asset_use_binding as binding;
+        let source=prepare_source("第一集\n场景：门口\n甲：第一句。\n甲：第二句。\n场景：远处\n△远处船只驶过。\n").unwrap();
+        let rows:Vec<_>=source.rows.iter().filter(|r|r.kind=="body").take(2).cloned().collect();
+        let refs:Vec<_>=rows.iter().map(|r|r.id.clone()).collect();
+        let asset=json!({"id":"person","variantId":"base","version":1,"name":"甲","kind":"character","sourceRefs":[refs[0]],"applicability":{"episodes":[rows[0].episode_id],"scenes":[rows[0].scene_id]}});
+        let request=TextRequest{stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),model:"offline".into(),reasoning:"medium".into(),input:json!({binding::FIELD:binding::PROFILE,"assets":[asset],"sourceRows":rows,"workPackage":{"eventId":"E1"}}),schema:json!({}),rule_snapshot:json!({})};
+        let plan=mock_plan(&request,false);let mut raw=mock_draft(&request,false);
+        raw["units"][0]["shots"][0]["sourceRefs"].as_array_mut().unwrap().push(json!(refs[1]));
+        raw["units"][0]["assetRefs"]=json!([{"assetId":"person","variantId":"base","use":"character","order":1,"useShotIds":[raw["units"][0]["shots"][0]["id"]]}]);
+        let before=raw.clone();let projected=binding::materialize(&request.input,&raw).unwrap();
+        let caps=json!({"minDuration":0,"maxDuration":15,"imageLimit":5});let assets=vec![asset];
+        let reason=validate_authored(&source,&mut projected.clone(),&assets,&caps,&refs,"原画风","P:").unwrap_err();
+        assert_eq!(reason,crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION);
+        let (candidate,issues)=author_validation_candidate(&source,&projected,&assets,&caps,&refs,"原画风","P:",&plan,&[],&reason).unwrap();
+        assert!(issues.iter().any(|i|i["code"]=="SHOT_SOURCE_SCOPE"));assert!(issues.iter().any(|i|i["code"]=="ASSET_SOURCE_SCOPE"));
+        assert!(validate_authored(&source,&mut candidate.clone(),&assets,&caps,&refs,"原画风","P:").is_err());
+        assert_eq!(raw,before,"projection and repair never rewrite wire");
+        let foreign=source.rows.iter().find(|r|r.kind=="body"&&!refs.contains(&r.id)).unwrap();
+        for id in [foreign.id.as_str(),"unknown"] {let mut bad=raw.clone();bad["units"][0]["shots"][0]["sourceRefs"]=json!([id]);assert!(binding::materialize(&request.input,&bad).is_err());}
+        let mut fixed=raw.clone();fixed["units"][0]["shots"][0]["sourceRefs"]=json!([refs[0]]);
+        let mut fixed=binding::materialize(&request.input,&fixed).unwrap();validate_authored(&source,&mut fixed,&assets,&caps,&refs,"原画风","P:").unwrap();
+        let mut outside=assets.clone();outside[0]["applicability"]=json!({"episodes":[rows[0].episode_id],"scenes":["other-scene"]});
+        assert_eq!(validate_authored(&source,&mut fixed,&outside,&caps,&refs,"原画风","P:").unwrap_err(),crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION);
+    }
+
+    #[test]
+    fn asset_use_binding_prefix_audio_and_pack_preserve_each_local_use() {
+        use super::super::asset_use_binding as binding;
+        let (mut input,mut raw)=binding::tests::fixture();input["assets"][0]["preparation"]=json!({"mode":"AUDIO"});
+        raw["units"][0]["sourceRefs"]=json!(["r1"]);raw["units"][0]["shots"]=json!([{"id":"S1","sourceRefs":["r1"],"duration":3}]);
+        raw["units"][0]["assetRefs"][0]["useShotIds"]=json!(["S1"]);raw["units"][0]["assetRefs"][0]["use"]=json!("audio");
+        raw["units"][0]["scene"]=json!("门口");raw["units"][0]["sceneId"]=json!("scene");raw["units"][0]["eventId"]=json!("E");
+        let mut next=raw["units"][0].clone();next["id"]=json!("U2");next["sourceRefs"]=json!(["r2"]);next["shots"][0]["sourceRefs"]=json!(["r2"]);next["boundaryBefore"]=json!({"kind":"continuous"});
+        raw["units"].as_array_mut().unwrap().push(next);
+        let mut draft=binding::materialize(&input,&raw).unwrap();let assets=input["assets"].as_array().unwrap();
+        materialize_asset_references(&mut draft,assets).unwrap();prefix_ids(&mut draft,"P:").unwrap();
+        assert_eq!(draft["units"][0]["soundSources"][0]["useShotIds"],json!(["P:U1:shot:S1"]));assert_eq!(draft["units"][1]["soundSources"][0]["useShotIds"],json!(["P:U2:shot:S1"]));
+        let once=draft.clone();prefix_ids(&mut draft,"P:").unwrap();assert_eq!(draft,once);
+        original::pack_event_units(&mut draft,&json!({"events":[{"id":"E","sourceRefs":["r1","r2"]}]}),15.0).unwrap();
+        assert_eq!(draft["units"].as_array().unwrap().len(),1);let unit=&draft["units"][0];
+        assert_eq!(unit["soundSources"][0]["useShotIds"],json!(["P:U1:shot:S1","P:U2:shot:S1"]));
+        assert_eq!(unit["soundSources"][0]["sourceRefs"],json!(["r1","r2"]));binding::validate_unit(unit,assets).unwrap();
+        let once=draft.clone();prefix_ids(&mut draft,"P:").unwrap();assert_eq!(draft,once);
+    }
+
+    #[tokio::test]
+    async fn asset_use_binding_new_profile_runs_existing_bounded_editor_delta() {
+        use super::super::asset_use_binding as binding;
+        struct WireModel(Recorded, bool);
+        #[async_trait::async_trait]
+        impl TextExecutor for WireModel {
+            async fn execute(&self, request:TextRequest)->Result<Value,String> {
+                let mut raw=self.0.execute(request.clone()).await?;
+                if request.stage=="storyboardCreate" {
+                    if self.1 { raw["units"][0]["shots"][0]["sourceRefs"]=raw["units"][0]["sourceRefs"].clone(); }
+                    raw["units"][0]["assetRefs"]=json!([{"assetId":"person-base","variantId":"base","use":"character","order":1,"useShotIds":[raw["units"][0]["shots"][0]["id"]]}]);
+                }
+                if self.1 && request.stage=="storyboardFinish" && request.input["executionBatch"]["version"]=="related-range-finish/v1" {
+                    let previous=request.input["previousDraft"]["units"].as_array().unwrap();assert!(previous.len()>1);
+                    let mut unit=previous[0].clone();unit["shots"][0]["sourceRefs"].as_array_mut().unwrap().push(previous[1]["sourceRefs"][0].clone());
+                    raw["retainedUnitIds"]=json!(previous.iter().skip(1).map(|u|u["id"].clone()).collect::<Vec<_>>());
+                    raw["replacements"]=json!([{"replaces":[unit["id"]],"units":[unit],"fantasyRealization":[]}]);
+                }
+                fn wire_units(value:&mut Value) {
+                    for unit in value.get_mut("units").and_then(Value::as_array_mut).into_iter().flatten() {
+                        unit.as_object_mut().unwrap().remove(binding::FIELD);
+                        for reference in unit["assetRefs"].as_array_mut().unwrap() {
+                            for key in ["sourceRefs","identityEvidence","sourceRefsPurpose"] { reference.as_object_mut().unwrap().remove(key); }
+                        }
+                    }
+                }
+                wire_units(&mut raw);for group in raw.get_mut("replacements").and_then(Value::as_array_mut).into_iter().flatten(){wire_units(group);}
+                Ok(raw)
+            }
+            async fn accept(&self,request:&TextRequest,value:&Value)->Result<(),String>{self.0.accept(request,value).await}
+            async fn reject(&self,request:&TextRequest,value:&Value,reason:&str)->Result<(),String>{self.0.reject(request,value,reason).await}
+        }
+        let source=prepare_source("第一集\n场景：门口\n甲：第一句。\n甲：第二句。\n甲：第三句。\n甲：第四句。\n甲：第五句。\n甲：第六句。\n").unwrap();let mut frozen=input(&source);
+        super::super::stage3_pack::mark_input(&mut frozen).unwrap();binding::freeze_new(&mut frozen).unwrap();freeze_scene_input_profile(&mut frozen).unwrap();
+        frozen["assets"]=json!([{"id":"person-base","variantId":"base","name":"甲","kind":"CH","version":1,"sourceRefs":[source.rows.iter().find(|r|r.kind=="body").unwrap().id],"applicability":{"episodes":[source.episodes[0].id],"scenes":[source.scenes[0].id]},"preparation":{"mode":"REFERENCE"}}]);
+        for finish_error in [false,true] {
+        let model=WireModel(Recorded{author_source_error:Some("SHOT_SOURCE"),..Default::default()},finish_error);
+        let output=run_storyboard(&frozen,&model,"offline","medium").await.unwrap();assert_eq!(output["status"],"completed","{}",output["blocked"]);
+        let calls=model.0.calls.lock().await;let repairs:Vec<_>=calls.iter().filter(|r|if finish_error{r.input["finishRepair"].is_object()}else{is_author_repair_request(r)}).collect();
+        assert_eq!(repairs.len(),1,"same existing bounded editor repairs original shot, no new role");
+        for request in calls.iter(){assert_eq!(request.input[binding::FIELD],binding::PROFILE);}
+        assert!(model.0.rejected_values.lock().await.iter().any(|(r,raw)|if finish_error{r.stage=="storyboardFinish"&&raw["replacements"][0]["units"][0].get(binding::FIELD).is_none()}else{r.stage=="storyboardCreate" && raw["units"][0].get(binding::FIELD).is_none() && raw["units"][0]["assetRefs"][0].get("sourceRefs").is_none()}));
+        validate_storyboard_scope(&source,&output,frozen["assets"].as_array().unwrap(),&frozen["capabilities"],None).unwrap();
+        }
     }
 
     #[test]

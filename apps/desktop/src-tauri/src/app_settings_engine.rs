@@ -1,6 +1,9 @@
 use super::*;
 use crate::app_settings;
 
+#[path = "app_settings_engine/dreamina_refresh.rs"]
+mod dreamina_refresh;
+
 impl Engine {
     pub(super) fn global_capability_cache(
         &self,
@@ -206,8 +209,13 @@ impl Engine {
                 if !self.live_accounts {
                     return Err("离线验收模式不读取宿主即梦账户或启动登录。".into());
                 }
-                let _guard = self.acquire_keys(vec!["channel:dreamina".into()])?;
                 let config = self.dreamina_config_with_settings(&settings)?;
+                if action == "dreamina.status" {
+                    return dreamina_refresh::refresh(self, &doc, &config, || {
+                        self.dreamina_sessions.poll_or_refresh(&config)
+                    });
+                }
+                let _guard = self.acquire_keys(vec!["channel:dreamina".into()])?;
                 let account = match action {
                     "dreamina.login" => {
                         let account = self.dreamina_sessions.begin(&config)?;

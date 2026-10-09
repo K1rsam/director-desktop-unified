@@ -4462,6 +4462,10 @@ pub struct SavedTextExecutor {
 #[path="text_executor_global_tests.rs"]
 mod global_settings_tests;
 
+#[cfg(test)]
+#[path="text_asset_use_replay_tests.rs"]
+mod asset_use_replay_tests;
+
 // This token is created only together with a new persistent CLI job/node. File
 // absence, a new UUID, or a caller-supplied input marker is never fresh evidence.
 struct CliDispatchAllocation {
@@ -5176,6 +5180,7 @@ impl TextExecutor for SavedTextExecutor {
                 self.store.accepted_step(run, &hash)?
             };
             if let Some(value) = accepted {
+                if let Some(raw) = self.asset_use_accepted_raw(&request, &snapshot)? { return Ok(raw); }
                 return Ok(value);
             }
         }
@@ -5299,6 +5304,7 @@ impl TextExecutor for SavedTextExecutor {
         if is_bounded_finisher_repair(&request) {
             if let Some(run) = &self.workflow_id {
                 if let Some(value) = self.store.accepted_step(run, &hash)? {
+                    if let Some(raw) = self.asset_use_accepted_raw(&request, &snapshot)? { return Ok(raw); }
                     return Ok(value);
                 }
             }
@@ -5462,6 +5468,11 @@ impl TextExecutor for SavedTextExecutor {
             }
             return Ok(());
         }
+        if self.asset_use_accepted_raw(request, &snapshot)?.is_some() {
+            let previous = self.store.accepted_step(self.workflow_id.as_deref().unwrap(), &hash)?;
+            if previous.as_ref() != Some(value) { return Err("素材绑定已采用投影重验不一致；原回包、采用结果和预算保持".into()); }
+            return Ok(());
+        }
         if let Some(replay) = self.exact_storyboard_finish_replay(request, &snapshot, &hash)? {
             self.commit_validation_replay(&replay, &hash, value, None)?;
             return Ok(());
@@ -5575,6 +5586,9 @@ impl TextExecutor for SavedTextExecutor {
         let standalone = self.standalone_asset_received(request)?;
         let snapshot = self.result_snapshot(request)?;
         let hash = crate::pipeline::digest(&snapshot.to_string());
+        if self.asset_use_accepted_raw(request, &snapshot)?.is_some() {
+            return Err("素材绑定已采用节点不能由重验改为拒绝；原回包、结果和预算保持".into());
+        }
         if self.reject_scoped_author_replay(request, &snapshot, &hash, value, reason)? {
             return Ok(());
         }
@@ -7330,6 +7344,57 @@ impl SavedTextExecutor {
             return event.get("value").cloned().map(Some).ok_or_else(held);
         }
         Ok(Some(accepted))
+    }
+
+    /// New asset-use workflows validate from the immutable model receive event,
+    /// not their program-derived accepted projection. Old workflows are untouched.
+    /// A missing/conflicting receive is held here, before any generation fallback.
+    fn asset_use_accepted_raw(&self, request: &TextRequest, snapshot: &Value) -> Result<Option<Value>> {
+        if !crate::pipeline::asset_use_binding::enabled(&request.input)? { return Ok(None); }
+        let Some(run) = self.workflow_id.as_deref() else { return Ok(None); };
+        let hash = crate::pipeline::digest(&snapshot.to_string());
+        let Some(accepted) = self.store.accepted_step(run, &hash)? else { return Ok(None); };
+        let held = || "ASSET_USE_ACCEPTED_RAW_HELD：素材绑定已采用节点缺少完整原回包或绑定冲突；保留原节点、结果、回执和预算，未重新生成".to_string();
+        let record: Option<(String,String,String,String,String,i64)> = self.store.conn()?.query_row(
+            "SELECT j.receipt,e.data,w.result,j.result,j.provider,e.id FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND w.node_key=?2 AND w.request_hash=?3 AND w.stage=?4 AND w.state='accepted' AND j.kind='text' AND j.state='completed' AND j.snapshot=?5",
+            params![run,step_key(request),hash,request.stage,snapshot.to_string()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).optional().map_err(|_| held())?;
+        let (receipt,event,result,job_result_text,provider,event_id)=record.ok_or_else(held)?;
+        let receipt:Value=serde_json::from_str(&receipt).map_err(|_|held())?;
+        let event:Value=serde_json::from_str(&event).map_err(|_|held())?;
+        let result:Value=serde_json::from_str(&result).map_err(|_|held())?;
+        let job_result:Value=serde_json::from_str(&job_result_text).map_err(|_|held())?;
+        let configured=s(&self.settings,"textProvider");
+        let expected=if configured.is_empty(){"codex"}else{configured};
+        if !["api","codex"].contains(&expected) || provider!=expected || result!=accepted
+            || receipt["validation"]!="accepted" || receipt["contract"]!="desktop-runner/v1"
+            || receipt.get("acceptedRequestHash").is_some_and(|value| value!=&json!(hash))
+            || event["requestHash"]!=hash || event["value"].is_null() {
+            return Err(held());
+        }
+        if receipt["migrationPolicy"].is_null() {
+            if job_result != accepted { return Err(held()); }
+        } else {
+            // These existing repair commits intentionally retain jobs.result as
+            // original wire and store the adopted projection only in the step.
+            // No other migration policy gains this new-profile replay authority.
+            let policy=s(&receipt,"migrationPolicy");
+            let audit=match policy {
+                "carrier-received-validation/v1" if is_carrier_repair(request) => &receipt["carrierReceivedValidation"],
+                "author-scope-received-validation/v1" if is_scope_finisher_repair(request) => &receipt["authorScopeReceivedValidation"],
+                _ => return Err(held()),
+            };
+            if receipt["acceptedRequestHash"]!=hash || audit["version"]!=policy
+                || audit["requestHash"]!=hash || audit["workflowId"]!=run
+                || audit["nodeKey"]!=step_key(request)
+                || audit["originalSnapshotSha256"]!=crate::pipeline::digest(&snapshot.to_string())
+                || audit["originalRawEventId"]!=event_id
+                || audit["originalResultSha256"]!=crate::pipeline::digest(&job_result_text)
+                || audit["generationRequestsSent"]!=0 || audit["acceptedAutomatically"]!=false
+                || event["value"]!=job_result { return Err(held()); }
+        }
+        Ok(Some(event["value"].clone()))
     }
 
     fn check_managed_node_resume_boundary(&self, request: &TextRequest) -> Result<()> {
@@ -12493,10 +12558,9 @@ mod sdk_core_tests {
     #[tokio::test]
     async fn sdk_core_disconnect_unknown_blocks_restart_new_workflow_and_cli_without_more_executions(
     ) {
-        let (_temp, mut executor, request) = fixture("hang");
-        executor.settings["sdkFixtureDeadlineMs"] = json!(200);
-        let run = executor.workflow_id.clone().unwrap();
-        executor.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",params![json!({"runnerVersion":"desktop-runner/v1","input":{"settings":executor.settings}}).to_string(),run]).unwrap();
+        // End the synthetic stream after a real turn starts. A 200ms deadline
+        // races Node/SDK cold startup and can expire before the first invocation.
+        let (_temp, executor, request) = fixture("reconnect-only");
         assert!(executor
             .execute(request.clone())
             .await
@@ -12505,6 +12569,12 @@ mod sdk_core_tests {
         assert_eq!(calls(&executor), 1);
         let original = text_job(&executor);
         assert_eq!(original["status"], "submission_unknown");
+        let worker = executor.store.root.join("sdk-worker").join(s(&original, "id"));
+        let receipt: Value = serde_json::from_slice(&std::fs::read(worker.join("receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["error"]["code"], "INCOMPLETE_STREAM");
+        let events = std::fs::read_to_string(worker.join("events.ndjson")).unwrap();
+        assert!(events.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .any(|event| event["rawEvent"]["type"] == "turn.started"));
         let resumed = restart(&executor);
         assert!(resumed
             .execute(request.clone())
