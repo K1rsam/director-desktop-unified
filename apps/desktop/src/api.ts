@@ -1,5 +1,5 @@
 import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Media, Request, Workspace } from './types';
+import type { AppSettings, Media, Request, Workspace } from './types';
 import { previewWorkspace } from './preview';
 import { dispatchOfflineRequest, OFFLINE_EXECUTION_POLICY } from './executionPolicy';
 
@@ -10,6 +10,7 @@ export async function request<T>(input: Request): Promise<T> {
   if (desktop) return dispatchOfflineRequest<T>(input, request => invoke<T>('desktop_request', { request }));
   if (preview) {
     if (input.action === 'getExecutionPolicy') return OFFLINE_EXECUTION_POLICY as T;
+    if (input.action === 'settings.global.get') return { schemaVersion: 'app-settings/v1', revision: 0, settings: { textProvider: 'codex_sdk', textModel: 'gpt-6.1-sol', reasoning: 'medium' }, providers: previewWorkspace.providers, rules: previewWorkspace.rules } as T;
     if (input.action === 'projects.list') return [previewWorkspace.project] as T;
     if (input.action === 'workspace.get') return previewWorkspace as T;
     if (input.action === 'assets.get') return previewWorkspace.assets.find(asset => asset.id === input.assetId) as T;
@@ -37,4 +38,12 @@ export function mediaUrl(media?: Media, thumbnail = false): string {
 
 export function isWorkspace(value: unknown): value is Workspace {
   return !!value && typeof value === 'object' && 'project' in value && 'assets' in value && 'units' in value;
+}
+
+export function isAppSettings(value: unknown): value is AppSettings {
+  if (!value || typeof value !== 'object') return false;
+  const settings = value as Partial<AppSettings>;
+  return settings.schemaVersion === 'app-settings/v1' && Number.isSafeInteger(settings.revision) && Number(settings.revision) >= 0
+    && !!settings.settings && typeof settings.settings === 'object' && !Array.isArray(settings.settings)
+    && !!settings.providers && typeof settings.providers === 'object' && Array.isArray(settings.rules);
 }

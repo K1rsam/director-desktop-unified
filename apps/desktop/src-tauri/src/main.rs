@@ -109,6 +109,8 @@ const STARTUP_PROBE: &str = r#"
     // A second launch against this same isolated home verifies persisted data.
     // The first launch leaves precisely these two projects after lifecycle tests.
     if (projects.length === 2 && projects.some(project => project.title === '行内项目一') && projects.some(project => project.title === '行内项目二')) {
+      const global = await invoke('desktop_request',{request:{action:'settings.global.get'}});
+      if (global.schemaVersion !== 'app-settings/v1' || global.settings.textModel !== 'startup-global-model') throw new Error('Software settings did not survive process restart');
       const savedProject = projects.find(project => project.title === '行内项目二');
       const saved = await invoke('desktop_request', {request:{action:'workspace.get',projectId:savedProject.id}});
       if (saved.source.text !== '第1集\n场景：门口\n甲：保存后重开。\n' || saved.jobs.length || saved.assets.length !== 1 || saved.units.length !== 1 || saved.media.length !== 1) throw new Error('Saved workspace did not survive process restart');
@@ -172,15 +174,25 @@ const STARTUP_PROBE: &str = r#"
     if(!blockedGeneration) throw new Error('Raw IPC bypassed the offline generation gate');
     if (!document.querySelector('.text-execution-summary')?.textContent.includes('Codex CLI')) throw new Error('Stage text executor identity did not render');
     await progress('stage_three');
-    const settingsButton=[...document.querySelectorAll('.sidebar-link')].find(button=>button.textContent.includes('渠道与设置'));
+    const settingsButton=[...document.querySelectorAll('.sidebar-link')].find(button=>button.textContent.includes('软件设置'));
     if (!settingsButton) throw new Error('Settings navigation is missing');
     settingsButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.dreamina-account-card'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     const accountCard=document.querySelector('.dreamina-account-card');
-    if (!accountCard || !accountCard.textContent.includes('即梦生成 CLI') || !accountCard.textContent.includes('OAuth 登录')) throw new Error('OAuth account panel did not render');
+    if (!accountCard || accountCard.getAttribute('aria-label') !== '即梦生成 CLI' || !accountCard.textContent.includes('OAuth 登录')) throw new Error('OAuth account panel did not render');
     const cliCard=document.querySelector('.text-execution-settings');
-    if (!cliCard || !cliCard.textContent.includes('文本执行 · 阶段 1 / 2 / 3') || !cliCard.textContent.includes('检查 CLI 与账户')) throw new Error('Text CLI connection settings did not render');
+    if (!cliCard || !cliCard.textContent.includes('OpenAI') || !cliCard.textContent.includes('SDK 与 CLI 共用 OpenAI 账户')) throw new Error('Unified OpenAI settings did not render');
+    const software = await invoke('desktop_request',{request:{action:'settings.global.get'}});
+    if(software.schemaVersion !== 'app-settings/v1') throw new Error('Software settings require an unexpected project');
+    const savedSoftware = await invoke('desktop_request',{request:{action:'settings.global.save',expectedRevision:software.revision,settings:{textModel:'startup-global-model'}}});
+    if(savedSoftware.settings.textModel !== 'startup-global-model' || savedSoftware.revision !== software.revision+1) throw new Error('Software settings did not save');
     await progress('settings');
+    // Software settings is global and deliberately hides project navigation.
+    // Return to the library before exercising the selected project's controls.
+    const libraryButton=[...document.querySelectorAll('.sidebar-link')].find(button=>button.textContent.includes('所有项目'));
+    if (!libraryButton) throw new Error('Library navigation is missing');
+    libraryButton.click();
+    for (let attempt=0; attempt<100 && !document.querySelector('.stage-nav button'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     // Reversible mutations in the isolated diagnostic project exercise the real
     // Tauri IPC and SQLite lifecycle. No provider worker is running in this mode.
     const pid=projects[0].id;
@@ -196,6 +208,7 @@ const STARTUP_PROBE: &str = r#"
     const restored=await call({action:'assets.restore',assetId:before.id,expectedVersion:deleted.version});
     if (!restored.assets.some(asset=>asset.id===before.id && asset.adoptedMediaId===media.id) || restored.deletedAssets.some(asset=>asset.id===before.id)) throw new Error('Restoration changed asset or image identity');
     const imageButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('图片资产'));
+    if (!imageButton) throw new Error('Image navigation is missing after leaving software settings');
     imageButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.asset-workspace'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     const refreshButton=[...document.querySelectorAll('.topbar button')].find(button=>button.textContent.includes('刷新'));

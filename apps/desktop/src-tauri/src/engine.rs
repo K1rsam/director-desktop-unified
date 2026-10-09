@@ -20,6 +20,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+#[path = "app_settings_engine.rs"]
+mod app_settings_engine;
 
 // Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
 const IMAGE_SUBMIT_WORKERS: usize = 8;
@@ -546,9 +548,12 @@ impl Engine {
         Ok(result)
     }
     pub fn config(&self, store: &Store, provider: &str) -> Result<(ProviderConfig, String)> {
-        self.config_with_settings(store, provider, &store.settings()?)
+        self.config_with_settings(store, provider, &self.effective_settings(store)?)
     }
     fn config_with_settings(&self, store: &Store, provider: &str, settings: &Value) -> Result<(ProviderConfig, String)> {
+        self.config_for_identity(s(&store.project()?,"id"),provider,settings)
+    }
+    fn config_for_identity(&self, pid:&str, provider: &str, settings: &Value) -> Result<(ProviderConfig, String)> {
         if provider == "dreamina" && self.live_accounts {
             let config = self.dreamina_config_with_settings(settings)?;
             let account = self.dreamina_sessions.snapshot(&config)?;
@@ -565,15 +570,20 @@ impl Engine {
                 },
             ));
         }
-        let project = store.project()?;
-        let pid = s(&project, "id");
-        let env = format!(
+        let mut env = format!(
             "DIRECTOR_NEW_{}_{}",
             pid.replace('-', "_"),
             provider.to_uppercase()
         );
+        if settings[crate::app_settings::SCOPE].is_object() {
+            if let Ok(reference)=crate::app_settings::reference(settings,pid,provider) {
+                env=format!("DIRECTOR_GLOBAL_{}_{}",provider.to_uppercase(),&pipeline::digest(&reference)[..24]);
+            }
+        }
         if self.live_accounts && ["bh", "chrome"].contains(&provider) {
-            let secret = crate::platform::read_credential(&format!("{pid}:{provider}")).ok();
+            let bound_secret = crate::app_settings::credential(settings,pid,provider);
+            if settings[crate::app_settings::SCOPE]["credentialHashes"].is_object() && bound_secret.is_err(){return Err(bound_secret.unwrap_err());}
+            let secret = bound_secret.ok();
             if let Some(secret) = secret {
                 std::env::set_var(&env, secret);
             } else {
@@ -608,11 +618,11 @@ impl Engine {
         let full = store.job(s(summary,"id"))?;
         let job=&full;
         let provider=s(job,"provider");
-        if !job["snapshot"]["frozenSettings"].is_object() {return self.config(store,provider);}
+        if !job["snapshot"]["frozenSettings"].is_object() {return self.config_with_settings(store,provider,&store.settings()?);}
         let mut settings=job["snapshot"]["frozenSettings"].clone();
         // Channel parameters are frozen, but current identity must still be
         // verified. Never label changed credentials as the old saved account.
-        if !self.live_accounts || provider!="dreamina" {
+        if (!self.live_accounts || provider!="dreamina") && !settings[crate::app_settings::SCOPE].is_object() {
             let account_key=format!("{provider}AccountId");
             settings[&account_key]=store.settings()?[&account_key].clone();
         }
@@ -624,7 +634,7 @@ impl Engine {
         Ok((config,account))
     }
     fn dreamina_config(&self, store: &Store) -> Result<ProviderConfig> {
-        self.dreamina_config_with_settings(&store.settings()?)
+        self.dreamina_config_with_settings(&self.effective_settings(store)?)
     }
     fn dreamina_config_with_settings(&self, settings: &Value) -> Result<ProviderConfig> {
         let cli = if s(&settings, "dreaminaPath").is_empty() {
@@ -647,7 +657,10 @@ impl Engine {
             }
             return Ok(());
         }
-        require_account(store, provider)
+        let settings=self.effective_settings(store)?;
+        if settings[crate::app_settings::SCOPE].is_object() && ["bh","chrome"].contains(&provider) {
+            crate::app_settings::credential(&settings,s(&store.project()?,"id"),provider).map(|_|())
+        } else {require_account(store, provider)}
     }
     fn checked_account(&self, config: &ProviderConfig, fallback: &str) -> ProviderResult<String> {
         if self.live_accounts && config.kind == "dreamina" {
@@ -942,8 +955,11 @@ impl Engine {
             .into_iter()
             .map(|r| json!({"id":r.id,"version":r.version,"sha256":r.sha256}))
             .collect();
+        let mut display_settings=self.effective_settings(store)?;
+        if let Some(object)=display_settings.as_object_mut(){object.remove(crate::app_settings::SCOPE);}
+        if self.standard_native {if let Some(global)=crate::app_settings::load(&self.home)? {for (_,entry) in global["catalogs"].as_object().into_iter().flatten(){let cap=entry["capabilities"].clone();providers.retain(|p|p["provider"]!=cap["provider"]);providers.push(cap);}}}
         Ok(
-            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":settings,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report}),
+            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report}),
         )
     }
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }
@@ -990,9 +1006,15 @@ impl Engine {
         if action=="readiness.check" && !self.readiness_enabled {
             return Err("READINESS_NATIVE_ONLY: 只读连接检查仅由本机桌面显式触发；云端和隔离启动探针不读取宿主账户".into());
         }
+        if action == "runtime.prepare" && (!self.standard_native || !self.readiness_enabled || !self.live_accounts) {
+            return Err("RUNTIME_SETUP_NATIVE_ONLY: 自动配置仅由标准桌面端连接操作触发；离线验收不会下载或安装程序。".into());
+        }
         if self.native_acceptance.is_some() { crate::execution_policy::check_native_action(&request)?; }
         else if self.standard_native { crate::execution_policy::check_standard(&request)?; }
         else if self.offline_only { crate::execution_policy::check(&request)?; }
+        if action.starts_with("settings.global.") || request["scope"]=="global" {
+            return self.dispatch_global_settings(&request);
+        }
         // File pickers and library reads must not hold a project lifecycle reservation.
         match action {
             "projects.list" => return Ok(json!(self.project_list()?)),
@@ -1231,6 +1253,7 @@ impl Engine {
             "videos.adopt" => adopt_video(&store, s(&request, "unitId"), s(&request, "mediaId"))?,
             "settings.save" => {
                 let data = &request["settings"];
+                if data.get(crate::app_settings::SCOPE).is_some(){return Err("全局执行身份只能由程序冻结，不能写入项目设置。".into());}
                 let old = store.settings()?;
                 let pid = s(&request, "projectId");
                 for (k, provider) in [
@@ -1266,6 +1289,10 @@ impl Engine {
                     store.invalidate_unsubmitted_settings("生成设置已变化，请重新准备")?;
                 }
                 crate::executable_paths::remember(&self.home, data)?;
+            }
+            "runtime.prepare" => {
+                let _setup = self.acquire_keys(vec!["runtime:prepare".into()])?;
+                return crate::runtime_setup::prepare(&request, &store.settings()?, &self.home, self.readiness_resources.as_deref());
             }
             "readiness.check" => {
                 let (provider,mut settings)=crate::readiness::request_settings(&request,&store.settings()?)?;
@@ -1413,7 +1440,7 @@ impl Engine {
                 if old["entityId"] != "storyboard.refine" { return Err("请选择原导演精修记录".into()); }
                 let original = &old["snapshot"]["input"];
                 if old["snapshot"]["savedSettingsSha256"] != pipeline::digest(&store.settings()?.to_string()) { return Err("项目参数已变化，精修结果已保留，请核对后重新精修".into()); }
-                let mut current = refinement_input(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}))?;
+                let mut current = refinement_input_with_capabilities(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}),original.get("capabilities"))?;
                 // Execution identity is frozen by preflight, not editable project state.
                 current["settings"] = original["settings"].clone();
                 store.publish_storyboard_refinement(run, s(&request,"candidateSha256"), &current)?;
@@ -1436,7 +1463,7 @@ impl Engine {
             "jobs.query" | "jobs.download" | "jobs.reconcile" => {
                 let key = s(&request, "jobId").to_owned();
                 let job = store.job(&key)?;
-                let (cfg, account) = self.config(&store, s(&job, "provider"))?;
+                let (cfg, account) = self.generation_config(&store, &job)?;
                 let engine = self.clone();
                 let st = store.clone();
                 let act = action.to_owned();
@@ -1748,7 +1775,7 @@ impl Engine {
                                 }
                             };
                             // Configuration edits must not make a burst silently use another account.
-                            let (current_config, current_account) = match engine.config(&st, &cfg.kind) {
+                            let (current_config, current_account) = match st.job(candidate).and_then(|job|engine.generation_config(&st, &job)) {
                                 Ok(config) => config,
                                 Err(error) => {
                                     if let Err(persist_error) = st.event(candidate, "local_error", &json!({"message":error})) {
@@ -2122,7 +2149,7 @@ impl Engine {
             return Err("账户身份已变化，请核对当前账户后重新准备".into());
         }
         let fingerprint = capability_fingerprint(&config, &account);
-        let usable = cached_video_capabilities(store, provider, &fingerprint)?;
+        let usable = self.global_capability_cache(provider,&fingerprint)?.or(cached_video_capabilities(store, provider, &fingerprint)?);
         let (capabilities, source) = if let Some(cap) = usable {
             (cap, "cache")
         } else {
@@ -2187,7 +2214,7 @@ impl Engine {
             return Err("账户身份已变化，请核对当前账户后重新准备".into());
         }
         let fingerprint = capability_fingerprint(&config, &account);
-        Ok(cached_video_capabilities(store, "dreamina", &fingerprint)?.map(|capabilities| {
+        Ok(self.global_capability_cache("dreamina",&fingerprint)?.or(cached_video_capabilities(store, "dreamina", &fingerprint)?).map(|capabilities| {
             let report = json!({"provider":"dreamina","capabilityVersion":capabilities.version,"source":"cache","checkedAt":capabilities.checked_at});
             VideoChannel { account, fingerprint, capabilities, report }
         }))
@@ -2208,7 +2235,7 @@ impl Engine {
             return Err("项目已归档，未排入新的准备任务".into());
         }
         let (config, account) = self.config(store, "dreamina")?;
-        let settings = store.settings()?;
+        let settings = self.effective_settings(store)?;
         let connection = store.conn()?;
         let ids = r["unitIds"].to_string();
         let source: i64 = connection
@@ -2303,7 +2330,8 @@ impl Engine {
                 return Err("分镜单元选择不能重复".into());
             }
         }
-        let settings = store.settings()?;
+        let mut settings = self.effective_settings(store)?;
+        crate::app_settings::freeze_credentials(&mut settings);
         let provider = video_provider(store, r)?;
         let model = r
             .get("model")
@@ -2462,6 +2490,8 @@ impl Engine {
                 }
                 let unit = store.get("units", key)?;
                 let mut snapshot = binding::bind(store, &unit, &provider, model)?;
+                snapshot["frozenSettings"]=settings.clone();
+                snapshot["providerConfig"]=serde_json::to_value(self.config_with_settings(store,&provider,&settings)?.0).map_err(|e|e.to_string())?;
                 snapshot["autoSubmit"] = json!(false);
                 snapshot["capabilityVersion"] = json!(verified.capabilities.version);
                 snapshot["capabilitySnapshot"] = json!({"version":verified.capabilities.version,"checkedAt":verified.capabilities.checked_at,"model":capability});
@@ -2526,7 +2556,7 @@ impl Engine {
         r: &Value,
         check: impl FnOnce(&ProviderConfig, &str) -> ProviderResult<String>,
     ) -> Result<Value> {
-        self.queue_images_frozen(store, r, &store.settings()?, |config,account| {
+        self.queue_images_frozen(store, r, &self.effective_settings(store)?, |config,account| {
             let checked = check(config,account)?;
             if self.live_accounts && config.kind == "dreamina" {
                 let current = self.dreamina_config(store).map_err(|e|ProviderError::new("CONFIG_CHANGED",e))?;
@@ -2541,6 +2571,9 @@ impl Engine {
         &self, store: &Store, r: &Value, settings: &Value,
         check: impl FnOnce(&ProviderConfig, &str) -> ProviderResult<String>,
     ) -> Result<Value> {
+        let mut frozen_settings=settings.clone();
+        crate::app_settings::freeze_credentials(&mut frozen_settings);
+        let settings=&frozen_settings;
         let provider = s(r, "provider");
         let model = s(r, "model");
         if model.is_empty() {
@@ -2576,10 +2609,12 @@ impl Engine {
             account
         } else {
             let key=format!("{provider}AccountId");
-            if ["dreamina","bh","chrome"].contains(&provider) && store.settings()?[&key] != settings[&key] {
+            if !settings[crate::app_settings::SCOPE].is_object() && ["dreamina","bh","chrome"].contains(&provider) && store.settings()?[&key] != settings[&key] {
                 return Err("图片制作期间账户身份已变化，请恢复原账户或发起新制作".into());
             }
-            if ["dreamina", "bh", "chrome"].contains(&provider) && s(settings, &format!("{provider}AccountId")).trim().is_empty() {
+            if settings[crate::app_settings::SCOPE].is_object() && ["bh","chrome"].contains(&provider) {
+                crate::app_settings::credential(settings,s(&store.project()?,"id"),provider)?;
+            } else if ["dreamina", "bh", "chrome"].contains(&provider) && s(settings, &format!("{provider}AccountId")).trim().is_empty() {
                 return Err("冻结图片设置缺少稳定账户标签，请在新制作请求中选择账户".into());
             }
             cached_account
@@ -2781,6 +2816,8 @@ impl Engine {
             &json!({"action":"foundation.run","episodeIds":episode_ids}),
         )?;
         let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        input["settings"]=self.effective_settings(&store)?;
+        crate::app_settings::freeze_credentials(&mut input["settings"]);
         input["settings"] =
             runtime.block_on(resolve_text_execution_settings(&input["settings"]))?;
         input["foundationPhase"] = json!("APPLY_DECISION");
@@ -2800,7 +2837,8 @@ impl Engine {
             let key = if stage == "foundation.run" { "foundation-start" } else { "storyboard-start" };
             Some(self.acquire_keys(vec![format!("{key}:{}", s(&store.project()?, "id"))])?)
         } else { None };
-        let mut input = if stage == "storyboard.refine" { refinement_input(&store, &request)? } else { production_input_for_new_workflow(&store, &request)? };
+        let planning=if matches!(stage,"storyboard.run"|"storyboard.refine"){self.global_planning_capabilities(&store)?}else{None};
+        let mut input = if stage == "storyboard.refine" { refinement_input_with_capabilities(&store, &request,planning.as_ref())? } else { production_input_for_new_workflow_with_capabilities(&store, &request,planning.as_ref())? };
         if stage == "foundation.run" {
             match existing_foundation_start(&store, &input)? {
                 FoundationStartBoundary::New => {},
@@ -2826,7 +2864,7 @@ impl Engine {
         }
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let saved_settings_sha256 = freeze_production_execution_settings(&store, stage, &mut input,
-            |settings| runtime.block_on(resolve_text_execution_settings(settings)))?;
+            |settings| {let mut effective=if self.standard_native {crate::app_settings::effective(&self.home,settings)?} else {settings.clone()};crate::app_settings::freeze_credentials(&mut effective);runtime.block_on(resolve_text_execution_settings(&effective))})?;
         if stage == "foundation.run" {
             // Freeze the new transport on new runs only. Resuming an existing
             // workflow keeps its original input and accepted request identities.
@@ -3090,8 +3128,10 @@ impl Engine {
             }
             (old["snapshot"]["settings"].clone(),old["snapshot"]["stage2Context"].clone())
         } else {
-            (store.settings()?,Value::Null)
+            (self.effective_settings(&store)?,Value::Null)
         };
+        let mut saved_settings=saved_settings;
+        crate::app_settings::freeze_credentials(&mut saved_settings);
         let policy = pipeline::image_production_policy(&saved_settings);
         r["imageProductionPolicy"] = json!(policy);
         let active_image_ids: Vec<_> = store
@@ -4425,6 +4465,11 @@ fn self_capabilities(store: &Store) -> Result<Value> {
         )
         .map_err(|_| "请先刷新所选视频渠道能力，再生成分镜")?;
     let caps: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    planning_capabilities_from_catalog(&settings,&caps)
+}
+fn planning_capabilities_from_catalog(settings:&Value,caps:&Value)->Result<Value>{
+    let provider=s(settings,"videoProvider");
+    let model=s(settings,"videoModel");
     let m = caps["models"]
         .as_array()
         .and_then(|a| {
@@ -5321,10 +5366,14 @@ fn freeze_production_execution_settings(
     Ok(saved_settings_sha256)
 }
 
+#[cfg(test)]
 fn refinement_input(store: &Store, request: &Value) -> Result<Value> {
+    refinement_input_with_capabilities(store,request,None)
+}
+fn refinement_input_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
     let episode = s(request, "episodeId");
     if episode.is_empty() { return Err("请先选择要精修的单集".into()); }
-    let mut input = production_input(store, &json!({"action":"storyboard.run","episodeIds":[episode]}))?;
+    let mut input = production_input_with_capabilities(store, &json!({"action":"storyboard.run","episodeIds":[episode]}),capabilities)?;
     let units: Vec<Value> = input["existingUnits"].as_array().into_iter().flatten()
         .filter(|unit| s(unit,"episodeId")==episode && unit["retired"]!=true).map(|unit|unit["id"].clone()).collect();
     if units.is_empty() { return Err("此集尚无已采用分镜，请先生成完整集稿".into()); }
@@ -5337,6 +5386,9 @@ fn refinement_input(store: &Store, request: &Value) -> Result<Value> {
     Ok(input)
 }
 fn production_input(store: &Store, request: &Value) -> Result<Value> {
+    production_input_with_capabilities(store,request,None)
+}
+fn production_input_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
     let mut request = request.clone();
     if let Some(selection) = request["options"]["selection"].as_object().cloned() {
         for (k, v) in selection {
@@ -5352,7 +5404,7 @@ fn production_input(store: &Store, request: &Value) -> Result<Value> {
             .collect::<Vec<_>>());
     }
     let mut input =
-        storyboard_input_inner(store, &request, s(&request, "action") != "foundation.run")?;
+        storyboard_input_inner_with_capabilities(store, &request, s(&request, "action") != "foundation.run",capabilities)?;
     if let Some(ids) = request.get("unitIds") {
         let ids = ids.as_array().ok_or("单元选择必须为数组")?;
         if ids.is_empty()
@@ -5388,8 +5440,12 @@ fn production_input(store: &Store, request: &Value) -> Result<Value> {
 }
 /// Only an actual new Stage3 writer receives this read-only projection. The
 /// refinement reader and every saved recovery snapshot use production_input.
+#[cfg(test)]
 fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<Value> {
-    let mut input = production_input(store, request)?;
+    production_input_for_new_workflow_with_capabilities(store,request,None)
+}
+fn production_input_for_new_workflow_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
+    let mut input = production_input_with_capabilities(store, request,capabilities)?;
     if s(request, "action") == "storyboard.run" {
         let projection = store.foundation_context_for_new_workflow()?;
         input["foundation"] = projection.foundation;
@@ -5402,7 +5458,11 @@ fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<V
 fn storyboard_input(store: &Store, request: &Value) -> Result<Value> {
     storyboard_input_inner(store, request, true)
 }
+#[cfg(test)]
 fn storyboard_input_inner(store: &Store, request: &Value, writing: bool) -> Result<Value> {
+    storyboard_input_inner_with_capabilities(store,request,writing,None)
+}
+fn storyboard_input_inner_with_capabilities(store: &Store, request: &Value, writing: bool,capabilities:Option<&Value>) -> Result<Value> {
     let raw_source = store.source()?;
     let source: pipeline::LockedSource =
         serde_json::from_value(raw_source.clone()).map_err(|_| "请先导入并锁定剧本原文")?;
@@ -5479,7 +5539,7 @@ fn storyboard_input_inner(store: &Store, request: &Value, writing: bool) -> Resu
     let mut source_json = serde_json::to_value(source).map_err(|e| e.to_string())?;
     source_json["version"] = raw_source["version"].clone();
     Ok(
-        json!({"source":source_json,"foundation":store.foundation()?,"assets":store.values("assets")?,"existingUnits":store.values("units")?,"settings":store.settings()?,"selection":{"episodeIds":episodes},"capabilities":if writing{self_capabilities(store)?}else{Value::Null},"previousBoundary":previous}),
+        json!({"source":source_json,"foundation":store.foundation()?,"assets":store.values("assets")?,"existingUnits":store.values("units")?,"settings":store.settings()?,"selection":{"episodeIds":episodes},"capabilities":if writing{match capabilities{Some(cap)=>cap.clone(),None=>self_capabilities(store)?}}else{Value::Null},"previousBoundary":previous}),
     )
 }
 pub fn merge(mut base: Value, changes: &Value) -> Value {

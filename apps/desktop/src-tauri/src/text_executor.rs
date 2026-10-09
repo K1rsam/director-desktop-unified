@@ -4458,6 +4458,10 @@ pub struct SavedTextExecutor {
     pub workflow_id: Option<String>,
 }
 
+#[cfg(test)]
+#[path="text_executor_global_tests.rs"]
+mod global_settings_tests;
+
 // This token is created only together with a new persistent CLI job/node. File
 // absence, a new UUID, or a caller-supplied input marker is never fresh evidence.
 struct CliDispatchAllocation {
@@ -7923,8 +7927,7 @@ impl SavedTextExecutor {
         if endpoint.is_empty() {
             return Err("请配置文本API地址".into());
         }
-        let token = crate::platform::read_credential(&format!("{}:text", s(&self.store.project()?, "id")))
-            .map_err(|_| "请配置文本API密钥")?;
+        let token = crate::app_settings::credential(&self.settings,s(&self.store.project()?, "id"),"text")?;
         let dir = self.store.root.join("text-runs").join(job);
         if wire.is_some() {
             save_wire_request(&dir, &json!({"profile":crate::pipeline::foundation_wire::PROFILE,"provider":"api","request":payload})).await?;

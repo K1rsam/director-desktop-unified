@@ -45,7 +45,13 @@ fn usable(value: &Value) -> bool {
 }
 
 pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
-    let health = json_request(config, &wire::client(15)?, "/health", None, false)?;
+    let health = crate::chrome_setup::inspect(
+        &json!({"chromeEndpoint":wire::base(config,true)?}),
+        &wire::credential(config,true)?,
+    ).map_err(|message|ProviderError::new("BRIDGE_OFFLINE",message))?;
+    if health["status"] != "ready" {
+        return Err(ProviderError::new("BRIDGE_BROWSER_NOT_READY",health["message"].as_str().unwrap_or("Chrome 网页尚未就绪。")));
+    }
     Ok(Capabilities {
         provider: "chrome".into(),
         version: "chrome-image-proof-v2".into(),

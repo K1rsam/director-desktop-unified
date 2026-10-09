@@ -62,7 +62,7 @@ export function messageOf(value: unknown): string {
   if (typeof value === 'object') { const object = value as Record<string, unknown>; return [object.message, object.error, object.reason, object.code].filter(Boolean).map(String).join(' · ') || JSON.stringify(value); }
   return String(value);
 }
-export function providerList(workspace: Workspace): Provider[] { const stored = Array.isArray(workspace.providers) ? workspace.providers : Object.entries(workspace.providers || {}).map(([id, provider]) => ({ ...provider, id: provider.id || id })); return ['dreamina', 'bh', 'chrome'].map(id => { const value = stored.find(provider => providerId(provider) === id); return value ? { ...value, id, available: value.available ?? !!value.models?.length } : { id, name: providerName(id), available: false, configured: false, message: '保存本机配置后检查连接' }; }); }
+export function providerList(workspace: Pick<Workspace, 'providers'>): Provider[] { const stored = Array.isArray(workspace.providers) ? workspace.providers : Object.entries(workspace.providers || {}).map(([id, provider]) => ({ ...provider, id: provider.id || id })); return ['dreamina', 'bh', 'chrome'].map(id => { const value = stored.find(provider => providerId(provider) === id); return value ? { ...value, id, available: value.available ?? !!value.models?.length } : { id, name: providerName(id), available: false, configured: false, message: '保存本机配置后检查连接' }; }); }
 export function providerId(provider: Provider): string { return provider.id || provider.provider || ''; }
 export const PROVIDER_NAMES: Record<string, string> = { dreamina: '即梦官方 CLI', bh: 'BH API', chrome: 'Chrome 网页', codex: 'Codex CLI', api: '文本 API', local: '本地流程' };
 export function providerName(id: string) { return PROVIDER_NAMES[id] || id; }

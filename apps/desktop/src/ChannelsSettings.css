@@ -1,0 +1,69 @@
+.channel-settings-layout {
+  display: grid;
+  gap: 18px;
+  align-items: start;
+}
+
+.channel-settings-layout > .dreamina-account-card {
+  margin-bottom: 0;
+}
+
+.channel-settings-layout .dreamina-session-summary {
+  display: flex;
+  gap: 20px 44px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+
+.channel-provider-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.channel-provider-card {
+  min-width: 0;
+}
+
+.channel-configuration > label {
+  display: block;
+  margin-top: 14px;
+}
+
+.channel-provider-card > .muted {
+  font-size: .75rem;
+  line-height: 1.6;
+  margin: 8px 0 14px;
+}
+
+.channel-provider-card > .actions {
+  margin-top: 16px;
+}
+
+.channel-settings-layout .channel-diagnostics {
+  margin-bottom: 0;
+}
+
+.channel-component-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.channel-component-status > div:first-child {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+@media (max-width: 850px) {
+  .channel-provider-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -27,6 +27,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+base64 = "0.22"
+flate2 = "1"
+tar = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 async-trait = "0.1"

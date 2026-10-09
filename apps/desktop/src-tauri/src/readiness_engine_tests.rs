@@ -1,7 +1,7 @@
 //! Real synthetic native executables; no host account, provider, or model access.
 use super::*;
 use std::process::Command;
-fn native_fixture(dir: &Path, kind: &str) -> PathBuf {
+pub(super) fn native_fixture(dir: &Path, kind: &str) -> PathBuf {
     let path = dir.join(if cfg!(windows) {
         format!("{kind}-fixture.exe")
     } else {
@@ -106,6 +106,8 @@ fn explicit_codex_check_uses_only_read_rpc_preserves_settings_and_never_unlocks_
     assert_eq!(result["installation"]["state"], "ready", "{result}");
     assert_eq!(result["protocol"]["state"], "ready");
     assert_eq!(result["authentication"]["state"], "authenticated");
+    assert_eq!(result["authentication"]["identityVerified"], true);
+    assert_eq!(result["details"]["accountChecked"], true);
     assert_eq!(result["catalog"]["state"], "available");
     assert_eq!(result["network"]["state"], "not_tested");
     assert_eq!(result["generation"]["calls"], 0);
@@ -172,6 +174,39 @@ fn dreamina_check_does_not_poll_oauth_resume_tasks_cache_catalogs_or_claim_free_
         "user_credit"
     ]
     .contains(&l)));
+}
+
+#[test]
+fn codex_account_verification_survives_public_identity_redaction_without_generation_claims() {
+    let status = json!({"available":true,"version":"codex-cli 0.162.0-alpha.2",
+        "readinessRpcReady":true,"loggedIn":true,"ready":true,
+        "account":{"type":"chatgpt","planType":"pro","email":"PRIVATE_ACCOUNT_EMAIL","id":"PRIVATE_ACCOUNT_ID"},
+        "models":[{"id":"synthetic-model"}],"limits":[],"generationRequestsSent":0});
+    let report = crate::readiness::codex_report(&status, &json!({}));
+    assert_eq!(report["authentication"]["state"], "authenticated");
+    assert_eq!(report["authentication"]["identityVerified"], true);
+    assert_eq!(report["details"]["accountChecked"], true);
+    assert_eq!(report["details"]["accountIdentityNotExported"], true);
+    assert_eq!(report["details"]["cliStatus"]["account"]["planType"], "pro");
+    for secret in ["PRIVATE_ACCOUNT_EMAIL", "PRIVATE_ACCOUNT_ID"] { assert!(!report.to_string().contains(secret)); }
+    assert_eq!(report["generation"]["enabled"], false);
+    assert_eq!(report["generation"]["testPerformed"], false);
+    assert_eq!(report["generation"]["calls"], 0);
+    assert_eq!(report["network"]["state"], "not_tested");
+    assert!(report["messages"].to_string().contains("不是套餐权限或真实模型调用证明"));
+    for (field, value) in [
+        ("available", json!(false)), ("version", json!("unknown")),
+        ("readinessRpcReady", json!(false)), ("readinessRpcReady", Value::Null),
+        ("loggedIn", json!(false)), ("account", Value::Null), ("account", json!({})),
+    ] {
+        let mut incomplete = status.clone(); incomplete[field] = value;
+        let report = crate::readiness::codex_report(&incomplete, &json!({}));
+        assert_eq!(report["authentication"]["identityVerified"], false, "{field}");
+        assert_eq!(report["generation"]["calls"], 0);
+    }
+    let version_only = crate::readiness::codex_report(&json!({"available":true,"version":"codex-cli 0.162.0-alpha.2"}), &json!({}));
+    assert_eq!(version_only["authentication"]["identityVerified"], false);
+    assert_eq!(version_only["details"]["accountChecked"], false);
 }
 #[test]
 fn legacy_build_json_readiness_preserves_original_job_and_settings_and_uses_only_read_probes() {

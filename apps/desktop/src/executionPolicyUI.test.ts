@@ -32,7 +32,7 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
     const workspace = structuredClone(previewWorkspace);
     workspace.jobs = [{ id: 'saved-job', kind: 'image', provider: 'dreamina', status: 'download_failed', providerTaskId: 'synthetic-task' }, { id: 'unknown-job', kind: 'video', provider: 'bh', status: 'submission_unknown', submissionUnknown: true }];
-    const props = { workspace, writable: true, mutate: async () => workspace, inspect: () => {}, onNotice: () => {}, onError: () => {}, onTasks: () => {} };
+    const props = { workspace, writable: true, mutate: async (): Promise<unknown> => workspace, inspect: () => {}, onNotice: () => {}, onError: () => {}, onTasks: () => {} };
     const stages = [
       ['/src/Stage1Panel.tsx', 'Stage1Panel', 'stage-one-workbench'],
       ['/src/AssetPanel.tsx', 'AssetPanel', 'asset-workspace'],
@@ -44,7 +44,7 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
     const blocked = new Set<string>();
     for (const [path, name, className] of stages) {
       const module = await server.ssrLoadModule(path);
-      const html = renderToStaticMarkup(createElement(module[name], { ...props, mode: 'videos' }));
+      const html = renderToStaticMarkup(createElement(module[name], name === 'SettingsPanel' ? { appSettings: { schemaVersion: 'app-settings/v1', revision: 0, settings: workspace.settings, providers: workspace.providers, rules: workspace.rules }, writable: true, mutate: async (): Promise<null> => null } : { ...props, mode: 'videos' }));
       assert.ok(html.includes(className), `${name} mature layout retained`);
       for (const button of actionButtons(html)) {
         if (actionBlockReason(button.action)) {
@@ -62,15 +62,17 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
         const credentials = [...html.matchAll(/<input\b([^>]*type="password"[^>]*)>/g)];
         assert.equal(credentials.length, 2);
         for (const [, attributes] of credentials) assert.match(attributes, /disabled=""/);
-        assert.ok(html.includes('只读检查未开放'));
+        assert.ok(html.includes('当前环境未开放手动只读连接检查'));
+        assert.ok(!html.includes('即梦 Canvas 账户与连接'), 'unused Canvas account is not mounted');
       }
     }
     for (const action of ['foundation.run', 'images.design', 'images.produce', 'images.run', 'storyboard.run', 'units.regenerate', 'videos.prepare', 'videos.submit', 'providers.refresh', 'readiness.check', 'textCli.login', 'dreamina.login', 'jobs.query', 'jobs.download', 'jobs.reconcile']) assert.ok(blocked.has(action), `${action} is represented and blocked`);
     const { TextExecutionSettings } = await server.ssrLoadModule('/src/TextExecutionSettings.tsx');
     const apiSettings = renderToStaticMarkup(createElement(TextExecutionSettings, { ...props, settings: { textProvider: 'api' }, update: () => {}, saveSettings: async () => true }));
-    assert.match(apiSettings, /<input\b[^>]*disabled=""[^>]*type="password"/);
+    assert.doesNotMatch(apiSettings, /type="password"/);
+    assert.ok(apiSettings.includes('请选择执行方式'), 'legacy text API configuration must not be silently changed');
     const sdkSettings = renderToStaticMarkup(createElement(TextExecutionSettings, { ...props, settings: { textProvider: 'codex_sdk', textModel: 'gpt-6.1-sol', reasoning: 'medium' }, update: () => {}, saveSettings: async () => true }));
-    assert.ok(sdkSettings.includes('官方 Codex SDK') && sdkSettings.includes('不会自动改用 CLI'));
+    assert.ok(sdkSettings.includes('value="codex_sdk" selected=""') && sdkSettings.includes('data-sdk-execution-state="closed"'));
     assert.ok(sdkSettings.includes('value="codex"') && sdkSettings.includes('value="codex_sdk"'));
     assert.doesNotMatch(sdkSettings, /type="password"/);
 

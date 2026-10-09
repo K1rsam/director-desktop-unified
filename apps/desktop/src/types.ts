@@ -1,4 +1,4 @@
-export type Page = 'projects' | 'foundation' | 'images' | 'storyboard' | 'videos' | 'jobs' | 'settings';
+export type Page = 'projects' | 'foundation' | 'images' | 'storyboard' | 'videos' | 'jobs' | 'settings' | 'project-settings';
 export type JsonObject = Record<string, unknown>;
 export type ProjectSummary = { id: string; title: string; rootPath?: string; updatedAt?: string; sourceVersion?: number; counts?: Record<string, number>; archivedAt?: string | null; lifecycleVersion?: number };
 export type SourceRef = string | { start?: number; end?: number; sourceVersion?: number; lineId?: string; speaker?: string; [key: string]: unknown };
@@ -23,6 +23,8 @@ export type VideoQueueReport = { queuedCount: number; reusedCount?: number; bloc
 export type Workspace = { project: ProjectSummary; source?: Source | null; foundation?: JsonObject | null; assets: Asset[]; deletedAssets?: Asset[]; media: Media[]; units: Unit[]; jobs: Job[]; settings: Settings; providers: Provider[] | Record<string, Provider>; rules: Rule[]; diagnostics?: unknown; lastImportReport?: JsonObject | null; dreaminaAccount?: DreaminaAccount; imageQueueReport?: { queuedCount: number; blockedCount: number; blocked: { assetId: string; reason: string }[] }; videoQueueReport?: VideoQueueReport; videoPreflight?: JsonObject; workflowProgress?: JsonObject[]; readState?: { checkedAt?: string; failedAt?: string; error?: string } };
 export type Request = { action: string; [key: string]: unknown };
 export type Mutation = (action: string, values?: JsonObject, message?: string) => Promise<Workspace | null>;
+export type AppSettings = { schemaVersion: 'app-settings/v1'; revision: number; settings: Settings; providers: Provider[] | Record<string, Provider>; dreaminaAccount?: DreaminaAccount; rules: Rule[]; credentialStatus?: Record<string, { configured: boolean }>; migration?: JsonObject };
+export type GlobalMutation = (action: string, values?: JsonObject, message?: string) => Promise<AppSettings | null>;
 
 export type ProviderReadinessReport = {
   schemaVersion: 'provider-readiness/v1';

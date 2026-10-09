@@ -1,20 +1,28 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { choose, request } from './api';
 import { actionBlockReason } from './executionPolicy';
 import { Stage1Panel } from './Stage1Panel';
 import { CreativeRules } from './CreativeRules';
 import { TextExecutionSettings } from './TextExecutionSettings';
-import { DreaminaCanvasReadiness } from './DreaminaCanvasReadiness';
-import { ProviderReadinessResult, ReadinessButton, useProviderReadiness } from './ProviderReadiness';
+import { invalidateProviderReadiness, ProviderReadinessResult, useProviderReadiness } from './ProviderReadiness';
 import type { ReadinessCheck } from './ProviderReadiness';
+import { prepareRuntime, readRuntimeStatus } from './runtimeSetup';
+import type { RuntimeStatus } from './runtimeSetup';
+import './ChannelsSettings.css';
 import { ProductionSettings } from './ProductionSettings';
 import { isLocalVideoPreparation, videoPreparationLabel } from './generationState';
 import { generationChoices, ratioLabel, resolutionLabel } from './contracts';
 import { Badge, Button, costText, Empty, formatDate, Icon, JsonDetails, kindName, MediaPreview, messageOf, Modal, providerId, providerList, providerName } from './components';
-import type { Job, Media, Mutation, Settings, Workspace } from './types';
+import type { AppSettings, DreaminaAccount, GlobalMutation, Job, Media, Mutation, Settings, Workspace } from './types';
 
 type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; onError?: (error: string) => void; onNotice?: (notice: string) => void };
+type ChromeSetup = { schemaVersion: 'chrome-setup/v1'; installed: boolean; configured: boolean; status: 'unconfigured' | 'offline' | 'waiting_browser' | 'ready' | 'busy' | 'needs_selection' | 'error'; message: string; clients: number; usableClients: number; componentVersion?: string; extensionPath?: string; checkedAt?: string | null };
+function chromeSetup(value: unknown): ChromeSetup {
+  const result = value as ChromeSetup | null;
+  if (!result || result.schemaVersion !== 'chrome-setup/v1' || typeof result.installed !== 'boolean' || typeof result.configured !== 'boolean' || !['unconfigured', 'offline', 'waiting_browser', 'ready', 'busy', 'needs_selection', 'error'].includes(result.status) || typeof result.message !== 'string' || !Number.isSafeInteger(result.clients) || result.clients < 0 || !Number.isSafeInteger(result.usableClients) || result.usableClients < 0 || result.usableClients > result.clients) throw new Error('Chrome 连接状态无效，请重新检查。');
+  return result;
+}
 
 export function FoundationPanel(props: Props) { return <Stage1Panel {...props}/>; }
 
@@ -38,20 +46,25 @@ export function TasksPanel({ workspace, writable, mutate, inspect }: Props & { i
   </div>;
 }
 
-export function DreaminaAccountCard({ workspace, writable, mutate, onError, readiness }: Props & { readiness?: ReadinessCheck }) {
+export function DreaminaAccountCard({ account: suppliedAccount, workspace, writable, mutate, onError, readiness, setupBusy = false, setupError = '', componentStatus, componentBusy = false, onRefreshComponents, onInstallComponents }: { account?: DreaminaAccount; workspace?: Pick<Workspace, 'dreaminaAccount'>; writable: boolean; mutate: Mutation | GlobalMutation; onError?: (error: string) => void; readiness?: ReadinessCheck; setupBusy?: boolean; setupError?: string; componentStatus?: RuntimeStatus | null; componentBusy?: boolean; onRefreshComponents?: () => void; onInstallComponents?: () => void }) {
   const [confirmLogout, setConfirmLogout] = useState(false);
-  const account = workspace.dreaminaAccount;
+  const account = suppliedAccount || workspace?.dreaminaAccount;
   const authorizing = account?.status === 'authorizing';
   const authenticated = account?.status === 'authenticated' && account.ready && account.identityVerified;
-  const status = authenticated ? '已登录' : authorizing ? '等待网页授权' : account?.status === 'error' ? '连接失败' : '未登录';
+  const status = authenticated ? '已登录' : authorizing ? '等待网页授权' : account?.status === 'error' ? '连接失败' : account?.status === 'logged_out' ? '未登录' : '尚未检查';
   const credits = authenticated ? account?.credits : undefined;
   const total = typeof credits?.total === 'number' ? credits.total.toLocaleString() : authenticated ? '暂未读取' : '登录后显示';
   const details = [['member', '会员'], ['gift', '赠送'], ['purchase', '购买']].flatMap(([key, label]) => {
     const value = credits?.[key as keyof typeof credits];
     return typeof value === 'number' ? [label + ' ' + value.toLocaleString()] : [];
   });
-  return <section className="surface dreamina-account-card">
-    <div className="section-heading compact"><h3>即梦生成 CLI</h3><span className="muted">官方 OAuth 登录</span></div>
+  const busy = setupBusy || componentBusy || !!readiness?.busy;
+  const componentsReady = onRefreshComponents ? componentStatus?.installed === true : true;
+  const invalid = componentStatus?.components.some(component => component.state === 'invalid');
+  return <section className="surface dreamina-account-card" aria-label="即梦生成 CLI">
+    <div className="section-heading compact"><h3>即梦</h3><span className="muted">图片与视频渠道 · 官方 OAuth 登录</span></div>
+    {onRefreshComponents && <div className="channel-component-status" data-runtime-provider="dreamina"><div><span className="muted">即梦生成组件</span><strong>{componentBusy ? '正在检查组件…' : componentsReady ? `已安装${componentStatus?.components[0]?.version ? ' · ' + componentStatus.components[0].version : ''}` : invalid ? '组件需要修复' : componentStatus ? '未安装' : '尚未检查'}</strong></div><div className="actions"><Button executionAction="runtime.status" disabled={!writable || busy} onClick={onRefreshComponents}>检查组件</Button>{componentStatus && !componentsReady && !invalid && <Button executionAction="runtime.prepare" variant="primary" disabled={!writable || busy || !componentStatus.installSupported} onClick={onInstallComponents}>{setupBusy ? '正在安装…' : '安装组件'}</Button>}</div></div>}
+    {invalid && <p className="warning" role="status">{componentStatus?.components.find(component => component.state === 'invalid')?.message || '组件校验失败，请更新或修复客户端后重新检查。'}</p>}
     <div className="dreamina-session-summary">
       <div><span className="muted">登录状态</span><Badge status={authenticated ? 'available' : authorizing ? 'running' : 'not_configured'}>{status}</Badge></div>
       <div><span className="muted">账户额度</span><strong>{typeof credits?.total === 'number' ? '总额度 ' + total : total}</strong>{details.length > 0 && <small>（{details.join(' / ')}）</small>}</div>
@@ -59,47 +72,274 @@ export function DreaminaAccountCard({ workspace, writable, mutate, onError, read
     {authorizing && <p className="oauth-authorizing" role="status">请在即梦官方网页确认授权，完成后这里会自动更新。</p>}
     {account?.status === 'error' && <p className="control-hint" role="status">暂时无法读取账户，请刷新状态或点击 OAuth 登录重新授权。</p>}
     <div className="actions">
-      <Button executionAction={authorizing ? "dreamina.open_authorization" : "dreamina.login"} variant="primary" disabled={!writable} onClick={() => void mutate(authorizing ? 'dreamina.open_authorization' : 'dreamina.login', {}, '已调用默认浏览器，请在即梦官方网页确认授权。')}>{authorizing ? '打开授权页' : authenticated ? '重新登录' : 'OAuth 登录'}</Button>
+      <Button executionAction={authorizing ? "dreamina.open_authorization" : "dreamina.login"} variant="primary" disabled={!writable || busy || !componentsReady} onClick={() => void mutate(authorizing ? 'dreamina.open_authorization' : 'dreamina.login', {}, '已调用默认浏览器，请在即梦官方网页确认授权。')}>{authorizing ? '打开授权页' : authenticated ? '重新登录' : 'OAuth 登录'}</Button>
       {authorizing && account?.authorization?.verificationUrl && <Button icon="copy" onClick={() => void navigator.clipboard.writeText(account.authorization!.verificationUrl).catch(() => onError?.('复制失败，请点击打开授权页重试。'))}>复制授权链接</Button>}
-      {(authenticated || authorizing) && <Button disabled={!writable} onClick={() => setConfirmLogout(true)}>退出登录</Button>}
-      <Button executionAction="dreamina.status" icon="refresh" disabled={!writable} onClick={() => void mutate('dreamina.status', {}, '正在刷新即梦登录状态和积分。')}>刷新状态</Button>
+      {(authenticated || authorizing) && <Button disabled={!writable || busy} onClick={() => setConfirmLogout(true)}>退出登录</Button>}
+      <Button executionAction="dreamina.status" icon="refresh" disabled={!writable || busy || !componentsReady} onClick={() => void mutate('dreamina.status', {}, '正在刷新即梦登录状态和积分。')}>刷新登录状态</Button>
+      {readiness && <Button executionAction="readiness.check" data-readiness-provider="dreamina" icon="refresh" disabled={!writable || busy || !componentsReady || !!readiness.blocked} title={readiness.blocked || undefined} onClick={() => void readiness.check()}>{setupBusy && componentsReady ? '正在检查…' : '检查账户与模型'}</Button>}
     </div>
-    {readiness && <><ReadinessButton check={readiness} writable={writable}>检查账户与模型</ReadinessButton><ProviderReadinessResult check={readiness}/></>}
-    <p className="control-hint">使用即梦官方 OAuth 网页授权，完成后自动同步登录状态与积分。</p>
+    {setupBusy && <p className="control-hint" role="status">{componentsReady ? '正在读取账户与模型…' : '正在安装官方组件，请稍候。'}</p>}
+    {(setupError || readiness?.error) && <p className="warning" role="alert">{setupError || readiness?.error}</p>}
+    {readiness?.result?.catalog.state === 'available' && <p className="control-hint" role="status">已读取 {readiness.result.catalog.models.length} 个模型</p>}
+    <p className="control-hint">确认官方网页授权后，账户状态与额度会自动同步。</p>
+    {readiness && <details className="details channel-diagnostics"><summary>连接详情与模型目录</summary><ProviderReadinessResult check={readiness}/></details>}
     {confirmLogout && <Modal title="退出即梦登录" onClose={() => setConfirmLogout(false)}><p>即梦 CLI 与 SHUO 可能共享登录状态，退出后需要重新授权。项目和任务记录会保留。</p><div className="form-actions"><Button onClick={() => setConfirmLogout(false)}>取消</Button><Button executionAction="dreamina.logout" variant="caution" disabled={!writable} onClick={() => { setConfirmLogout(false); void mutate('dreamina.logout', {}, '已退出即梦登录。'); }}>退出登录</Button></div></Modal>}
   </section>;
 }
 
-export function SettingsPanel({ workspace, writable, mutate, onError }: Props) {
-  const [settings, setSettings] = useState<Settings>({ ...workspace.settings, bhToken: '', chromeToken: '', textApiKey: '' });
+export function SettingsPanel({ appSettings, writable, mutate, onError }: { appSettings: AppSettings; writable: boolean; mutate: GlobalMutation; onError?: (error: string) => void }) {
+  const cleanSettings = (value: Settings): Settings => ({ ...value, bhToken: '', chromeToken: '', textApiKey: '' });
+  const [settings, setSettings] = useState<Settings>(cleanSettings(appSettings.settings));
   const [tab, setTab] = useState('channels');
-  const dreaminaCheck = useProviderReadiness(workspace.project.id, 'dreamina', String(settings.dreaminaPath || ''), writable && tab === 'channels');
+  const [channelBusy, setChannelBusy] = useState(''), [channelError, setChannelError] = useState<{ provider: string; message: string } | null>(null), [saving, setSaving] = useState(false);
+  const [dreaminaComponents, setDreaminaComponents] = useState<RuntimeStatus | null>(null), [componentBusy, setComponentBusy] = useState(false);
+  const [chrome, setChrome] = useState<ChromeSetup | null>(null);
+  const chromeSequence = useRef(0);
+  const componentSequence = useRef(0);
+  const settingsRef = useRef(settings), writableRef = useRef(writable), revision = useRef(0), mounted = useRef(true);
+  const savedBase = useRef({ revision: appSettings.revision, settings: cleanSettings(appSettings.settings) });
+  const channelOperation = useRef<string | null>(null);
+  const saveQueue = useRef<Promise<void> | null>(null), savePending = useRef(0);
+  if (writableRef.current !== writable) {
+    writableRef.current = writable; revision.current++; channelOperation.current = null;
+  }
+  const dreaminaCheck = useProviderReadiness({ scope: 'global' }, 'dreamina', String(settings.dreaminaPath || ''), writable && tab === 'channels');
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; revision.current++; }; }, []);
+  useEffect(() => { if (writable && tab === 'channels') void refreshDreaminaComponents(); return () => { componentSequence.current++; }; }, [writable, tab, settings.dreaminaPath]);
+  useEffect(() => {
+    const sequence = ++chromeSequence.current, currentRevision = revision.current;
+    if (writable && tab === 'channels') void request({ action: 'chrome.status', scope: 'global' }).then(value => {
+      const status = chromeSetup(value);
+      if (mounted.current && sequence === chromeSequence.current && currentRevision === revision.current) setChrome(status);
+    }).catch(reason => { if (mounted.current && sequence === chromeSequence.current && currentRevision === revision.current) setChannelError({ provider: 'chrome', message: messageOf(reason) }); });
+    return () => { chromeSequence.current++; };
+  }, [writable, tab]);
+  useEffect(() => { setSettings(settingsRef.current); setChannelBusy(''); setChannelError(null); setSaving(savePending.current > 0); }, [writable]);
+  useEffect(() => {
+    if (savedBase.current.revision === appSettings.revision || savePending.current > 0) return;
+    if (JSON.stringify(settingsRef.current) !== JSON.stringify(savedBase.current.settings)) return;
+    savedBase.current = { revision: appSettings.revision, settings: cleanSettings(appSettings.settings) };
+    settingsRef.current = savedBase.current.settings; setSettings(settingsRef.current);
+  }, [appSettings.revision, appSettings.settings, saving]);
+  function updateFields(patch: Partial<Settings>) { settingsRef.current = { ...settingsRef.current, ...patch }; setSettings(settingsRef.current); }
+  function update(key: string, value: string) { updateFields({ [key]: value }); }
+  async function refreshDreaminaComponents() {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null) return;
+    const sequence = ++componentSequence.current, currentRevision = revision.current;
+    setComponentBusy(true); setChannelError(null);
+    try {
+      const status = await readRuntimeStatus({ scope: 'global' }, 'dreamina', settingsRef.current);
+      if (mounted.current && currentRevision === revision.current && sequence === componentSequence.current) setDreaminaComponents(status);
+    } catch (reason) {
+      if (mounted.current && currentRevision === revision.current && sequence === componentSequence.current) { setDreaminaComponents(null); setChannelError({ provider: 'dreamina', message: messageOf(reason) }); }
+    } finally {
+      if (mounted.current && currentRevision === revision.current && sequence === componentSequence.current) setComponentBusy(false);
+    }
+  }
+  function queueSettingsWrite<T>(operation: (currentRevision: number) => Promise<T>, cancelled: T): Promise<T> {
+    if (!mounted.current || !writableRef.current) return Promise.resolve(cancelled);
+    const currentRevision = revision.current;
+    savePending.current++; setSaving(true);
+    const run = async () => {
+      try {
+        if (!mounted.current || !writableRef.current || currentRevision !== revision.current) return cancelled;
+        return await operation(currentRevision);
+      } finally { savePending.current--; if (mounted.current) setSaving(savePending.current > 0); }
+    };
+    const result = saveQueue.current ? saveQueue.current.then(run, run) : run();
+    const tail = result.then(() => {}, () => {});
+    saveQueue.current = tail;
+    void tail.then(() => { if (saveQueue.current === tail) saveQueue.current = null; });
+    return result;
+  }
+  function saveSettings(override?: Partial<Settings>) {
+    return queueSettingsWrite(async currentRevision => {
+      // Read the draft and CAS revision when this write starts, after earlier
+      // channel saves/auto-discovery have adopted their acknowledged revision.
+      const submitted = { ...settingsRef.current, ...override }, values = { ...submitted };
+      settingsRef.current = submitted; setSettings(submitted);
+      for (const key of ['bhToken', 'chromeToken', 'textApiKey']) if (!values[key]) delete values[key];
+      try {
+        const next = await mutate('settings.global.save', { settings: values, expectedRevision: savedBase.current.revision }, '软件渠道与执行设置已保存。');
+        if (!next || !mounted.current || currentRevision !== revision.current) return false;
+        // Keep edits made while the save was in flight, including newly typed credentials.
+        const laterEdits = Object.fromEntries(Object.entries(settingsRef.current).filter(([key, value]) => !Object.is(value, submitted[key])));
+        savedBase.current = { revision: next.revision, settings: cleanSettings(next.settings) };
+        settingsRef.current = { ...savedBase.current.settings, ...laterEdits };
+        setSettings(settingsRef.current); return true;
+      } catch (reason) {
+        if (mounted.current && currentRevision === revision.current) onError?.(messageOf(reason));
+        return false;
+      }
+    }, false);
+  }
+  async function connectDreamina(action?: Parameters<Mutation>[0], values?: Parameters<Mutation>[1], notice?: string) {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null || (action ? actionBlockReason(action) : dreaminaCheck.blocked)) return null;
+    const currentRevision = revision.current;
+    if (action === 'dreamina.login') { invalidateProviderReadiness(['dreamina']); dreaminaCheck.reset(); }
+    channelOperation.current = 'dreamina'; setChannelBusy('dreamina'); setChannelError(null);
+    try {
+      const status = await readRuntimeStatus({ scope: 'global' }, 'dreamina', settingsRef.current);
+      if (!mounted.current || currentRevision !== revision.current) return null;
+      setDreaminaComponents(status);
+      if (!status.installed) throw new Error('请先安装或修复即梦生成组件，再登录或检查账户。');
+      const patch = status.settings;
+      if (!mounted.current || currentRevision !== revision.current || !await saveSettings(patch)) return null;
+      if (!mounted.current || currentRevision !== revision.current) return null;
+      if (action) return await mutate(action, values, notice);
+      const report = await dreaminaCheck.checkPrepared(patch);
+      if (!report || !mounted.current || currentRevision !== revision.current) return null;
+      return await mutate('dreamina.status', {}, '已刷新即梦账户与模型。');
+    } catch (reason) {
+      if (mounted.current && currentRevision === revision.current) setChannelError({ provider: 'dreamina', message: messageOf(reason) });
+      return null;
+    } finally {
+      if (mounted.current && currentRevision === revision.current) { channelOperation.current = null; setChannelBusy(''); }
+    }
+  }
+  async function installDreaminaComponents() {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null || actionBlockReason('runtime.prepare') || !dreaminaComponents || dreaminaComponents.installed || !dreaminaComponents.installSupported || dreaminaComponents.components.some(component => component.state === 'invalid')) return;
+    const currentRevision = revision.current;
+    channelOperation.current = 'dreamina'; setChannelBusy('dreamina'); setChannelError(null);
+    try {
+      const patch = await prepareRuntime({ scope: 'global' }, 'dreamina', settingsRef.current);
+      if (!mounted.current || currentRevision !== revision.current) return;
+      const status = await readRuntimeStatus({ scope: 'global' }, 'dreamina', { ...settingsRef.current, ...patch });
+      if (!mounted.current || currentRevision !== revision.current) return;
+      setDreaminaComponents(status);
+      if (!status.installed) throw new Error('组件安装尚未通过校验，请重新检查组件。');
+      if (!await saveSettings(status.settings) || !mounted.current || currentRevision !== revision.current) return;
+      await mutate('dreamina.status', {}, '即梦组件已安装，已刷新登录状态。');
+    } catch (reason) {
+      if (mounted.current && currentRevision === revision.current) setChannelError({ provider: 'dreamina', message: messageOf(reason) });
+    } finally {
+      if (mounted.current && currentRevision === revision.current) { channelOperation.current = null; setChannelBusy(''); }
+    }
+  }
+  const dreaminaMutation: GlobalMutation = (action, values, notice) => {
+    if (['dreamina.login', 'dreamina.status'].includes(action)) return connectDreamina(action, values, notice);
+    if (action === 'dreamina.logout') { invalidateProviderReadiness(['dreamina']); dreaminaCheck.reset(); }
+    return mutate(action, values, notice);
+  };
+  async function checkProvider(provider: string) {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null || actionBlockReason(provider === 'chrome' ? 'chrome.check' : 'providers.refresh')) return;
+    const currentRevision = revision.current;
+    channelOperation.current = provider; setChannelBusy(provider); setChannelError(null);
+    try {
+      if (!await saveSettings() || !mounted.current || currentRevision !== revision.current) return;
+      if (provider === 'chrome') {
+        const status = chromeSetup(await request({ action: 'chrome.check', scope: 'global' }));
+        if (!mounted.current || currentRevision !== revision.current) return;
+        setChrome(status);
+        if (!['ready', 'busy'].includes(status.status)) return;
+      }
+      await mutate('providers.refresh', { provider }, '已检查当前配置并更新模型目录。');
+    } catch (reason) {
+      if (mounted.current && currentRevision === revision.current) setChannelError({ provider, message: messageOf(reason) });
+    } finally {
+      if (mounted.current && currentRevision === revision.current) { channelOperation.current = null; setChannelBusy(''); }
+    }
+  }
+  async function connectChrome(action: 'chrome.connect' | 'chrome.open', values: { sourceConfigPath?: string } = {}) {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null || actionBlockReason(action)) return;
+    const currentRevision = revision.current;
+    channelOperation.current = 'chrome'; setChannelBusy('chrome'); setChannelError(null);
+    try {
+      const connected = await queueSettingsWrite(async () => {
+        const next = await mutate(action, values, action === 'chrome.open' ? '已请求打开专用浏览器，请在网页完成登录。' : '已检查本机 Chrome 组件，请查看连接状态。');
+        if (!next || !mounted.current || currentRevision !== revision.current) return false;
+        // Connecting can update the global revision itself. Adopt it inside
+        // the write queue before another channel saves its discovered paths.
+        const edits = Object.fromEntries(Object.entries(settingsRef.current).filter(([key, value]) => !Object.is(value, savedBase.current.settings[key]) && (action !== 'chrome.connect' || !['chromeEndpoint', 'chromeAccountId', 'chromeToken'].includes(key))));
+        savedBase.current = { revision: next.revision, settings: cleanSettings(next.settings) };
+        settingsRef.current = { ...savedBase.current.settings, ...edits }; setSettings(settingsRef.current);
+        return true;
+      }, false);
+      if (!connected || !mounted.current || currentRevision !== revision.current) return;
+      const status = chromeSetup(await request({ action: 'chrome.status', scope: 'global' }));
+      if (mounted.current && currentRevision === revision.current) setChrome(status);
+    } catch (reason) { if (mounted.current && currentRevision === revision.current) setChannelError({ provider: 'chrome', message: messageOf(reason) }); }
+    finally { if (mounted.current && currentRevision === revision.current) { channelOperation.current = null; setChannelBusy(''); } }
+  }
+  async function importChromeConfiguration() {
+    if (!mounted.current || !writableRef.current || channelOperation.current !== null || actionBlockReason('chrome.connect')) return;
+    const currentRevision = revision.current;
+    channelOperation.current = 'chrome-import'; setChannelBusy('chrome'); setChannelError(null);
+    try {
+      const paths = await choose('file');
+      if (!mounted.current || currentRevision !== revision.current) return;
+      channelOperation.current = null; setChannelBusy('');
+      if (paths[0]) await connectChrome('chrome.connect', { sourceConfigPath: paths[0] });
+    } catch (reason) { if (mounted.current && currentRevision === revision.current) setChannelError({ provider: 'chrome', message: messageOf(reason) }); }
+    finally { if (mounted.current && currentRevision === revision.current && channelOperation.current === 'chrome-import') { channelOperation.current = null; setChannelBusy(''); } }
+  }
+  async function save(event: FormEvent) { event.preventDefault(); await saveSettings(); }
+  const settingsConflict = !saving && savedBase.current.revision !== appSettings.revision && JSON.stringify(settings) !== JSON.stringify(savedBase.current.settings);
+  function reloadSettingsDraft() {
+    if (saving || channelBusy) return;
+    savedBase.current = { revision: appSettings.revision, settings: cleanSettings(appSettings.settings) };
+    settingsRef.current = savedBase.current.settings; setSettings(settingsRef.current); setChannelError(null);
+  }
+  return <div className="settings-page"><div className="stage-intro"><div><h2>软件渠道与账户</h2><p>本机所有项目共用连接设置。项目的画风、尺寸与备份在“制作设置”中调整。</p></div><div className="segmented">{[['channels', '渠道'], ['rules', '规则版本']].map(([id, label]) => <button key={id} aria-pressed={tab === id} onClick={() => setTab(id)}>{label}</button>)}</div></div>
+    {settingsConflict && <div className="warning" role="status">软件设置已在别处更新，当前未保存内容仍保留。<Button disabled={!!channelBusy} onClick={reloadSettingsDraft}>放弃本页修改并载入最新设置</Button></div>}
+    <form onSubmit={event => void save(event)}>
+    {tab === 'channels' && <div className="channel-settings-layout">
+      <TextExecutionSettings requestScope={{ scope: 'global' }} settings={settings} writable={writable && !channelBusy && !saving} connectionAllowed={writable} update={update} saveSettings={saveSettings} onError={onError}/>
+      <DreaminaAccountCard account={appSettings.dreaminaAccount} writable={writable && !saving && (!channelBusy || channelBusy === 'dreamina')} mutate={dreaminaMutation} onError={onError} readiness={{ ...dreaminaCheck, check: async () => { await connectDreamina(); return undefined; } }} setupBusy={channelBusy === 'dreamina'} setupError={channelError?.provider === 'dreamina' ? channelError.message : ''} componentStatus={dreaminaComponents} componentBusy={componentBusy} onRefreshComponents={() => void refreshDreaminaComponents()} onInstallComponents={() => void installDreaminaComponents()}/>
+      <div className="channel-provider-grid">{providerList(appSettings).filter(provider => ['bh', 'chrome'].includes(providerId(provider))).sort((a, b) => (providerId(a) === 'bh' ? 0 : 1) - (providerId(b) === 'bh' ? 0 : 1)).map(provider => {
+        const id = providerId(provider), isBh = id === 'bh', title = isBh ? 'BH API' : 'Chrome 网页';
+        const accountKey = isBh ? 'bhAccountId' : 'chromeAccountId', endpointKey = isBh ? 'bhEndpoint' : 'chromeEndpoint', tokenKey = isBh ? 'bhToken' : 'chromeToken';
+        const changed = [accountKey, endpointKey].some(key => String(settings[key] || '') !== String(appSettings.settings[key] || '')) || !!settings[tokenKey];
+        const credentialBlocked = actionBlockReason({ action: 'settings.global.save', settings: { [tokenKey]: 'credential' } });
+        const configuration = <div className="channel-configuration">
+          <label>服务地址<input aria-label={`${title} 服务地址`} value={String(settings[endpointKey] || '')} onChange={event => update(endpointKey, event.target.value)} placeholder={isBh ? 'https://…' : 'http://127.0.0.1:…'}/></label>
+          <label>{isBh ? 'API 凭据' : '执行器凭据'}<input aria-label={`${title} 凭据`} disabled={!writable || !!credentialBlocked} title={credentialBlocked || undefined} type="password" autoComplete="new-password" value={String(settings[tokenKey] || '')} onChange={event => update(tokenKey, event.target.value)} placeholder="留空保留已保存凭据"/></label>
+          {isBh && <details className="details"><summary>账户标识</summary><label>账户名称<input aria-label="BH API 账户名称" value={String(settings.bhAccountId || '')} onChange={event => update('bhAccountId', event.target.value)} placeholder="例如：BH 主账户"/></label><p className="control-hint">同一账户保留这个名称；更换账户时改用新名称。</p></details>}
+        </div>;
+        return <section className="surface channel-provider-card" key={id} aria-label={title}>
+          <div className="section-heading compact"><h3>{title}</h3><Badge status={changed ? 'draft' : !isBh && chrome ? chrome.status === 'ready' ? 'available' : chrome.status : provider.available ? 'available' : provider.status || 'not_configured'}>{changed ? '有未检查的修改' : !isBh && chrome ? ({ ready: '已连接', busy: '网页正忙', waiting_browser: '等待网页连接', offline: '组件未运行', unconfigured: '尚未连接', needs_selection: '需要选择网页', error: '连接异常' }[chrome.status]) : undefined}</Badge></div>
+          <p className="muted">{changed ? '保存并检查后更新连接状态。' : !isBh && chrome ? chrome.message : provider.message || (provider.configured ? '已保存配置' : isBh ? '填写服务地址和凭据后连接。' : '连接本机 Chrome 组件，在专用浏览器登录后用于网页出图。')}</p>
+          {!isBh && <><div className="channel-component-status"><span>{chrome?.installed ? `本机组件已安装${chrome.componentVersion ? ' · ' + chrome.componentVersion : ''}` : chrome ? '未找到本机组件' : '正在检查本机组件…'}</span><span className="muted">{chrome?.usableClients ? `${chrome.usableClients} 个网页可用` : '尚无可用网页'}</span></div><div className="actions"><Button executionAction="chrome.connect" data-chrome-connect icon="refresh" disabled={!writable || saving || !!channelBusy} onClick={() => void connectChrome('chrome.connect')}>{channelBusy === 'chrome' ? '正在处理…' : '连接本机 Chrome'}</Button><Button executionAction="chrome.open" disabled={!writable || saving || !!channelBusy || !chrome?.installed} onClick={() => void connectChrome('chrome.open')}>打开专用浏览器</Button></div></>}
+          {!isBh && chrome?.checkedAt && <p className="control-hint">上次检查：{formatDate(chrome.checkedAt)}</p>}
+          {isBh ? configuration : <details className="details"><summary>手动连接设置</summary><Button executionAction="chrome.connect" data-chrome-import icon="upload" disabled={!writable || saving || !!channelBusy} onClick={() => void importChromeConfiguration()}>导入已有连接配置</Button><p className="control-hint">选择旧版的 bridge.env，直接恢复连接，无需复制凭据。</p>{configuration}</details>}
+          {channelError?.provider === id && <p className="warning" role="alert">{channelError.message}</p>}
+          <div className="actions"><Button executionAction={isBh ? 'providers.refresh' : 'chrome.check'} data-provider-check={id} icon="refresh" disabled={!writable || saving || !!channelBusy} onClick={() => void checkProvider(id)}>{channelBusy === id ? '正在检查…' : changed ? '保存并检查连接' : '检查连接与模型'}</Button></div>
+          {!isBh && chrome?.extensionPath && <details className="details"><summary>组件详情</summary><p className="path-value">浏览器扩展：{chrome.extensionPath}</p></details>}
+          {!!provider.models?.length && <details className="details"><summary>模型目录 · {provider.models.length} 个模型{changed ? '（上次检查）' : ''}</summary><ul className="model-list">{provider.models.map((model, index) => <li key={typeof model === 'string' ? model : model.id || index}>{typeof model === 'string' ? model : model.name || model.id}<small>{typeof model === 'object' ? costText(model.price) : '价格未知'}</small></li>)}</ul></details>}
+          {!!provider.capabilities && <JsonDetails title="连接诊断" value={provider.capabilities}/>}
+        </section>;
+      })}</div>
+    </div>}
+    {tab === 'rules' && <CreativeRules rules={appSettings.rules}/>}
+    {tab !== 'rules' && <div className="form-actions settings-save"><Button type="submit" variant="primary" icon="check" disabled={!writable || saving || !!channelBusy}>{saving ? '正在保存…' : '保存软件设置'}</Button></div>}
+    </form>
+  </div>;
+}
+
+export function ProjectSettingsPanel({ workspace, writable, mutate, onError }: Props) {
+  const [settings, setSettings] = useState<Settings>({ ...workspace.settings });
+  function updateFields(patch: Partial<Settings>) { setSettings(current => ({ ...current, ...patch })); }
+  function update(key: string, value: string) { updateFields({ [key]: value }); }
   const imageParameters = { model: String(settings.imageModel || ''), ratio: String(settings.ratio ?? '16:9'), resolution: String(settings.imageResolution ?? '2k') }, videoParameters = { model: String(settings.videoModel || ''), ratio: String(settings.ratio ?? '16:9'), resolution: String(settings.videoResolution ?? '720p') };
   const imageChoices = generationChoices(workspace, String(settings.imageProvider || 'dreamina'), 'image', imageParameters), videoChoices = generationChoices(workspace, String(settings.videoProvider || 'dreamina'), 'video', videoParameters);
   const defaultProblems = [...(imageParameters.model ? imageChoices.problems.map(problem => '图片：' + problem) : []), ...(videoParameters.model ? videoChoices.problems.map(problem => '视频：' + problem) : [])], commonRatios = imageChoices.selected && videoChoices.selected ? imageChoices.ratios.filter(ratio => videoChoices.ratios.includes(ratio)) : imageChoices.selected ? imageChoices.ratios : videoChoices.ratios;
-  useEffect(() => { setSettings({ ...workspace.settings, bhToken: '', chromeToken: '', textApiKey: '' }); }, [workspace.project.id]);
-  function update(key: string, value: string) { setSettings(current => ({ ...current, [key]: value })); }
-  async function saveSettings() { const values = { ...settings }; for (const key of ['bhToken', 'chromeToken', 'textApiKey']) if (!values[key]) delete values[key]; const next = await mutate('settings.save', { settings: values }, '本机渠道与执行设置已保存。'); if (!next) return false; setSettings({ ...next.settings, bhToken: '', chromeToken: '', textApiKey: '' }); return true; }
-  async function save(event: FormEvent) { event.preventDefault(); if (tab === 'execution' && defaultProblems.length) { onError?.(defaultProblems.join(' ')); return; } await saveSettings(); }
+  async function save(event: FormEvent) {
+    event.preventDefault(); if (!writable || defaultProblems.length) return;
+    const keys = ['projectVisualStyle', 'visualStyle', 'productionDirection', 'productionDirectionConfirmed', 'imagePresentation', 'fantasyMode', 'requireFantasyReview', 'imageProvider', 'imageModel', 'imageResolution', 'videoProvider', 'videoModel', 'videoResolution', 'ratio'];
+    const patch = Object.fromEntries(keys.filter(key => Object.hasOwn(settings, key)).map(key => [key, settings[key]]));
+    const next = await mutate('settings.save', { settings: patch }, '此项目的制作设置已保存。');
+    if (next) setSettings({ ...next.settings });
+  }
   async function restoreBackup() { try { const paths = await choose('file'); if (paths[0]) await mutate('backup.restore', { path: paths[0] }, '项目备份已恢复，请核对版本与媒体。'); } catch (reason) { onError?.(messageOf(reason)); } }
-  return <div className="settings-page"><div className="stage-intro"><div><h2>连接一次，按项目制作</h2><p>模型与能力由渠道核实。凭据只在本机配置，不进入项目导出。</p></div><div className="segmented">{[['channels', '渠道'], ['execution', '执行与保存'], ['rules', '规则版本']].map(([id, label]) => <button key={id} aria-pressed={tab === id} onClick={() => setTab(id)}>{label}</button>)}</div></div>
-    <form onSubmit={event => void save(event)}>
-    {tab === 'channels' && <><DreaminaAccountCard workspace={workspace} writable={writable} mutate={mutate} onError={onError} readiness={dreaminaCheck}/><DreaminaCanvasReadiness projectId={workspace.project.id} path={String(settings.dreaminaCanvasPath || "")} writable={writable} update={update}/><div className="provider-grid">{providerList(workspace).filter(provider => providerId(provider) !== 'dreamina').map(provider => <section className="surface provider-card" key={providerId(provider)}><div className="section-heading compact"><h3>{provider.name || providerName(providerId(provider))}</h3><Badge status={provider.available ? 'available' : provider.status || 'not_configured'}/></div><p className="muted">{provider.message || (provider.configured ? '已保存本机配置' : '保存配置后检查连接')}</p><div className="actions"><Button executionAction="providers.refresh" icon="refresh" disabled={!writable} onClick={() => void mutate('providers.refresh', { provider: providerId(provider) }, '已刷新渠道能力与模型目录。')}>检查连接与模型</Button></div>{provider.models?.length ? <details className="details"><summary>{provider.models.length} 个模型</summary><ul className="model-list">{provider.models.map((model, index) => <li key={typeof model === 'string' ? model : model.id || index}>{typeof model === 'string' ? model : model.name || model.id}<small>{typeof model === 'object' ? costText(model.price) : '价格未知'}</small></li>)}</ul></details> : null}{(provider.capabilities || provider.models?.length) ? <JsonDetails title="已核实的渠道能力" value={provider.capabilities || provider}/> : null}</section>)}</div>
-      <div className="settings-grid"><TextExecutionSettings workspace={workspace} settings={settings} writable={writable} update={update} saveSettings={saveSettings} onError={onError}/>
-      <details className="surface dreamina-advanced"><summary>即梦生成 CLI 高级设置</summary><label>CLI 路径<input value={settings.dreaminaPath || ''} onChange={event => update('dreaminaPath', event.target.value)} placeholder="填写已安装即梦生成 CLI 的完整路径"/></label><p className="control-hint">使用当前输入路径检查账户与模型，无需先保存。实际生成使用保存后的路径，请在检查通过后保存设置。</p><ReadinessButton check={dreaminaCheck} writable={writable}>更新模型目录</ReadinessButton></details>
-      <section className="surface"><h3>BH API</h3><label>稳定账户标签<input value={String(settings.bhAccountId || '')} onChange={event => update('bhAccountId', event.target.value)} placeholder="例如：BH 主账户；准备前必填"/></label><p className="muted">给同一个 BH 账户固定命名。API Token 轮换时保留标签；更换账户时使用新标签。此标签用于核对任务归属。</p><label>服务地址<input value={settings.bhEndpoint || ''} onChange={event => update('bhEndpoint', event.target.value)} placeholder="https://…"/></label><label>本机 API 凭据<input disabled={!!actionBlockReason('textCli.login')} title={actionBlockReason('textCli.login') || undefined} type="password" autoComplete="new-password" value={settings.bhToken || ''} onChange={event => update('bhToken', event.target.value)} placeholder="留空保留已保存凭据"/></label></section>
-      <section className="surface"><h3>Chrome 图片执行器</h3><label>稳定账户标签<input value={String(settings.chromeAccountId || '')} onChange={event => update('chromeAccountId', event.target.value)} placeholder="例如：Chrome 图片账户；准备前必填"/></label><label>本机执行器地址<input value={settings.chromeEndpoint || ''} onChange={event => update('chromeEndpoint', event.target.value)} placeholder="http://127.0.0.1:…"/></label><label>执行器凭据<input disabled={!!actionBlockReason('textCli.login')} title={actionBlockReason('textCli.login') || undefined} type="password" autoComplete="new-password" value={settings.chromeToken || ''} onChange={event => update('chromeToken', event.target.value)} placeholder="留空保留已保存凭据"/></label><p className="muted">连接已登录的网页出图执行器，生成结果会自动设为当前图片，旧图保留在历史中。</p></section></div></>}
-    {tab === 'execution' && <div className="settings-grid"><section className="surface"><h3>制作默认值</h3><ProductionSettings settings={settings} writable={writable} onChange={patch => setSettings(current => ({ ...current, ...patch }))}/><div className="form-grid">
-      <label>图片渠道<select value={settings.imageProvider || 'dreamina'} onChange={event => setSettings(current => ({ ...current, imageProvider: event.target.value, imageModel: '', imageResolution: '' }))}><option value="dreamina">即梦官方 CLI</option><option value="bh">BH API</option><option value="chrome">Chrome 网页</option></select></label>
+  return <div className="settings-page project-settings-page"><div className="stage-intro"><div><h2>项目制作设置</h2><p>仅用于当前项目。渠道和账户请在软件设置中配置。</p></div></div><form onSubmit={event => void save(event)}>
+    <div className="settings-grid"><section className="surface"><h3>制作默认值</h3><ProductionSettings settings={settings} writable={writable} onChange={updateFields}/><div className="form-grid">
+      <label>图片渠道<select value={settings.imageProvider || 'dreamina'} onChange={event => updateFields({ imageProvider: event.target.value, imageModel: '', imageResolution: '' })}><option value="dreamina">即梦官方 CLI</option><option value="bh">BH API</option><option value="chrome">Chrome 网页</option></select></label>
       <label>图片模型<select value={imageParameters.model} onChange={event => update('imageModel', event.target.value)}><option value="">选择图片模型</option>{imageParameters.model && !imageChoices.models.some(item => item.id === imageParameters.model) && <option value={imageParameters.model}>{imageParameters.model} · 请重新选择</option>}{imageChoices.models.map(item => <option key={item.id} value={item.id} disabled={item.adapted !== true || item.available === false}>{item.name || item.id}{item.adapted !== true ? ' · 待适配' : ''}</option>)}</select></label>
       <label>图片尺寸<select value={imageParameters.resolution} onChange={event => update('imageResolution', event.target.value)}><option value="">选择图片尺寸</option>{imageParameters.resolution && !imageChoices.resolutions.includes(imageParameters.resolution) && <option value={imageParameters.resolution}>{imageParameters.resolution} · 请重新选择</option>}{imageChoices.resolutions.map(value => <option key={value} value={value}>{resolutionLabel(value, 'image')}</option>)}</select></label>
-      <label>视频渠道<select value={settings.videoProvider || 'dreamina'} onChange={event => setSettings(current => ({ ...current, videoProvider: event.target.value, videoModel: '', videoResolution: '' }))}><option value="dreamina">即梦官方 CLI</option><option value="bh">BH API</option></select></label>
+      <label>视频渠道<select value={settings.videoProvider || 'dreamina'} onChange={event => updateFields({ videoProvider: event.target.value, videoModel: '', videoResolution: '' })}><option value="dreamina">即梦官方 CLI</option><option value="bh">BH API</option></select></label>
       <label>视频模型<select value={videoParameters.model} onChange={event => update('videoModel', event.target.value)}><option value="">选择视频模型</option>{videoParameters.model && !videoChoices.models.some(item => item.id === videoParameters.model) && <option value={videoParameters.model}>{videoParameters.model} · 请重新选择</option>}{videoChoices.models.map(item => <option key={item.id} value={item.id} disabled={item.adapted !== true || item.available === false}>{item.name || item.id}{item.adapted !== true ? ' · 待适配' : ''}</option>)}</select></label>
       <label>视频尺寸<select value={videoParameters.resolution} onChange={event => update('videoResolution', event.target.value)}><option value="">选择视频尺寸</option>{videoParameters.resolution && !videoChoices.resolutions.includes(videoParameters.resolution) && <option value={videoParameters.resolution}>{videoParameters.resolution} · 请重新选择</option>}{videoChoices.resolutions.map(value => <option key={value} value={value}>{resolutionLabel(value, 'video')}</option>)}</select></label>
-    </div><label>画面比例<select value={imageParameters.ratio} onChange={event => update('ratio', event.target.value)}><option value="">选择共同可用比例</option>{imageParameters.ratio && !commonRatios.includes(imageParameters.ratio) && <option value={imageParameters.ratio}>{imageParameters.ratio} · 请重新选择</option>}{commonRatios.map(value => <option key={value} value={value}>{ratioLabel(value)}</option>)}</select></label>{defaultProblems.length > 0 && <p className="warning">{defaultProblems.join(' ')}</p>}<p className="control-hint">比例按所选图片与视频模型的共同能力列出。尺寸无效时请明确重新选择；保存不会自动降级。</p><div className="note">文本全局 4 路，同集最多 2 路；视频与 Chrome 图片初始每渠道 1 路。连续状态依赖优先。</div></section><section className="surface"><h3>备份与项目目录</h3><p className="path-value">{workspace.project.rootPath || '本机项目目录'}</p><p className="muted">内容变化后每 15 分钟备份。保留 48 份状态快照、2 个检查点，自动备份总量不超过 2 GiB。</p><div className="actions"><Button executionAction="backup.create" icon="download" disabled={!writable} onClick={() => void mutate('backup.create', {}, '一致性备份已创建。')}>立即备份</Button><Button icon="upload" disabled={!writable} onClick={() => void restoreBackup()}>恢复备份</Button></div><p className="muted">原始图片、音频与视频不参与自动清理。</p></section></div>}
-    {tab === 'rules' && <CreativeRules rules={workspace.rules}/>}
-    {tab !== 'rules' && <div className="form-actions settings-save"><Button type="submit" variant="primary" icon="check" disabled={!writable || tab === 'execution' && defaultProblems.length > 0}>保存本机设置</Button></div>}
-    </form>
-    {Boolean(workspace.diagnostics) && <JsonDetails title="诊断与能力记录" value={workspace.diagnostics}/>}
-  </div>;
+    </div><label>画面比例<select value={imageParameters.ratio} onChange={event => update('ratio', event.target.value)}><option value="">选择共同可用比例</option>{imageParameters.ratio && !commonRatios.includes(imageParameters.ratio) && <option value={imageParameters.ratio}>{imageParameters.ratio} · 请重新选择</option>}{commonRatios.map(value => <option key={value} value={value}>{ratioLabel(value)}</option>)}</select></label>{defaultProblems.length > 0 && <p className="warning">{defaultProblems.join(' ')}</p>}<p className="control-hint">比例按所选图片与视频模型的共同能力列出。尺寸无效时请明确重新选择；保存不会自动降级。</p><div className="note">文本全局 4 路，同集最多 2 路；视频与 Chrome 图片初始每渠道 1 路。连续状态依赖优先。</div></section><section className="surface"><h3>备份与项目目录</h3><p className="path-value">{workspace.project.rootPath || '本机项目目录'}</p><p className="muted">内容变化后每 15 分钟备份。保留 48 份状态快照、2 个检查点，自动备份总量不超过 2 GiB。</p><div className="actions"><Button executionAction="backup.create" icon="download" disabled={!writable} onClick={() => void mutate('backup.create', {}, '一致性备份已创建。')}>立即备份</Button><Button icon="upload" disabled={!writable} onClick={() => void restoreBackup()}>恢复备份</Button></div><p className="muted">原始图片、音频与视频不参与自动清理。</p></section></div>
+    <div className="form-actions settings-save"><Button type="submit" variant="primary" icon="check" disabled={!writable || defaultProblems.length > 0}>保存项目设置</Button></div>
+  </form></div>;
 }

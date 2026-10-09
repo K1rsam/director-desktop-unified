@@ -5,6 +5,10 @@ use std::path::Path;
 
 pub const OFFLINE_ACTIONS: &[&str] = &[
     "getExecutionPolicy",
+    "settings.global.get",
+    "settings.global.save",
+    "runtime.status",
+    "chrome.status",
     "readiness.check",
     "textSdk.status",
     "images.previewPrompt",
@@ -47,6 +51,8 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
 ];
 pub const CREDENTIAL_FIELDS: &[&str] = &["bhToken", "chromeToken", "textApiKey"];
 pub const STANDARD_ACTIONS: &[&str] = &[
+    "chrome.connect", "chrome.check", "chrome.open",
+    "runtime.prepare",
     "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
     "workflows.resume", "providers.refresh", "videos.preflight", "videos.prepare", "videos.submit",
     "jobs.query", "jobs.download", "jobs.reconcile", "textCli.status", "textCli.login",
@@ -92,7 +98,7 @@ pub fn check(request: &Value) -> Result<(), String> {
             "OFFLINE_EXECUTION_BLOCKED: {action} 需要单独启用并验证的本地执行入口"
         ));
     }
-    if action == "settings.save"
+    if ["settings.save", "settings.global.save"].contains(&action)
         && CREDENTIAL_FIELDS.iter().any(|field| {
             request["settings"]
                 .get(field)

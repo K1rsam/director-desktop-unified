@@ -3,9 +3,25 @@ import { request } from './api';
 import { actionBlockReason, currentExecutionPolicy, hasSdkExecutionCapability, subscribeExecutionPolicy } from './executionPolicy';
 import type { ExecutionPolicy, ReadinessProvider } from './executionPolicy';
 import { Button, formatDate, messageOf } from './components';
-import type { ProviderReadinessReport } from './types';
+import type { ProviderReadinessReport, Settings } from './types';
+import { settingsRequestScope, type SettingsRequestScope } from './runtimeSetup';
 
 const pathKeys = { codex_cli: 'codexPath', dreamina: 'dreaminaPath', dreamina_canvas: 'dreaminaCanvasPath', codex_sdk: 'textSdkNodePath' } as const;
+
+// Session-only observations, never credentials or persisted authorization.
+// Returning to software settings may display the last check; clicking check
+// always performs IPC again. Project-scoped checks never use this cache.
+const globalReports = new Map<ReadinessProvider, { key: string; report: ProviderReadinessReport }>();
+const globalGenerations = new Map<ReadinessProvider, number>(), globalListeners = new Set<() => void>();
+let globalRevision = 0;
+const generationOf = (provider: ReadinessProvider) => globalGenerations.get(provider) || 0;
+const notifyGlobalReadiness = () => { globalRevision++; for (const listener of globalListeners) listener(); };
+const subscribeGlobalReadiness = (listener: () => void) => { globalListeners.add(listener); return () => { globalListeners.delete(listener); }; };
+const globalReadinessSnapshot = () => globalRevision;
+export function invalidateProviderReadiness(providers: ReadinessProvider[]): void {
+  for (const provider of providers) { globalReports.delete(provider); globalGenerations.set(provider, generationOf(provider) + 1); }
+  notifyGlobalReadiness();
+}
 
 export function sdkReadinessAllowsExecution(report: ProviderReadinessReport | null, policy: ExecutionPolicy = currentExecutionPolicy()): boolean {
   return hasSdkExecutionCapability(policy) && report?.provider === 'codex_sdk'
@@ -43,38 +59,61 @@ export function validateProviderReadiness(value: unknown, provider: ReadinessPro
   return report;
 }
 
-type CheckState = { scope: string; attempt: number; busy: boolean; result: ProviderReadinessReport | null; error: string };
-export function useProviderReadiness(projectId: string, provider: ReadinessProvider, path: string, enabled = true, sdkSettings?: { codexPath: string }) {
+type CheckState = { scope: string; attempt: number; generation: number; busy: boolean; result: ProviderReadinessReport | null; error: string };
+export function useProviderReadiness(target: SettingsRequestScope | string, provider: ReadinessProvider, path: string, enabled = true, sdkSettings?: { codexPath: string }) {
   useSyncExternalStore(subscribeExecutionPolicy, currentExecutionPolicy, currentExecutionPolicy);
-  const codexPath = provider === 'codex_sdk' ? sdkSettings?.codexPath : undefined;
-  const scope = JSON.stringify([projectId, provider, path, enabled, codexPath]);
+  useSyncExternalStore(subscribeGlobalReadiness, globalReadinessSnapshot, globalReadinessSnapshot);
+  const requestScope = settingsRequestScope(target), requestScopeKey = JSON.stringify(requestScope);
+  const codexPath = provider === 'codex_sdk' ? sdkSettings?.codexPath ?? '' : undefined;
+  const global = 'scope' in requestScope, cacheKey = JSON.stringify([provider, path, codexPath]);
+  const scope = JSON.stringify([requestScopeKey, provider, path, enabled, codexPath]);
   const currentScope = useRef(scope), sequence = useRef(0), inFlight = useRef<string | null>(null), mounted = useRef(true);
-  if (currentScope.current !== scope) { currentScope.current = scope; sequence.current++; inFlight.current = null; }
-  const [state, setState] = useState<CheckState>({ scope, attempt: sequence.current, busy: false, result: null, error: '' });
+  const preparedTransition = useRef<{ from: string; to: string; attempt: number } | null>(null);
+  if (currentScope.current !== scope) {
+    const transition = preparedTransition.current;
+    if (!transition || transition.from !== currentScope.current || transition.to !== scope || transition.attempt !== sequence.current) {
+      sequence.current++; inFlight.current = null;
+    }
+    currentScope.current = scope; preparedTransition.current = null;
+  }
+  const [state, setState] = useState<CheckState>({ scope, attempt: sequence.current, generation: generationOf(provider), busy: false, result: null, error: '' });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current++; inFlight.current = null; }; }, []);
+  useEffect(() => { const saved = globalReports.get(provider); if (global && saved && saved.key !== cacheKey) invalidateProviderReadiness([provider]); }, [global, provider, cacheKey]);
   const blocked = actionBlockReason({ action: 'readiness.check', provider });
-  const check = useCallback(async () => {
-    if (!enabled || !mounted.current || currentScope.current !== scope || inFlight.current === scope
+  const checkPrepared = useCallback(async (patch: Partial<Settings> = {}) => {
+    const checkedPath = String(patch[pathKeys[provider]] ?? path);
+    const checkedCodex = provider === 'codex_sdk' ? String(patch.codexPath ?? codexPath ?? '') : undefined;
+    const checkedScope = JSON.stringify([requestScopeKey, provider, checkedPath, enabled, checkedCodex]);
+    if (!enabled || !mounted.current || ![scope, checkedScope].includes(currentScope.current) || inFlight.current === checkedScope
         || actionBlockReason({ action: 'readiness.check', provider })) return;
     const attempt = ++sequence.current;
-    inFlight.current = scope;
-    setState({ scope, attempt, busy: true, result: null, error: '' });
+    if (global) invalidateProviderReadiness([provider]);
+    const generation = generationOf(provider);
+    preparedTransition.current = { from: scope, to: checkedScope, attempt };
+    inFlight.current = checkedScope;
+    setState({ scope: checkedScope, attempt, generation, busy: true, result: null, error: '' });
     try {
-      const response = await request<unknown>({ action: 'readiness.check', projectId, provider, settings: { [pathKeys[provider]]: path, ...(codexPath !== undefined ? { codexPath } : {}) } });
-      if (!mounted.current || attempt !== sequence.current || currentScope.current !== scope) return;
-      setState({ scope, attempt, busy: false, result: validateProviderReadiness(response, provider), error: '' });
+      const response = await request<unknown>({ action: 'readiness.check', ...requestScope, provider, settings: { [pathKeys[provider]]: checkedPath, ...(checkedCodex !== undefined ? { codexPath: checkedCodex } : {}) } });
+      if (!mounted.current || attempt !== sequence.current || ![scope, checkedScope].includes(currentScope.current) || global && generation !== generationOf(provider)) return;
+      const result = validateProviderReadiness(response, provider);
+      if (global) { globalReports.set(provider, { key: JSON.stringify([provider, checkedPath, checkedCodex]), report: result }); notifyGlobalReadiness(); }
+      setState({ scope: checkedScope, attempt, generation, busy: false, result, error: '' });
+      return result;
     } catch (reason) {
-      if (mounted.current && attempt === sequence.current && currentScope.current === scope) setState({ scope, attempt, busy: false, result: null, error: messageOf(reason) });
+      if (mounted.current && attempt === sequence.current && [scope, checkedScope].includes(currentScope.current) && (!global || generation === generationOf(provider))) setState({ scope: checkedScope, attempt, generation, busy: false, result: null, error: messageOf(reason) });
     } finally {
       if (attempt === sequence.current) inFlight.current = null;
     }
-  }, [enabled, scope, projectId, provider, path, codexPath]);
-  const current = state.scope === scope && state.attempt === sequence.current ? state : { busy: false, result: null, error: '' };
+  }, [enabled, scope, requestScopeKey, provider, path, codexPath, global]);
+  const check = useCallback(() => checkPrepared(), [checkPrepared]);
+  const cached = global && enabled && globalReports.get(provider)?.key === cacheKey ? globalReports.get(provider)!.report : null;
+  const current = state.scope === scope && state.attempt === sequence.current && (!global || state.generation === generationOf(provider)) ? { ...state, result: state.result || cached } : { busy: false, result: cached, error: '' };
   const reset = useCallback(() => {
-    const attempt = ++sequence.current; inFlight.current = null;
-    setState({ scope, attempt, busy: false, result: null, error: '' });
-  }, [scope]);
-  return { ...current, check, reset, blocked, provider };
+    const attempt = ++sequence.current; inFlight.current = null; preparedTransition.current = null;
+    if (global) invalidateProviderReadiness([provider]);
+    setState({ scope, attempt, generation: generationOf(provider), busy: false, result: null, error: '' });
+  }, [scope, global, provider]);
+  return { ...current, check, checkPrepared, reset, blocked, provider };
 }
 export type ReadinessCheck = ReturnType<typeof useProviderReadiness>;
 

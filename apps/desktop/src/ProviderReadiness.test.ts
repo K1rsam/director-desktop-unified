@@ -76,8 +76,30 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
     const api = await server.ssrLoadModule('/src/api.ts');
     const policy = await server.ssrLoadModule('/src/executionPolicy.ts');
     const { TextExecutionSettings } = await server.ssrLoadModule('/src/TextExecutionSettings.tsx');
-    const { SettingsPanel, DreaminaAccountCard } = await server.ssrLoadModule('/src/Panels.tsx');
-    const { validateProviderReadiness, ProviderReadinessResult } = await server.ssrLoadModule('/src/ProviderReadiness.tsx');
+    const { SettingsPanel: ActualSettingsPanel, DreaminaAccountCard } = await server.ssrLoadModule('/src/Panels.tsx');
+    const { DreaminaCanvasReadiness } = await server.ssrLoadModule('/src/DreaminaCanvasReadiness.tsx');
+    const { validateProviderReadiness, ProviderReadinessResult, ReadinessButton, useProviderReadiness } = await server.ssrLoadModule('/src/ProviderReadiness.tsx');
+    // Compatibility harness for the retained low-level Canvas/legacy components.
+    // Product settings no longer mounts Canvas or exposes executable inputs; the
+    // new complete settings interaction is tested in SettingsChannels.test.ts.
+    function SettingsPanel({ workspace, writable, mutate }: any) {
+      const [settings, setSettings] = React.useState(workspace.settings);
+      const [tab, setTab] = React.useState('渠道');
+      React.useEffect(() => setSettings(workspace.settings), [workspace.project.id]);
+      const update = (key: string, value: string) => setSettings((old: any) => ({ ...old, [key]: value }));
+      const check = useProviderReadiness(workspace.project.id, 'dreamina', settings.dreaminaPath || '', writable && tab === '渠道');
+      const h = React.createElement;
+      return h('form', { onSubmit: (event: any) => { event.preventDefault(); void mutate('settings.save', { settings }); } },
+        ...['渠道', '执行与保存'].map(label => h('button', { onClick: () => setTab(label), key: label }, label)),
+        tab === '渠道' ? h(React.Fragment, {},
+          h('input', { value: settings.dreaminaPath, placeholder: '填写已安装即梦生成 CLI 的完整路径', onChange: (event: any) => update('dreaminaPath', event.target.value) }),
+          h('p', {}, '使用当前输入路径检查账户与模型，无需先保存'),
+          h(DreaminaAccountCard, { workspace, writable, mutate, readiness: check }),
+          h(ReadinessButton, { check, writable }, '更新模型目录'),
+          h(DreaminaCanvasReadiness, { projectId: workspace.project.id, path: settings.dreaminaCanvasPath || '', writable, update }),
+          h('select', { value: settings.textProvider || 'codex', onChange: (event: any) => update('textProvider', event.target.value) }, h('option', { value: 'codex' }, 'CLI'), h('option', { value: 'codex_sdk' }, 'SDK')),
+        ) : [['dreamina', 'bh', 'chrome'], ['dreamina', 'bh']].map((values, index) => h('select', { key: index }, ...values.map(value => h('option', { key: value, value }, value)))));
+    }
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
     const workspace = { ...structuredClone(previewWorkspace), project: { id: 'readiness-project', title: 'Synthetic' }, settings: { codexPath: '/saved/codex', dreaminaPath: '/saved/dreamina', dreaminaCanvasPath: '/saved/canvas', imageProvider: 'dreamina', videoProvider: 'dreamina' } };
     const props = { workspace, settings: { textProvider: 'codex', codexPath: '/unsaved/CLI path' }, writable: true, update() {}, saveSettings: async () => { throw new Error('readiness must not save settings'); } };
@@ -128,18 +150,15 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         }
       } finally { view.unmount(); }
     });
-    await t.test('the main Jimeng check targets Canvas and its OAuth belongs to the same connection', () => {
+    await t.test('normal settings keeps generation CLI and removes the redundant Canvas account', () => {
       const view = hookRenderer();
       try {
-        const nodes = view.render(React.createElement(SettingsPanel, { workspace, writable: true, mutate: async () => { throw new Error('no writes during render'); } }));
-        const main = nodes.find(node => node.type === 'button' && content(node) === '检查即梦 CLI、账户与模型');
-        assert.ok(main);
-        assert.equal(main.props['data-readiness-provider'], 'dreamina_canvas');
-        const oauth = nodes.find(node => node.type === 'button' && content(node) === 'OAuth 连接即梦');
-        assert.ok(oauth);
-        assert.equal(oauth.props['data-execution-action'], 'canvas.login');
-        assert.ok(nodes.some(node => node.type === 'h3' && content(node) === '即梦 Canvas 账户与连接'));
-        assert.ok(nodes.some(node => node.type === 'h3' && content(node) === '即梦生成 CLI'));
+        calls.length = 0;
+        const nodes = view.render(React.createElement(ActualSettingsPanel, { appSettings: { schemaVersion: 'app-settings/v1', revision: 0, settings: workspace.settings, providers: workspace.providers, rules: workspace.rules, dreaminaAccount: workspace.dreaminaAccount }, writable: true, mutate: async () => { throw new Error('no writes during render'); } }));
+        assert.ok(!nodes.some(node => node.props['data-readiness-provider'] === 'dreamina_canvas'));
+        assert.ok(!nodes.some(node => node.props['data-canvas-path']));
+        assert.ok(nodes.some(node => node.type === 'h3' && content(node) === '即梦'));
+        assert.ok(calls.every(call => ['runtime.status', 'chrome.status'].includes(call.action)), 'only local component inventory is automatic');
       } finally { view.unmount(); }
     });
     await t.test('Jimeng account and provider buttons use readiness with the current unsaved path', async () => {
@@ -152,7 +171,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         input.props.onChange({ target: { value: '/unsaved/Jimeng path' } }); nodes = view.render(element);
         const checks = nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina'); assert.equal(checks.length, 2);
         for (const check of checks) assert.equal(check.props.disabled, false);
-        tab(nodes, '检查账户与模型').props.onClick(); tab(nodes, '更新模型目录').props.onClick();
+        checks[0].props.onClick(); tab(nodes, '更新模型目录').props.onClick();
         nodes = view.render(element);
         assert.ok(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina').every(node => node.props.disabled), 'both entries share the pending request');
         await settle(); nodes = view.render(element);
@@ -458,6 +477,47 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         const nodes = view.render(initial); button(nodes, 'codex_cli').props.onClick(); view.unmount(); resolve(result('codex_cli', 'after-unmount')); await settle();
       } finally { view.unmount(); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
     });
+    await t.test('global readiness sends no project and rejects a late result after scope changes', async () => {
+      const view = hookRenderer(); let resolve: (value: unknown) => void = () => {};
+      respond = () => new Promise(done => { resolve = done; }); calls.length = 0;
+      let run: (() => Promise<void>) | undefined;
+      function Scoped({ target }: { target: { scope: 'global' } | { projectId: string } }) {
+        const check = useProviderReadiness(target, 'dreamina', '/saved/dreamina', true); run = check.check;
+        return React.createElement(ProviderReadinessResult, { check });
+      }
+      try {
+        view.render(React.createElement(Scoped, { target: { scope: 'global' } }));
+        const first = run!();
+        assert.deepEqual(calls, [{ action: 'readiness.check', scope: 'global', provider: 'dreamina', settings: { dreaminaPath: '/saved/dreamina' } }]);
+        resolve(result('dreamina', 'global-proof')); await first;
+        assert.match(view.render(React.createElement(Scoped, { target: { scope: 'global' } })).map(content).join(' '), /global-proof/);
+        const late = run!(); view.render(React.createElement(Scoped, { target: { projectId: 'production-project' } }));
+        resolve(result('dreamina', 'late-global-proof')); await late;
+        assert.doesNotMatch(view.render(React.createElement(Scoped, { target: { projectId: 'production-project' } })).map(content).join(' '), /global-proof/);
+      } finally { view.unmount(); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
+    });
+    await t.test('prepared paths retain only their own in-flight proof across settings persistence', async () => {
+      const view = hookRenderer(); let resolve: (value: unknown) => void = () => {};
+      respond = () => new Promise(done => { resolve = done; }); calls.length = 0;
+      let preparedCheck: ((patch: any) => Promise<void>) | undefined;
+      function Prepared({ path }: { path: string }) {
+        const check = useProviderReadiness(workspace.project.id, 'dreamina', path, true);
+        preparedCheck = check.checkPrepared;
+        return React.createElement(ProviderReadinessResult, { check });
+      }
+      try {
+        view.render(React.createElement(Prepared, { path: '/old/dreamina' }));
+        const done = preparedCheck!({ dreaminaPath: '/prepared/dreamina' });
+        view.render(React.createElement(Prepared, { path: '/prepared/dreamina' }));
+        resolve(result('dreamina', 'new-proof')); await done;
+        assert.ok(view.render(React.createElement(Prepared, { path: '/prepared/dreamina' })).map(content).join(' ').includes('new-proof'));
+        assert.equal(calls.at(-1)?.settings && (calls.at(-1)!.settings as any).dreaminaPath, '/prepared/dreamina');
+        const late = preparedCheck!({ dreaminaPath: '/second/prepared' });
+        view.render(React.createElement(Prepared, { path: '/unrelated/user/path' }));
+        resolve(result('dreamina', 'stale-prepared-proof')); await late;
+        assert.ok(!view.render(React.createElement(Prepared, { path: '/unrelated/user/path' })).map(content).join(' ').includes('stale-prepared-proof'));
+      } finally { view.unmount(); respond = async input => result(input.provider as ProviderReadinessReport['provider']); }
+    });
     await t.test('failed and mismatched checks clear busy and allow an explicit retry', async () => {
       const view = hookRenderer(); calls.length = 0;
       const element = React.createElement(TextExecutionSettings, props);
@@ -596,7 +656,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         settings = { ...settings, textProvider: 'codex_sdk' }; const before = calls.length;
         nodes = view.render(element()); await settle(); assert.equal(calls.length, before, 'switching to SDK cannot check or execute automatically');
         assert.equal(state(nodes), 'unverified');
-        assert.ok(nodes.map(content).join(' ').includes('cli-only-model · 尚未核实'), 'saved CLI preference is retained without reusing the CLI catalog');
+        assert.ok(nodes.some(node => node.type === 'option' && node.props.value === 'cli-only-model'), 'saved CLI preference is retained without reusing the CLI catalog');
         button(nodes, 'codex_sdk').props.onClick(); await settle(); nodes = view.render(element());
         assert.deepEqual(calls.at(-1), { action: 'readiness.check', projectId: workspace.project.id, provider: 'codex_sdk', settings: { textSdkNodePath: '/draft/node', codexPath: '/draft/codex' } });
         assert.equal(state(nodes), 'ready');
@@ -609,7 +669,7 @@ test('actual readiness controls and effects use only the explicit read-only IPC'
         assert.ok(!nodes.some(node => node.type === 'option' && node.props.value === 'cli-only-model'));
         const beforeEdit = calls.length; settings = { ...settings, codexPath: '/new/draft/codex' };
         nodes = view.render(element()); assert.equal(state(nodes), 'unverified');
-        assert.ok(nodes.map(content).join(' ').includes('sdk-verified-model · 尚未核实'));
+        assert.ok(nodes.some(node => node.type === 'option' && node.props.value === 'sdk-verified-model'));
         assert.equal(calls.length, beforeEdit, 'editing the Codex path clears proof without IPC or saving');
         let resolve!: (value: unknown) => void; respond = () => new Promise(done => { resolve = done; });
         button(nodes, 'codex_sdk').props.onClick();

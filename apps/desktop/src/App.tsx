@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { choose, desktop, isWorkspace, mediaUrl, preview, request } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { choose, desktop, isAppSettings, isWorkspace, mediaUrl, preview, request } from './api';
 import { createCatalogDiscovery, missingCatalogs, normalizeWorkspace as normalize } from './contracts';
 import type { CatalogDiscoveryState } from './contracts';
 import { AssetPanel } from './AssetPanel';
 import { ExecutionPolicyBanner } from './ExecutionPolicyBanner';
 import { actionBlockReason } from './executionPolicy';
-import { FoundationPanel, SettingsPanel, TasksPanel } from './Panels';
+import { FoundationPanel, ProjectSettingsPanel, SettingsPanel, TasksPanel } from './Panels';
 import { UnitPanel } from './UnitPanel';
 import { TextExecutionSummary } from './TextExecutionSettings';
 import { ProjectLibrary } from './ProjectLibrary';
@@ -14,7 +14,7 @@ import { createWorkspacePoller } from './workflowProgressModel';
 import type { ProjectFilter, ProjectLifecycleAction } from './ProjectLibrary';
 import { Button, Empty, Icon, jobActive, MediaPreview, messageOf, Modal, providerName } from './components';
 import type { IconName } from './components';
-import type { Media, Mutation, Page, ProjectSummary, Workspace } from './types';
+import type { AppSettings, GlobalMutation, Media, Mutation, Page, ProjectSummary, Workspace } from './types';
 
 const stages: { id: Page; number: string; title: string; subtitle: string; icon: IconName }[] = [
   { id: 'foundation', number: '01', title: '剧本与基础', subtitle: '原文 · 方向 · 资产目录', icon: 'source' },
@@ -25,25 +25,94 @@ const stages: { id: Page; number: string; title: string; subtitle: string; icon:
 function freshWorkspace(value: Workspace, checkedAt = new Date().toISOString()): Workspace {
   return { ...normalize(value), readState: { checkedAt } };
 }
+const SOFTWARE_DISPLAY_FIELDS = ['textProvider', 'textModel', 'reasoning', 'textEndpoint', 'codexPath', 'textSdkNodePath', 'dreaminaPath', 'dreaminaCanvasPath', 'bhEndpoint', 'bhAccountId', 'chromeEndpoint', 'chromeAccountId', 'providerTimeoutSeconds', 'textConcurrency', 'episodeConcurrency', 'videoConcurrency', 'chromeConcurrency'] as const;
+/** Render current software connections without changing project records or frozen jobs. */
+export function projectWorkspaceView(workspace: Workspace | null, appSettings: AppSettings | null): Workspace | null {
+  if (!workspace || !appSettings || !isAppSettings(appSettings)) return workspace;
+  const settings = { ...workspace.settings };
+  for (const key of SOFTWARE_DISPLAY_FIELDS) if (Object.hasOwn(appSettings.settings, key)) Object.assign(settings, { [key]: appSettings.settings[key] });
+  return { ...workspace, settings, providers: appSettings.providers, dreaminaAccount: appSettings.dreaminaAccount };
+}
 
 export default function App() {
-  const [projects, setProjects] = useState<ProjectSummary[]>([]), [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]), [storedWorkspace, setWorkspace] = useState<Workspace | null>(null);
   const [page, setPage] = useState<Page>('projects'), [busy, setBusy] = useState(''), [loading, setLoading] = useState(true), [notice, setNotice] = useState(''), [error, setError] = useState('');
   const [projectFilter, setProjectFilter] = useState<ProjectFilter>('active');
   const [inspected, setInspected] = useState<Media | null>(null), [mobileNav, setMobileNav] = useState(false);
   const [catalogStates, setCatalogStates] = useState<CatalogDiscoveryState[]>([]);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null), [settingsLoading, setSettingsLoading] = useState(false), [settingsBusy, setSettingsBusy] = useState('');
+  const workspace = useMemo(() => projectWorkspaceView(storedWorkspace, appSettings), [storedWorkspace, appSettings]);
+  const globalSequence = useRef(0), globalBusyRef = useRef(''), pageRef = useRef(page);
+  const globalQueue = useRef<Promise<unknown>>(Promise.resolve()), globalPending = useRef(0), globalViewRevision = useRef(0);
+  if (pageRef.current !== page) globalViewRevision.current++;
+  pageRef.current = page;
   const workspaceRef = useRef(workspace), busyRef = useRef(''), requestSequence = useRef(0), projectListSequence = useRef(0);
   const mounted = useRef(true), discoverCatalogs = useRef<ReturnType<typeof createCatalogDiscovery> | null>(null);
   workspaceRef.current = workspace;
   if (!discoverCatalogs.current) discoverCatalogs.current = createCatalogDiscovery({
-    enabled: () => desktop && mounted.current && !actionBlockReason('providers.refresh'), current: () => workspaceRef.current, busy: () => !!busyRef.current, revision: () => requestSequence.current,
-    refresh: (projectId, provider) => request({ action: 'providers.refresh', projectId, provider }), read: projectId => request<Workspace>({ action: 'workspace.get', projectId }),
+    enabled: () => desktop && mounted.current && pageRef.current !== 'settings' && !actionBlockReason('providers.refresh'), current: () => workspaceRef.current, busy: () => !!busyRef.current, revision: () => requestSequence.current,
+    refresh: async (_projectId, provider) => {
+      const next = await globalMutate('providers.refresh', { provider }, '');
+      if (!next) throw new Error('软件渠道检查未完成，请到软件设置重试。');
+      return next;
+    }, read: projectId => request<Workspace>({ action: 'workspace.get', projectId }),
     apply: next => { ++requestSequence.current; const fresh = freshWorkspace(next); workspaceRef.current = fresh; setWorkspace(fresh); },
     report: state => setCatalogStates(current => [...current.filter(item => item.key !== state.key), state]),
   });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { void discoverCatalogs.current?.(); }, [workspace, busy]);
   const writable = desktop && !busy;
+  // Connection controls own their pending state. Their own save must never revoke
+  // permission and cancel the following readiness/login step.
+  const connectionAllowed = desktop;
+
+  const loadAppSettings = useCallback(async () => {
+    if (globalPending.current) return;
+    const sequence = ++globalSequence.current;
+    setSettingsLoading(true);
+    try {
+      const migrationSourceProjectId = workspaceRef.current?.project.id;
+      const next = await request<unknown>({ action: 'settings.global.get', ...(migrationSourceProjectId ? { migrationSourceProjectId } : {}) });
+      if (!isAppSettings(next)) throw new Error('软件设置读取结果无效，请刷新重试。');
+      if (mounted.current && sequence === globalSequence.current) setAppSettings(next);
+    } catch (reason) { if (mounted.current && sequence === globalSequence.current && pageRef.current === 'settings') setError(messageOf(reason)); }
+    finally { if (mounted.current && sequence === globalSequence.current) setSettingsLoading(false); }
+  }, []);
+
+  const globalMutate: GlobalMutation = useCallback(async (action, values = {}, success = '软件设置已保存。') => {
+    if (!desktop) { if (mounted.current) setError('请在桌面客户端配置软件连接。'); return null; }
+    const viewRevision = globalViewRevision.current;
+    globalPending.current++; setSettingsBusy(action);
+    const run = async () => {
+      try {
+        if (!mounted.current || viewRevision !== globalViewRevision.current) return null;
+        ++globalSequence.current; globalBusyRef.current = action; setSettingsBusy(action);
+        setError(''); setNotice('');
+        const result = await request<unknown>({ ...values, action, scope: 'global' });
+        const next = isAppSettings(result) ? result : await request<unknown>({ action: 'settings.global.get' });
+        if (!isAppSettings(next)) throw new Error('软件连接状态读取结果无效，请刷新重试。');
+        if (mounted.current) {
+          setAppSettings(next);
+          if (viewRevision === globalViewRevision.current) setNotice(success);
+        }
+        return next;
+      } catch (reason) { if (mounted.current && viewRevision === globalViewRevision.current) setError(messageOf(reason)); return null; }
+      finally {
+        globalBusyRef.current = ''; globalPending.current--;
+        if (mounted.current) { setSettingsBusy(globalPending.current ? 'queued' : ''); setSettingsLoading(false); }
+      }
+    };
+    const result = globalQueue.current.then(run, run);
+    globalQueue.current = result;
+    return result;
+  }, []);
+  useEffect(() => { if (page === 'settings') void loadAppSettings(); }, [page, loadAppSettings]);
+  useEffect(() => {
+    if (!desktop || page !== 'settings' || appSettings?.dreaminaAccount?.status !== 'authorizing') return;
+    const interval = Math.max(1500, Math.min(10000, Number(appSettings.dreaminaAccount.authorization?.pollIntervalSeconds || 3) * 1000));
+    const timer = window.setInterval(() => { if (!document.hidden && !globalPending.current) void globalMutate('dreamina.status', {}, ''); }, interval);
+    return () => window.clearInterval(timer);
+  }, [page, appSettings?.dreaminaAccount?.status, appSettings?.dreaminaAccount?.authorization?.pollIntervalSeconds, globalMutate]);
 
   const listProjects = useCallback(async () => {
     const sequence = ++projectListSequence.current;
@@ -85,6 +154,10 @@ export default function App() {
   const mutate: Mutation = useCallback(async (action, values = {}, success = '已保存。') => {
     if (busyRef.current || !desktop) return null;
     const projectId = workspaceRef.current?.project.id;
+    if (action === 'providers.refresh') {
+      const next = await globalMutate(action, values, success);
+      return next && projectId === workspaceRef.current?.project.id ? projectWorkspaceView(workspaceRef.current, next) : null;
+    }
     ++requestSequence.current; // An earlier poll must not overwrite this action's newer result.
     busyRef.current = action; setBusy(action); setError(''); setNotice('');
     try {
@@ -98,7 +171,7 @@ export default function App() {
       const videoNotice = videoQueue?.blockedCount ? `视频${action === 'videos.submit' ? '提交' : '素材准备'}：${videoQueue.queuedCount + (videoQueue.reusedCount || 0)} 个单元已接收，${videoQueue.blockedCount} 个尚未就绪。具体原因见对应单元的配图与问题。` : '';
       setNotice(videoNotice || (imageQueue?.blockedCount ? `已排队 ${imageQueue.queuedCount} 项图片，${imageQueue.blockedCount} 项尚未就绪。具体原因见资产的任务状态与任务记录。` : success)); void listProjects(); return next;
     } catch (reason) { setError(messageOf(reason)); return null; } finally { busyRef.current = ''; setBusy(''); }
-  }, [listProjects]);
+  }, [listProjects, globalMutate]);
 
   useEffect(() => {
     if (!desktop || !workspace?.project.id) return;
@@ -119,7 +192,7 @@ export default function App() {
     return () => { alive = false; window.clearInterval(timer); window.removeEventListener('focus', visible); document.removeEventListener('visibilitychange', visible); };
   }, [workspace?.project.id]);
 
-  async function refresh() { if (busy || !workspace) return; await loadProject(workspace.project, page); setNotice('已读取最新保存状态。'); }
+  async function refresh() { if (page === 'settings') { await loadAppSettings(); return; } if (busy || !workspace) return; await loadProject(workspace.project, page); setNotice('已读取最新保存状态。'); }
   async function createProject(title: string): Promise<boolean> {
     const cleanTitle = title.trim();
     if (!cleanTitle || cleanTitle.length > 160 || busyRef.current || !desktop) return false;
@@ -133,7 +206,7 @@ export default function App() {
   }
   async function exportProject() { const paths = await choose('directory'); if (paths[0] && workspace) { const filename = `${workspace.project.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')}-${new Date().toISOString().replace(/[:.]/g, '-')}.director.zip`; await mutate('project.export', { path: `${paths[0].replace(/[\\/]$/, '')}/${filename}` }, `项目包已导出：${filename}`); } }
   const selectedStage = stages.find(stage => stage.id === page), activeJobs = workspace?.jobs.filter(jobActive).length || 0;
-  const pageTitle = selectedStage?.title || ({ projects: '所有项目', jobs: '任务记录', settings: '渠道与执行设置' } as Partial<Record<Page, string>>)[page];
+  const pageTitle = selectedStage?.title || ({ projects: '所有项目', jobs: '任务记录', settings: '软件设置', 'project-settings': '项目制作设置' } as Partial<Record<Page, string>>)[page];
   const missingCatalogKeys = new Set(workspace ? missingCatalogs(workspace).map(item => item.key) : []), catalogNotices = catalogStates.filter(item => missingCatalogKeys.has(item.key) && item.status !== 'ready');
   function navigate(target: Page) { setPage(target); setMobileNav(false); setError(''); setNotice(''); if (target === 'projects') void listProjects(); }
 
@@ -141,26 +214,26 @@ export default function App() {
     <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
       <div className="brand"><span className="brand-mark"><Icon name="story" size={25}/></span><div><strong>分镜导演 Next</strong><span>独立本地制作工作台</span></div></div>
       <button className={`sidebar-link ${page === 'projects' ? 'selected' : ''}`} onClick={() => navigate('projects')}><Icon name="home"/><span>所有项目</span><small>{projects.filter(project => !project.archivedAt).length}</small></button>
-      <div className="sidebar-project"><span className="eyebrow">当前项目</span><strong title={workspace?.project.title}>{workspace?.project.title || '选择或创建项目'}</strong></div>
-      <nav className="stage-nav" aria-label="制作阶段">{stages.map(stage => <button key={stage.id} disabled={!workspace} className={`stage-link ${page === stage.id ? 'selected' : ''}`} onClick={() => navigate(stage.id)}><span className="stage-number">{stage.number}</span><span className="stage-label"><strong>{stage.title}</strong><small>{stage.subtitle}</small></span></button>)}</nav>
-      <div className="sidebar-bottom"><button className={`sidebar-link ${page === 'jobs' ? 'selected' : ''}`} disabled={!workspace} onClick={() => navigate('jobs')}><Icon name="tasks"/><span>任务记录</span>{activeJobs > 0 && <small>{activeJobs}</small>}</button><button className={`sidebar-link ${page === 'settings' ? 'selected' : ''}`} disabled={!workspace} onClick={() => navigate('settings')}><Icon name="settings"/><span>渠道与设置</span></button><div className="local-status"><span className={`status-dot ${desktop ? 'online' : ''}`}/>{desktop ? '本地核心已连接' : preview ? '浏览器预览 · 示例资料' : '浏览器 · 未连接本地核心'}<small>v0.1.0</small></div></div>
+      {page !== 'settings' && <><div className="sidebar-project"><span className="eyebrow">当前项目</span><strong title={workspace?.project.title}>{workspace?.project.title || '选择或创建项目'}</strong></div>
+      <nav className="stage-nav" aria-label="制作阶段">{stages.map(stage => <button key={stage.id} disabled={!workspace} className={`stage-link ${page === stage.id ? 'selected' : ''}`} onClick={() => navigate(stage.id)}><span className="stage-number">{stage.number}</span><span className="stage-label"><strong>{stage.title}</strong><small>{stage.subtitle}</small></span></button>)}</nav></>}
+      <div className="sidebar-bottom"><button className={`sidebar-link ${page === 'jobs' ? 'selected' : ''}`} disabled={!workspace} onClick={() => navigate('jobs')}><Icon name="tasks"/><span>任务记录</span>{activeJobs > 0 && <small>{activeJobs}</small>}</button><button className={`sidebar-link ${page === 'settings' ? 'selected' : ''}`} onClick={() => navigate('settings')}><Icon name="settings"/><span>软件设置</span></button><div className="local-status"><span className={`status-dot ${desktop ? 'online' : ''}`}/>{desktop ? '本地核心已连接' : preview ? '浏览器预览 · 示例资料' : '浏览器 · 未连接本地核心'}<small>v0.1.0</small></div></div>
     </aside>
     {mobileNav && <button className="nav-shade" aria-label="关闭导航" onClick={() => setMobileNav(false)}/>}
     <main className="main-area">
-      <header className="topbar"><div className="topbar-title"><Button icon="story" variant="ghost" className="mobile-nav-toggle" aria-label="打开导航" onClick={() => setMobileNav(!mobileNav)}/><div><span className="eyebrow">{selectedStage ? `阶段 ${selectedStage.number} / 04` : 'DIRECTOR DESKTOP NEXT'}{workspace && page !== 'projects' ? ` · ${workspace.project.title}` : ''}</span><h1>{pageTitle}</h1></div></div><div className="topbar-actions">{busy && <span className="pending-text" role="status"><span className="spinner"/>正在处理</span>}{workspace && page !== 'projects' && <><Button icon="refresh" disabled={!!busy || loading} onClick={() => void refresh()}>刷新</Button><Button icon="download" disabled={!writable} onClick={() => void exportProject().catch(reason => setError(messageOf(reason)))}>导出项目</Button></>}{page === 'projects' && <Button icon="upload" disabled={!writable} onClick={() => void importProject()}>导入项目包</Button>}</div></header>
-      <ExecutionPolicyBanner/>
+      <header className="topbar"><div className="topbar-title"><Button icon="story" variant="ghost" className="mobile-nav-toggle" aria-label="打开导航" onClick={() => setMobileNav(!mobileNav)}/><div><span className="eyebrow">{page === 'settings' ? '本机所有项目共用' : selectedStage ? `阶段 ${selectedStage.number} / 04` : 'DIRECTOR DESKTOP NEXT'}{workspace && !['projects', 'settings'].includes(page) ? ` · ${workspace.project.title}` : ''}</span><h1>{pageTitle}</h1></div></div><div className="topbar-actions">{(page === 'settings' ? settingsBusy : busy) && <span className="pending-text" role="status"><span className="spinner"/>正在处理</span>}{page === 'settings' && <Button icon="refresh" disabled={!!settingsBusy || settingsLoading} onClick={() => void refresh()}>刷新设置</Button>}{workspace && !['projects', 'settings'].includes(page) && <><Button icon="settings" disabled={!!busy} onClick={() => navigate('project-settings')}>制作设置</Button><Button icon="refresh" disabled={!!busy || loading} onClick={() => void refresh()}>刷新</Button><Button icon="download" disabled={!writable} onClick={() => void exportProject().catch(reason => setError(messageOf(reason)))}>导出项目</Button></>}{page === 'projects' && <Button icon="upload" disabled={!writable} onClick={() => void importProject()}>导入项目包</Button>}</div></header>
+      <ExecutionPolicyBanner globalSettings={page === 'settings'}/>
       {!desktop && <div className="mode-banner">{preview ? '这是只读界面预览，图像与剧本均为示例；没有连接项目数据，也不会生成或提交任务。' : '浏览器预览未连接本地核心。制作与文件管理请在桌面客户端操作。'}{!preview && <a href="?preview=1">查看界面示例 <Icon name="arrow" size={15}/></a>}</div>}
       {(error || notice) && <div className={`notification ${error ? 'error' : ''}`} role={error ? 'alert' : 'status'}><span>{error || notice}</span><Button variant="ghost" icon="close" aria-label="关闭提示" onClick={() => { setError(''); setNotice(''); }}/></div>}
-      {desktop && page !== 'projects' && catalogNotices.map(item => <div key={item.key} className={`notification ${item.status === 'error' ? 'error' : ''}`} role="status"><span>{providerName(item.provider)}：{item.status === 'checking' ? '正在读取渠道能力与模型目录。' : `自动读取未完成：${item.error} 请到渠道与设置点击“检查连接与模型”重试。`}</span>{page !== 'settings' && <Button variant="ghost" icon="settings" onClick={() => navigate('settings')}>渠道与设置</Button>}</div>)}
-      {workspace?.readState?.error && page !== 'projects' && <div className="notification error" role="status"><span>最新制作状态读取失败，以下为上次保存状态。正在继续读取：{workspace.readState.error}</span></div>}
+      {desktop && !['projects', 'settings'].includes(page) && catalogNotices.map(item => <div key={item.key} className={`notification ${item.status === 'error' ? 'error' : ''}`} role="status"><span>{providerName(item.provider)}：{item.status === 'checking' ? '正在读取渠道能力与模型目录。' : `自动读取未完成：${item.error} 请到软件设置检查连接。`}</span><Button variant="ghost" icon="settings" onClick={() => navigate('settings')}>软件设置</Button></div>)}
+      {workspace?.readState?.error && !['projects', 'settings'].includes(page) && <div className="notification error" role="status"><span>最新制作状态读取失败，以下为上次保存状态。正在继续读取：{workspace.readState.error}</span></div>}
       <div className="page-content">
         {workspace && ['foundation', 'images', 'storyboard'].includes(page) && <TextExecutionSummary settings={workspace.settings} stage={page as 'foundation' | 'images' | 'storyboard'} onConfigure={() => navigate('settings')}/>}
-        {loading && !workspace ? <Empty title="正在读取项目…"/> : page === 'projects' ? <><ProjectLibrary projects={projects} filter={projectFilter} writable={writable} busy={!!busy} onFilterChange={setProjectFilter} onOpen={project => void loadProject(project)} createForm={<InlineProjectCreate writable={writable} busy={!!busy} onCreate={createProject}/>} onLifecycle={projectLifecycle}/><div className="flow-guide">{stages.map(stage => <div key={stage.id}><span>{stage.number}</span><Icon name={stage.icon}/><strong>{stage.title}</strong><small>{stage.subtitle}</small></div>)}</div></> : workspace ? <>
+        {page === 'settings' ? appSettings ? <SettingsPanel appSettings={appSettings} writable={connectionAllowed} mutate={globalMutate} onError={setError}/> : <Empty title={settingsLoading ? '正在读取软件设置…' : '软件设置尚未读取'}><Button icon="refresh" disabled={settingsLoading} onClick={() => void loadAppSettings()}>重新读取</Button></Empty> : loading && !workspace ? <Empty title="正在读取项目…"/> : page === 'projects' ? <><ProjectLibrary projects={projects} filter={projectFilter} writable={writable} busy={!!busy} onFilterChange={setProjectFilter} onOpen={project => void loadProject(project)} createForm={<InlineProjectCreate writable={writable} busy={!!busy} onCreate={createProject}/>} onLifecycle={projectLifecycle}/><div className="flow-guide">{stages.map(stage => <div key={stage.id}><span>{stage.number}</span><Icon name={stage.icon}/><strong>{stage.title}</strong><small>{stage.subtitle}</small></div>)}</div></> : workspace ? <>
           {page === 'foundation' && <FoundationPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} onNotice={setNotice} onError={setError}/>}
           {page === 'images' && <AssetPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} inspect={setInspected} onNotice={setNotice} onError={setError} onTasks={() => setPage('jobs')}/>}
           {(page === 'storyboard' || page === 'videos') && <UnitPanel key={`${workspace.project.id}-${page}`} workspace={workspace} mode={page} writable={writable} mutate={mutate} inspect={setInspected} onNotice={setNotice} onError={setError}/>}
           {page === 'jobs' && <TasksPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} inspect={setInspected}/>}
-          {page === 'settings' && <SettingsPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} onError={setError}/>}
+          {page === 'project-settings' && <ProjectSettingsPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} onError={setError}/>}
         </> : <Empty title="先选择一个项目"/>}
       </div>
     </main>

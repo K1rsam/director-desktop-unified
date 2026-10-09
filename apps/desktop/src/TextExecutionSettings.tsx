@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { choose, request } from './api';
+import { request } from './api';
+import { prepareRuntime, readRuntimeStatus, settingsRequestScope, type RuntimeStatus, type SettingsRequestScope } from './runtimeSetup';
+import './TextExecutionSettings.css';
 import { actionBlockReason, currentExecutionPolicy, hasSdkExecutionCapability, subscribeExecutionPolicy } from './executionPolicy';
-import { Badge, Button, messageOf } from './components';
+import { Badge, Button, formatDate, messageOf } from './components';
 import type { Settings, TextCliLimitWindow, TextCliLogin, Workspace } from './types';
 
-import { ProviderReadinessResult, ReadinessButton, sdkReadinessAllowsExecution, useProviderReadiness } from './ProviderReadiness';
+import { invalidateProviderReadiness, ProviderReadinessResult, sdkReadinessAllowsExecution, useProviderReadiness } from './ProviderReadiness';
 
-type Props = { workspace: Workspace; settings: Settings; writable: boolean; update: (key: string, value: string) => void; saveSettings: () => Promise<boolean>; onError?: (message: string) => void };
+type Props = { settings: Settings; writable: boolean; connectionAllowed?: boolean; update: (key: string, value: string) => void; saveSettings: (override?: Partial<Settings>) => Promise<boolean>; onError?: (message: string) => void }
+  & ({ requestScope: SettingsRequestScope; workspace?: Workspace } | { workspace: Workspace; requestScope?: SettingsRequestScope });
 
 export function TextExecutionSummary({ settings, onConfigure, stage }: { settings: Settings; onConfigure: () => void; stage?: 'foundation' | 'images' | 'storyboard' }) {
   const policy = useSyncExternalStore(subscribeExecutionPolicy, currentExecutionPolicy, currentExecutionPolicy);
@@ -28,74 +31,158 @@ function windowText(window?: TextCliLimitWindow | null): string | undefined {
   return remaining === undefined ? undefined : `${period}额度剩余 ${Math.max(0, Math.min(100, remaining)).toFixed(0)}%`;
 }
 
-export function TextExecutionSettings({ workspace, settings, writable, update, saveSettings, onError }: Props) {
+export function TextExecutionSettings({ workspace, requestScope, settings, writable, connectionAllowed = writable, update, saveSettings }: Props) {
   const policy = useSyncExternalStore(subscribeExecutionPolicy, currentExecutionPolicy, currentExecutionPolicy);
-  const [login, setLogin] = useState<TextCliLogin>({ state: 'idle' }), [loginBusy, setLoginBusy] = useState(false), [error, setError] = useState('');
-  const mounted = useRef(true), sequence = useRef(0), projectId = workspace.project.id;
-  const provider = settings.textProvider || 'codex', path = String(settings.codexPath || ''), sdkPath = String(settings.textSdkNodePath || '');
+  const [login, setLogin] = useState<TextCliLogin>({ state: 'idle' });
+  const [operation, setOperation] = useState<'connecting' | 'installing' | 'login' | null>(null), [error, setError] = useState('');
+  const [components, setComponents] = useState<RuntimeStatus | null>(null), [componentBusy, setComponentBusy] = useState(false), [componentError, setComponentError] = useState('');
+  const target = settingsRequestScope(requestScope ?? workspace!.project.id), provider = settings.textProvider || 'codex';
+  const path = String(settings.codexPath || ''), sdkPath = String(settings.textSdkNodePath || '');
+  const operationScope = JSON.stringify([target, provider, connectionAllowed]);
+  const runtimeProvider = provider === 'codex_sdk' ? 'codex_sdk' : 'codex_cli';
+  const componentScope = JSON.stringify([operationScope, path, provider === 'codex_sdk' ? sdkPath : '']);
+  const componentEpoch = useRef(0), currentComponentScope = useRef(componentScope);
+  if (currentComponentScope.current !== componentScope) { currentComponentScope.current = componentScope; componentEpoch.current++; }
+  const mounted = useRef(true), scope = useRef(operationScope), sequence = useRef(0), inFlight = useRef(false);
+  // Identity or permission changes invalidate work. A parent's temporary busy
+  // state during our own settings save is only a button lock, not revocation.
+  if (scope.current !== operationScope) { scope.current = operationScope; sequence.current++; inFlight.current = false; }
+  useEffect(() => { setLogin({ state: 'idle' }); setOperation(null); setError(''); }, [operationScope]);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current++; inFlight.current = false; }; }, []);
   const sdkAvailable = hasSdkExecutionCapability(policy);
-  const cliCheck = useProviderReadiness(projectId, 'codex_cli', path, writable && provider === 'codex');
-  const sdkCheck = useProviderReadiness(projectId, 'codex_sdk', sdkPath, writable && provider === 'codex_sdk', typeof settings.codexPath === 'string' ? { codexPath: path } : undefined);
+  const cliCheck = useProviderReadiness(target, 'codex_cli', path, connectionAllowed && provider === 'codex');
+  const sdkCheck = useProviderReadiness(target, 'codex_sdk', sdkPath, connectionAllowed && provider === 'codex_sdk', typeof settings.codexPath === 'string' ? { codexPath: path } : undefined);
+  const activeCheck = provider === 'codex_sdk' ? sdkCheck : cliCheck;
+  const automaticSetup = !actionBlockReason('runtime.prepare');
+  useEffect(() => {
+    setComponents(null); setComponentError('');
+    if (!connectionAllowed || !automaticSetup || provider === 'api' || actionBlockReason('runtime.status')) { setComponentBusy(false); return; }
+    const epoch = ++componentEpoch.current; let active = true;
+    setComponentBusy(true);
+    void readRuntimeStatus(target, runtimeProvider, settings).then(result => {
+      if (active && epoch === componentEpoch.current) setComponents(result);
+    }).catch(reason => { if (active && epoch === componentEpoch.current) setComponentError(messageOf(reason)); })
+      .finally(() => { if (active && epoch === componentEpoch.current) setComponentBusy(false); });
+    return () => { active = false; };
+  }, [componentScope, automaticSetup]);
   const sdkReady = sdkReadinessAllowsExecution(sdkCheck.result, policy);
   const status = cliCheck.result?.details.cliStatus;
-  const activeCheck = provider === 'codex_sdk' ? sdkCheck : cliCheck;
   const models = (activeCheck.result?.catalog.state === 'available' ? activeCheck.result.catalog.models : []).map(model => {
     const detail = status?.models?.find(item => item.id === model.id);
     return { id: model.id, displayName: model.name || model.id, supportedReasoningEfforts: model.supportedReasoningEfforts || (provider === 'codex' ? detail?.supportedReasoningEfforts : undefined) || [], defaultReasoningEffort: model.defaultReasoningEffort || (provider === 'codex' ? detail?.defaultReasoningEffort : undefined) || 'medium', isDefault: model.isDefault || (provider === 'codex' && detail?.isDefault) || false };
   });
   const selectedModel = models.find(model => model.id === settings.textModel), efforts = selectedModel?.supportedReasoningEfforts || [], reasoning = settings.reasoning || 'medium';
-  const busy = loginBusy || (provider === 'codex' ? cliCheck.busy : sdkCheck.busy);
-  useEffect(() => { mounted.current = true; sequence.current++; setLogin({ state: 'idle' }); setLoginBusy(false); setError(''); return () => { mounted.current = false; sequence.current++; }; }, [projectId, provider, path, sdkPath]);
+  const busy = !!operation || activeCheck.busy;
+  const connected = components?.installed && (provider === 'codex_sdk' ? sdkReady : activeCheck.result?.installation.state === 'ready'
+    && activeCheck.result?.protocol.state === 'ready' && activeCheck.result?.authentication.state === 'authenticated'
+    && activeCheck.result.authentication.identityVerified && models.length > 0);
+  const needsLogin = activeCheck.result?.authentication.state === 'not_logged_in';
+  const validOperation = (attempt: number) => mounted.current && sequence.current === attempt && scope.current === operationScope;
 
-  async function loginAction(action: 'textCli.login' | 'textCli.cancelLogin' | 'textCli.openLogin') {
-    if (actionBlockReason(action)) return;
-    const current = ++sequence.current;
-    setLoginBusy(true); setError('');
+  async function connect(install = false) {
+    if (!writable || !connectionAllowed || inFlight.current || busy || activeCheck.blocked) return;
+    if (install && (!components || components.installed || !components.installSupported || !automaticSetup)) return;
+    // Offline acceptance can inspect existing programs, without install or writes.
+    if (!automaticSetup) { await activeCheck.check(); return; }
+    const attempt = ++sequence.current; inFlight.current = true; setOperation(install ? 'installing' : 'connecting'); setError(''); activeCheck.reset();
     try {
-      if (action === 'textCli.login' && !await saveSettings()) return;
-      const next = await request<{ login?: TextCliLogin }>({ action, projectId });
-      if (mounted.current && current === sequence.current && next.login) setLogin(next.login);
-    } catch (reason) { if (mounted.current && current === sequence.current) setError(messageOf(reason)); }
-    finally { if (mounted.current && current === sequence.current) setLoginBusy(false); }
+      const prepared = install ? await prepareRuntime(target, runtimeProvider, settings) : {};
+      if (!validOperation(attempt)) return;
+      const found = await readRuntimeStatus(target, runtimeProvider, { ...settings, ...prepared });
+      if (!validOperation(attempt)) return;
+      setComponents(found); setComponentError('');
+      if (!found.installed) { setError(found.components.find(component => component.state === 'invalid')?.message || (install ? '组件尚未安装，请重试安装组件。' : '')); return; }
+      const patch = found.settings;
+      if (!validOperation(attempt)) return;
+      if (!await saveSettings(patch) || !validOperation(attempt)) return;
+      await activeCheck.checkPrepared(patch);
+    } catch (reason) { if (validOperation(attempt)) setError(messageOf(reason)); }
+    finally { if (validOperation(attempt)) { inFlight.current = false; setOperation(null); } }
   }
-  async function selectExecutable() { try { const paths = await choose('file'); if (paths[0]) update('codexPath', paths[0]); } catch (reason) { onError?.(messageOf(reason)); } }
-  async function selectNode() { try { const paths = await choose('file'); if (paths[0]) update('textSdkNodePath', paths[0]); } catch (reason) { onError?.(messageOf(reason)); } }
-  const labels = cliCheck.blocked ? '只读检查未开放' : busy ? '正在检查' : cliCheck.result ? '已完成只读检查' : '尚未检查';
-  const modelControls = <div className="form-grid"><label>文本模型<select data-text-model value={settings.textModel || ''} onChange={event => { update('textModel', event.target.value); const model = models.find(item => item.id === event.target.value); if (model && !model.supportedReasoningEfforts.includes(reasoning)) update('reasoning', model.defaultReasoningEffort); }}><option value="" disabled>选择已核实的文本模型</option>{settings.textModel && !models.some(model => model.id === settings.textModel) && <option value={settings.textModel}>{settings.textModel} · 尚未核实</option>}{models.map(model => <option key={model.id} value={model.id}>{model.displayName}{model.isDefault ? ' · 目录默认' : ''}</option>)}</select></label><label>推理强度<select data-text-reasoning value={reasoning} onChange={event => update('reasoning', event.target.value)}>{!efforts.includes(reasoning) && <option value={reasoning}>{reasoning} · 尚未核实</option>}{efforts.map(effort => <option key={effort} value={effort}>{effort}</option>)}</select></label></div>;
+  async function loginAction(action: 'textCli.login' | 'textCli.cancelLogin' | 'textCli.openLogin') {
+    if (!writable || !connectionAllowed || inFlight.current || busy || actionBlockReason(action)) return;
+    const attempt = ++sequence.current; inFlight.current = true; setOperation('login'); setError('');
+    try {
+      if (action === 'textCli.login') {
+        invalidateProviderReadiness(['codex_cli', 'codex_sdk']);
+        activeCheck.reset();
+        const found = await readRuntimeStatus(target, runtimeProvider, settings);
+        if (!validOperation(attempt)) return;
+        setComponents(found); setComponentError('');
+        if (!found.installed) { setError('请先安装组件，再登录 OpenAI 账户。'); return; }
+        const patch = found.settings;
+        if (!validOperation(attempt) || !await saveSettings(patch) || !validOperation(attempt)) return;
+      }
+      const next = await request<{ login?: TextCliLogin }>({ action, ...target });
+      if (validOperation(attempt) && next.login) setLogin(next.login);
+    } catch (reason) { if (validOperation(attempt)) setError(messageOf(reason)); }
+    finally { if (validOperation(attempt)) { inFlight.current = false; setOperation(null); } }
+  }
+  useEffect(() => {
+    if (login.state !== 'pending' || !connectionAllowed || actionBlockReason('textCli.loginStatus')) return;
+    let cancelled = false, attempts = 0, timer: ReturnType<typeof setTimeout>;
+    const deadline = Date.now() + 5 * 60 * 1000;
+    const expectedScope = operationScope;
+    async function poll() {
+      if (cancelled || scope.current !== expectedScope) return;
+      if (Date.now() >= deadline) { setLogin({ state: 'failed' }); setError('登录等待已超时，可重新登录。'); return; }
+      try {
+        const next = await request<{ login?: TextCliLogin }>({ action: 'textCli.loginStatus', ...target });
+        if (cancelled || scope.current !== expectedScope) return;
+        if (!next.login) throw new Error('登录状态暂不可用，请重新检查。');
+        if (next.login.state === 'pending') {
+          if (++attempts < 150) timer = setTimeout(() => void poll(), 2000);
+          else { setLogin({ state: 'failed', error: '登录等待已超时，可重新登录。' }); setError('登录等待已超时，可重新登录。'); }
+        } else {
+          setLogin(next.login);
+          if (next.login.state === 'completed') await activeCheck.check();
+          else if (next.login.error) setError(next.login.error);
+        }
+      } catch (reason) { if (!cancelled && scope.current === expectedScope) { setLogin({ state: 'failed' }); setError(messageOf(reason)); } }
+    }
+    timer = setTimeout(() => void poll(), 2000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [login.state, login.loginId, operationScope]);
+  const modelControls = <div className="form-grid text-model-controls"><label>文本模型<select data-text-model disabled={!writable} value={settings.textModel || ''} onChange={event => { update('textModel', event.target.value); const model = models.find(item => item.id === event.target.value); if (model && !model.supportedReasoningEfforts.includes(reasoning)) update('reasoning', model.defaultReasoningEffort); }}><option value="" disabled>连接后选择模型</option>{settings.textModel && !models.some(model => model.id === settings.textModel) && <option value={settings.textModel}>{settings.textModel} · 待检查</option>}{models.map(model => <option key={model.id} value={model.id}>{model.displayName}{model.isDefault ? ' · 默认' : ''}</option>)}</select></label><label>推理强度<select data-text-reasoning disabled={!writable} value={reasoning} onChange={event => update('reasoning', event.target.value)}>{!efforts.includes(reasoning) && <option value={reasoning}>{reasoning} · 待检查</option>}{efforts.map(effort => <option key={effort} value={effort}>{effort}</option>)}</select></label></div>;
+  function componentVersion(component: RuntimeStatus['components'][number]): string | undefined | null {
+    if (component.version) return component.version;
+    const report = activeCheck.result;
+    if (!report) return;
+    if (component.id === 'codex' && report.provider === 'codex_cli' && report.installation.executable === component.path) return report.installation.version;
+    const field = component.id === 'node' ? 'nodeVersion' : 'runtimeVersion';
+    const executable = component.id === 'node' ? report.installation.executable : report.details.runtimeExecutable;
+    return report.provider === 'codex_sdk' && executable === component.path && typeof report.details[field] === 'string' ? report.details[field] as string : undefined;
+  }
+  const connectionLabel = busy ? operation === 'installing' ? '正在安装组件…' : '正在检查连接…' : login.state === 'pending' && !connected ? '等待网页登录' : connected ? '账户与模型已连接' : needsLogin ? '请登录 OpenAI 账户' : error || activeCheck.error ? '连接未完成' : activeCheck.result ? '连接尚未就绪' : '尚未检查登录状态';
 
-  return <section className="surface text-execution-settings"><div className="section-heading compact"><h3>文本执行 · 阶段 1 / 2 / 3</h3>{provider === 'codex' && <Badge status={busy || login.state === 'pending' ? 'running' : 'not_configured'}>{labels}</Badge>}</div>
-    <p className="muted">制作基础、图片提示词设计、分镜文字共用此设置。{policy.mode === 'standard_native' ? sdkAvailable ? '标准版可显式选择 CLI 或 SDK；账户与模型目录需检查，发起流程时会重新核验并冻结实际入口。' : '标准版 CLI 文字执行已开放，账户与模型目录需检查；SDK 真实调用尚未开放。' : policy.mode === 'native_cli_acceptance' ? '当前为固定源、固定模型与范围的受控 CLI 文字验收；SDK、API、图片和视频真实生成保持关闭。' : policy.readiness?.enabled ? '程序、账户和模型目录可按按钮单独只读检查；真实生成与登录、凭据变更仍受独立门禁控制。' : '当前环境的只读连接检查尚未开放；可保存本地执行偏好，真实生成与登录、凭据变更保持关闭。'}</p>
-    <label>文本渠道<select value={provider} onChange={event => update('textProvider', event.target.value)}><option value="codex">Codex CLI</option><option value="codex_sdk">{sdkAvailable ? '官方 Codex SDK（需原生就绪检查）' : '官方 Codex SDK（离线核验，真实调用关闭）'}</option><option value="api">文本 API</option></select></label>
-    {provider === 'codex' ? <>
-      <label>Codex CLI 程序<div className="text-cli-path"><input value={path} onChange={event => update('codexPath', event.target.value)} placeholder="自动查找本机 Codex CLI，或填写完整路径"/><Button icon="source" disabled={!writable || busy} onClick={() => void selectExecutable()}>选择程序</Button></div></label>
-      {status?.executable && <p className="control-hint text-cli-resolved">{status.version || 'Codex CLI'} · {status.executable}</p>}
-      <div className="text-cli-account"><strong>{cliCheck.result?.authentication.state === 'authenticated' ? '已登录本机 Codex 账户' : cliCheck.result?.authentication.state === 'not_logged_in' ? '本机 Codex 账户未登录' : '本机 Codex 账户尚未核验'}</strong>{status?.account?.planType && <span className="badge">{status.account.planType}</span>}</div>
-      <div className="actions"><ReadinessButton check={cliCheck} writable={writable && !loginBusy}>检查 CLI 与账户</ReadinessButton>{login.state === 'pending' ? <><Button executionAction="textCli.openLogin" disabled={!writable || busy} onClick={() => void loginAction('textCli.openLogin')}>打开登录网页</Button><Button executionAction="textCli.cancelLogin" disabled={!writable || busy} onClick={() => void loginAction('textCli.cancelLogin')}>取消等待</Button></> : <Button executionAction="textCli.login" disabled={!writable || busy || status?.available === false} onClick={() => void loginAction('textCli.login')}>{status?.loggedIn ? '重新登录' : '登录 Codex'}</Button>}</div>
-      {login.state === 'pending' && <p className="control-hint">请在已打开的官方网页完成登录，再点击只读检查核对账户。</p>}
-      {status?.limits?.length ? <div className="text-cli-limits">{status.limits.map(limit => { const windows = [windowText(limit.primary), windowText(limit.secondary)].filter(Boolean); return <div key={limit.id}><strong>{limit.name || '账户额度'}</strong>{windows.map((value, index) => <span key={index}>{value}</span>)}{limit.credits?.unlimited ? <span>额度不限</span> : limit.credits?.balance != null && <span>余额 {limit.credits.balance}</span>}</div>; })}</div> : status?.loggedIn ? <p className="control-hint">账户未返回额度明细。</p> : null}
-      {error && <p className="warning" role="alert">{error}</p>}
-      <ProviderReadinessResult check={cliCheck}/>
-      {status?.warnings?.map((warning, index) => <p className="control-hint" key={index}>{warning}</p>)}
+  return <section className="surface text-execution-settings"><div className="section-heading compact"><h3>OpenAI</h3>{provider !== 'api' && <Badge status={busy || login.state === 'pending' && !connected ? 'running' : connected ? 'available' : needsLogin ? 'auth_required' : 'not_configured'}>{busy ? '连接中' : connected ? '已连接' : needsLogin ? '待登录' : '待连接'}</Badge>}</div>
+    <p className="muted">SDK 与 CLI 共用 OpenAI 账户，用于制作基础、图片提示词和分镜脚本。</p>
+    <label>执行方式<select disabled={!writable || busy} data-text-provider value={provider === 'api' ? '' : provider} onChange={event => update('textProvider', event.target.value)}>{provider === 'api' && <option value="" disabled>请选择执行方式</option>}<option value="codex">Codex CLI</option><option value="codex_sdk">Codex SDK</option></select></label>
+    {provider !== 'api' ? <>
+      <div className="text-component-status" role="status"><strong>组件</strong><span>{componentBusy ? '正在检测本机组件…' : components?.installed ? '已安装' : components ? components.components.some(item => item.state === 'invalid') ? '需要修复' : '未安装' : '检测未完成'}</span>{components?.installed && components.components.map(component => { const version = componentVersion(component); return <span key={component.id}>{component.name}{version ? ` ${version}` : activeCheck.result ? '' : ' · 版本待检查'}</span>; })}</div>
+      {(componentError || components?.components.find(component => component.state === 'invalid')?.message) && <p className="warning" role="alert">{componentError || components?.components.find(component => component.state === 'invalid')?.message}</p>}
       {modelControls}
-      {models.length > 0 && (!selectedModel || !efforts.includes(reasoning)) && <p className="warning">当前模型或推理强度未获此 CLI 确认，请从目录中重新选择。</p>}
-      <p className="control-hint">检查使用输入框里的当前路径，无需先保存；修改路径后请重新检查。保存设置只影响新流程。</p>
-    </> : provider === 'codex_sdk' ? <>
-      <p className="control-hint">官方 SDK 共用工作流、原始回包、领域校验、缓存与持久修订预算。{sdkAvailable ? '后端已开放显式 SDK 入口，须核验 Node.js、官方运行器、账户与模型；不会自动改用 CLI。' : '当前只支持离线环境核验，SDK 真实调用保持关闭；不会自动改用 CLI。'}</p>
-      <strong role="status" data-sdk-execution-state={sdkReady ? 'ready' : sdkAvailable ? 'unverified' : 'closed'}>{sdkReady ? 'SDK 环境、账户与目录已核验；发起流程前仍会核对所选模型和强度' : sdkAvailable ? 'SDK 尚未就绪核验，请检查环境、账户与模型' : 'SDK 真实执行当前关闭'}</strong>
-      <label>SDK Node.js 程序<div className="text-cli-path"><input value={sdkPath} onChange={event => update('textSdkNodePath', event.target.value)} placeholder="自动查找 Node.js，或填写本机程序绝对路径"/><Button icon="source" disabled={!writable || busy} onClick={() => void selectNode()}>选择 Node.js</Button></div></label>
-      <label>已有 Codex CLI 程序<div className="text-cli-path"><input value={path} onChange={event => update('codexPath', event.target.value)} placeholder="复用 CLI 路径，留空自动查找官方运行器"/><Button icon="source" disabled={!writable || busy} onClick={() => void selectExecutable()}>选择程序</Button></div></label>
-      {typeof sdkCheck.result?.details.runtimeExecutable === 'string' && <p className="control-hint text-cli-resolved">{String(sdkCheck.result.details.runtimeVersion || 'Codex')} · {sdkCheck.result.details.runtimeExecutable}</p>}
-      <ReadinessButton check={sdkCheck} writable={writable}>{sdkAvailable ? '检查 SDK 环境、账户与模型' : '检查 SDK 环境与协议'}</ReadinessButton>
-      <ProviderReadinessResult check={sdkCheck}/>
-      {sdkAvailable ? modelControls : <><label>文本模型<input value={settings.textModel || ''} onChange={event => update('textModel', event.target.value)} placeholder="gpt-6.1-sol"/></label><label>推理强度<input value={reasoning} onChange={event => update('reasoning', event.target.value)} placeholder="medium"/></label></>}
-      {sdkAvailable && models.length > 0 && (!selectedModel || !efforts.includes(reasoning)) && <p className="warning">当前模型或推理强度未获本次 SDK 目录确认，请重新选择。</p>}
-      <p className="control-hint">检查使用当前 Node.js 与 Codex 路径，无需先保存；更改任一路径会清除旧检查。保存设置只影响新流程，不启动模型请求。</p>
-      <p className="warning">固定 SDK 仅支持本地回执核对，无法证明远端停止。未知任务保留占位，不自动重发或切换 CLI；保存偏好不会启动模型请求。</p>
-    </> : <>
-      <label>文本模型<input value={settings.textModel || ''} onChange={event => update('textModel', event.target.value)} placeholder="填写 API 支持的模型"/></label>
-      <label>API 地址<input value={settings.textEndpoint || ''} onChange={event => update('textEndpoint', event.target.value)} placeholder="https://…"/></label><label>本机凭据<input disabled={!!actionBlockReason('textCli.login')} title={actionBlockReason('textCli.login') || undefined} type="password" autoComplete="new-password" value={settings.textApiKey || ''} onChange={event => update('textApiKey', event.target.value)} placeholder="留空保留已保存凭据"/></label>
-      <p className="control-hint">Rust 核心直接调用已保存的文本 API，推理策略使用服务默认值。</p>
-    </>}
-    <p className="note">全局文本上限 4 路，两入口共用；SDK 单 worker 上限 1 路，未知执行持续占位。同集上限 2 路；连续依赖顺序执行。更改设置只影响新流程，历史任务保留原入口。</p>
+      <div className="text-connection-status" role="status" data-sdk-execution-state={provider === 'codex_sdk' ? sdkReady ? 'ready' : sdkAvailable ? 'unverified' : 'closed' : undefined}>
+        <strong>{connectionLabel}</strong>{provider === 'codex' && status?.account?.planType && <span className="badge">{status.account.planType}</span>}
+      </div>
+      {activeCheck.result && <p className="control-hint">最近检查：{formatDate(activeCheck.result.checkedAt)}</p>}
+      <div className="actions text-connection-actions">{components && !components.installed && <Button executionAction="runtime.prepare" icon="download" disabled={!writable || busy || !components.installSupported || !automaticSetup} onClick={() => void connect(true)}>{operation === 'installing' ? '正在安装…' : '安装组件'}</Button>}<Button executionAction="readiness.check" data-readiness-provider={activeCheck.provider} icon="refresh" disabled={!writable || busy || componentBusy || !!activeCheck.blocked} title={activeCheck.blocked || undefined} onClick={() => void connect()}>{busy ? '正在检查…' : components && !components.installed ? '重新检测组件' : activeCheck.result ? '重新检查' : '检查连接'}</Button>
+        {login.state === 'pending' && !connected ? <><Button executionAction="textCli.openLogin" disabled={!writable || busy} onClick={() => void loginAction('textCli.openLogin')}>打开登录网页</Button><Button executionAction="textCli.cancelLogin" disabled={!writable || busy} onClick={() => void loginAction('textCli.cancelLogin')}>取消等待</Button></> : <Button executionAction="textCli.login" disabled={!writable || busy || !components?.installed} onClick={() => void loginAction('textCli.login')}>{connected ? '重新登录' : '登录'}</Button>}
+      </div>
+      <p className="control-hint">{login.state === 'pending' && !connected ? '请在官方网页完成登录，完成后自动更新连接状态。' : components?.installed ? '组件已就绪，可登录或检查账户与模型。' : automaticSetup ? '先安装缺少的组件，再登录账户。' : '当前环境仅支持检查已有程序。'}</p>
+      {(error || activeCheck.error) && <p className="warning" role="alert">{error || activeCheck.error}</p>}
+      {activeCheck.blocked && <p className="warning">{activeCheck.blocked}</p>}
+      {provider === 'codex_sdk' && !sdkAvailable && <p className="warning">此环境暂未开放 SDK 执行。</p>}
+      {models.length > 0 && (!selectedModel || !efforts.includes(reasoning)) && <p className="warning">请从已连接的模型目录中选择模型与推理强度。</p>}
+      <details className="details text-execution-diagnostics"><summary>连接诊断</summary>
+        <ProviderReadinessResult check={activeCheck}/>
+        {provider === 'codex_sdk' && typeof sdkCheck.result?.details.runtimeExecutable === 'string' && <p className="control-hint path-value">Codex：{sdkCheck.result.details.runtimeExecutable}</p>}
+        {provider === 'codex_sdk' && sdkPath && <p className="control-hint path-value">Node.js：{sdkPath}</p>}
+        {path && <p className="control-hint path-value">Codex 程序：{path}</p>}
+        {provider === 'codex' && status?.warnings?.map((warning, index) => <p className="control-hint" key={index}>{warning}</p>)}
+        {provider === 'codex' && status?.limits?.length ? <div className="text-cli-limits">{status.limits.map(limit => { const windows = [windowText(limit.primary), windowText(limit.secondary)].filter(Boolean); return <div key={limit.id}><strong>{limit.name || '账户额度'}</strong>{windows.map((value, index) => <span key={index}>{value}</span>)}{limit.credits?.unlimited ? <span>额度不限</span> : limit.credits?.balance != null && <span>余额 {limit.credits.balance}</span>}</div>; })}</div> : null}
+        <p className="control-hint">检查连接不会生成内容。更改设置仅影响新流程；历史任务保留原入口，结果未知的任务不会自动重发。</p>
+      </details>
+    </> : <p className="warning">此前使用了其他执行方式，请选择 CLI 或 SDK。原设置已保留。</p>}
   </section>;
 }

@@ -46,7 +46,7 @@ export function installExecutionPolicy(policy: ExecutionPolicy): void {
 const NATIVE_EXTRA_ACTIONS = new Set(['foundation.run', 'images.design', 'workflows.resume', 'textCli.status', 'storyboard.run', 'storyboard.decision.resolve']);
 
 const LOCAL_READ_ACTIONS = new Set([
-  'getExecutionPolicy', 'textSdk.status', 'images.previewPrompt', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get',
+  'getExecutionPolicy', 'settings.global.get', 'runtime.status', 'chrome.status', 'textSdk.status', 'images.previewPrompt', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get',
   'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail',
 ]);
 const LOCAL_WRITE_ACTIONS = new Set([
@@ -55,14 +55,14 @@ const LOCAL_WRITE_ACTIONS = new Set([
   'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete',
   'assets.restore', 'jobs.close_unknown', 'source.import', 'source.resolve', 'source.reparse',
   'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt',
-  'settings.save', 'backup.create', 'backup.restore',
+  'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',
 ]);
 const GENERATION_ACTIONS = new Set([
   'foundation.run', 'foundation.choices.apply', 'images.design', 'images.produce', 'images.run',
   'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',
 ]);
 const PROVIDER_ACTIONS = new Set([
-  'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
+  'runtime.prepare', 'chrome.connect', 'chrome.check', 'chrome.open', 'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
 ]);
 const CREDENTIAL_ACTIONS = new Set([
   'canvas.login', 'canvas.loginStatus', 'canvas.openAuthorization', 'canvas.cancelLogin', 'canvas.logout',
@@ -76,7 +76,7 @@ export const CREDENTIAL_SETTING_KEYS = ['bhToken', 'chromeToken', 'textApiKey'] 
 
 export function classifyAction(input: PolicyRequest | string): ActionCategory {
   const request = typeof input === 'string' ? { action: input } : input;
-  if (request.action === 'settings.save' && request.settings && typeof request.settings === 'object') {
+  if (['settings.save', 'settings.global.save'].includes(request.action) && request.settings && typeof request.settings === 'object') {
     const settings = request.settings as Record<string, unknown>;
     if (CREDENTIAL_SETTING_KEYS.some(key => settings[key] != null && settings[key] !== '')) return 'credentials';
   }

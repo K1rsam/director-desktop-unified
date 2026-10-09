@@ -1,4 +1,6 @@
 pub mod binding;
+pub mod app_settings;
+pub mod chrome_setup;
 pub mod engine;
 pub mod executable_paths;
 pub mod importer;
@@ -29,6 +31,7 @@ pub mod native_acceptance;
 pub mod startup_diagnostics;
 
 pub mod readiness;
+pub mod runtime_setup;
 pub mod readiness_sdk;
 pub mod readiness_canvas;
 pub mod canvas_oauth;

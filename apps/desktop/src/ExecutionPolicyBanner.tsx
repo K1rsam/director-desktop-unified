@@ -5,7 +5,7 @@ import { OFFLINE_EXECUTION_POLICY } from './executionPolicy';
 import type { ExecutionPolicy } from './executionPolicy';
 import './executionPolicy.css';
 
-export function ExecutionPolicyBanner() {
+export function ExecutionPolicyBanner({ globalSettings = false }: { globalSettings?: boolean }) {
   const [policy, setPolicy] = useState<ExecutionPolicy>(OFFLINE_EXECUTION_POLICY);
   const [state, setState] = useState<'checking' | 'verified' | 'failed'>(desktop ? 'checking' : 'verified');
   const [error, setError] = useState(''), [retry, setRetry] = useState(0);
@@ -18,6 +18,7 @@ export function ExecutionPolicyBanner() {
     }).catch(reason => { if (active) { setPolicy(OFFLINE_EXECUTION_POLICY); setError(messageOf(reason)); setState('failed'); } });
     return () => { active = false; };
   }, [retry]);
+  if (globalSettings) return state === 'failed' ? <div className="notification error" role="alert"><span>本地连接状态读取失败：{error}</span><Button icon="refresh" onClick={() => setRetry(value => value + 1)}>重新连接</Button></div> : null;
   const native = policy.mode === 'native_cli_acceptance';
   if (policy.mode === 'standard_native' || native) return <section className="execution-policy-banner" aria-label="产品执行状态" data-execution-mode={policy.mode}>
     <div className="execution-policy-heading"><strong>Director Desktop Next · 标准版</strong><span>{native ? '当前绑定有界文字验收范围' : '本机渠道与制作功能'} · {policy.stage3CreativePackStatus === 'inactive' ? '第三阶段暂不可生成' : '第三阶段已接入'}</span></div>

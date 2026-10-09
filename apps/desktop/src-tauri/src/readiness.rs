@@ -79,10 +79,17 @@ pub fn codex_report(status: &Value, settings: &Value) -> Value {
             .is_some_and(|v| v.starts_with("codex-cli "));
     let rpc_ready = status["readinessRpcReady"].as_bool().unwrap_or(inspected);
     let logged_in = status["loggedIn"] == true;
+    // The official read-only RPC checked the account in this invocation. Do not
+    // confuse redacting its identity from the public report with not checking it.
+    // A local version string alone is not account evidence.
+    let account_checked = inspected && status["readinessRpcReady"] == true;
+    let identity_verified = account_checked
+        && logged_in
+        && status["account"].as_object().is_some_and(|account| !account.is_empty());
     let models:Vec<Value>=status["models"].as_array().into_iter().flatten().take(1000).filter(|m|m["id"].as_str().is_some_and(|s|s.len()<=256&&!s.chars().any(char::is_control))).map(|m|json!({"id":m["id"],"name":bounded(&m["displayName"],256),"displayName":bounded(&m["displayName"],256),"supportedReasoningEfforts":m["supportedReasoningEfforts"],"defaultReasoningEffort":m["defaultReasoningEffort"],"isDefault":m["isDefault"]})).collect();
     result["installation"] = json!({"state":if inspected{"ready"}else if installed{"invalid"}else{"missing"},"version":bounded(&status["version"],128),"executable":bounded(&status["executable"],4096)});
     result["protocol"] = json!({"state":if rpc_ready{"ready"}else if installed{"failed"}else{"not_checked"},"name":"Codex app-server read-only RPC"});
-    result["authentication"] = json!({"state":if logged_in{"authenticated"}else if rpc_ready{"not_logged_in"}else{"unknown"},"identityVerified":false});
+    result["authentication"] = json!({"state":if logged_in{"authenticated"}else if rpc_ready{"not_logged_in"}else{"unknown"},"identityVerified":identity_verified});
     result["catalog"] = json!({"state":if models.is_empty(){"unavailable"}else{"available"},"models":models,"selectedModelAvailable":models.iter().any(|m|m["id"]==settings["textModel"])});
     let warnings: Vec<Value> = status["warnings"]
         .as_array()
@@ -94,7 +101,7 @@ pub fn codex_report(status: &Value, settings: &Value) -> Value {
         .collect();
     result["messages"] = json!([
         "检查只读取 CLI 版本、现有登录、模型目录与额度，没有发起文本生成。",
-        "模型目录不是套餐权限或真实模型调用证明；公网及真实生成尚未单独验证。"
+        "账户核验仅确认 CLI 返回的现有登录；模型目录不是套餐权限或真实模型调用证明，公网及真实生成尚未单独验证。"
     ]);
     if let Some(error) = bounded(&status["error"], 512)
         .as_str()
@@ -113,7 +120,7 @@ pub fn codex_report(status: &Value, settings: &Value) -> Value {
     }
     let mut safe = json!({"available":installed,"ready":status["ready"]==true,"loggedIn":logged_in,"version":result["installation"]["version"],"executable":result["installation"]["executable"],"models":models,"limits":status["limits"],"warnings":warnings,"error":bounded(&status["error"],512),"checkedAt":result["checkedAt"],"generationRequestsSent":0,"catalogIsEntitlementCheck":false,"globalConcurrency":4,"episodeConcurrency":2,"login":{"state":"idle"}});
     safe["account"] = json!({"type":bounded(&status["account"]["type"],64),"planType":bounded(&status["account"]["planType"],64)});
-    result["details"] = json!({"cliStatus":safe,"accountIdentityNotExported":true,"permittedRpcMethods":["account/read(refreshToken=false)","model/list","account/rateLimits/read"]});
+    result["details"] = json!({"cliStatus":safe,"accountChecked":account_checked,"accountIdentityNotExported":true,"permittedRpcMethods":["account/read(refreshToken=false)","model/list","account/rateLimits/read"]});
     result
 }
 pub async fn check(provider: &str, settings: &Value, resource_root: Option<&Path>) -> Value {
