@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 pub use source::*;
 use std::collections::{HashMap, HashSet};
-pub(crate) use storyboard::{finish_base_hash, validate_episode_delivery, CONTEXT_INPUT_PROFILE_FIELD, CONTEXT_INPUT_PROFILE};
+pub(crate) use storyboard::{finish_base_hash, finish_base_input_projection, validate_episode_delivery, CONTEXT_INPUT_PROFILE_FIELD, CONTEXT_INPUT_PROFILE};
 #[cfg(test)]
 pub(crate) fn scope_repair_delta_schema_for_test(full: &Value, base: &Value) -> Value {
     storyboard::finish_delta_schema(full, base)

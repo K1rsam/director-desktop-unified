@@ -184,7 +184,7 @@ fn remove_unit_program_exports(unit: &mut Value) -> bool {
     changed
 }
 
-fn remove_program_exports(draft: &mut Value) {
+pub(super) fn remove_program_exports(draft: &mut Value) {
     for unit in draft["units"].as_array_mut().into_iter().flatten() {
         remove_unit_program_exports(unit);
     }

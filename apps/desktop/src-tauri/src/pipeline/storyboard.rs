@@ -173,6 +173,13 @@ pub(crate) fn finish_base_hash(base: &Value) -> String {
     digest(&json!({"schemaVersion":base["schemaVersion"],"units":base["units"],"fantasyRealization":base["fantasyRealization"]}).to_string())
 }
 
+/// The same deterministic projection used when freezing an editor request.
+pub(crate) fn finish_base_input_projection(base: &Value) -> Value {
+    let mut projected = base.clone();
+    creative::remove_program_exports(&mut projected);
+    projected
+}
+
 pub(super) fn finish_delta_schema(full: &Value, base: &Value) -> Value {
     let ids: Vec<_> = base["units"]
         .as_array()

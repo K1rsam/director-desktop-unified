@@ -171,9 +171,9 @@ impl SavedTextExecutor {
                     || !rows.iter().all(|row| row.pointer("/range/end").and_then(Value::as_u64)
                         .is_some_and(|end| end <= first.unwrap())))
             { continue; }
-            let Some(accepted) = self.sealed_plain_finish_value(&prior, &saved)? else { continue; };
+            let Some((accepted, prior_base)) = self.sealed_plain_finish_value(&prior, &saved)? else { continue; };
             if accepted["materializedDraft"]["units"].as_array().and_then(|units| units.last()) != Some(&tail["unit"])
-                || prior.input["previousDraft"]["units"].as_array().and_then(|units| units.last()) != Some(&author_tail["unit"])
+                || prior_base["units"].as_array().and_then(|units| units.last()) != Some(&author_tail["unit"])
             { continue; }
             for (repair_text, repair_hash, node) in &candidates {
                 let repair_snapshot: Value = serde_json::from_str(repair_text).map_err(|_| held())?;
@@ -187,10 +187,10 @@ impl SavedTextExecutor {
                 { continue; }
                 let Some(repaired) = self.managed_accepted_value(&repair, &repair_snapshot)? else { continue; };
                 let draft = &repaired["materializedDraft"];
-                if draft["units"] == prior.input["previousDraft"]["units"]
-                    && draft["fantasyRealization"] == prior.input["previousDraft"]["fantasyRealization"]
+                if draft["units"] == prior_base["units"]
+                    && draft["fantasyRealization"] == prior_base["fantasyRealization"]
                     && prior.input["baseDraftHash"] == crate::pipeline::finish_base_hash(draft)
-                    && prior.input["baseDraftHash"] == crate::pipeline::finish_base_hash(&prior.input["previousDraft"])
+                    && prior.input["baseDraftHash"] == crate::pipeline::finish_base_hash(&prior_base)
                     && prior.input["authorRepairProvenance"] == draft["authorRepairProvenance"]
                     && crate::workflow::accepted_author_repair_predecessor(&self.store,run,node,author_tail)?
                 {
@@ -201,7 +201,65 @@ impl SavedTextExecutor {
         Ok(None)
     }
 
-    fn sealed_plain_finish_value(&self, request: &TextRequest, snapshot: &Value) -> Result<Option<Value>> {
+    /// Recover a single author's full immutable base. The editor's frozen
+    /// previousDraft omits program exports, but its base hash intentionally
+    /// identifies the complete accepted author. Never hash the smaller view as
+    /// if it were that base, and never reconstruct from current published units.
+    fn sealed_plain_finish_base(&self, request: &TextRequest) -> Result<Option<Value>> {
+        let frozen = &request.input["previousDraft"];
+        if request.input["baseDraftHash"] == crate::pipeline::finish_base_hash(frozen) {
+            return Ok(Some(frozen.clone()));
+        }
+        let Some(batches) = request.input["executionBatch"]["authorBatchIds"].as_array().filter(|ids| ids.len() == 1) else { return Ok(None); };
+        let Some(batch) = batches[0].as_str().filter(|id| !id.is_empty()) else { return Ok(None); };
+        if request.input["storyboardCreativeProfile"] != "original-production-contract/v1" { return Ok(None); }
+        let run = self.workflow_id.as_deref().ok_or_else(held)?;
+        let node = format!("storyboardCreate:{}:batch:{batch}",s(&request.input,"episodeId"));
+        let c = self.store.conn()?;
+        let origin: Option<(String,String,String)> = c.query_row(
+            "SELECT j.snapshot,w.request_hash,w.state FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2 AND w.stage='storyboardCreate' AND j.kind='text' AND j.provider='codex'",
+            params![run,node],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|_|held())?;
+        let Some((text,hash,state)) = origin else { return Ok(None); };
+        let snapshot: Value = serde_json::from_str(&text).map_err(|_|held())?;
+        let author: TextRequest = serde_json::from_value(snapshot.clone()).map_err(|_|held())?;
+        if snapshot.to_string()!=text || crate::pipeline::digest(&text)!=hash || step_key(&author)!=node
+            || author.skill!="unit-performance-director" || author.model!=request.model || author.reasoning!=request.reasoning
+            || ["sourceRows","settings","capabilities","assetCatalogScope","storyboardCreativeProfile","storyboardRulePackProfile","storyboardRulePackSha256"]
+                .iter().any(|field|author.input[*field]!=request.input[*field])
+        {return Ok(None);}
+        let draft = if state=="accepted" {
+            if !request.input["authorRepairProvenance"].is_null() { return Ok(None); }
+            let Some(value)=self.managed_accepted_value(&author,&snapshot)? else {return Ok(None);};
+            value
+        } else if state=="rejected" {
+            let proof=&request.input["authorRepairProvenance"];
+            let Some(domain_hash)=proof["nodes"].as_array().and_then(|nodes|nodes.last()).and_then(|last|last["canonicalDomainRequestSha256"].as_str()) else {return Ok(None);};
+            if proof["originDomainRequestSha256"]!=crate::pipeline::digest(&serde_json::to_string(&author).map_err(|_|held())?) {return Ok(None);}
+            let mut q=c.prepare("SELECT j.snapshot,w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardFinish' AND w.state='accepted' AND j.kind='text' AND j.provider='codex' AND j.state='completed' AND json_extract(j.snapshot,'$.input.authorRepair.originDomainRequestSha256')=?2").map_err(|_|held())?;
+            let candidates=q.query_map(params![run,proof["originDomainRequestSha256"].as_str().unwrap()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|_|held())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|_|held())?;
+            let mut matched=None;
+            for (text,node) in candidates {
+                let saved:Value=serde_json::from_str(&text).map_err(|_|held())?;
+                let repair:TextRequest=serde_json::from_value(saved.clone()).map_err(|_|held())?;
+                if !is_author_scope_repair(&repair) || crate::pipeline::digest(&serde_json::to_string(&repair).map_err(|_|held())?)!=domain_hash {continue;}
+                let Some(value)=self.managed_accepted_value(&repair,&saved)? else {return Ok(None);};
+                let draft=&value["materializedDraft"];
+                let tail=json!({"executionBatchId":batch,"unit":draft["units"].as_array().and_then(|units|units.last())});
+                if draft["authorRepairProvenance"]!=*proof || !crate::workflow::accepted_author_repair_predecessor(&self.store,run,&node,&tail)? {return Ok(None);}
+                if matched.replace(draft.clone()).is_some(){return Ok(None);}
+            }
+            let Some(draft)=matched else {return Ok(None);};draft
+        } else {return Ok(None);};
+        let base=json!({"schemaVersion":draft["schemaVersion"],"units":draft["units"],"fantasyRealization":draft["fantasyRealization"],"revisionNotes":[],"unresolved":[]});
+        if base["schemaVersion"]!="storyboard-draft/v2"
+            || base["units"].as_array().is_none_or(Vec::is_empty)
+            || request.input["baseDraftHash"]!=crate::pipeline::finish_base_hash(&base)
+            || crate::pipeline::finish_base_input_projection(&base)!=*frozen
+        {return Ok(None);}
+        Ok(Some(base))
+    }
+
+    fn sealed_plain_finish_value(&self, request: &TextRequest, snapshot: &Value) -> Result<Option<(Value,Value)>> {
         if request.stage != "storyboardFinish" || request.skill != "episode-finishing-editor"
             || request.input["executionBatch"]["version"] != "related-range-finish/v1" {
             return Ok(None);
@@ -218,13 +276,13 @@ impl SavedTextExecutor {
         if !receipt["migrationPolicy"].is_null() || !raw.is_object()
             || raw["schemaVersion"] != "storyboard-delta/v2"
             || raw["baseDraftHash"] != request.input["baseDraftHash"]
-            || request.input["baseDraftHash"] != crate::pipeline::finish_base_hash(&request.input["previousDraft"])
             || accepted["materializedDraft"]["units"].as_array().is_none_or(Vec::is_empty)
             || raw.get("materializedDraft").is_some()
             || event["requestHash"] != crate::pipeline::digest(&snapshot.to_string())
         { return Ok(None); }
+        let Some(base)=self.sealed_plain_finish_base(request)? else {return Ok(None);};
         raw["materializedDraft"] = accepted["materializedDraft"].clone();
-        Ok((raw == accepted).then_some(accepted))
+        Ok((raw == accepted).then_some((accepted,base)))
     }
 
     /// API has no passive reconciliation for an interrupted request. Existing
@@ -519,6 +577,103 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    #[tokio::test]
+    #[ignore = "explicit stable private B database copy; real pipeline cache replay, no runtime or provider calls"]
+    async fn readonly_actual_finish_missing_predecessor_pipeline_replays_sealed_results() {
+        let path = PathBuf::from(std::env::var("DIRECTOR_FINISH_PREDECESSOR_DB").unwrap()).canonicalize().unwrap();
+        let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.local/live-acceptance-20261008").canonicalize().unwrap();
+        assert!(path.starts_with(&allowed) && path.file_name().unwrap() == "project.sqlite");
+        let before_hash = crate::store::hash_file(&path).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&path, dir.path().join("project.sqlite")).unwrap();
+        let wal = path.with_file_name("project.sqlite-wal");
+        assert!(!wal.exists() || std::fs::metadata(wal).unwrap().len() == 0, "stable checkpointed copy required");
+        let store = Store { root: dir.path().to_path_buf() };
+        let run = std::env::var("DIRECTOR_FINISH_PREDECESSOR_WORKFLOW").unwrap();
+        let record = store.job(&run).unwrap();
+        let parent = record["snapshot"].clone();
+        let saved = SavedTextExecutor { store: store.clone(), settings: parent["input"]["settings"].clone(), workflow_id: Some(run.clone()) };
+        let before = evidence(&saved);
+        struct Readonly {
+            saved: SavedTextExecutor,
+            report: std::sync::Mutex<Vec<Value>>,
+            captures: std::sync::Mutex<Vec<Value>>,
+        }
+        fn differences(a: &Value, b: &Value, path: &str, result: &mut Vec<String>) {
+            if a == b { return; }
+            match (a,b) {
+                (Value::Object(a),Value::Object(b)) => {
+                    let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+                    for key in keys { differences(a.get(key).unwrap_or(&Value::Null),b.get(key).unwrap_or(&Value::Null),&format!("{path}/{key}"),result); }
+                },
+                (Value::Array(a),Value::Array(b)) if a.len()==b.len() => {
+                    for (i,(a,b)) in a.iter().zip(b).enumerate() { differences(a,b,&format!("{path}/{i}"),result); }
+                },
+                _ => result.push(path.into()),
+            }
+        }
+        #[async_trait::async_trait]
+        impl TextExecutor for Readonly {
+            async fn prepare_transport_request(&self, r: TextRequest) -> Result<TextRequest> {
+                self.saved.prepare_transport_request(r).await
+            }
+            fn input_transport_characters(&self,r:&TextRequest)->Result<usize>{ self.saved.input_transport_characters(r) }
+            async fn author_chain_revision(&self,r:&TextRequest,p:&Value)->Result<Option<Value>>{ self.saved.author_chain_revision(r,p).await }
+            async fn prepare_finish_asset_projection(&self,legacy:TextRequest,projected:TextRequest)->Result<TextRequest> {
+                let result=self.saved.saved_finish_asset_projection(legacy.clone(),projected.clone());
+                if result.is_err() {
+                    let old:Option<String>=self.saved.store.conn()?.query_row("SELECT j.snapshot FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",params![self.saved.workflow_id,step_key(&legacy)],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+                    let old:Value=old.as_deref().map(serde_json::from_str).transpose().map_err(|e|e.to_string())?.unwrap_or(Value::Null);
+                    let mut domain=old.clone(); if let Some(map)=domain.as_object_mut(){map.remove("executorIdentity");}
+                    let asset=asset_only_finish_request(&legacy,&projected)?;
+                    let mut diffs=Vec::new(); differences(&domain,&self.saved.request_domain_snapshot(&projected)?,"",&mut diffs);
+                    self.report.lock().unwrap().push(json!({"gate":"selector","node":step_key(&legacy),"diffs":diffs}));
+                    self.captures.lock().unwrap().push(json!({"original":old,"legacy":legacy,"asset":asset,"projected":projected}));
+                }
+                result
+            }
+            async fn execute(&self,r:TextRequest)->Result<Value> {
+                // Deliberately never delegates execute: even a newly required
+                // planner must stop here, with no process or network access.
+                let c=self.saved.store.conn()?;
+                let row:Option<(String,String,String,String,String)>=c.query_row("SELECT w.state,j.state,w.request_hash,j.snapshot,e.data FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND w.node_key=?2",params![self.saved.workflow_id,step_key(&r)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|e|e.to_string())?;
+                let Some((step,state,hash,text,event))=row else { return Err("READONLY_NO_NEW_EXECUTION".into()); };
+                if !matches!((step.as_str(),state.as_str()),("accepted","completed")|("rejected","rejected")) {return Err("READONLY_UNRESOLVED_EXECUTION".into());}
+                let snapshot:Value=serde_json::from_str(&text).map_err(|e|e.to_string())?;
+                let mut domain=snapshot.clone();domain.as_object_mut().unwrap().remove("executorIdentity");
+                let current=self.saved.request_domain_snapshot(&r)?;
+                if domain!=current {
+                    let mut diffs=Vec::new();differences(&domain,&current,"",&mut diffs);
+                    self.report.lock().unwrap().push(json!({"gate":"execute","node":step_key(&r),"diffs":diffs}));
+                    return Err("READONLY_DOMAIN_MISMATCH".into());
+                }
+                let event:Value=serde_json::from_str(&event).map_err(|e|e.to_string())?;
+                assert_eq!(crate::pipeline::digest(&text),hash);assert_eq!(snapshot.to_string(),text);assert_eq!(event["requestHash"],hash);
+                if step=="accepted" { assert!(self.saved.managed_accepted_value(&r,&snapshot)?.is_some(),"{}",step_key(&r)); }
+                self.report.lock().unwrap().push(json!({"gate":"raw_replayed","node":step_key(&r),"state":step}));
+                Ok(event["value"].clone())
+            }
+        }
+        let executor=Readonly{saved,report:Default::default(),captures:Default::default()};
+        let mut input=parent["input"].clone();
+        let history={let c=store.conn().unwrap();let mut q=c.prepare("SELECT w.stage,w.state,json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.finishMode'),json_extract(j.snapshot,'$.input.executionBatch.version'),json_extract(w.result,'$.schemaVersion'),w.request_hash FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 ORDER BY w.rowid").unwrap();let rows=q.query_map([&run],|r|Ok(json!({"stage":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"episodeId":r.get::<_,Option<String>>(2)?,"finishMode":r.get::<_,Option<String>>(3)?,"executionBatchVersion":r.get::<_,Option<String>>(4)?,"outputSchemaVersion":r.get::<_,Option<String>>(5)?,"requestHash":r.get::<_,String>(6)?}))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();rows};
+        input["storyboardHistory"]=json!(history);
+        input["decisions"]=record["prepared"]["decisions"].clone();
+        input["frozenFinisherAssetContext"]=parent["input"].clone();
+        let output=crate::pipeline::run_storyboard(&input,&executor,s(&parent["input"]["settings"],"textModel"),s(&parent["input"]["settings"],"reasoning")).await.unwrap();
+        let report=json!({"workflowId":run,"calls":executor.report.lock().unwrap().clone(),"status":output["status"],"blocked":output["blocked"],"units":output["units"].as_array().map(Vec::len),"newJobs":0,"newEvents":0,"newModelCalls":0,"imageRequests":0,"videoRequests":0});
+        println!("{}",report);
+        if let Ok(report_path)=std::env::var("DIRECTOR_FINISH_PREDECESSOR_REPORT") {
+            let report_path=PathBuf::from(report_path);assert!(report_path.parent().unwrap().canonicalize().unwrap().starts_with(&allowed));
+            std::fs::write(&report_path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            std::fs::write(report_path.with_extension("private-captures.json"),serde_json::to_vec_pretty(&executor.captures.lock().unwrap().clone()).unwrap()).unwrap();
+        }
+        assert_eq!(evidence(&executor.saved),before,"no persisted job, result, raw, attempt, or publication mutation");
+        assert_eq!(crate::store::hash_file(&path).unwrap(),before_hash);
+        assert!(executor.captures.lock().unwrap().is_empty(),"the actual existing selector must recover");
+        assert_eq!(output["units"].as_array().unwrap().len(),13,"all sealed episode 1/2 units recover before the unsubmitted episode 3 planner");
+    }
+
     fn fixture() -> (
         tempfile::TempDir,
         SavedTextExecutor,
@@ -788,13 +943,25 @@ mod tests {
         let original_raw=json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"first-unit","episodeId":"episode-1","sourceRefs":[rows[0]["id"]]},{"id":"invalid-second-unit","episodeId":"episode-1","sourceRefs":[rows[1]["id"]]}],"fantasyRealization":[]});
         seed(&author,&original_raw,None,false);
         let mut repaired_draft=original_raw.clone();repaired_draft["units"][1]["id"]=json!("repaired-first-tail");
+        if profile == "boundary-v1-program-exports" {
+            for unit in repaired_draft["units"].as_array_mut().unwrap() {
+                unit["prompt"] = json!("SYNTHETIC_PROGRAM_EXPORT");
+                unit["channelPromptTemplate"] = json!("SYNTHETIC_CHANNEL_EXPORT");
+                unit["referenceBindings"] = json!([{"assetId":"SYNTHETIC_BOUND_ASSET"}]);
+                unit["visualStyle"] = json!("SYNTHETIC_STYLE");
+                unit["seedanceExportVersion"] = json!("synthetic-export/v1");
+                unit["storyboardCreativeProfile"] = json!("original-production-contract/v1");
+                unit["shots"] = json!([{"id":"synthetic-shot","prompt":"nested creative field stays"}]);
+            }
+        }
         let descriptor=json!({"version":"rejected-author-scope-repair/v1","attempt":1,"maximumAttempts":2,"sourceSha256":source["sha256"],"originDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(&author).unwrap()),"originExecutionBatch":author.input["executionBatch"],"originalAuthorRawSha256":crate::pipeline::digest(&original_raw.to_string()),"baseDraftHash":crate::pipeline::finish_base_hash(&original_raw)});
         let repair=TextRequest{stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:old.model.clone(),reasoning:old.reasoning.clone(),input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"author-domain-repair/v1","id":"repair:first","originExecutionBatchId":"first-B01"},"sourceRows":author.input["sourceRows"],"authorRepair":descriptor,"finishMode":"delta","baseDraftHash":descriptor["baseDraftHash"],"previousDraft":original_raw}),schema:json!({"type":"object"}),rule_snapshot:crate::pipeline::snapshot("episode-finishing-editor",&[]).unwrap()};
         repaired_draft["authorRepairProvenance"]=json!({"version":"accepted-author-scope-repair/v1","sourceSha256":source["sha256"],"originDomainRequestSha256":descriptor["originDomainRequestSha256"],"originalAuthorRawSha256":descriptor["originalAuthorRawSha256"],"originalAuthorAccepted":false,"nodes":[{"attempt":1,"canonicalDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(&repair).unwrap()),"baseDraftHash":descriptor["baseDraftHash"],"draftSha256":crate::pipeline::finish_base_hash(&repaired_draft)}]});
         let repair_raw=json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":descriptor["baseDraftHash"],"retainedUnitIds":["first-unit"],"replacements":[{"replaces":["invalid-second-unit"],"units":[repaired_draft["units"][1]],"fantasyRealization":[]}],"revisionNotes":[],"unresolved":[]});
         let mut repaired=repair_raw.clone();repaired["materializedDraft"]=repaired_draft.clone();
         let repair_job=seed(&repair,&repair_raw,Some(&repaired),true);
-        let prior=TextRequest{input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"related-range-finish/v1","id":"finish:first","authorBatchIds":["first-B01"]},"sourceRows":author.input["sourceRows"],"previousDraft":repaired_draft,"baseDraftHash":crate::pipeline::finish_base_hash(&repaired_draft),"authorRepairProvenance":repaired_draft["authorRepairProvenance"]}),..repair.clone()};
+        let prior_base=json!({"schemaVersion":repaired_draft["schemaVersion"],"units":repaired_draft["units"],"fantasyRealization":repaired_draft["fantasyRealization"],"revisionNotes":[],"unresolved":[]});
+        let prior=TextRequest{input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"related-range-finish/v1","id":"finish:first","authorBatchIds":["first-B01"]},"sourceRows":author.input["sourceRows"],"previousDraft":if profile=="boundary-v1-program-exports" {crate::pipeline::finish_base_input_projection(&prior_base)}else{repaired_draft.clone()},"baseDraftHash":crate::pipeline::finish_base_hash(&repaired_draft),"authorRepairProvenance":repaired_draft["authorRepairProvenance"]}),..repair.clone()};
         let mut finished=repaired_draft.clone();finished.as_object_mut().unwrap().remove("authorRepairProvenance");finished["units"][1]["id"]=json!("accepted-finish-first-tail");
         let prior_raw=json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":prior.input["baseDraftHash"],"retainedUnitIds":["first-unit"],"replacements":[{"replaces":["repaired-first-tail"],"units":[finished["units"][1]],"fantasyRealization":[]}],"revisionNotes":[],"unresolved":[]});
         let mut prior_accepted=prior_raw.clone();prior_accepted["materializedDraft"]=finished.clone();
@@ -809,7 +976,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn finish_missing_predecessor_reuses_exact_accepted_context_and_raw_on_reopen() {
-        for profile in ["legacy","asset-v1","boundary-v1"] {
+        for profile in ["legacy","asset-v1","boundary-v1","boundary-v1-program-exports"] {
             let f=missing_finish_predecessor(profile);let before=evidence(&f.executor);
             for _ in 0..2 {
                 let actual=f.executor.saved_finish_asset_projection(f.legacy.clone(),f.projected.clone()).unwrap();
@@ -820,6 +987,36 @@ mod tests {
             assert_eq!(evidence(&f.executor),before,"{profile}: no request/raw/receipt/job/attempt mutation or dispatch");
             assert!(!f.executor.store.root.join("text-runs").exists());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finish_missing_predecessor_projection_requires_exact_frozen_author_base() {
+        let f=missing_finish_predecessor("boundary-v1-program-exports");
+        let before=evidence(&f.executor);
+        let text:String=f.executor.store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1",[&f.prior_job],|r|r.get(0)).unwrap();
+        let prior:TextRequest=serde_json::from_str(&text).unwrap();
+        assert_ne!(prior.input["baseDraftHash"],crate::pipeline::finish_base_hash(&prior.input["previousDraft"]));
+        let base=f.executor.sealed_plain_finish_base(&prior).unwrap().unwrap();
+        assert_eq!(prior.input["baseDraftHash"],crate::pipeline::finish_base_hash(&base));
+        assert_eq!(crate::pipeline::finish_base_input_projection(&base),prior.input["previousDraft"]);
+        for change in ["baseHash","creative","nestedPrompt","exportInjected","otherAuthor","otherRepair","source","settings","rulePack","model"] {
+            let mut drift=prior.clone();
+            match change {
+                "baseHash"=>drift.input["baseDraftHash"]=json!("changed"),
+                "creative"=>drift.input["previousDraft"]["units"][0]["id"]=json!("changed"),
+                "nestedPrompt"=>drift.input["previousDraft"]["units"][0]["shots"][0]["prompt"]=json!("changed"),
+                "exportInjected"=>drift.input["previousDraft"]["units"][0]["prompt"]=json!("not the frozen projection"),
+                "otherAuthor"=>drift.input["executionBatch"]["authorBatchIds"]=json!(["second-B01"]),
+                "otherRepair"=>drift.input["authorRepairProvenance"]["nodes"][0]["canonicalDomainRequestSha256"]=json!("unrelated-accepted-node"),
+                "source"=>drift.input["sourceRows"][0]["text"]=json!("changed"),
+                "settings"=>drift.input["settings"]=json!({"visualStyle":"changed"}),
+                "rulePack"=>drift.input["storyboardRulePackSha256"]=json!("changed"),
+                _=>drift.model="changed".into(),
+            }
+            assert!(f.executor.sealed_plain_finish_base(&drift).unwrap().is_none(),"{change}");
+        }
+        assert_eq!(evidence(&f.executor),before);
     }
 
     #[cfg(windows)]
