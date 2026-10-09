@@ -338,4 +338,12 @@ C 第二集第一主创因四处真实 SHOT_SOURCE_SCOPE 被拒：提前使用�
 
 12:29–12:32（UTC+8）最新免费图片检查再次确认外部阻塞：Canvas 账户 `oauth_scope_insufficient`、图片目录 `access_denied`；生成 CLI 的目录虽有 5.0，但没有可验证本次免费的报价或零费上限。十一条有界只读命令没有登录、授权、上传、节点创建或生成。该结果不通过反复轮询、付费替代或用户未参与的 OAuth 处理来绕过。真实图片质量仍未验收，图片与视频任务均为零。
 
+### 2026-10-09 桌面快捷方式与固定当前版
+
+用户反馈桌面客户端没有 SDK。实际检查发现原桌面 `director-desktop.lnk` 仍指向旧 Windows 工程的 `src-tauri/target/release/director-desktop.exe`，并非本轮 Next；此前未同步桌面入口。已在本机私有证据目录保存原快捷方式及属性，正常启动验证 `adec7b623647633f48e5088da9f5387e715a15cf` 候选后，使用已回归的 PublishOnly 更新固定 current，再将原桌面快捷方式指向该固定路径。没有新增桌面图标、改写旧 EXE 或自动迁移旧项目库。
+
+固定 current `apps/desktop/.local/client/director-desktop-next.exe` 为 35,317,248 bytes，SHA256 `8c75a330594b453a10aa55ba69b02f3acabf26e415e8af67cf38fb65d93657d8`；previous 为 `52abd26c4876c6e0912548ce30f55eb120f6a122f2daa7d81355f3db9ed99bdd`。两版各自九份 SDK 0.160.1 资源长度和哈希均通过独立复核；已发布 candidate、准备记录和暂存文件已清理。固定版原生启动后四个隔离项目完整，C 保留 58 项资产和 14 个单元，“渠道与设置 → 文本执行 → 文本渠道”实际显示官方 Codex SDK。发布入口不代表十集质量验收完成。
+
+本次只读进度核查另确认：C 第三集规划于 04:59:56 UTC 进入 SDK_SUBMISSION_UNKNOWN，原 SDK 回执保留 SDK_TURN_FAILED 和 TLS handshake EOF；没有据此自动重发。B 客户端原流程恢复、第三至十集、成稿局部精修和免费实图仍需继续，视频仍禁止。
+
 主控补录：最终集成提交 SHA 与新仓库远端 SHA、最终 manifest/profile、完整 Rust/前端/SDK/适用平台策略结果、成品 EXE 与资源 SHA256、独立原生启动及隔离保存重开结果、实际渠道检查与未测范围。上述字段补齐后再移除本文草稿标记。
