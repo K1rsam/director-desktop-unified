@@ -790,7 +790,7 @@ impl Store {
             // An older node key can remain after a runner key migration. Its exact
             // cached request is still one step; keep every checkpoint on disk but
             // project only the latest state for each stage/request identity.
-            let mut steps=c.prepare("SELECT w.node_key,w.stage,w.state,w.error,json_extract(j.snapshot,'$.input.delivery'),json_extract(j.snapshot,'$.input.scope'),json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'),CASE WHEN e.rowid IS NOT NULL THEN json_object('phase',json_extract(e.data,'$.phase'),'elapsedSeconds',json_extract(e.data,'$.elapsedSeconds'),'outputQuietSeconds',json_extract(e.data,'$.outputQuietSeconds'),'processAlive',json_extract(e.data,'$.processAlive'),'needsDiagnosis',json_extract(e.data,'$.needsDiagnosis'),'observedAt',e.created_at,'stderrCategory',json_extract(e.data,'$.stderrCategory')) END,w.request_hash,json_extract(j.snapshot,'$.input.executionBatch.version'),json_extract(j.snapshot,'$.input.asset.id') FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id LEFT JOIN events e ON w.state='running' AND j.state='submitting' AND e.rowid=(SELECT x.rowid FROM events x WHERE x.job_id=w.text_job_id AND x.type='codex_heartbeat' ORDER BY x.rowid DESC LIMIT 1) WHERE w.workflow_id=?1 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid))) ORDER BY w.rowid").map_err(|e|e.to_string())?;
+            let mut steps=c.prepare("SELECT w.node_key,w.stage,w.state,w.error,json_extract(j.snapshot,'$.input.delivery'),json_extract(j.snapshot,'$.input.scope'),json_extract(j.snapshot,'$.input.episodeId'),json_extract(j.snapshot,'$.input.episode.id'),CASE WHEN j.provider='codex_sdk' AND w.state='running' AND j.state='submitting' THEN json_object('backend','codex_sdk','startedAt',j.created_at,'elapsedSeconds',MAX(0,CAST((julianday('now')-julianday(j.created_at))*86400 AS INTEGER)),'phase',CASE WHEN se.type='sdk_observation' AND json_extract(se.data,'$.state')='transport_completed' THEN 'output_received' WHEN se.type='sdk_observation' THEN 'unknown' WHEN json_extract(se.data,'$.rawEvent.type')='turn.failed' THEN 'failed' ELSE 'executing' END,'processAlive',NULL,'lastEventType',CASE WHEN se.type='sdk_event' AND json_extract(se.data,'$.rawEvent.type') IN ('thread.started','turn.started','turn.completed','turn.failed','item.started','item.updated','item.completed','error') THEN json_extract(se.data,'$.rawEvent.type') WHEN se.type='sdk_observation' THEN 'sdk.observation' END,'lastEventAt',se.created_at,'observedAt',se.created_at) WHEN e.rowid IS NOT NULL THEN json_object('phase',json_extract(e.data,'$.phase'),'elapsedSeconds',json_extract(e.data,'$.elapsedSeconds'),'outputQuietSeconds',json_extract(e.data,'$.outputQuietSeconds'),'processAlive',json_extract(e.data,'$.processAlive'),'needsDiagnosis',json_extract(e.data,'$.needsDiagnosis'),'observedAt',e.created_at,'stderrCategory',json_extract(e.data,'$.stderrCategory')) END,w.request_hash,json_extract(j.snapshot,'$.input.executionBatch.version'),json_extract(j.snapshot,'$.input.asset.id') FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id LEFT JOIN events e ON w.state='running' AND j.state='submitting' AND e.rowid=(SELECT x.rowid FROM events x WHERE x.job_id=w.text_job_id AND x.type='codex_heartbeat' ORDER BY x.rowid DESC LIMIT 1) LEFT JOIN events se ON j.provider='codex_sdk' AND w.state='running' AND j.state='submitting' AND se.rowid=(SELECT x.rowid FROM events x WHERE x.job_id=w.text_job_id AND x.type IN ('sdk_event','sdk_observation') ORDER BY x.rowid DESC LIMIT 1) WHERE w.workflow_id=?1 AND NOT EXISTS(SELECT 1 FROM workflow_steps newer WHERE newer.workflow_id=w.workflow_id AND newer.stage=w.stage AND newer.request_hash=w.request_hash AND (newer.updated_at>w.updated_at OR (newer.updated_at=w.updated_at AND newer.rowid>w.rowid))) ORDER BY w.rowid").map_err(|e|e.to_string())?;
             let mut nodes=steps.query_map([&id],|r| {
                 let stage=r.get::<_,String>(1)?;
                 let delivery=r.get::<_,Option<String>>(4)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
@@ -2011,5 +2011,74 @@ fn step_title(stage: &str) -> &str {
         "storyboardCreate" => "完整单元主创",
         "storyboardFinish" => "关联范围整编",
         _ => "整理制作内容",
+    }
+}
+
+#[cfg(test)]
+mod sdk_progress_tests {
+    use super::*;
+
+    fn sdk_progress_fixture() -> (tempfile::TempDir, Store, String, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_owned()).unwrap();
+        store.create("SDK progress synthetic fixture", "fixture").unwrap();
+        store.ensure_workflow_storage().unwrap();
+        let run = store.add_job("workflow", "foundation.run", "local", "fixture",
+            &json!({"runnerVersion":"desktop-runner/v1","stage":"foundation.run"}), "running").unwrap();
+        let text = store.add_job("text", "fixture-node", "codex_sdk", "fixture",
+            &json!({"input":{"privatePrompt":"never expose this payload"}}), "submitting").unwrap();
+        let started = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store.conn().unwrap().execute("UPDATE jobs SET created_at=?1 WHERE id=?2", params![started, text]).unwrap();
+        store.checkpoint(&run, "fixture-node", "foundation:F2", &"a".repeat(64), "running", Some(&text), None, None).unwrap();
+        (dir, store, run, text, started)
+    }
+
+    #[test]
+    fn sdk_progress_uses_task_start_and_only_attached_safe_event_metadata() {
+        let (_dir, store, _run, text, started) = sdk_progress_fixture();
+        let other = store.add_job("text", "unrelated", "codex_sdk", "fixture", &json!({}), "submitting").unwrap();
+        store.event(&text, "sdk_event", &json!({"rawEvent":{"type":"thread.started","message":"private body"}})).unwrap();
+        store.event(&text, "sdk_event", &json!({"rawEvent":{"type":"turn.started","message":"private body"},"runtimeExecutable":"private path"})).unwrap();
+        let stamp = "2026-10-05T23:00:00.000Z";
+        store.conn().unwrap().execute("UPDATE events SET created_at=?1 WHERE job_id=?2", params![stamp, text]).unwrap();
+        store.event(&other, "sdk_event", &json!({"rawEvent":{"type":"turn.failed"}})).unwrap();
+        let before: String = store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1", [&text], |r| r.get(0)).unwrap();
+        for _ in 0..2 {
+            let progress = store.workflow_progress().unwrap();
+            let execution = &progress[0]["nodes"][0]["execution"];
+            assert_eq!(execution["backend"], "codex_sdk");
+            assert_eq!(execution["startedAt"], started);
+            assert!(execution["elapsedSeconds"].as_i64().unwrap() >= 299);
+            assert_eq!(execution["phase"], "executing");
+            assert_eq!(execution["lastEventType"], "turn.started");
+            assert_eq!(execution["lastEventAt"], stamp);
+            assert_eq!(execution["observedAt"], stamp, "polling must not mint a new event timestamp");
+            assert!(execution["processAlive"].is_null());
+            let public = serde_json::to_string(&progress).unwrap();
+            assert!(!public.contains("private body") && !public.contains("private path") && !public.contains("never expose this payload"));
+        }
+        let after: String = store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1", [&text], |r| r.get(0)).unwrap();
+        assert_eq!(before, after, "progress never changes the frozen request");
+    }
+
+    #[test]
+    fn sdk_progress_without_heartbeat_tracks_real_terminal_metadata_and_hides_inactive_execution() {
+        let (_dir, store, run, text, started) = sdk_progress_fixture();
+        let progress = store.workflow_progress().unwrap();
+        let execution = &progress[0]["nodes"][0]["execution"];
+        assert_eq!(execution["startedAt"], started);
+        assert!(execution["lastEventType"].is_null() && execution["lastEventAt"].is_null());
+        assert!(execution["processAlive"].is_null(), "absence of a process probe is unknown, not exit");
+        store.event(&text, "sdk_observation", &json!({"state":"transport_completed","rawResult":{"private":"do not expose"}})).unwrap();
+        let execution = store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].clone();
+        assert_eq!(execution["phase"], "output_received");
+        assert_eq!(execution["lastEventType"], "sdk.observation");
+        assert!(execution.get("rawResult").is_none());
+        store.event(&text, "sdk_observation", &json!({"state":"submission_unknown"})).unwrap();
+        assert_eq!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"]["phase"], "unknown");
+        store.event(&text, "sdk_event", &json!({"rawEvent":{"type":"private unrecognized event"}})).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"]["lastEventType"].is_null());
+        store.checkpoint(&run, "fixture-node", "foundation:F2", &"a".repeat(64), "accepted", Some(&text), Some(&json!({})), None).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
     }
 }

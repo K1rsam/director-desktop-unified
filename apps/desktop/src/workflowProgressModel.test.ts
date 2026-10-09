@@ -265,6 +265,61 @@ test('过期心跳不外推用时或伪称当前进程存活，完成步骤不�
   assert.equal(executionSummary({ ...current, execution: null }, stamp), '正在读取本批执行状态');
 });
 
+function sdkNode(overrides: Record<string, unknown> = {}) {
+  return { ...node('storyboardCreate', 'running', 'B01'), execution: {
+    backend: 'codex_sdk', startedAt: new Date(stamp - 300000).toISOString(), elapsedSeconds: 300,
+    processAlive: null, phase: 'executing', lastEventType: 'turn.started',
+    lastEventAt: new Date(stamp - 30000).toISOString(), observedAt: new Date(stamp - 30000).toISOString(), ...overrides,
+  } };
+}
+
+test('SDK用真实任务开始时间计时，无CLI心跳或进程证明也不误报退出', () => {
+  const current = sdkNode(), before = JSON.stringify(current);
+  const initial = executionSummary(current, stamp), later = executionSummary(current, stamp + 15000);
+  assert.match(initial, /^等待 SDK 返回 · 已用时 5 分 0 秒/);
+  assert.match(later, /已用时 5 分 15 秒/);
+  assert.match(later, /最后执行事件：本轮已开始（45 秒前）/);
+  assert.doesNotMatch(initial + later, /CLI|已退出|进程存活|持续跟踪/);
+  assert.equal(JSON.stringify(current), before, 'rendering preserves the journal timestamp and original evidence');
+});
+
+test('SDK持续等待只增加已用时和距原事件时间，不假装有新事件', () => {
+  const current = sdkNode({ lastEventAt: new Date(stamp - 120000).toISOString() });
+  assert.match(executionSummary(current, stamp), /最后执行事件：本轮已开始（2 分 0 秒前）/);
+  const later = executionSummary(current, stamp + 60000);
+  assert.match(later, /已用时 6 分 0 秒/);
+  assert.match(later, /最后执行事件：本轮已开始（3 分 0 秒前）/);
+  assert.match(later, /较长时间未收到新执行事件，可查看任务记录/);
+  const noEvent = executionSummary(sdkNode({ lastEventType: null, lastEventAt: null }), stamp);
+  assert.match(noEvent, /尚无可核对的执行事件记录/);
+  assert.doesNotMatch(noEvent, /已退出|最后执行事件/);
+});
+
+test('SDK传输完成和失败记录区分待核对与执行失败，不宣称成果已采用', () => {
+  assert.match(executionSummary(sdkNode({ phase: 'output_received', lastEventType: 'sdk.observation' }), stamp), /^SDK 已收到返回，正在核对/);
+  assert.match(executionSummary(sdkNode({ lastEventType: 'turn.completed' }), stamp), /^SDK 本轮已结束，结果待核对/);
+  assert.match(executionSummary(sdkNode({ phase: 'failed', lastEventType: 'turn.failed' }), stamp), /^SDK 本轮执行失败，请查看任务记录/);
+  assert.match(executionSummary(sdkNode({ phase: 'unknown', lastEventType: 'sdk.observation' }), stamp), /^SDK 提交状态待核对，请查看任务记录/);
+  assert.doesNotMatch(executionSummary(sdkNode({ phase: 'output_received' }), stamp), /已采用|制作完成|较长时间/);
+});
+
+test('SDK读取失败只显示上次保存用时，不递增旧事件或猜测执行状态', () => {
+  const current = sdkNode(), at = executionSummary(current, stamp, true);
+  assert.equal(executionSummary(current, stamp + 600000, true), at);
+  assert.match(at, /^SDK 执行状态待刷新 · 上次记录 · 已用时 5 分 0 秒/);
+  assert.match(at, /最后执行事件：本轮已开始$/);
+  assert.doesNotMatch(at, /等待 SDK 返回|前）|较长时间|已退出/);
+});
+
+test('SDK未知时间与事件不能变成零秒、自由文本或已完成证据', () => {
+  assert.equal(executionSummary(sdkNode({ startedAt: null, elapsedSeconds: null }), stamp), '正在读取 SDK 本批开始时间');
+  assert.equal(executionSummary(sdkNode({ elapsedSeconds: null }), stamp, true), 'SDK 执行状态待刷新');
+  const arbitrary = executionSummary(sdkNode({ lastEventType: 'private source text' }), stamp);
+  assert.match(arbitrary, /尚无可核对的执行事件记录/);
+  assert.doesNotMatch(arbitrary, /private source text/);
+  assert.equal(executionSummary({ ...sdkNode(), status: 'accepted' }, stamp), '');
+});
+
 function repairedFixture(kind = 'author-scope-repair') {
   const workspace = fixture(), originHash = 'a'.repeat(64), resolverHash = 'b'.repeat(64);
   const originStage = kind === 'continuity-superseded' ? 'storyboardPlan' : 'storyboardCreate', resolverStage = kind === 'continuity-superseded' ? 'storyboardPlan' : 'storyboardFinish';

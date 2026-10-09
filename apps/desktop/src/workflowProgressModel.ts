@@ -80,7 +80,29 @@ export function secondsLabel(value: number): string {
 }
 export function executionSummary(node: Node, now = Date.now(), readFailed = false): string {
   if (words(node.status) !== 'running') return '';
-  const execution = record(node.execution), elapsed = Number(execution.elapsedSeconds), quiet = Number(execution.outputQuietSeconds);
+  const execution = record(node.execution);
+  if (execution.backend === 'codex_sdk') {
+    const started = Date.parse(words(execution.startedAt)), saved = execution.elapsedSeconds;
+    const elapsed = readFailed ? typeof saved === 'number' && Number.isFinite(saved) && saved >= 0 ? saved : NaN
+      : Number.isFinite(started) && Number.isFinite(now) ? Math.max(0, (now - started) / 1000) : NaN;
+    if (!Number.isFinite(elapsed)) return readFailed ? 'SDK 执行状态待刷新' : '正在读取 SDK 本批开始时间';
+    const phase = words(execution.phase), event = words(execution.lastEventType), eventAt = Date.parse(words(execution.lastEventAt));
+    const eventLabels: Record<string, string> = { 'thread.started': '会话已开始', 'turn.started': '本轮已开始', 'turn.completed': '本轮已结束', 'turn.failed': '本轮失败', 'item.started': '输出项开始', 'item.updated': '输出项更新', 'item.completed': '输出项完成', error: '执行错误记录', 'sdk.observation': '传输终态记录' };
+    const label = readFailed ? 'SDK 执行状态待刷新 · 上次记录' : phase === 'output_received' ? 'SDK 已收到返回，正在核对'
+      : phase === 'unknown' ? 'SDK 提交状态待核对，请查看任务记录'
+      : event === 'turn.failed' || phase === 'failed' ? 'SDK 本轮执行失败，请查看任务记录'
+        : event === 'turn.completed' ? 'SDK 本轮已结束，结果待核对' : '等待 SDK 返回';
+    let result = label + ' · 已用时 ' + secondsLabel(elapsed);
+    if (eventLabels[event] && Number.isFinite(eventAt)) {
+      result += ' · 最后执行事件：' + eventLabels[event] + (readFailed ? '' : `（${secondsLabel(Math.max(0, (now - eventAt) / 1000))}前）`);
+    } else result += ' · 尚无可核对的执行事件记录';
+    if (!readFailed && phase === 'executing' && !['turn.completed', 'turn.failed', 'error'].includes(event)
+      && (now - (Number.isFinite(eventAt) ? eventAt : started)) / 1000 >= 120) {
+      result += ' · 较长时间未收到新执行事件，可查看任务记录';
+    }
+    return result;
+  }
+  const elapsed = Number(execution.elapsedSeconds), quiet = Number(execution.outputQuietSeconds);
   if (!Object.keys(execution).length || !Number.isFinite(elapsed) || elapsed < 0) return readFailed ? '当前执行状态待刷新' : '正在读取本批执行状态';
   const stamp = Date.parse(words(execution.observedAt)), age = Number.isFinite(stamp) ? Math.max(0, (now - stamp) / 1000) : Infinity;
   const alive = execution.processAlive === true || execution.processAlive === 1;

@@ -444,10 +444,15 @@ fn expand(value: &Value, input: &Value) -> Result<Value, String> {
                         && field == "design/prompt"
                 })
             });
-            if !pointer.starts_with("/plan/") && pointer != "/acceptedContinuity" && !asset_prompt {
+            let continuity_unit = pointer == "/acceptedContinuity/unit";
+            if !pointer.starts_with("/plan/") && pointer != "/acceptedContinuity"
+                && !continuity_unit && !asset_prompt {
                 return Err("整编无损运输引用越出完整规划目录".into());
             }
             let target = input.pointer(pointer).ok_or("整编无损运输引用目标不存在")?;
+            if continuity_unit && !target.is_object() {
+                return Err("整编前稿单元等值目标必须为完整对象".into());
+            }
             if asset_prompt && !target.is_string() {
                 return Err("整编资产提示词等值目标必须为完整字符串".into());
             }
@@ -799,6 +804,100 @@ pub(crate) fn compile_storyboard_transport(
 pub(crate) fn compile_storyboard_dispatch_transport(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
+    compile_dispatch_transport(request, true)
+}
+
+#[cfg(test)]
+pub(super) fn compile_dispatch_before_finish_repetitions(
+    request: &TextRequest,
+) -> Result<Option<CompiledStoryboardTransport>, String> {
+    compile_dispatch_transport(request, false)
+}
+
+/// Only the oversized outgoing editor may share these additional exact copies.
+/// Canonical hashes, historical accepted grouping and existing fitting wires stay unchanged.
+fn compact_finish_repetitions(input: &mut Value, canonical: &Value) {
+    fn references_plan_unit(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => map.get("$same").and_then(Value::as_str).is_some_and(|target| {
+                target == "#/plan/acceptedContinuity/unit"
+                    || target.starts_with("#/plan/acceptedContinuity/unit/")
+            }) || map.values().any(references_plan_unit),
+            Value::Array(items) => items.iter().any(references_plan_unit),
+            _ => false,
+        }
+    }
+    if let (Some(top), Some(copy)) = (
+        canonical.pointer("/acceptedContinuity/unit"),
+        canonical.pointer("/plan/acceptedContinuity/unit"),
+    ) {
+        if top.is_object() && top == copy && !has_notation(top)
+            && input.pointer("/acceptedContinuity/unit") == Some(top)
+            // A whole-continuity alias has no writable unit. Existing single-hop
+            // aliases may also depend on this complete unit or one of its fields.
+            && input.pointer("/plan/acceptedContinuity/unit").is_some()
+            && !references_plan_unit(input)
+        {
+            let reference = reference_if_shorter(copy, "/acceptedContinuity/unit");
+            input["plan"]["acceptedContinuity"]["unit"] = reference;
+        }
+    }
+    // Selector IDs are coverage metadata, not new rows. Every ID must resolve
+    // to the directly preserved row catalogue, in exactly the original order.
+    let mut positions = HashMap::new();
+    for catalog in ["sourceRows", "contextRows"] {
+        for (index, row) in canonical[catalog].as_array().into_iter().flatten().enumerate() {
+            let Some(id) = row["id"].as_str() else { return; };
+            if positions.insert(id, (catalog, index)).is_some() { return; }
+        }
+    }
+    for field in ["sourceRefs", "contextRefs"] {
+        let Some(ids) = input.pointer(&format!("/assetSelection/{field}")).and_then(Value::as_array)
+            .filter(|ids| !ids.is_empty() && ids.iter().all(Value::is_string)) else { continue; };
+        let mut spans: Vec<(&str, usize, usize)> = Vec::new();
+        let mut known = true;
+        for id in ids {
+            let Some(&(catalog, index)) = positions.get(id.as_str().unwrap()) else { known = false; break; };
+            if let Some(last) = spans.last_mut().filter(|span| span.0 == catalog && span.2 + 1 == index) {
+                last.2 = index;
+            } else { spans.push((catalog, index, index)); }
+        }
+        if known {
+            let original = json!(ids);
+            let replacement = json!({"$rowIds":spans});
+            if replacement.to_string().encode_utf16().count() < original.to_string().encode_utf16().count() {
+                input["assetSelection"][field] = replacement;
+            }
+        }
+    }
+}
+
+fn compile_dispatch_transport(
+    request: &TextRequest,
+    finish_repetitions: bool,
+) -> Result<Option<CompiledStoryboardTransport>, String> {
+    if finish_repetitions && request.stage == "storyboardFinish" {
+        // Measure the old compiler's final selected wire, not an intermediate
+        // candidate with an extra instruction. Fitting frozen SDK bytes stay exact.
+        let original = compile_dispatch_transport(request, false)?;
+        let (old_input, old_schema) = original.as_ref()
+            .map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+        if crate::text_executor::codex_wire_characters(request, old_input, old_schema) <= STORYBOARD_TRANSPORT_LIMIT
+            || !supported_request(request) || has_notation(&request.input)
+            || request.input.get("losslessInputRule").is_some()
+        { return Ok(original); }
+        let mut input = old_input.clone();
+        input.as_object_mut().ok_or("整编输入不是对象")?.remove("losslessInputRule");
+        compact_finish_repetitions(&mut input, &request.input);
+        if expand(&input, &input)? != request.input {
+            return Err("整编重复资料反解未完整还原原输入；未派发请求".into());
+        }
+        input["losslessInputRule"] = old_input.get("losslessInputRule").cloned().unwrap_or_else(|| json!(shared_row_rule()));
+        let old_chars = crate::text_executor::transport_payload_characters(request, old_input, old_schema);
+        let new_chars = crate::text_executor::transport_payload_characters(request, &input, old_schema);
+        if old_chars.checked_sub(new_chars).is_none_or(|gain| gain < 2_048) { return Ok(original); }
+        return Ok(Some(CompiledStoryboardTransport {profile:PROFILE,input,schema:old_schema.clone()}));
+    }
     let baseline = compile_storyboard_transport(request)?;
     if !supported_request(request)
         || has_notation(&request.input)
@@ -961,6 +1060,187 @@ fn compile_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finish_repetition_fixture(padding: usize) -> TextRequest {
+        let mut request = dispatch_fixture();
+        let unit = json!({"id":"accepted-original-tail","shots":[{"picture":"完整已采用表演🙂".repeat(2_000)}],"exitState":"原连续态"});
+        request.input["acceptedContinuity"] = json!({"version":"accepted-tail-v1","unit":unit,"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"});
+        request.input["plan"]["acceptedContinuity"] = json!({"version":"accepted-tail-v1","executionBatchId":"original-author-batch","unit":unit,"boundaryBefore":{"kind":"continuous"},"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"});
+        request.input["assetSelection"] = json!({"sourceRefs":request.input["sourceRows"].as_array().unwrap().iter().map(|row|row["id"].clone()).collect::<Vec<_>>(),
+            "contextRefs":request.input["contextRows"].as_array().unwrap().iter().map(|row|row["id"].clone()).collect::<Vec<_>>(),"productionSceneIds":["original-scene"],"selectedAssets":[{"assetId":"person:state","purpose":"PRODUCTION_SCOPE"}]});
+        request.input["previousDraft"]["units"][0]["unitDirection"] = json!("全".repeat(padding));
+        request
+    }
+
+    fn dispatch_chars(request: &TextRequest, extra: bool) -> usize {
+        let wire = compile_dispatch_transport(request, extra).unwrap();
+        let (input,schema) = wire.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
+        crate::text_executor::codex_wire_characters(request,input,schema)
+    }
+
+    #[test]
+    fn finish_repetition_preserves_existing_whole_continuity_alias() {
+        let mut request = finish_repetition_fixture(180_000);
+        request.input["plan"]["acceptedContinuity"] = request.input["acceptedContinuity"].clone();
+        let old = compile_dispatch_before_finish_repetitions(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request, &old.input, &old.schema) > STORYBOARD_TRANSPORT_LIMIT);
+        assert_eq!(old.input["plan"]["acceptedContinuity"], json!({"$same":"#/acceptedContinuity"}));
+        let new = compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(new.input["plan"]["acceptedContinuity"], old.input["plan"]["acceptedContinuity"]);
+        assert_eq!(expand_storyboard_input(&new.input).unwrap(), request.input);
+    }
+
+    #[test]
+    fn finish_repetition_keeps_original_plan_unit_when_existing_aliases_target_its_children() {
+        let mut request = finish_repetition_fixture(180_000);
+        let refs = json!((0..16).map(|index| format!("prior-row-{index}-{}", "x".repeat(32))).collect::<Vec<_>>());
+        request.input["acceptedContinuity"]["unit"]["sourceRefs"] = refs.clone();
+        request.input["plan"]["acceptedContinuity"]["unit"]["sourceRefs"] = refs.clone();
+        request.input["plan"]["events"] = json!([{"sourceRefs":refs}]);
+        let old = compile_dispatch_before_finish_repetitions(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request, &old.input, &old.schema) > STORYBOARD_TRANSPORT_LIMIT);
+        assert_eq!(old.input["plan"]["events"][0]["sourceRefs"], json!({"$same":"#/plan/acceptedContinuity/unit/sourceRefs"}));
+        assert_eq!(expand_storyboard_input(&old.input).unwrap(), request.input);
+        let new = compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(new.input["plan"]["acceptedContinuity"]["unit"], old.input["plan"]["acceptedContinuity"]["unit"]);
+        assert_eq!(new.input["plan"]["events"], old.input["plan"]["events"]);
+        assert_eq!(expand_storyboard_input(&new.input).unwrap(), request.input);
+    }
+
+    #[test]
+    fn finish_repetition_fitting_canonical_boundary_never_adds_a_transport_instruction() {
+        let unit=json!({"id":"tail","picture":"完整🙂".repeat(2_000)});
+        let mut request=TextRequest {stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:"offline".into(),reasoning:"medium".into(),
+            input:json!({"finishMode":"delta","acceptedContinuity":{"unit":unit},"plan":{"acceptedContinuity":{"unit":unit,"executionBatchId":"old-batch"}},"previousDraft":{"units":[{"id":"current","unitDirection":""}]}}),
+            schema:json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),rule_snapshot:json!({"primary":{"content":"原规则"}})};
+        let base=crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema);
+        request.input["previousDraft"]["units"][0]["unitDirection"]=json!("全".repeat(199_800-base));
+        assert_eq!(crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema),199_800);
+        assert!(compile_dispatch_before_finish_repetitions(&request).unwrap().is_none());
+        assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();
+        assert_eq!(compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),199_800);
+        assert!(!compiled.prompt.contains("losslessInputRule"));
+    }
+
+    #[test]
+    fn finish_repetition_uses_canonical_equality_when_the_plan_copy_is_already_projected() {
+        let mut request=finish_repetition_fixture(0);
+        let ids=request.input["assetSelection"]["sourceRefs"].clone();
+        request.input["acceptedContinuity"]["unit"]["sourceRefs"]=ids.clone();
+        request.input["plan"]["acceptedContinuity"]["unit"]["sourceRefs"]=ids;
+        let mut wire=request.input.clone();
+        wire["plan"]["acceptedContinuity"]["unit"]["sourceRefs"]=json!({"$rowIds":[["sourceRows",0,request.input["sourceRows"].as_array().unwrap().len()-1]]});
+        assert_eq!(expand(&wire,&wire).unwrap(),request.input);
+        compact_finish_repetitions(&mut wire,&request.input);
+        assert_eq!(wire["plan"]["acceptedContinuity"]["unit"],json!({"$same":"#/acceptedContinuity/unit"}));
+        assert_eq!(expand(&wire,&wire).unwrap(),request.input);
+    }
+
+    #[test]
+    fn finish_repetition_wire_roundtrips_complete_units_and_selector_rows_with_real_wrapper_capacity() {
+        let mut padding = 150_000;
+        let mut request = finish_repetition_fixture(padding);
+        for _ in 0..3 {
+            let old = dispatch_chars(&request, false);
+            padding = (padding as isize + 215_000 - old as isize).try_into().unwrap();
+            request.input["previousDraft"]["units"][0]["unitDirection"] = json!("全".repeat(padding));
+        }
+        let canonical = serde_json::to_vec(&request).unwrap();
+        let grouping = compile_storyboard_transport(&request).unwrap();
+        let legacy = compile_legacy_finish_grouping_transport(&request).unwrap();
+        assert_eq!(dispatch_chars(&request, false), 215_000);
+        assert!(dispatch_chars(&request, true) <= STORYBOARD_TRANSPORT_LIMIT);
+        let wire = compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(wire.input["plan"]["acceptedContinuity"]["unit"], json!({"$same":"#/acceptedContinuity/unit"}));
+        assert!(wire.input["assetSelection"]["sourceRefs"].get("$rowIds").is_some());
+        assert!(wire.input["assetSelection"]["contextRefs"].get("$rowIds").is_some());
+        assert_eq!(wire.input["acceptedContinuity"], request.input["acceptedContinuity"]);
+        assert_eq!(wire.input["previousDraft"], request.input["previousDraft"]);
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(), request.input);
+        assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(), request.schema);
+        assert_eq!(serde_json::to_vec(&request).unwrap(), canonical);
+        let grouping_after = compile_storyboard_transport(&request).unwrap();
+        let legacy_after = compile_legacy_finish_grouping_transport(&request).unwrap();
+        assert_eq!(grouping.map(|wire|json!([wire.input,wire.schema])), grouping_after.map(|wire|json!([wire.input,wire.schema])));
+        assert_eq!(legacy.map(|wire|json!([wire.input,wire.schema])), legacy_after.map(|wire|json!([wire.input,wire.schema])));
+    }
+
+    #[test]
+    fn finish_repetition_fitting_and_nonfinish_compiled_wires_keep_exact_bytes() {
+        let fitting = finish_repetition_fixture(0);
+        assert!(dispatch_chars(&fitting,false) <= STORYBOARD_TRANSPORT_LIMIT);
+        for request in [fitting, {let mut request=finish_repetition_fixture(180_000);request.stage="storyboardCreate".into();request.skill="unit-performance-director".into();request}] {
+            let old = compile_dispatch_before_finish_repetitions(&request).unwrap();
+            let new = compile_storyboard_dispatch_transport(&request).unwrap();
+            let bytes = |wire:Option<CompiledStoryboardTransport>| {
+                let (input,schema)=wire.map(|wire|(wire.input,wire.schema)).unwrap_or((request.input.clone(),request.schema.clone()));
+                serde_json::to_vec(&json!([input,schema])).unwrap()
+            };
+            assert_eq!(bytes(old),bytes(new),"fitting or already-frozen other-role transport is unaffected");
+        }
+    }
+
+    #[test]
+    fn finish_repetition_never_aliases_different_units_or_unknown_ambiguous_selector_ids() {
+        let mut request=finish_repetition_fixture(180_000);
+        request.input["plan"]["acceptedContinuity"]["unit"]["exitState"]=json!("真正不同的前稿末态");
+        request.input["assetSelection"]["contextRefs"][0]=json!("unprovided-source-id");
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(wire.input["plan"]["acceptedContinuity"]["unit"],request.input["plan"]["acceptedContinuity"]["unit"]);
+        assert_eq!(wire.input["assetSelection"]["contextRefs"],request.input["assetSelection"]["contextRefs"]);
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);
+        let mut ambiguous=finish_repetition_fixture(0).input;
+        let original=ambiguous.clone();
+        let row=ambiguous["sourceRows"][0].clone();
+        ambiguous["contextRows"][0]=row;
+        let canonical=ambiguous.clone();
+        compact_finish_repetitions(&mut ambiguous,&canonical);
+        assert_eq!(ambiguous["assetSelection"],original["assetSelection"],"ambiguous catalogue does not grant coverage from a guessed index");
+    }
+
+    #[test]
+    fn finish_repetition_decoder_accepts_only_the_exact_literal_unit_object_target() {
+        let unit=json!({"id":"literal-original-unit","shots":[{"picture":"完整原镜头🙂","sourceRefs":["original-row"]}],"exitState":"保留原末态","futureField":{"literal":"完整未知扩展也原样保留"}});
+        let reference=json!({"$same":"#/acceptedContinuity/unit"});
+        let original=json!({"acceptedContinuity":{"unit":unit},"plan":{"acceptedContinuity":{"unit":reference}}});
+        assert_eq!(expand(&original,&original).unwrap()["plan"]["acceptedContinuity"]["unit"],unit);
+        for pointer in ["#/acceptedContinuity/unit/shots","#/acceptedContinuity/unit/shots/0","#/acceptedContinuity/unit/exitState","#/acceptedContinuity/executionBatchId","#/acceptedContinuity/unit/","#/acceptedContinuity//unit","#/acceptedContinuity/unit~1shots"] {
+            let input=json!({"acceptedContinuity":{"unit":unit,"executionBatchId":"batch"},"local":{"$same":pointer}});
+            assert!(expand(&input,&input).is_err(),"arbitrary child path is not authorized: {pointer}");
+        }
+        for target in [Value::Null,json!("not a unit"),json!([]),json!(1),json!(true),
+            json!({"$same":"#/plan/original"}),
+            json!({"id":"chained-unit","nested":{"$same":"#/plan/original"}}),
+            json!({"id":"row-unit","nested":{"$rowIds":[["sourceRows",0,0]]}}),
+            json!({"id":"table-unit","nested":{"$sourceRows":{}}}),
+            json!({"id":"fingerprint-unit","nested":{"$sourceFingerprints":"SHA256_UTF8_ROWS"}})] {
+            let input=json!({"acceptedContinuity":{"unit":target},"plan":{"original":unit},"local":reference});
+            assert!(expand(&input,&input).is_err(),"target must be a complete literal object without any nested notation");
+        }
+        let extra=json!({"acceptedContinuity":{"unit":unit},"local":{"$same":"#/acceptedContinuity/unit","extra":true}});
+        assert!(expand(&extra,&extra).is_err());
+        let missing=json!({"acceptedContinuity":{},"local":reference});
+        assert!(expand(&missing,&missing).is_err());
+    }
+
+    #[test]
+    fn finish_repetition_selector_decoder_preserves_mixed_order_duplicates_and_rejects_bad_spans() {
+        let mut request=finish_repetition_fixture(0);
+        let refs=json!([request.input["contextRows"][3]["id"],request.input["contextRows"][2]["id"],request.input["sourceRows"][1]["id"],request.input["sourceRows"][1]["id"],request.input["sourceRows"][2]["id"]]);
+        request.input["assetSelection"]["sourceRefs"]=refs.clone();
+        let mut wire=request.input.clone();
+        compact_finish_repetitions(&mut wire,&request.input);
+        compact_shared_source_rows(&mut wire,&request.input);
+        assert!(wire["assetSelection"]["sourceRefs"].get("$rowIds").is_some());
+        assert_eq!(expand(&wire,&wire).unwrap()["assetSelection"]["sourceRefs"],refs);
+        for spans in [json!([["assets",0,0]]),json!([["sourceRows",3,2]]),json!([["contextRows",0,999999]]),json!([["sourceRows",-1,0]]),json!([["sourceRows",0,"1"]]),json!([["sourceRows",0,0,0]])] {
+            let mut bad=wire.clone();bad["assetSelection"]["sourceRefs"]=json!({"$rowIds":spans});
+            assert!(expand(&bad,&bad).is_err(),"selector transport cannot invent, reorder or exceed catalogue spans");
+        }
+        let mut extra=wire.clone();extra["assetSelection"]["sourceRefs"]=json!({"$rowIds":[["sourceRows",0,0]],"extra":true});
+        assert!(expand(&extra,&extra).is_err());
+    }
 
     #[test]
     fn shared_source_columns_roundtrip_full_ids_speech_and_unicode_with_no_canonical_changes() {

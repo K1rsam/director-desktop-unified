@@ -11,6 +11,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     executable: PathBuf,
     counter: PathBuf,
+    runtime_counter: PathBuf,
     settings: Value,
 }
 impl Fixture {
@@ -20,6 +21,7 @@ impl Fixture {
             .tempdir()
             .unwrap();
         let counter = directory.path().join("calls.txt");
+        let runtime_counter = directory.path().join("runtime-invocations.txt");
         let executable = directory.path().join(if cfg!(windows) {
             "fixture-cli.exe"
         } else {
@@ -31,6 +33,8 @@ impl Fixture {
         let code = r#"
 use std::io::{BufRead, Read, Write};
 fn main() {
+    std::fs::OpenOptions::new().create(true).append(true)
+        .open(__RUNTIME_COUNTER_PATH__).unwrap().write_all(b"invoked\n").unwrap();
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.iter().any(|a| a=="--version") { println!("codex-cli offline-fixture"); return; }
     if arguments.iter().any(|a| a=="--help") {
@@ -66,7 +70,8 @@ fn main() {
     println!("{{\"type\":\"fixture.completed\"}}");
 }
 "#
-        .replace("__COUNTER_PATH__", &json!(counter).to_string());
+        .replace("__COUNTER_PATH__", &json!(counter).to_string())
+        .replace("__RUNTIME_COUNTER_PATH__", &json!(runtime_counter).to_string());
         std::fs::write(&source, code).unwrap();
         let compiler = std::env::var_os("RUSTC")
             .map(PathBuf::from)
@@ -120,6 +125,7 @@ fn main() {
             directory,
             executable,
             counter,
+            runtime_counter,
             settings,
         }
     }
@@ -133,6 +139,12 @@ fn main() {
     }
     fn calls(&self) -> usize {
         std::fs::read_to_string(&self.counter)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+    fn runtime_calls(&self) -> usize {
+        std::fs::read_to_string(&self.runtime_counter)
             .unwrap_or_default()
             .lines()
             .count()
@@ -197,6 +209,12 @@ fn step_state(store: &Store, run: &str) -> String {
             |row| row.get(0),
         )
         .unwrap()
+}
+fn step_evidence(store: &Store, run: &str) -> String {
+    store.conn().unwrap().query_row(
+        "SELECT json_array(node_key,stage,request_hash,state,text_job_id,result,error,updated_at) FROM workflow_steps WHERE workflow_id=?1",
+        [run], |row| row.get(0),
+    ).unwrap()
 }
 
 #[tokio::test]
@@ -393,6 +411,8 @@ async fn received_and_rejected_outputs_are_never_completed_cache_after_reopen() 
                 .unwrap();
         }
         let first = text_jobs(&store)[0].clone();
+        let first_job = store.job(first["id"].as_str().unwrap()).unwrap();
+        let first_step = step_evidence(&store, &run);
         assert_eq!(first["state"], if reject { "rejected" } else { "received" });
         assert_eq!(
             step_state(&store, &run),
@@ -403,19 +423,23 @@ async fn received_and_rejected_outputs_are_never_completed_cache_after_reopen() 
         drop(store);
 
         let reopened = Store::open(root).unwrap();
-        fixture
-            .executor(&reopened, Some(run))
+        let runtime_calls = fixture.runtime_calls();
+        let error = fixture
+            .executor(&reopened, Some(run.clone()))
             .execute(request)
             .await
-            .unwrap();
-        assert_eq!(fixture.calls(), 2, "unaccepted response must execute again");
+            .unwrap_err();
+        assert!(error.starts_with("CODEX_EXISTING_ATTEMPT_UNRESOLVED:"), "{error}");
+        assert_eq!(fixture.runtime_calls(), runtime_calls, "received/rejected nodes are held before any runtime I/O");
+        assert_eq!(fixture.calls(), 1, "unaccepted output is neither an accepted cache nor permission to redispatch");
         let jobs = text_jobs(&reopened);
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 1);
         assert_eq!(
             jobs[0], first,
             "original rejected/received evidence must remain intact"
         );
-        assert_eq!(jobs[1]["state"], "received");
+        assert_eq!(reopened.job(first["id"].as_str().unwrap()).unwrap(), first_job, "the original frozen request and all job evidence remain exact");
+        assert_eq!(step_evidence(&reopened, &run), first_step, "the original node hash/state/error/budget is not replaced");
     }
 }
 
@@ -429,6 +453,9 @@ async fn different_native_executor_identity_cannot_reuse_accepted_output() {
     let value = first.execute(request.clone()).await.unwrap();
     let accepted = json!({"validated":true,"from":"first executor"});
     first.accept(&request, &accepted).await.unwrap();
+    let original = text_jobs(&store)[0].clone();
+    let original_job = store.job(original["id"].as_str().unwrap()).unwrap();
+    let original_step = step_evidence(&store, &run);
     let alternative = fixture.directory.path().join(if cfg!(windows) {
         "alternative-cli.exe"
     } else {
@@ -443,19 +470,46 @@ async fn different_native_executor_identity_cannot_reuse_accepted_output() {
         }))
         .await
         .unwrap(),
-        workflow_id: Some(run),
+        workflow_id: Some(run.clone()),
     };
-    assert_eq!(changed.execute(request).await.unwrap(), value);
+    let runtime_calls = fixture.runtime_calls();
+    let error = changed.execute(request.clone()).await.unwrap_err();
+    assert!(error.starts_with("CODEX_EXISTING_ATTEMPT_UNRESOLVED:"), "{error}");
+    assert_eq!(fixture.runtime_calls(), runtime_calls, "an executor change does not authorize replacing this workflow node");
+    assert_eq!(fixture.calls(), 1);
+    assert_eq!(text_jobs(&store), vec![original.clone()]);
+    assert_eq!(store.job(original["id"].as_str().unwrap()).unwrap(), original_job);
+    assert_eq!(step_evidence(&store, &run), original_step);
+
+    // A real new request has its own explicitly frozen parent and executor
+    // identity. It does not borrow the old node or relabel its accepted cache.
+    let new_run = store.add_job("workflow", "foundation.run", "local", "local",
+        &json!({"runnerVersion":"desktop-runner/v1","stage":"foundation.run","input":{"settings":changed.settings}}),
+        "running").unwrap();
+    assert_ne!(new_run, run);
+    assert_eq!(store.job(&new_run).unwrap()["snapshot"]["input"]["settings"], changed.settings);
+    let fresh = SavedTextExecutor {
+        store: changed.store.clone(), settings: changed.settings.clone(), workflow_id: Some(new_run.clone()),
+    };
+    assert_eq!(fresh.execute(request).await.unwrap(), value);
     assert_eq!(
         fixture.calls(),
         2,
-        "changed executor must launch the offline fixture"
+        "the explicitly frozen new workflow launches only its own offline fixture once"
     );
     let jobs = text_jobs(&store);
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[0]["result"], accepted);
     assert_eq!(jobs[0]["state"], "completed");
     assert_eq!(jobs[1]["state"], "received");
+    assert_ne!(jobs[1]["id"], original["id"]);
+    let new_job = store.job(jobs[1]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(new_job["snapshot"]["executorIdentity"]["executable"], fresh.settings["textCliExecutable"]);
+    assert_eq!(new_job["snapshot"]["executorIdentity"]["version"], fresh.settings["textCliVersion"]);
+    assert_ne!(new_job["snapshot"]["executorIdentity"], original_job["snapshot"]["executorIdentity"]);
+    assert_eq!(store.job(original["id"].as_str().unwrap()).unwrap(), original_job);
+    assert_eq!(step_evidence(&store, &run), original_step);
+    assert_eq!(step_state(&store, &new_run), "running");
 }
 
 #[tokio::test]

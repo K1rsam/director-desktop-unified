@@ -67,6 +67,166 @@ fn asset_only_finish_request(legacy: &TextRequest, projected: &TextRequest) -> R
 }
 
 impl SavedTextExecutor {
+    /// Read-only recovery of an accepted ordinary editor whose predecessor did
+    /// not exist when it was frozen. This never updates the old request or
+    /// authorizes a changed creative dependency to become a new execution.
+    fn saved_finish_missing_predecessor(
+        &self,
+        legacy: &TextRequest,
+        asset_only: &TextRequest,
+        projected: &TextRequest,
+        snapshot: &Value,
+        domain: &Value,
+    ) -> Result<Option<TextRequest>> {
+        if s(&self.settings, "textProvider") != "codex"
+            || legacy.input["executionBatch"]["version"] != "related-range-finish/v1"
+            || !snapshot["input"]["acceptedContinuity"].is_null()
+            || !snapshot["input"]["plan"]["acceptedContinuity"].is_null()
+            || ["authorChainRevision", "continuityRevision", "textTransportRetry"]
+                .iter().any(|field| legacy.input.get(*field).is_some()
+                    || snapshot["input"].get(*field).is_some())
+        {
+            return Ok(None);
+        }
+        let original: TextRequest = serde_json::from_value(snapshot.clone()).map_err(|_| held())?;
+        if original.stage != "storyboardFinish"
+            || original.skill != "episode-finishing-editor"
+            || original.input["executionBatch"]["version"] != "related-range-finish/v1"
+            || step_key(&original) != step_key(legacy)
+        {
+            return Ok(None);
+        }
+        // Restore only the two previously absent context fields. Their two
+        // projection hashes must be recomputed, then the entire frozen domain
+        // (including base, next boundary, model, schema and rules) must match.
+        let restore = |request: &TextRequest| {
+            let mut restored = request.clone();
+            let map = restored.input.as_object_mut().ok_or_else(held)?;
+            if let Some(value) = original.input.get("acceptedContinuity") {
+                map.insert("acceptedContinuity".into(), value.clone());
+            } else {
+                map.remove("acceptedContinuity");
+            }
+            let map = restored.input["plan"].as_object_mut().ok_or_else(held)?;
+            if let Some(value) = original.input["plan"].get("acceptedContinuity") {
+                map.insert("acceptedContinuity".into(), value.clone());
+            } else {
+                map.remove("acceptedContinuity");
+            }
+            Ok::<TextRequest, String>(restored)
+        };
+        let restored_legacy = restore(legacy)?;
+        let mut restored_asset = restore(asset_only)?;
+        restored_asset.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+            json!(crate::pipeline::digest(&serde_json::to_string(&restored_legacy).map_err(|_| held())?));
+        let mut restored_projected = restore(projected)?;
+        restored_projected.input["finisherAssetInputProjection"] =
+            restored_asset.input["finisherAssetInputProjection"].clone();
+        if restored_projected.input.get("finisherBoundaryInputProjection").is_some() {
+            restored_projected.input["finisherBoundaryInputProjection"]["assetOnlyDomainRequestSha256"] =
+                json!(crate::pipeline::digest(&serde_json::to_string(&restored_asset).map_err(|_| held())?));
+        }
+        if ![restored_legacy, restored_asset, restored_projected].iter()
+            .map(|request| self.request_domain_snapshot(request))
+            .collect::<Result<Vec<_>>>()?.iter().any(|candidate| candidate == domain)
+        {
+            return Ok(None);
+        }
+        if self.sealed_plain_finish_value(&original, snapshot)?.is_none() {
+            return Ok(None);
+        }
+        let tail = &legacy.input["acceptedContinuity"];
+        let author_tail = &legacy.input["plan"]["acceptedContinuity"];
+        let predecessor = s(author_tail, "executionBatchId");
+        let first = legacy.input["sourceRows"].as_array().and_then(|rows| rows.first())
+            .and_then(|row| row.pointer("/range/start")).and_then(Value::as_u64);
+        if predecessor.is_empty() || first.is_none()
+            || tail != &json!({"version":"accepted-tail-v1","unit":tail["unit"],
+                "sourceRefs":tail["unit"]["sourceRefs"],"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"})
+            || author_tail != &json!({"version":"accepted-tail-v1","executionBatchId":predecessor,
+                "unit":author_tail["unit"],"sourceRefs":author_tail["unit"]["sourceRefs"],
+                "boundaryBefore":legacy.input["plan"]["events"][0]["boundaryBefore"],
+                "evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"})
+            || tail["unit"].is_null() || author_tail["unit"].is_null()
+        {
+            return Ok(None);
+        }
+        let run = self.workflow_id.as_deref().ok_or_else(held)?;
+        let c = self.store.conn()?;
+        let mut q = c.prepare("SELECT j.snapshot,w.request_hash,w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardFinish' AND w.state='accepted' AND j.state='completed' AND j.kind='text' AND j.provider='codex' AND json_extract(j.snapshot,'$.input.episodeId')=?2").map_err(|_| held())?;
+        let candidates = q.query_map(params![run,s(&legacy.input,"episodeId")], |row|
+            Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))
+            .map_err(|_| held())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|_| held())?;
+        for (text, hash, _) in &candidates {
+            let saved: Value = serde_json::from_str(text).map_err(|_| held())?;
+            if saved.to_string() != *text || crate::pipeline::digest(text) != *hash { continue; }
+            let prior: TextRequest = serde_json::from_value(saved.clone()).map_err(|_| held())?;
+            if prior.input["executionBatch"]["version"] != "related-range-finish/v1"
+                || prior.input["executionBatch"]["authorBatchIds"] != json!([predecessor])
+                || prior.model != legacy.model || prior.reasoning != legacy.reasoning
+                || prior.rule_snapshot["primary"] != legacy.rule_snapshot["primary"]
+                || ["authorChainRevision", "continuityRevision", "textTransportRetry"]
+                    .iter().any(|field| prior.input.get(*field).is_some())
+                || prior.input["sourceRows"].as_array().is_none_or(|rows| rows.is_empty()
+                    || !rows.iter().all(|row| row.pointer("/range/end").and_then(Value::as_u64)
+                        .is_some_and(|end| end <= first.unwrap())))
+            { continue; }
+            let Some(accepted) = self.sealed_plain_finish_value(&prior, &saved)? else { continue; };
+            if accepted["materializedDraft"]["units"].as_array().and_then(|units| units.last()) != Some(&tail["unit"])
+                || prior.input["previousDraft"]["units"].as_array().and_then(|units| units.last()) != Some(&author_tail["unit"])
+            { continue; }
+            for (repair_text, repair_hash, node) in &candidates {
+                let repair_snapshot: Value = serde_json::from_str(repair_text).map_err(|_| held())?;
+                if repair_snapshot.to_string() != *repair_text
+                    || crate::pipeline::digest(repair_text) != *repair_hash { continue; }
+                let repair: TextRequest = serde_json::from_value(repair_snapshot.clone()).map_err(|_| held())?;
+                if !is_author_scope_repair(&repair)
+                    || repair.input["executionBatch"]["originExecutionBatchId"] != predecessor
+                    || repair.input["sourceRows"] != prior.input["sourceRows"]
+                    || repair.model != prior.model || repair.reasoning != prior.reasoning
+                { continue; }
+                let Some(repaired) = self.managed_accepted_value(&repair, &repair_snapshot)? else { continue; };
+                let draft = &repaired["materializedDraft"];
+                if draft["units"] == prior.input["previousDraft"]["units"]
+                    && draft["fantasyRealization"] == prior.input["previousDraft"]["fantasyRealization"]
+                    && prior.input["baseDraftHash"] == crate::pipeline::finish_base_hash(draft)
+                    && prior.input["baseDraftHash"] == crate::pipeline::finish_base_hash(&prior.input["previousDraft"])
+                    && prior.input["authorRepairProvenance"] == draft["authorRepairProvenance"]
+                    && crate::workflow::accepted_author_repair_predecessor(&self.store,run,node,author_tail)?
+                {
+                    return Ok(Some(original));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn sealed_plain_finish_value(&self, request: &TextRequest, snapshot: &Value) -> Result<Option<Value>> {
+        if request.stage != "storyboardFinish" || request.skill != "episode-finishing-editor"
+            || request.input["executionBatch"]["version"] != "related-range-finish/v1" {
+            return Ok(None);
+        }
+        let Some(accepted) = self.managed_accepted_value(request, snapshot)? else { return Ok(None); };
+        let run = self.workflow_id.as_deref().ok_or_else(held)?;
+        let record: Option<(String,String)> = self.store.conn()?.query_row(
+            "SELECT j.receipt,e.data FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND w.node_key=?2 AND w.state='accepted' AND j.state='completed'",
+            params![run,step_key(request)],|row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| held())?;
+        let Some((receipt,event)) = record else { return Ok(None); };
+        let receipt: Value = serde_json::from_str(&receipt).map_err(|_| held())?;
+        let event: Value = serde_json::from_str(&event).map_err(|_| held())?;
+        let mut raw = event["value"].clone();
+        if !receipt["migrationPolicy"].is_null() || !raw.is_object()
+            || raw["schemaVersion"] != "storyboard-delta/v2"
+            || raw["baseDraftHash"] != request.input["baseDraftHash"]
+            || request.input["baseDraftHash"] != crate::pipeline::finish_base_hash(&request.input["previousDraft"])
+            || accepted["materializedDraft"]["units"].as_array().is_none_or(Vec::is_empty)
+            || raw.get("materializedDraft").is_some()
+            || event["requestHash"] != crate::pipeline::digest(&snapshot.to_string())
+        { return Ok(None); }
+        raw["materializedDraft"] = accepted["materializedDraft"].clone();
+        Ok((raw == accepted).then_some(accepted))
+    }
+
     /// API has no passive reconciliation for an interrupted request. Existing
     /// nodes may only use a proven cache or the original sealed raw recovery;
     /// neither permission authorizes a replacement API task.
@@ -322,6 +482,10 @@ impl SavedTextExecutor {
                 asset_only
             } else if domain == new_domain {
                 projected
+            } else if let Some(original) = self.saved_finish_missing_predecessor(
+                &legacy, &asset_only, &projected, &snapshot, &domain,
+            )? {
+                original
             } else {
                 return Err(held());
             };
@@ -548,6 +712,197 @@ mod tests {
             row.get::<_,String>(3)?,row.get::<_,String>(4)?
         ]))).unwrap().collect::<std::result::Result<_,_>>().unwrap();
         json!({"jobs":executor.store.jobs().unwrap(),"steps":steps,"events":events})
+    }
+
+    #[cfg(windows)]
+    struct MissingFinishPredecessor {
+        _dir: tempfile::TempDir,
+        executor: SavedTextExecutor,
+        frozen: TextRequest,
+        legacy: TextRequest,
+        projected: TextRequest,
+        frozen_job: String,
+        repair_job: String,
+        prior_job: String,
+        frozen_raw: Value,
+        frozen_accepted: Value,
+    }
+
+    #[cfg(windows)]
+    fn missing_finish_predecessor(profile: &str) -> MissingFinishPredecessor {
+        let (dir, mut e, mut old, mut asset, _) = boundary_fixture_at("https://invalid.example");
+        // A nonexistent managed path supplies identity evidence only. These
+        // tests must restore cache; they cannot launch a runtime or read auth.
+        let executable = crate::text_cli::managed_codex_root().unwrap()
+            .join(crate::store::id().replace('-', "")[..16].to_string()).join("codex.exe");
+        assert!(!executable.exists());
+        e.settings = json!({"textProvider":"codex","codexPath":executable,
+            "textCliExecutable":executable,"textCliVersion":"codex-cli 0.162.0-alpha.2"});
+        let rows = json!([
+            {"id":"row:first:0:4","text":"甲开门。","range":{"start":0,"end":4},"kind":"action","episodeId":"episode-1","sceneId":"scene-1"},
+            {"id":"row:first:5:9","text":"乙坐下。","range":{"start":5,"end":9},"kind":"action","episodeId":"episode-1","sceneId":"scene-1"},
+            {"id":"row:second:10:14","text":"丙回应。","range":{"start":10,"end":14},"kind":"action","episodeId":"episode-1","sceneId":"scene-2"}]);
+        let source = json!({"text":"甲开门。\n乙坐下。\n丙回应。",
+            "sha256":crate::pipeline::digest("甲开门。\n乙坐下。\n丙回应。"),"episodes":[{"id":"episode-1"}],"rows":rows});
+        let parent_input = json!({"storyboardAssetInputProfile":"asset-production-card/v2","settings":e.settings,"source":source});
+        e.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",
+            params![json!({"runnerVersion":"desktop-runner/v1","stage":"storyboard.run","input":parent_input}).to_string(),e.workflow_id]).unwrap();
+        for request in [&mut old, &mut asset] {
+            request.rule_snapshot = crate::pipeline::snapshot("episode-finishing-editor",&[]).unwrap();
+            request.input["assetCatalogScope"]["sourceSha256"] = source["sha256"].clone();
+            request.input["storyboardCreativeProfile"] = json!("original-production-contract/v1");
+            request.input["executionBatch"] = json!({"version":"related-range-finish/v1","id":"finish:second","authorBatchIds":["second-B01"],"packageIds":["second"],"sourceRefs":[rows[2]["id"]]});
+            request.input["sourceRows"] = json!([rows[2]]);
+            request.input["finishMode"] = json!("delta");
+            request.input["acceptedContinuity"] = Value::Null;
+            request.input["plan"] = json!({"events":[{"id":"event-second","boundaryBefore":{"kind":"time_space_jump"}}]});
+            request.input["previousDraft"] = json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"second-unit","sourceRefs":[rows[2]["id"]]}],"fantasyRealization":[],"revisionNotes":[],"unresolved":[]});
+            request.input["baseDraftHash"] = json!(crate::pipeline::finish_base_hash(&request.input["previousDraft"]));
+        }
+        let rebind = |old: &TextRequest, asset: &mut TextRequest| {
+            asset.input["finisherAssetInputProjection"]["sourceSha256"] = source["sha256"].clone();
+            asset.input["finisherAssetInputProjection"]["frozenWorkflowInputSha256"] = json!(crate::pipeline::digest(&parent_input.to_string()));
+            asset.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] = json!(crate::pipeline::digest(&serde_json::to_string(old).unwrap()));
+        };
+        rebind(&old, &mut asset);
+        let frozen = match profile { "legacy" => old.clone(), "asset-v1" => asset.clone(), _ => boundary_projection(&asset) };
+        let seed = |request: &TextRequest, raw: &Value, accepted: Option<&Value>, migration: bool| {
+            let mut snap=e.request_domain_snapshot(request).unwrap();
+            snap["executorIdentity"]=json!({"provider":"codex","executable":executable});
+            let hash=crate::pipeline::digest(&snap.to_string());
+            let job=e.store.add_job("text","synthetic-finish-context","codex","local",&snap,if accepted.is_some(){"completed"}else{"rejected"}).unwrap();
+            e.store.event(&job,"text_received_raw",&json!({"requestHash":hash,"value":raw})).unwrap();
+            let event_id:i64=e.store.conn().unwrap().query_row("SELECT MAX(id) FROM events WHERE job_id=?1 AND type='text_received_raw'",[&job],|r|r.get(0)).unwrap();
+            let mut receipt=json!({"contract":"desktop-runner/v1","validation":if accepted.is_some(){"accepted"}else{"rejected"}});
+            if migration {receipt["migrationPolicy"]=json!("author-scope-received-validation/v1");receipt["acceptedRequestHash"]=json!(hash);receipt["authorScopeReceivedValidation"]=json!({"version":"author-scope-received-validation/v1","workflowId":e.workflow_id,"nodeKey":step_key(request),"requestHash":hash,"originalRawEventId":event_id,"originalResultSha256":crate::pipeline::digest(&raw.to_string()),"originalSnapshotSha256":hash,"generationRequestsSent":0,"acceptedAutomatically":false});}
+            let state=if accepted.is_some(){"completed"}else{"rejected"};
+            let stored=if migration{raw}else{accepted.unwrap_or(raw)};
+            let error=accepted.is_none().then_some(AUTHOR_SHOT_SOURCE_REJECTION);
+            e.store.update_job(&job,state,&json!({"result":stored,"receipt":receipt,"error":error})).unwrap();
+            e.store.checkpoint(e.workflow_id.as_deref().unwrap(),&step_key(request),&request.stage,&hash,if accepted.is_some(){"accepted"}else{"rejected"},Some(&job),Some(accepted.unwrap_or(raw)),error).unwrap();job
+        };
+        let frozen_raw=json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":old.input["baseDraftHash"],"retainedUnitIds":["second-unit"],"replacements":[],"revisionNotes":[],"unresolved":[]});
+        let mut frozen_accepted=frozen_raw.clone();frozen_accepted["materializedDraft"]=old.input["previousDraft"].clone();
+        let frozen_job=seed(&frozen,&frozen_raw,Some(&frozen_accepted),false);
+        let author=TextRequest {stage:"storyboardCreate".into(),skill:"unit-performance-director".into(),model:old.model.clone(),reasoning:old.reasoning.clone(),input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"source-production-batch/v1","id":"first-B01"},"sourceRows":[rows[0],rows[1]]}),schema:json!({"type":"object"}),rule_snapshot:crate::pipeline::snapshot("unit-performance-director",&[]).unwrap()};
+        let original_raw=json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"first-unit","episodeId":"episode-1","sourceRefs":[rows[0]["id"]]},{"id":"invalid-second-unit","episodeId":"episode-1","sourceRefs":[rows[1]["id"]]}],"fantasyRealization":[]});
+        seed(&author,&original_raw,None,false);
+        let mut repaired_draft=original_raw.clone();repaired_draft["units"][1]["id"]=json!("repaired-first-tail");
+        let descriptor=json!({"version":"rejected-author-scope-repair/v1","attempt":1,"maximumAttempts":2,"sourceSha256":source["sha256"],"originDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(&author).unwrap()),"originExecutionBatch":author.input["executionBatch"],"originalAuthorRawSha256":crate::pipeline::digest(&original_raw.to_string()),"baseDraftHash":crate::pipeline::finish_base_hash(&original_raw)});
+        let repair=TextRequest{stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:old.model.clone(),reasoning:old.reasoning.clone(),input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"author-domain-repair/v1","id":"repair:first","originExecutionBatchId":"first-B01"},"sourceRows":author.input["sourceRows"],"authorRepair":descriptor,"finishMode":"delta","baseDraftHash":descriptor["baseDraftHash"],"previousDraft":original_raw}),schema:json!({"type":"object"}),rule_snapshot:crate::pipeline::snapshot("episode-finishing-editor",&[]).unwrap()};
+        repaired_draft["authorRepairProvenance"]=json!({"version":"accepted-author-scope-repair/v1","sourceSha256":source["sha256"],"originDomainRequestSha256":descriptor["originDomainRequestSha256"],"originalAuthorRawSha256":descriptor["originalAuthorRawSha256"],"originalAuthorAccepted":false,"nodes":[{"attempt":1,"canonicalDomainRequestSha256":crate::pipeline::digest(&serde_json::to_string(&repair).unwrap()),"baseDraftHash":descriptor["baseDraftHash"],"draftSha256":crate::pipeline::finish_base_hash(&repaired_draft)}]});
+        let repair_raw=json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":descriptor["baseDraftHash"],"retainedUnitIds":["first-unit"],"replacements":[{"replaces":["invalid-second-unit"],"units":[repaired_draft["units"][1]],"fantasyRealization":[]}],"revisionNotes":[],"unresolved":[]});
+        let mut repaired=repair_raw.clone();repaired["materializedDraft"]=repaired_draft.clone();
+        let repair_job=seed(&repair,&repair_raw,Some(&repaired),true);
+        let prior=TextRequest{input:json!({"episodeId":"episode-1","storyboardCreativeProfile":"original-production-contract/v1","executionBatch":{"version":"related-range-finish/v1","id":"finish:first","authorBatchIds":["first-B01"]},"sourceRows":author.input["sourceRows"],"previousDraft":repaired_draft,"baseDraftHash":crate::pipeline::finish_base_hash(&repaired_draft),"authorRepairProvenance":repaired_draft["authorRepairProvenance"]}),..repair.clone()};
+        let mut finished=repaired_draft.clone();finished.as_object_mut().unwrap().remove("authorRepairProvenance");finished["units"][1]["id"]=json!("accepted-finish-first-tail");
+        let prior_raw=json!({"schemaVersion":"storyboard-delta/v2","baseDraftHash":prior.input["baseDraftHash"],"retainedUnitIds":["first-unit"],"replacements":[{"replaces":["repaired-first-tail"],"units":[finished["units"][1]],"fantasyRealization":[]}],"revisionNotes":[],"unresolved":[]});
+        let mut prior_accepted=prior_raw.clone();prior_accepted["materializedDraft"]=finished.clone();
+        let prior_job=seed(&prior,&prior_raw,Some(&prior_accepted),false);
+        old.input["acceptedContinuity"]=json!({"version":"accepted-tail-v1","unit":finished["units"][1],"sourceRefs":finished["units"][1]["sourceRefs"],"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"});
+        old.input["plan"]["acceptedContinuity"]=json!({"version":"accepted-tail-v1","executionBatchId":"first-B01","unit":repaired_draft["units"][1],"sourceRefs":repaired_draft["units"][1]["sourceRefs"],"boundaryBefore":old.input["plan"]["events"][0]["boundaryBefore"],"evidenceRole":"ACCEPTED_CREATIVE_STATE_ONLY"});
+        asset.input["acceptedContinuity"]=old.input["acceptedContinuity"].clone();asset.input["plan"]=old.input["plan"].clone();rebind(&old,&mut asset);
+        let projected=boundary_projection(&asset);
+        MissingFinishPredecessor{_dir:dir,executor:e,frozen,legacy:old,projected,frozen_job,repair_job,prior_job,frozen_raw,frozen_accepted}
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn finish_missing_predecessor_reuses_exact_accepted_context_and_raw_on_reopen() {
+        for profile in ["legacy","asset-v1","boundary-v1"] {
+            let f=missing_finish_predecessor(profile);let before=evidence(&f.executor);
+            for _ in 0..2 {
+                let actual=f.executor.saved_finish_asset_projection(f.legacy.clone(),f.projected.clone()).unwrap();
+                assert_eq!(serde_json::to_value(&actual).unwrap(),serde_json::to_value(&f.frozen).unwrap(),"{profile}");
+                assert_eq!(f.executor.execute(actual.clone()).await.unwrap(),f.frozen_raw);
+                f.executor.accept(&actual,&f.frozen_accepted).await.unwrap();
+            }
+            assert_eq!(evidence(&f.executor),before,"{profile}: no request/raw/receipt/job/attempt mutation or dispatch");
+            assert!(!f.executor.store.root.join("text-runs").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finish_missing_predecessor_rejects_real_domain_changes_and_unproven_tails() {
+        for field in ["model","reasoning","rule","schema","source","assets","base","nextBoundary","revision","continuityUnit","planUnit"] {
+            let mut f=missing_finish_predecessor("boundary-v1");
+            let mut asset_only=f.projected.clone();asset_only.input["nextBoundary"]=f.legacy.input["nextBoundary"].clone();
+            asset_only.input.as_object_mut().unwrap().remove("finisherBoundaryInputProfile");
+            asset_only.input.as_object_mut().unwrap().remove("finisherBoundaryInputProjection");
+            let mutate=|r:&mut TextRequest|match field {
+                "model"=>r.model="changed-model".into(),"reasoning"=>r.reasoning="changed-effort".into(),
+                "rule"=>r.rule_snapshot["primary"]["sha256"]=json!("changed"),"schema"=>r.schema["changed"]=json!(true),
+                "source"=>r.input["sourceRows"][0]["text"]=json!("改动"),"assets"=>r.input["assets"]=json!([]),
+                "base"=>r.input["previousDraft"]["units"][0]["id"]=json!("changed"),
+                "nextBoundary"=>r.input["nextBoundary"]["initialState"]=json!("changed"),
+                "revision"=>r.input["authorChainRevision"]=json!({"version":"unverified-author-chain-change/v0"}),
+                "continuityUnit"=>{r.input["acceptedContinuity"]["unit"]["id"]=json!("changed");},
+                _=>{r.input["plan"]["acceptedContinuity"]["unit"]["id"]=json!("changed");},
+            };
+            mutate(&mut f.legacy);mutate(&mut asset_only);
+            asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"]=json!(crate::pipeline::digest(&serde_json::to_string(&f.legacy).unwrap()));
+            asset_only.input["finisherAssetInputProjection"]["projectedAssetsSha256"]=json!(crate::pipeline::digest(&asset_only.input["assets"].to_string()));
+            f.projected=boundary_projection(&asset_only);let before=evidence(&f.executor);
+            assert!(f.executor.saved_finish_asset_projection(f.legacy,f.projected).is_err(),"{field}");
+            assert_eq!(evidence(&f.executor),before,"{field}: immutable evidence");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finish_missing_predecessor_verified_revision_is_a_new_node_and_never_old_cache_recovery() {
+        let mut f = missing_finish_predecessor("boundary-v1");
+        let before = evidence(&f.executor);
+        let mut asset_only = asset_only_finish_request(&f.legacy, &f.projected).unwrap();
+        let revision = json!({"version":"accepted-author-chain-change/v1","testMarker":"different-domain"});
+        f.legacy.input["authorChainRevision"] = revision.clone();
+        asset_only.input["authorChainRevision"] = revision.clone();
+        asset_only.input["finisherAssetInputProjection"]["legacyDomainRequestSha256"] =
+            json!(crate::pipeline::digest(&serde_json::to_string(&f.legacy).unwrap()));
+        f.projected = boundary_projection(&asset_only);
+        let text: String = f.executor.store.conn().unwrap().query_row(
+            "SELECT snapshot FROM jobs WHERE id=?1", [&f.frozen_job], |row| row.get(0)).unwrap();
+        let snapshot: Value = serde_json::from_str(&text).unwrap();
+        let mut domain = snapshot.clone();
+        domain.as_object_mut().unwrap().remove("executorIdentity");
+        assert!(f.executor.saved_finish_missing_predecessor(
+            &f.legacy, &asset_only, &f.projected, &snapshot, &domain).unwrap().is_none());
+        assert_ne!(step_key(&f.legacy), step_key(&f.frozen), "existing revision contracts create a distinct node, not cache recovery");
+        let selected = f.executor.saved_finish_asset_projection(f.legacy, f.projected).unwrap();
+        assert_ne!(serde_json::to_value(&selected).unwrap(), serde_json::to_value(&f.frozen).unwrap());
+        assert_eq!(selected.input["authorChainRevision"], revision);
+        assert_eq!(evidence(&f.executor), before, "selection cannot rewrite or dispatch the new node");
+        assert!(!f.executor.store.root.join("text-runs").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finish_missing_predecessor_requires_accepted_states_events_and_repair_provenance() {
+        for changed in ["unknown","rejected","received","old-event","old-hash","old-receipt","prior-unknown","repair-unknown","repair-provenance","original-rejection","original-had-tail"] {
+            let f=missing_finish_predecessor("boundary-v1");let c=f.executor.store.conn().unwrap();
+            match changed {
+                "unknown"|"rejected"|"received"=>{let state=if changed=="unknown"{"submission_unknown"}else{changed};c.execute("UPDATE jobs SET state=?1 WHERE id=?2",params![state,f.frozen_job]).unwrap();c.execute("UPDATE workflow_steps SET state=?1 WHERE text_job_id=?2",params![state,f.frozen_job]).unwrap();},
+                "old-event"=>{c.execute("UPDATE events SET data=json_set(data,'$.value.baseDraftHash','changed') WHERE job_id=?1 AND type='text_received_raw'",[&f.frozen_job]).unwrap();},
+                "old-hash"=>{c.execute("UPDATE workflow_steps SET request_hash='changed' WHERE text_job_id=?1",[&f.frozen_job]).unwrap();},
+                "old-receipt"=>{c.execute("UPDATE jobs SET receipt=NULL WHERE id=?1",[&f.frozen_job]).unwrap();},
+                "prior-unknown"=>{c.execute("UPDATE jobs SET state='submission_unknown' WHERE id=?1",[&f.prior_job]).unwrap();},
+                "repair-unknown"=>{c.execute("UPDATE jobs SET state='submission_unknown' WHERE id=?1",[&f.repair_job]).unwrap();},
+                "repair-provenance"=>{c.execute("UPDATE workflow_steps SET result=json_remove(result,'$.materializedDraft.authorRepairProvenance') WHERE text_job_id=?1",[&f.repair_job]).unwrap();},
+                "original-had-tail"=>{
+                    let original:String=c.query_row("SELECT snapshot FROM jobs WHERE id=?1",[&f.frozen_job],|r|r.get(0)).unwrap();
+                    let mut original:Value=serde_json::from_str(&original).unwrap();original["input"]["acceptedContinuity"]=json!({"version":"accepted-tail-v1","unit":{"id":"previously-adopted-different-tail"}});
+                    let hash=crate::pipeline::digest(&original.to_string());
+                    c.execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",params![original.to_string(),f.frozen_job]).unwrap();
+                    c.execute("UPDATE workflow_steps SET request_hash=?1 WHERE text_job_id=?2",params![hash,f.frozen_job]).unwrap();
+                    c.execute("UPDATE events SET data=json_set(data,'$.requestHash',?1) WHERE job_id=?2 AND type='text_received_raw'",params![hash,f.frozen_job]).unwrap();
+                },
+                _=>{c.execute("UPDATE jobs SET error='unrelated rejection' WHERE kind='text' AND state='rejected'",[]).unwrap();},
+            }
+            drop(c);let before=evidence(&f.executor);
+            assert!(f.executor.saved_finish_asset_projection(f.legacy,f.projected).is_err(),"{changed}");
+            assert_eq!(evidence(&f.executor),before,"{changed}: no old data rewrite");
+        }
     }
 
     /// Loopback only; every attempted request is counted and rejected. The guard

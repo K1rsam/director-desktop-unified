@@ -2548,6 +2548,12 @@ pub async fn run_storyboard(
                 let mut end=start+1;
                 let mut prepared=finish_request(&authored_scopes[start..end],&plan,&rows,&context,&current_assets,&selected,&episode.id,model,reasoning,input.get("voiceReference"),prior,authored_scopes.get(end).and_then(|scope|scope.draft["units"].as_array().unwrap().first()))?;
                 let measured=prepare_finish_assets(prepared.clone(),frozen_finish_assets,&current_assets,executor).await?;
+                // An adopted editor can retain the empty predecessor context
+                // frozen before a formerly rejected earlier package was repaired.
+                // Keep that exact node's range; never coalesce it into a new paid
+                // request merely because the predecessor is now available.
+                let restored_finish_context=measured.0.input["acceptedContinuity"]!=prepared.0.input["acceptedContinuity"]
+                    || measured.0.input["plan"]["acceptedContinuity"]!=prepared.0.input["plan"]["acceptedContinuity"];
                 let actual_characters=executor.input_transport_characters(&measured.0)?;
                 if actual_characters>FINISH_TRANSPORT_LIMIT {
                     local_blocked.push(json!({"episodeId":episode.id,"executionBatchId":first.batch.id,"packageIds":first.batch.package_ids,"status":"blocked","code":"FINISH_TRANSPORT_CAPACITY","actualCharacters":actual_characters,"limit":FINISH_TRANSPORT_LIMIT,"reason":"不可再分的完整作者范围超过桌面请求容量；已校验主创保留，不截断原文、现稿或规则。"}));
@@ -2555,7 +2561,7 @@ pub async fn run_storyboard(
                 }
                 // Greedily retain the full adjacent range. Neither source video
                 // seconds nor the author's 5/150 soft target splits the editor.
-                while end<authored_scopes.len() && authored_scopes[end-1].index+1==authored_scopes[end].index {
+                while !restored_finish_context && end<authored_scopes.len() && authored_scopes[end-1].index+1==authored_scopes[end].index {
                     let next_owners=&authored_scopes[end].batch.package_ids;
                     let next_dependencies:HashSet<_>=packages.iter().filter(|owner|next_owners.iter().any(|id|id==text(owner,"id"))).flat_map(|owner|strings(owner,"dependsOn").unwrap_or_default()).collect();
                     if next_owners.iter().any(|id|failed_finish_owners.contains(id)) || next_dependencies.iter().any(|id|failed_finish_owners.contains(id)) {break;}
@@ -11013,5 +11019,116 @@ mod production_contract_tests {
         let part = json!({"lineId":quote.id,"quoteStart":quote.range.start,"quoteEnd":quote.range.start+1});
         let mut repeated = json!({"units":[{"shots":[{"dialogueParts":[part.clone(),part]}]}]});
         assert!(materialize_dialogue(&repeat_source, &mut repeated, false).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit private stable SDK database COPY; exact accepted chain and actual compiler, zero model/media calls"]
+    async fn readonly_sdk_finish_repetition_capacity_preserves_saved_chain_and_fitting_wire() {
+        use rusqlite::{Connection, OpenFlags};
+        use std::path::{Path, PathBuf};
+        let env = |key:&str| std::env::var(key).expect("explicit private read-only capacity evidence required");
+        let path = PathBuf::from(env("DIRECTOR_FINISH_REPETITIONS_DB")).canonicalize().unwrap();
+        let workflow = env("DIRECTOR_FINISH_REPETITIONS_WORKFLOW");
+        let author_id = env("DIRECTOR_FINISH_REPETITIONS_AUTHOR");
+        let prior_id = env("DIRECTOR_FINISH_REPETITIONS_PRIOR_FINISH");
+        let next_id = env("DIRECTOR_FINISH_REPETITIONS_NEXT_AUTHOR");
+        let evidence_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/live-acceptance-20261008").canonicalize().unwrap();
+        assert!(path.starts_with(&evidence_root), "never connect to the production project database");
+        let before = crate::store::hash_file(&path).unwrap();
+        let c = Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        c.execute_batch("PRAGMA query_only=ON; BEGIN;").unwrap();
+        let load = |job:&str|->Value {
+            c.query_row("SELECT w.stage,w.state,w.request_hash,w.result,j.snapshot,j.result,j.receipt,j.state,j.provider,e.data FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND j.id=?2 AND j.kind='text'",
+                rusqlite::params![workflow,job],|r| Ok(json!({"stage":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"hash":r.get::<_,String>(2)?,"adopted":r.get::<_,String>(3)?,"snapshot":r.get::<_,String>(4)?,"raw":r.get::<_,String>(5)?,"receipt":r.get::<_,String>(6)?,"jobState":r.get::<_,String>(7)?,"provider":r.get::<_,String>(8)?,"event":r.get::<_,String>(9)?}))).unwrap()
+        };
+        let records = [load(&author_id),load(&prior_id),load(&next_id)];
+        for record in &records {
+            assert_eq!(record["state"],"accepted"); assert_eq!(record["jobState"],"completed"); assert_eq!(record["provider"],"codex_sdk");
+            assert_eq!(record["hash"],digest(text(record,"snapshot")));
+            let event:Value=serde_json::from_str(text(record,"event")).unwrap();
+            let raw:Value=serde_json::from_str(text(record,"raw")).unwrap();
+            let receipt:Value=serde_json::from_str(text(record,"receipt")).unwrap();
+            assert_eq!(event["requestHash"],record["hash"]); assert_eq!(event["value"],raw);
+            assert_eq!(receipt["contract"],"desktop-runner/v1"); assert_eq!(receipt["validation"],"accepted");
+        }
+        let (parent_text,result_text):(String,String)=c.query_row("SELECT snapshot,result FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run'",[&workflow],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let parent:Value=serde_json::from_str(&parent_text).unwrap();
+        let result:Value=serde_json::from_str(&result_text).unwrap();
+        let frozen=&parent["input"];
+        assert_eq!(frozen["settings"]["textProvider"],"codex_sdk");
+        let source:LockedSource=serde_json::from_value(frozen["source"].clone()).unwrap();
+        let source=upgrade_source_dialogues(&source).unwrap(); validate_source(&source).unwrap();
+        let author:TextRequest=serde_json::from_str(text(&records[0],"snapshot")).unwrap();
+        let prior:TextRequest=serde_json::from_str(text(&records[1],"snapshot")).unwrap();
+        let next:TextRequest=serde_json::from_str(text(&records[2],"snapshot")).unwrap();
+        assert_eq!(author.stage,"storyboardCreate"); assert_eq!(next.stage,"storyboardCreate"); assert_eq!(prior.stage,"storyboardFinish");
+        let episode_id=text(&author.input,"episodeId");
+        assert_eq!(prior.input["episodeId"],episode_id); assert_eq!(next.input["episodeId"],episode_id);
+        let episode=source.episodes.iter().find(|episode|episode.id==episode_id).unwrap();
+        let rows:Vec<_>=source.rows.iter().filter(|row|row.kind=="body" && row.episode_id.as_deref()==Some(episode_id)).cloned().collect();
+        let mut assets=episode_assets(frozen["assets"].as_array().unwrap(),episode_id);
+        asset_cards::inherit_identity_aliases(frozen,&mut assets).unwrap();
+        let decisions=scoped_author_decisions(&source,frozen,&rows).unwrap();
+        let context=decision_context(&source,&rows,&relevant_context(&source,episode,&assets,&frozen["foundation"]),decisions.as_ref());
+        let plan_text:String=c.query_row("SELECT w.result FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='storyboardPlan' AND w.state='accepted' AND j.state='completed' AND json_extract(j.snapshot,'$.input.episode.id')=?2",rusqlite::params![workflow,episode_id],|r|r.get(0)).unwrap();
+        let plan:Value=serde_json::from_str(&plan_text).unwrap();
+        let replay_author=|request:&TextRequest,record:&Value| {
+            let event:Value=serde_json::from_str(text(record,"event")).unwrap();
+            let mut raw=event["value"].clone();
+            let refs=strings(&request.input["executionBatch"],"sourceRefs").unwrap();
+            let style=text(&request.input["settings"],"visualStyle");
+            validate_authored(&source,&mut raw,&assets,&request.input["capabilities"],&refs,style,&format!("{episode_id}:{}:",text(&request.input["executionBatch"],"id"))).unwrap();
+            validate_event_bindings(&raw,&plan).unwrap();
+            validate_fantasy_profile(&raw,request.input["selectedFantasy"].as_array().unwrap(),true).unwrap();
+            creative::add_delivery(&mut raw,&source,style,&assets,true).unwrap();
+            assert_eq!(raw,serde_json::from_str::<Value>(text(record,"adopted")).unwrap(),"saved accepted author reproduces from the immutable raw");
+            raw
+        };
+        let draft=replay_author(&author,&records[0]); let next_draft=replay_author(&next,&records[2]);
+        let prior_result:Value=serde_json::from_str(text(&records[1],"adopted")).unwrap();
+        let prior_tail=prior_result["materializedDraft"]["units"].as_array().unwrap().last().unwrap();
+        let execution=&author.input["executionBatch"];
+        let scope=AcceptedAuthorScope{index:2,batch:original::ExecutionBatch{id:text(execution,"id").into(),package_ids:strings(execution,"packageIds").unwrap(),source_refs:strings(execution,"sourceRefs").unwrap(),provisional_unit_ids:strings(execution,"provisionalUnitIds").unwrap(),estimated_seconds:execution["estimatedSeconds"].as_f64().unwrap(),exceeds_soft_target:execution["exceedsSoftTarget"].as_bool().unwrap()},input:author.input.clone(),draft};
+        let prepared=finish_request(&[scope],&plan,&rows,&context,&assets,author.input["selectedFantasy"].as_array().unwrap(),episode_id,&author.model,&author.reasoning,frozen.get("voiceReference"),Some(prior_tail),next_draft["units"].as_array().unwrap().first()).unwrap();
+        // Exercise the real Saved selector against an isolated clone. No execute/accept
+        // method is called; no runtime, account, dispatch, adoption or new jobs are involved.
+        let isolated=tempfile::tempdir().unwrap();
+        std::fs::copy(&path,isolated.path().join("project.sqlite")).unwrap();
+        let wal=path.with_file_name("project.sqlite-wal");
+        if wal.exists(){std::fs::copy(&wal,isolated.path().join("project.sqlite-wal")).unwrap();}
+        let saved=crate::text_executor::SavedTextExecutor{store:crate::store::Store{root:isolated.path().to_path_buf()},settings:frozen["settings"].clone(),workflow_id:Some(workflow.clone())};
+        let counts=|conn:&Connection|->(i64,i64){conn.query_row("SELECT (SELECT COUNT(*) FROM jobs),(SELECT COUNT(*) FROM events)",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap()};
+        let counts_before=counts(&saved.store.conn().unwrap());
+        let request=prepare_finish_assets(prepared,frozen,&assets,&saved).await.unwrap().0;
+        let canonical=serde_json::to_vec(&request).unwrap();
+        let old_wire=crate::pipeline::storyboard_transport::compile_dispatch_before_finish_repetitions(&request).unwrap();
+        let (old_input,old_schema)=old_wire.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
+        let old_chars=crate::text_executor::codex_wire_characters(&request,old_input,old_schema);
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();
+        let new_chars=compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count();
+        let wire=crate::pipeline::compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(crate::pipeline::storyboard_transport::expand_storyboard_input(&wire.input).unwrap(),request.input);
+        assert_eq!(crate::pipeline::storyboard_transport::expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),canonical);
+        let block=result["blocked"].as_array().unwrap().iter().find(|block|block["code"]=="FINISH_TRANSPORT_CAPACITY" && block["executionBatchId"]==execution["id"]).unwrap();
+        assert_eq!(old_chars as u64,block["actualCharacters"].as_u64().unwrap(),"exact original actual wrapper+schema capacity must reproduce");
+        println!("oldActualUtf16={old_chars} newActualUtf16={new_chars} limitUtf16={FINISH_TRANSPORT_LIMIT}");
+        assert!(old_chars>FINISH_TRANSPORT_LIMIT); assert!(new_chars<=FINISH_TRANSPORT_LIMIT,"complete editor must fit without raising the cap: old={old_chars} new={new_chars}");
+        let prior_path=PathBuf::from(env("DIRECTOR_FINISH_REPETITIONS_PRIOR_COMPILED")).canonicalize().unwrap();
+        assert!(prior_path.starts_with(&evidence_root));
+        let prior_compiled:Value=serde_json::from_slice(&std::fs::read(&prior_path).unwrap()).unwrap();
+        let golden=crate::text_executor::compile_codex_input(&prior).unwrap();
+        assert_eq!(golden.prompt,prior_compiled["prompt"].as_str().unwrap());
+        assert_eq!(golden.schema,prior_compiled["schema"].as_str().unwrap());
+        assert_eq!(counts(&saved.store.conn().unwrap()),counts_before);
+        assert_eq!(records,[load(&author_id),load(&prior_id),load(&next_id)]);
+        c.execute_batch("ROLLBACK;").unwrap(); drop(c);
+        assert_eq!(crate::store::hash_file(&path).unwrap(),before);
+        let report=json!({"version":"readonly-sdk-finisher-repetition-capacity/v1","workflowId":workflow,"sourceSha256":source.sha256,"originalActualUtf16":old_chars,"newActualUtf16":new_chars,"limitUtf16":FINISH_TRANSPORT_LIMIT,"exactInputSchemaRoundtrip":true,"priorFittingCompiledBytesUnchanged":true,"canonicalRequestSha256":digest(std::str::from_utf8(&canonical).unwrap()),"originalJobsRawAndFrozenChainUnchanged":true,"newJobs":0,"newEvents":0,"newModelCalls":0,"imageRequests":0,"videoRequests":0});
+        if let Ok(report_path)=std::env::var("DIRECTOR_FINISH_REPETITIONS_REPORT") {
+            let report_path=Path::new(&report_path);assert!(report_path.parent().unwrap().canonicalize().unwrap().starts_with(&evidence_root));
+            std::fs::write(report_path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        println!("{report}");
     }
 }

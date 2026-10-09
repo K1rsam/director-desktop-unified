@@ -425,6 +425,7 @@ async fn replay_requires_exact_workflow_step_snapshot_identity_and_known_error()
             workflow_id: selected_run,
         };
         let old_evidence = job_evidence(&store, &job);
+        let external_calls = fixture.calls();
         let generation_calls = fixture.generation_calls();
         let original_steps: String = store.conn().unwrap().query_row(
             "SELECT COALESCE(json_group_array(json_array(node_key,stage,request_hash,state,text_job_id,result,error)), '[]') FROM workflow_steps WHERE workflow_id=?1",
@@ -457,11 +458,24 @@ async fn replay_requires_exact_workflow_step_snapshot_identity_and_known_error()
             "unfrozen {change} must retain original snapshot/raw/receipt/error/state"
         );
 
-        if change == "model" {
-            assert_eq!(
-                result.unwrap_err(),
-                "所选文本模型不在 CLI 模型目录中，请刷新并选择模型"
+        let error = result.unwrap_err();
+        let existing_node_held = !matches!(change, "workflow" | "stage" | "input" | "node");
+        if existing_node_held {
+            assert!(
+                error.starts_with("CODEX_EXISTING_ATTEMPT_UNRESOLVED:"),
+                "{change}: {error}"
             );
+            assert_eq!(
+                fixture.calls(), external_calls,
+                "{change}: an old node or unowned original snapshot is held before all runtime I/O"
+            );
+        } else {
+            assert!(
+                error.contains("CODEX_UNMANAGED_IDENTITY_CHANGED"),
+                "{change}: {error}"
+            );
+        }
+        if change == "model" {
             let preflight = director_core::text_cli::resolve_settings(&json!({
                 "textProvider":"codex", "codexPath":executor_path,
                 "textModel":request.model, "reasoning":request.reasoning
@@ -478,12 +492,6 @@ async fn replay_requires_exact_workflow_step_snapshot_identity_and_known_error()
                 "an unavailable model stays blocked through explicit preflight"
             );
         } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .contains("CODEX_UNMANAGED_IDENTITY_CHANGED"),
-                "changed {change} must fail closed until its native identity is frozen"
-            );
             let settings = director_core::text_cli::resolve_settings(&json!({
                 "textProvider":"codex", "codexPath":executor_path,
                 "textModel":request.model, "reasoning":request.reasoning
@@ -498,19 +506,18 @@ async fn replay_requires_exact_workflow_step_snapshot_identity_and_known_error()
                 "explicit preflight only reads the synthetic runtime contract"
             );
             // Never relabel or overwrite the historical two-field workflow to
-            // authorize a fresh request. The standalone case stays standalone;
-            // otherwise the caller explicitly starts a newly frozen workflow.
-            let fresh_run = if change == "no_workflow" {
-                None
-            } else {
-                Some(store.add_job("workflow", "foundation.run", "local", "local",
-                    &json!({"runnerVersion":"desktop-runner/v1", "stage":"foundation.run", "input":{"settings":settings}}),
-                    "running").unwrap())
-            };
+            // authorize a fresh request. Even dropping the workflow identifier
+            // cannot turn an original request into a fresh standalone attempt.
+            // A separate, explicitly frozen parent owns the new attempt.
+            let fresh_run = store.add_job("workflow", "foundation.run", "local", "local",
+                &json!({"runnerVersion":"desktop-runner/v1", "stage":"foundation.run", "input":{"settings":settings}}),
+                "running").unwrap();
+            assert_ne!(fresh_run, run);
+            assert_eq!(store.job(&fresh_run).unwrap()["snapshot"]["input"]["settings"], settings);
             let fresh = SavedTextExecutor {
                 store: store.clone(),
                 settings: settings.clone(),
-                workflow_id: fresh_run,
+                workflow_id: Some(fresh_run),
             };
             assert_eq!(
                 fresh.execute(request.clone()).await.unwrap(),
@@ -579,14 +586,27 @@ async fn unsupported_reasoning_rejects_before_a_new_job_or_generation_and_holds_
     let raw = json!({"draft":"rejected raw cannot become a readiness result"});
     let job = seed(&store, &run, &request, &saved_snapshot, &raw, OLD_ERROR);
     let evidence = job_evidence(&store, &job);
+    let original_step: String = store.conn().unwrap().query_row(
+        "SELECT json_array(node_key,stage,request_hash,state,text_job_id,result,error,updated_at) FROM workflow_steps WHERE workflow_id=?1",
+        [&run], |row| row.get(0),
+    ).unwrap();
     request.reasoning = "unsupported-strength".into();
+    let external_calls = fixture.calls();
     let error = fixture
-        .executor(&store, Some(run))
-        .execute(request)
+        .executor(&store, Some(run.clone()))
+        .execute(request.clone())
         .await
         .unwrap_err();
-    assert_eq!(error, "所选文本模型不支持此推理强度，请调整后再生成");
+    assert!(error.starts_with("CODEX_EXISTING_ATTEMPT_UNRESOLVED:"), "{error}");
+    assert_eq!(fixture.calls(), external_calls, "the original node is held before readiness or generation I/O");
     assert_eq!(fixture.generation_calls(), 0);
+    assert_eq!(job_evidence(&store, &job), evidence);
+    let preflight = director_core::text_cli::resolve_settings(&json!({
+        "textProvider":"codex", "codexPath":fixture.executable,
+        "textModel":request.model, "reasoning":request.reasoning
+    })).await.unwrap_err();
+    assert_eq!(preflight, "所选文本模型不支持此推理强度，请调整后再生成");
+    assert_eq!(fixture.generation_calls(), 0, "explicit read-only preflight does not authorize a replacement request");
     assert_eq!(job_evidence(&store, &job), evidence);
     let jobs: i64 = store
         .conn()
@@ -609,6 +629,11 @@ async fn unsupported_reasoning_rejects_before_a_new_job_or_generation_and_holds_
         replays, 0,
         "an unavailable reasoning choice cannot reuse rejected raw"
     );
+    let current_step: String = store.conn().unwrap().query_row(
+        "SELECT json_array(node_key,stage,request_hash,state,text_job_id,result,error,updated_at) FROM workflow_steps WHERE workflow_id=?1",
+        [&run], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(current_step, original_step, "read-only preflight cannot change the original node or its frozen budget");
 }
 
 #[tokio::test]

@@ -4457,6 +4457,20 @@ pub struct SavedTextExecutor {
     pub settings: Value,
     pub workflow_id: Option<String>,
 }
+
+// This token is created only together with a new persistent CLI job/node. File
+// absence, a new UUID, or a caller-supplied input marker is never fresh evidence.
+struct CliDispatchAllocation {
+    job: String,
+    request_hash: String,
+    workflow: Option<String>,
+    node: String,
+    retry_origin: Option<(String, String)>,
+}
+const CLI_RULES_FIRST_FORMAT: &str = "rules-first-json/v1";
+const CLI_LEGACY_FORMAT: &str = "legacy-json/v1";
+const CLI_FORMAT_EVIDENCE: &str = "cli-dispatch-format/v1";
+
 struct FrozenTextReplay {
     job: String,
     value: Value,
@@ -5233,7 +5247,9 @@ impl TextExecutor for SavedTextExecutor {
         let cached:Option<(String,String)>=self.store.conn()?.query_row("SELECT id,result FROM jobs WHERE kind='text' AND state='completed' AND json_extract(receipt,'$.validation')='accepted' AND json_extract(receipt,'$.migrationPolicy') IS NULL AND snapshot=?1 AND (json_extract(receipt,'$.acceptedRequestHash') IS NULL OR json_extract(receipt,'$.acceptedRequestHash')=?2) ORDER BY created_at DESC,rowid DESC LIMIT 1",params![snapshot.to_string(),hash],|r|Ok((r.get(0)?,r.get(1)?))).ok();
         if let Some((job, raw)) = cached {
             let value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            if let Some(run) = &self.workflow_id {
+            if s(&self.settings, "textProvider") == "codex" {
+                self.claim_cli_cached_checkpoint(&request, &snapshot, &job, &value, false)?;
+            } else if let Some(run) = &self.workflow_id {
                 self.store.checkpoint(
                     run,
                     &key,
@@ -5247,6 +5263,7 @@ impl TextExecutor for SavedTextExecutor {
             }
             return Ok(value);
         }
+        self.check_cli_allocation_boundary(&request, &snapshot)?;
         self.check_sdk_unresolved_hold()?;
         self.sdk_revision_budget(&request)?;
         let _permit = TEXT_SLOTS
@@ -5318,18 +5335,7 @@ impl TextExecutor for SavedTextExecutor {
                 if let Some((job, raw)) = cached {
                     let value: Value =
                         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-                    if let Some(run) = &self.workflow_id {
-                        self.store.checkpoint(
-                            run,
-                            &key,
-                            &request.stage,
-                            &hash,
-                            "accepted",
-                            Some(&job),
-                            Some(&value),
-                            None,
-                        )?;
-                    }
+                    self.claim_cli_cached_checkpoint(&request, &snapshot, &job, &value, true)?;
                     return Ok(value);
                 }
             }
@@ -5345,26 +5351,24 @@ impl TextExecutor for SavedTextExecutor {
             self.check_managed_node_resume_boundary(&request)?;
         }
         self.check_api_finish_submission_boundary(&request)?;
-        let job = self.store.add_job(
-            "text",
-            &format!("{}:{}:{}", request.stage, request.skill, id()),
-            s(&self.settings, "textProvider"),
-            "local-text-account",
-            &snapshot,
-            "queued",
-        )?;
-        if let Some(run) = &self.workflow_id {
-            self.store.checkpoint(
-                run,
-                &key,
-                &request.stage,
-                &hash,
-                "running",
-                Some(&job),
-                None,
-                None,
+        let (job, cli_allocation) = if s(&self.settings, "textProvider") == "codex" {
+            let allocation = self.allocate_cli_text_job(&request, &snapshot)?;
+            (allocation.job.clone(), Some(allocation))
+        } else {
+            // API keeps its existing allocation, payload and recovery contract.
+            let job = self.store.add_job(
+                "text",
+                &format!("{}:{}:{}", request.stage, request.skill, id()),
+                s(&self.settings, "textProvider"),
+                "local-text-account",
+                &snapshot,
+                "queued",
             )?;
-        }
+            if let Some(run) = &self.workflow_id {
+                self.store.checkpoint(run, &key, &request.stage, &hash, "running", Some(&job), None, None)?;
+            }
+            (job, None)
+        };
         self.store.update_job(&job, "submitting", &json!({}))?;
         let result = if s(&self.settings, "textProvider") == "api" {
             self.api(&request, &job).await
@@ -5373,6 +5377,7 @@ impl TextExecutor for SavedTextExecutor {
                 &request,
                 &job,
                 launch.as_deref().ok_or("Codex CLI 缺少已核实的执行身份")?,
+                cli_allocation.as_ref().ok_or("CLI_NEW_DISPATCH_UNPROVEN: 未取得新任务分配证明，未派发")?,
             )
             .await
         };
@@ -6830,6 +6835,7 @@ impl SavedTextExecutor {
             return Ok(Vec::new());
         }
         let Some(run) = self.workflow_id.as_deref() else { return Ok(Vec::new()); };
+        let Some(managed_root) = crate::text_cli::managed_codex_root() else { return Ok(Vec::new()); };
         // This also proves the original full request, parent settings, native
         // identity and canonical hash. Source/rule/schema drift fails closed.
         let snapshot = self.request_snapshot(request)?;
@@ -6843,8 +6849,15 @@ impl SavedTextExecutor {
         for _ in 0..256 {
             let mut prior = request.clone();
             prior.input["textTransportRetry"] = proofs.last().unwrap().clone();
-            let mut prior_snapshot = snapshot.clone();
-            prior_snapshot["input"]["textTransportRetry"] = prior.input["textTransportRetry"].clone();
+            // A dispatched retry freezes its actually inspected native version.
+            // The first historical attempt may only have a two-field identity;
+            // cloning that identity would miss this retry's exact saved job and
+            // incorrectly return to the first origin on a later quota resume.
+            // Do not call request_snapshot here: it validates this same proof
+            // chain recursively. This reader independently binds the original
+            // parent, domain, node and canonical snapshot hash without writes.
+            let prior_domain = self.request_domain_snapshot(&prior)?;
+            let Some(prior_snapshot) = self.managed_saved_snapshot_at(&prior, &prior_domain, &managed_root)? else { break; };
             let Some(mut next) = self.stopped_transport_attempt_proof(&prior, &prior_snapshot)? else { break; };
             if next["quotaRejection"]["failureKind"] != "USAGE_LIMIT" { break; }
             let c = self.store.conn()?;
@@ -7648,8 +7661,186 @@ impl SavedTextExecutor {
         self.request_snapshot(request)
     }
 
-    async fn cli(&self, r: &TextRequest, job: &str, launch: &Path) -> Result<Value> {
+    fn claim_cli_cached_checkpoint(&self, request: &TextRequest, snapshot: &Value, job: &str, value: &Value, require_contract: bool) -> Result<()> {
+        let held = || "CODEX_CACHE_NODE_HELD: 已有CLI节点或缓存绑定变化；保留原节点、任务和冻结包，未覆盖或派发".to_string();
+        if s(&self.settings, "textProvider") != "codex" { return Err(held()); }
+        let mut connection = self.store.conn()?;
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        let hash = crate::pipeline::digest(&snapshot.to_string());
+        // Re-read the accepted cache in the same write transaction as the node
+        // claim. A cache hit never authorizes replacing an unresolved old node.
+        let cached: Option<String> = transaction.query_row(
+            "SELECT result FROM jobs WHERE id=?1 AND kind='text' AND provider='codex' AND state='completed' AND snapshot=?2 AND json_extract(receipt,'$.validation')='accepted' AND json_extract(receipt,'$.migrationPolicy') IS NULL AND (json_extract(receipt,'$.acceptedRequestHash') IS NULL OR json_extract(receipt,'$.acceptedRequestHash')=?3) AND (?4=0 OR json_extract(receipt,'$.contract')='desktop-runner/v1')",
+            params![job, snapshot.to_string(), hash, require_contract], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if cached.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()).as_ref() != Some(value) {
+            return Err(held());
+        }
+        if let Some(run) = &self.workflow_id {
+            let node = step_key(request);
+            let existing: Option<(String, String, String, Option<String>, Option<String>, Option<String>)> = transaction.query_row(
+                "SELECT stage,request_hash,state,text_job_id,result,error FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2",
+                params![run, node], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            if let Some((stage, original_hash, state, original_job, original_raw, error)) = existing {
+                // The original node's own exact accepted cache is an idempotent
+                // replay. Another job, even with the same request, cannot claim it.
+                if stage != request.stage || original_hash != hash || state != "accepted"
+                    || original_job.as_deref() != Some(job) || error.is_some()
+                    || original_raw.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()).as_ref() != Some(value) {
+                    return Err(held());
+                }
+            } else {
+                require_unallocated_cli_node(&transaction, Some(run), request, snapshot)?;
+                let timestamp = now();
+                // INSERT, not UPSERT: absence and claim have one serialized
+                // boundary with allocation, including post-readiness cache hits.
+                transaction.execute(
+                    "INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,result,error,updated_at) VALUES(?1,?2,?3,?4,'accepted',?5,?6,NULL,?7)",
+                    params![run, node, request.stage, hash, job, value.to_string(), timestamp],
+                ).map_err(|error| error.to_string())?;
+                transaction.execute("INSERT INTO metadata(key,value) VALUES('changed_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&timestamp]).map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn check_cli_allocation_boundary(&self, request: &TextRequest, snapshot: &Value) -> Result<()> {
+        if s(&self.settings, "textProvider") != "codex" {
+            return Ok(());
+        }
+        self.validate_transport_retry(request)?;
+        require_unallocated_cli_node(&self.store.conn()?, self.workflow_id.as_deref(), request, snapshot)
+    }
+
+    fn allocate_cli_text_job(&self, request: &TextRequest, snapshot: &Value) -> Result<CliDispatchAllocation> {
+        if s(&self.settings, "textProvider") != "codex" {
+            return Err("CLI_NEW_DISPATCH_UNPROVEN: 新CLI任务分配不能用于其他渠道".into());
+        }
+        self.validate_transport_retry(request)?;
+        let retry_origin = request.input.get("textTransportRetry").map(|proof| {
+            Ok::<_, String>((
+                proof["originJobId"].as_str().filter(|value| !value.is_empty()).ok_or("CLI_RETRY_ORIGIN_UNBOUND")?.to_owned(),
+                proof["originRequestHash"].as_str().filter(|value| !value.is_empty()).ok_or("CLI_RETRY_ORIGIN_UNBOUND")?.to_owned(),
+            ))
+        }).transpose()?;
+        let mut connection = self.store.conn()?;
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        // The absence check, job allocation and original node claim are atomic.
+        // A second owner cannot turn an existing/unknown node into a fresh UUID.
+        require_unallocated_cli_node(&transaction, self.workflow_id.as_deref(), request, snapshot)?;
+        let job = id();
+        let request_hash = crate::pipeline::digest(&snapshot.to_string());
+        let node = step_key(request);
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO jobs(id,kind,entity_id,provider,state,account_id,snapshot,created_at,updated_at) VALUES(?1,'text',?2,'codex','queued','local-text-account',?3,?4,?4)",
+            params![job, format!("{}:{}:{}", request.stage, request.skill, id()), snapshot.to_string(), timestamp],
+        ).map_err(|error| error.to_string())?;
+        if let Some(run) = &self.workflow_id {
+            // No UPSERT: an old node must be replayed or held before allocation.
+            transaction.execute(
+                "INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,result,error,updated_at) VALUES(?1,?2,?3,?4,'running',?5,NULL,NULL,?6)",
+                params![run, node, request.stage, request_hash, job, timestamp],
+            ).map_err(|error| error.to_string())?;
+        }
+        transaction.execute("INSERT INTO metadata(key,value) VALUES('changed_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&timestamp]).map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(CliDispatchAllocation { job, request_hash, workflow: self.workflow_id.clone(), node, retry_origin })
+    }
+
+    fn validate_cli_dispatch_allocation(&self, request: &TextRequest, job: &str, allocation: &CliDispatchAllocation) -> Result<()> {
+        let held = || "CLI_NEW_DISPATCH_UNPROVEN: 新CLI任务/节点/冻结请求绑定不匹配，未派发".to_string();
+        if job != allocation.job || allocation.workflow != self.workflow_id || allocation.node != step_key(request) {
+            return Err(held());
+        }
+        let connection = self.store.conn()?;
+        let saved: Option<String> = connection.query_row(
+            "SELECT snapshot FROM jobs WHERE id=?1 AND kind='text' AND provider='codex' AND state='submitting' AND result IS NULL AND receipt IS NULL",
+            [job], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        let saved = saved.ok_or_else(held)?;
+        let mut domain: Value = serde_json::from_str(&saved).map_err(|_| held())?;
+        if crate::pipeline::digest(&saved) != allocation.request_hash || saved != domain.to_string() {
+            return Err(held());
+        }
+        domain.as_object_mut().ok_or_else(held)?.remove("executorIdentity");
+        if domain != self.request_domain_snapshot(request)? {
+            return Err(held());
+        }
+        if let Some(run) = &allocation.workflow {
+            let bound: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2 AND stage=?3 AND request_hash=?4 AND state='running' AND text_job_id=?5 AND result IS NULL AND error IS NULL)",
+                params![run, allocation.node, request.stage, allocation.request_hash, job], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if !bound { return Err(held()); }
+        }
+        Ok(())
+    }
+
+    fn cli_dispatch_prompt(&self, compiled: &CompiledCodexInput, allocation: &CliDispatchAllocation) -> Result<(String, String)> {
+        let prompt: Value = serde_json::from_str(&compiled.prompt).map_err(|error| error.to_string())?;
+        let Some((origin, origin_hash)) = &allocation.retry_origin else {
+            return Ok((CLI_RULES_FIRST_FORMAT.into(), rules_first_cli_prompt(&prompt)?));
+        };
+        // Retry permission comes from the existing stopped-transport proof. It
+        // selects the original format/bytes; it is never another first dispatch.
+        let held = || "CLI_RETRY_FORMAT_UNBOUND: 原CLI格式/请求证据不完整，未改变格式或重发".to_string();
+        let root = self.store.root.join("text-runs").join(origin);
+        let metadata_path = root.join("cli-dispatch.json");
+        let prompt_path = root.join("cli-prompt.txt");
+        let frozen_event: Option<String> = self.store.conn()?.query_row(
+            "SELECT data FROM events WHERE job_id=?1 AND type='cli_dispatch_frozen' ORDER BY id DESC LIMIT 1",
+            [origin], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if !metadata_path.try_exists().map_err(|error| error.to_string())? {
+            if frozen_event.is_some() || prompt_path.try_exists().map_err(|error| error.to_string())? { return Err(held()); }
+            // Old versions never wrote format metadata. Their known serializer
+            // remains unchanged; missing files do not grant a new format.
+            let wire = root.join("wire-request.json");
+            if wire.try_exists().map_err(|error| error.to_string())? {
+                let saved: Value = serde_json::from_slice(&read_bounded_cli_artifact(&wire)?).map_err(|_| held())?;
+                if saved["provider"] != "codex" || saved["prompt"] != prompt
+                    || saved["schema"] != serde_json::from_str::<Value>(&compiled.schema).map_err(|_| held())? {
+                    return Err(held());
+                }
+            }
+            return Ok((CLI_LEGACY_FORMAT.into(), compiled.prompt.clone()));
+        }
+        let metadata_bytes = read_bounded_cli_artifact(&metadata_path)?;
+        let metadata: Value = serde_json::from_slice(&metadata_bytes).map_err(|_| held())?;
+        let bytes = read_bounded_cli_artifact(&prompt_path)?;
+        let text = String::from_utf8(bytes).map_err(|_| held())?;
+        let original_schema = String::from_utf8(read_bounded_cli_artifact(&root.join("schema.json"))?).map_err(|_| held())?;
+        let (saved_origin, origin_node): (String, String) = self.store.conn()?.query_row(
+            "SELECT j.snapshot,w.node_key FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex' AND w.workflow_id=?2 AND w.request_hash=?3",
+            params![origin, allocation.workflow, origin_hash], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?.ok_or_else(held)?;
+        if crate::pipeline::digest(&saved_origin) != *origin_hash { return Err(held()); }
+        let original: TextRequest = serde_json::from_str(&saved_origin).map_err(|_| held())?;
+        let original_retry = original.input.get("textTransportRetry").map(|proof| {
+            Ok::<_, String>((proof["originJobId"].as_str().ok_or_else(held)?.to_owned(), proof["originRequestHash"].as_str().ok_or_else(held)?.to_owned()))
+        }).transpose()?;
+        let original_allocation = CliDispatchAllocation { job:origin.clone(), request_hash:origin_hash.clone(), workflow:allocation.workflow.clone(), node:origin_node, retry_origin:original_retry };
+        let format = metadata["format"].as_str().ok_or_else(held)?;
+        let expected = match format {
+            CLI_RULES_FIRST_FORMAT => rules_first_cli_prompt(&prompt)?,
+            CLI_LEGACY_FORMAT if original_allocation.retry_origin.is_some() => compiled.prompt.clone(),
+            _ => return Err(held()),
+        };
+        if metadata != cli_dispatch_metadata(&original_allocation, format, &text, &compiled.schema)
+            || metadata_bytes != metadata.to_string().as_bytes()
+            || original_schema != compiled.schema
+            || text != expected || frozen_event.as_deref() != Some(metadata.to_string().as_str()) {
+            return Err(held());
+        }
+        Ok((format.into(), text))
+    }
+
+    async fn cli(&self, r: &TextRequest, job: &str, launch: &Path, allocation: &CliDispatchAllocation) -> Result<Value> {
         children().check_open()?;
+        self.validate_cli_dispatch_allocation(r, job, allocation)?;
         let mut policy = CliRunPolicy::default();
         let deadline = tokio::time::Instant::now() + policy.overall;
         // Preparation, process I/O, exit/drain and result-file I/O share one budget.
@@ -7663,17 +7854,21 @@ impl SavedTextExecutor {
             let dir = tokio::fs::canonicalize(&dir).await.map_err(|e| e.to_string())?;
             let schema = dir.join("schema.json");
             let output = dir.join("result.json");
-            tokio::fs::write(&schema, serde_json::to_vec(&transport_schema).map_err(|e| e.to_string())?)
-                .await.map_err(|e| e.to_string())?;
             let execution_dir = IsolatedExecutionDirectory::create()?;
             let compiled = compile_codex_input(r)?;
             let prompt_value: Value = serde_json::from_str(&compiled.prompt).map_err(|e|e.to_string())?;
-            if wire.is_some() {
-                save_wire_request(&dir, &json!({"profile":crate::pipeline::foundation_wire::PROFILE,"provider":"codex","model":r.model,"reasoning":r.reasoning,"prompt":prompt_value,"schema":transport_schema})).await?;
+            let (format, prompt) = self.cli_dispatch_prompt(&compiled, allocation)?;
+            let actual_wire = if wire.is_some() {
+                Some(json!({"profile":crate::pipeline::foundation_wire::PROFILE,"provider":"codex","model":r.model,"reasoning":r.reasoning,"prompt":prompt_value,"schema":transport_schema}))
             } else if let Some(wire) = &storyboard_wire {
-                save_wire_request(&dir, &json!({"profile":wire.profile,"provider":"codex","model":r.model,"reasoning":r.reasoning,"prompt":prompt_value,"schema":transport_schema})).await?;
-            }
-            Ok::<_, String>((wire, schema, output, execution_dir, prompt_value.to_string().into_bytes()))
+                Some(json!({"profile":wire.profile,"provider":"codex","model":r.model,"reasoning":r.reasoning,"prompt":prompt_value,"schema":transport_schema}))
+            } else { None };
+            let metadata = cli_dispatch_metadata(allocation, &format, &prompt, &compiled.schema);
+            save_new_cli_dispatch(&dir, &prompt, &compiled.schema, &metadata, actual_wire.as_ref()).await?;
+            self.store.event(job, "cli_dispatch_frozen", &metadata)?;
+            // Keep the ordered bytes. Parsing back through Value::to_string()
+            // would silently put dynamic input before rules again.
+            Ok::<_, String>((wire, schema, output, execution_dir, prompt.into_bytes()))
         }).await.map_err(|_| "文本执行准备超过完整运行期限；未启动CLI，不自动重跑".to_string())?;
         let (wire, schema, output, execution_dir, prompt) = preparation?;
         policy.overall = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -7798,6 +7993,102 @@ fn compile_model_transport(
         .map(Some)
 }
 pub(crate) struct CompiledCodexInput { pub prompt: String, pub schema: String }
+
+fn require_unallocated_cli_node(connection: &rusqlite::Connection, workflow: Option<&str>, request: &TextRequest, snapshot: &Value) -> Result<()> {
+    let held = || "CODEX_EXISTING_ATTEMPT_UNRESOLVED: 原CLI节点没有可验证回放；保留原任务、冻结包和预算，未分配或派发新任务".to_string();
+    let has_steps: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')", [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if let Some(run) = workflow {
+        if !has_steps { return Err(held()); }
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2)",
+            params![run, step_key(request)], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if exists {
+            return Err(if request.input.get("textTransportRetry").is_some() {
+                "TEXT_TRANSPORT_RETRY_EXHAUSTED: 原有界恢复节点已经存在，未再分配或派发".into()
+            } else { held() });
+        }
+    }
+    // Old add_job/checkpoint writes were separate. An exact unowned interrupted
+    // job is missing allocation evidence, not proof that another attempt is new.
+    let query = if workflow.is_none() {
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='text' AND j.provider='codex' AND j.snapshot=?1)"
+    } else if has_steps {
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='text' AND j.provider='codex' AND j.snapshot=?1 AND j.state NOT IN ('completed','rejected','stale','cancelled') AND NOT EXISTS(SELECT 1 FROM workflow_steps w WHERE w.text_job_id=j.id))"
+    } else {
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='text' AND j.provider='codex' AND j.snapshot=?1 AND j.state NOT IN ('completed','rejected','stale','cancelled'))"
+    };
+    let orphan: bool = connection.query_row(query, [snapshot.to_string()], |row| row.get(0)).map_err(|error| error.to_string())?;
+    if orphan { return Err(held()); }
+    Ok(())
+}
+
+fn rules_first_cli_prompt(prompt: &Value) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct RulesFirst<'a> {
+        rules: &'a Value,
+        instruction: &'a Value,
+        stage: &'a Value,
+        skill: &'a Value,
+        input: &'a Value,
+    }
+    let object = prompt.as_object().ok_or("CLI_PROMPT_ORDER_INVALID: CLI封装不是对象")?;
+    let keys = ["rules", "instruction", "stage", "skill", "input"];
+    if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+        return Err("CLI_PROMPT_ORDER_INVALID: CLI封装字段发生变化，未改变已有请求或派发".into());
+    }
+    let ordered = serde_json::to_string(&RulesFirst {
+        rules: &object["rules"], instruction: &object["instruction"], stage: &object["stage"],
+        skill: &object["skill"], input: &object["input"],
+    }).map_err(|error| error.to_string())?;
+    let legacy = prompt.to_string();
+    if serde_json::from_str::<Value>(&ordered).map_err(|error| error.to_string())? != *prompt
+        || ordered.len() != legacy.len() || ordered.encode_utf16().count() != legacy.encode_utf16().count() {
+        return Err("CLI_PROMPT_ORDER_INVALID: 规则前置改变了JSON语义或预算，未派发".into());
+    }
+    Ok(ordered)
+}
+
+fn read_bounded_cli_artifact(path: &Path) -> Result<Vec<u8>> {
+    if std::fs::metadata(path).map_err(|error| error.to_string())?.len() > 2_097_152 {
+        return Err("CLI_FORMAT_ARTIFACT_TOO_LARGE: 原格式证据超出上限，未派发".into());
+    }
+    std::fs::read(path).map_err(|error| error.to_string())
+}
+
+fn cli_dispatch_metadata(allocation: &CliDispatchAllocation, format: &str, prompt: &str, schema: &str) -> Value {
+    json!({"version":CLI_FORMAT_EVIDENCE,"format":format,"jobId":allocation.job,
+        "workflowId":allocation.workflow,"nodeKey":allocation.node,"requestHash":allocation.request_hash,
+        "freshSemanticNode":allocation.retry_origin.is_none(),"retryOrigin":allocation.retry_origin.as_ref().map(|(job, hash)|json!({"jobId":job,"requestHash":hash})),
+        "promptSha256":crate::pipeline::digest(prompt),"schemaSha256":crate::pipeline::digest(schema),
+        "promptBytes":prompt.len(),"promptUtf16":prompt.encode_utf16().count()})
+}
+
+async fn write_new_cli_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(path).await
+        .map_err(|error| format!("CLI_FORMAT_ARTIFACT_HELD: 不能覆盖或重建CLI冻结文件: {error}"))?;
+    file.write_all(bytes).await.map_err(|error| error.to_string())?;
+    file.sync_all().await.map_err(|error| error.to_string())
+}
+
+async fn save_new_cli_dispatch(dir: &Path, prompt: &str, schema: &str, metadata: &Value, wire: Option<&Value>) -> Result<()> {
+    // File checks only prevent writes; they never select fresh/legacy format.
+    for name in ["cli-prompt.txt", "cli-dispatch.json", "schema.json", "wire-request.json", "result.json"] {
+        if dir.join(name).try_exists().map_err(|error| error.to_string())? {
+            return Err("CLI_FORMAT_ARTIFACT_HELD: 新分配目录已有冻结证据，未覆盖或派发".into());
+        }
+    }
+    write_new_cli_artifact(&dir.join("cli-prompt.txt"), prompt.as_bytes()).await?;
+    write_new_cli_artifact(&dir.join("cli-dispatch.json"), metadata.to_string().as_bytes()).await?;
+    write_new_cli_artifact(&dir.join("schema.json"), schema.as_bytes()).await?;
+    if let Some(wire) = wire {
+        write_new_cli_artifact(&dir.join("wire-request.json"), wire.to_string().as_bytes()).await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn compile_codex_input(request: &TextRequest) -> Result<CompiledCodexInput> {
     let wire=compile_model_transport(request)?;
     let storyboard=crate::pipeline::compile_storyboard_dispatch_transport(request)?;
@@ -8175,7 +8466,7 @@ mod managed_installation_resume_tests {
         (directory, executor, request, job, snapshot, raw)
     }
 
-    fn stopped_text_fixture() -> (tempfile::TempDir, SavedTextExecutor, TextRequest, String, Value, Value) {
+    pub(super) fn stopped_text_fixture() -> (tempfile::TempDir, SavedTextExecutor, TextRequest, String, Value, Value) {
         let fixture = fixture("failed", false);
         let (_, executor, request, job, snapshot, _) = &fixture;
         executor.store.conn().unwrap().execute("UPDATE jobs SET snapshot=json_set(snapshot,'$.stage','storyboard.run') WHERE id=?1",[executor.workflow_id.as_deref().unwrap()]).unwrap();
@@ -8264,7 +8555,7 @@ mod managed_installation_resume_tests {
         println!("{{\"actualEditorPredecessorBound\":true,\"adoptedAuthorVerbatimReplay\":true,\"noDependencyFork\":true,\"originalEvidenceUnchanged\":true,\"modelExecutions\":0}}");
     }
 
-    fn save_quota_failure(executor: &SavedTextExecutor, request: &TextRequest, job: &str, snapshot: &Value) {
+    pub(super) fn save_quota_failure(executor: &SavedTextExecutor, request: &TextRequest, job: &str, snapshot: &Value) {
         let message="You’ve hit your usage limit. Try again later.";
         let error=format!("Codex执行失败: {message}");
         executor.store.update_job(job,"failed",&json!({"error":error})).unwrap();
@@ -8273,7 +8564,7 @@ mod managed_installation_resume_tests {
         executor.store.event(job,"codex_heartbeat",&json!({"format":"codex-runtime-heartbeat/v1","phase":"failed","processAlive":false,"pid":42,"stdinBytes":100,"stdinTotalBytes":100,"resultBytes":0})).unwrap();
     }
 
-    fn save_explicit_text_resume(executor: &SavedTextExecutor) {
+    pub(super) fn save_explicit_text_resume(executor: &SavedTextExecutor) {
         let run=executor.workflow_id.as_deref().unwrap();
         let snapshot=executor.store.job(run).unwrap()["snapshot"].clone();
         executor.store.event(run,"text_workflow_resume_requested",&json!({"version":"text-workflow-resume/v1","snapshotSha256":crate::pipeline::digest(&snapshot.to_string()),"previousStatus":"partially_blocked","maximumQuotaAttempts":1})).unwrap();
@@ -12534,6 +12825,505 @@ mod stage2_checkpoint_identity_tests {
 #[cfg(all(test, windows))]
 #[path = "text_executor_frozen_parent_tests.rs"]
 mod frozen_parent_tests;
+
+#[cfg(test)]
+mod cli_rules_first_dispatch_tests {
+    use super::*;
+
+    fn request() -> TextRequest {
+        TextRequest {
+            stage: "foundation:CLI_FORMAT_CONTRACT".into(),
+            skill: "foundation-asset-catalog".into(), model: "offline".into(), reasoning: "medium".into(),
+            input: json!({"episodeId":"offline-episode","locked":"原文🦀\n\"引用\"\\保持","sourceSha256":"offline-source"}),
+            schema: json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+            rule_snapshot: json!({"primary":{"version":"fixture/v1","content":"complete frozen offline rules"},"methods":[{"content":"complete method, unchanged"}]}),
+        }
+    }
+
+    fn offline_native(directory: &Path) -> PathBuf {
+        static BINARY: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
+        let (_, binary) = BINARY.get_or_init(|| {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("cli_format_fixture.rs");
+            let binary = temporary.path().join(if cfg!(windows) { "cli-format-fixture.exe" } else { "cli-format-fixture" });
+            // This executable implements no network, credential or model code.
+            std::fs::write(&source, r#"
+use std::io::{Read,Write};
+fn main() {
+    let args:Vec<String>=std::env::args().collect();
+    if args.get(1).map(String::as_str)==Some("--version") { println!("codex-cli 0.160.1");return; }
+    if args.iter().any(|arg|arg=="--help") { println!("--output-schema --output-last-message --json");return; }
+    if args.get(1).map(String::as_str)!=Some("exec") { std::process::exit(78); }
+    let output=std::path::PathBuf::from(&args[args.iter().position(|arg|arg=="--output-last-message").unwrap()+1]);
+    let mut input=Vec::new();std::io::stdin().read_to_end(&mut input).unwrap();
+    std::fs::write(output.with_extension("stdin"),&input).unwrap();
+    let mut counter=std::fs::OpenOptions::new().create(true).append(true).open(std::env::current_exe().unwrap().with_extension("executed")).unwrap();
+    writeln!(counter,"dispatch").unwrap();
+    std::fs::write(&output,b"{\"ok\":true}").unwrap();
+    println!("{{\"type\":\"turn.completed\"}}");
+}
+"#).unwrap();
+            let compiler = std::env::var_os("RUSTC").map(PathBuf::from).unwrap_or_else(|| {
+                std::env::var_os("CARGO_HOME").map(PathBuf::from)
+                    .or_else(|| std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|root| PathBuf::from(root).join(".cargo")))
+                    .map(|root| root.join("bin").join(if cfg!(windows) { "rustc.exe" } else { "rustc" }))
+                    .unwrap_or_else(|| PathBuf::from("rustc"))
+            });
+            let mut command = std::process::Command::new(compiler);
+            command.args(["--edition=2021", "--crate-name", "cli_format_fixture"]).arg(&source).arg("-o").arg(&binary);
+            #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "offline fixture compile failed: {}", String::from_utf8_lossy(&output.stderr));
+            (temporary, binary)
+        });
+        let native = directory.join(if cfg!(windows) { "format-fixture.exe" } else { "format-fixture" });
+        std::fs::copy(binary, &native).unwrap();
+        crate::text_cli::verified_native_path(&native).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, SavedTextExecutor, TextRequest, Value, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let native = offline_native(directory.path());
+        let store = Store::open(directory.path().join("project")).unwrap();
+        store.create("offline CLI format contract", "fixture").unwrap();
+        store.ensure_workflow_storage().unwrap();
+        let settings = json!({"textProvider":"codex","codexPath":native,"textCliExecutable":native,"textCliVersion":"codex-cli 0.160.1"});
+        let run = store.add_job("workflow", "storyboard.run", "local", "local", &json!({"runnerVersion":"desktop-runner/v1","stage":"storyboard.run","input":{"settings":settings}}), "running").unwrap();
+        let executor = SavedTextExecutor { store, settings, workflow_id: Some(run) };
+        let request = request();
+        let snapshot = executor.request_snapshot(&request).unwrap();
+        (directory, executor, request, snapshot, native)
+    }
+
+    fn mark_submitting(executor: &SavedTextExecutor, allocation: &CliDispatchAllocation) {
+        executor.store.update_job(&allocation.job, "submitting", &json!({})).unwrap();
+    }
+
+    fn file_hashes(directory: &Path) -> std::collections::BTreeMap<String, String> {
+        if !directory.exists() { return Default::default(); }
+        std::fs::read_dir(directory).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            use sha2::Digest;
+            (entry.file_name().to_string_lossy().into_owned(), format!("{:x}", sha2::Sha256::digest(bytes)))
+        }).collect()
+    }
+
+    fn steps(executor: &SavedTextExecutor) -> Vec<String> {
+        let connection = executor.store.conn().unwrap();
+        let mut query = connection.prepare("SELECT json_object('workflow_id',workflow_id,'node_key',node_key,'stage',stage,'request_hash',request_hash,'state',state,'text_job_id',text_job_id,'result',result,'error',error,'updated_at',updated_at) FROM workflow_steps WHERE workflow_id=?1 ORDER BY node_key").unwrap();
+        let rows = query.query_map([executor.workflow_id.as_deref().unwrap()], |row| row.get::<_,String>(0)).unwrap().map(|row|row.unwrap()).collect();
+        rows
+    }
+
+    fn exact_cache(executor: &SavedTextExecutor, snapshot: &Value, value: &Value) -> String {
+        let job = executor.store.add_job("text", "independent accepted cache", "codex", "local", snapshot, "completed").unwrap();
+        executor.store.update_job(&job, "completed", &json!({"result":value,"receipt":{"contract":"desktop-runner/v1","validation":"accepted","acceptedRequestHash":crate::pipeline::digest(&snapshot.to_string())}})).unwrap();
+        job
+    }
+
+    #[test]
+    fn cli_rules_first_json_preserves_semantics_budget_domain_sdk_compiler_and_api_bytes() {
+        let request = request();
+        let frozen = serde_json::to_value(&request).unwrap();
+        let domain_hash = crate::pipeline::digest(&frozen.to_string());
+        let compiled = compile_codex_input(&request).unwrap();
+        let legacy = cli_prompt(&request, &request.input).to_string();
+        let api = api_payload(&request, &request.input, &request.schema).to_string();
+        let prompt: Value = serde_json::from_str(&compiled.prompt).unwrap();
+        let ordered = rules_first_cli_prompt(&prompt).unwrap();
+        assert!(ordered.starts_with("{\"rules\":"));
+        assert!(compiled.prompt.starts_with("{\"input\":"), "shared SDK compiler keeps legacy order");
+        assert_eq!(compiled.prompt, legacy);
+        assert_eq!(crate::pipeline::digest(&compiled.prompt), "8e242516ca469c4aa791fa64a99f26b4d46fe088ea8723ec3ae8fa69817eceda", "SDK compiled-prompt golden hash is unchanged");
+        assert_eq!(crate::pipeline::digest(&compiled.schema), "4528a3c79c4aaee242a31e586366657f8e9a3f11cc8d2cb040d9bf61ab1bbb63", "SDK compiled-schema golden hash is unchanged");
+        assert_eq!(serde_json::from_str::<Value>(&ordered).unwrap(), prompt);
+        assert_eq!(ordered.len(), compiled.prompt.len());
+        assert_eq!(ordered.encode_utf16().count(), compiled.prompt.encode_utf16().count());
+        assert_eq!(serde_json::to_value(&request).unwrap(), frozen);
+        assert_eq!(crate::pipeline::digest(&frozen.to_string()), domain_hash);
+        let unchanged = compile_codex_input(&request).unwrap();
+        assert_eq!(unchanged.prompt, compiled.prompt);
+        assert_eq!(unchanged.schema, compiled.schema);
+        assert_eq!(crate::pipeline::digest(&unchanged.prompt), crate::pipeline::digest(&legacy));
+        assert_eq!(api_payload(&request, &request.input, &request.schema).to_string(), api);
+        assert_eq!(codex_wire_characters(&request, &request.input, &request.schema), ordered.encode_utf16().count() + compiled.schema.encode_utf16().count());
+        let mut other = request.clone();
+        other.input["locked"] = json!("另一个严格原文");
+        let next = rules_first_cli_prompt(&cli_prompt(&other, &other.input)).unwrap();
+        let prefix = ordered.split("\"input\":").next().unwrap();
+        assert!(next.starts_with(prefix), "identical frozen rules have a static prefix before dynamic input");
+        let mut additional = prompt.clone();
+        additional["unexpected"] = json!(true);
+        assert!(rules_first_cli_prompt(&additional).is_err());
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_new_allocation_reaches_mock_stdin_and_freezes_exact_bytes() {
+        let (_directory, executor, request, snapshot, native) = fixture();
+        let allocation = executor.allocate_cli_text_job(&request, &snapshot).unwrap();
+        assert!(allocation.retry_origin.is_none());
+        mark_submitting(&executor, &allocation);
+        let before_hash = crate::pipeline::digest(&snapshot.to_string());
+        let result = executor.cli(&request, &allocation.job, &native, &allocation).await.unwrap();
+        assert_eq!(result, json!({"ok":true}));
+        let directory = executor.store.root.join("text-runs").join(&allocation.job);
+        let actual = std::fs::read_to_string(directory.join("result.stdin")).unwrap();
+        let frozen = std::fs::read_to_string(directory.join("cli-prompt.txt")).unwrap();
+        assert_eq!(actual, frozen, "test observes actual supervisor stdin, not only a formatter helper");
+        assert!(actual.starts_with("{\"rules\":"));
+        assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), cli_prompt(&request, &request.input));
+        let metadata: Value = serde_json::from_slice(&std::fs::read(directory.join("cli-dispatch.json")).unwrap()).unwrap();
+        assert_eq!(metadata["format"], CLI_RULES_FIRST_FORMAT);
+        assert_eq!(metadata["freshSemanticNode"], true);
+        assert_eq!(metadata["requestHash"], before_hash);
+        assert_eq!(metadata["promptSha256"], crate::pipeline::digest(&actual));
+        assert_eq!(executor.store.job(&allocation.job).unwrap()["snapshot"], snapshot);
+        assert_eq!(std::fs::read_to_string(native.with_extension("executed")).unwrap(), "dispatch\n");
+        let originals = file_hashes(&directory);
+        assert!(executor.cli(&request, &allocation.job, &native, &allocation).await.unwrap_err().contains("CLI_FORMAT_ARTIFACT_HELD"));
+        assert_eq!(file_hashes(&directory), originals);
+        assert_eq!(std::fs::read_to_string(native.with_extension("executed")).unwrap(), "dispatch\n");
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_old_nodes_and_unknown_never_allocate_or_dispatch() {
+        for state in ["queued", "submitting", "running", "received", "interrupted", "submission_unknown", "failed", "rejected", "completed"] {
+            let (_directory, executor, request, snapshot, native) = fixture();
+            let job = executor.store.add_job("text", "original", "codex", "local", &snapshot, state).unwrap();
+            executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(), &step_key(&request), &request.stage, &crate::pipeline::digest(&snapshot.to_string()), state, Some(&job), None, None).unwrap();
+            let root = executor.store.root.join("text-runs").join(&job);
+            std::fs::create_dir_all(&root).unwrap();
+            for name in ["wire-request.json", "cli-dispatch.json", "cli-prompt.txt", "result.json"] {
+                std::fs::write(root.join(name), format!("original {state}: {name}")).unwrap();
+            }
+            let hashes = file_hashes(&root);
+            let before_job = executor.store.job(&job).unwrap();
+            let before_steps = steps(&executor);
+            let count = executor.store.jobs().unwrap().len();
+            assert!(executor.execute(request.clone()).await.is_err(), "{state}");
+            let reopened = SavedTextExecutor { store: Store::open(executor.store.root.clone()).unwrap(), settings: executor.settings.clone(), workflow_id: executor.workflow_id.clone() };
+            assert!(reopened.allocate_cli_text_job(&request, &snapshot).is_err(), "{state}: reopening files does not prove fresh allocation");
+            assert_eq!(executor.store.jobs().unwrap().len(), count, "{state}: no new text job");
+            assert_eq!(executor.store.job(&job).unwrap(), before_job, "{state}: raw job preserved");
+            assert_eq!(steps(&executor), before_steps, "{state}: original checkpoint preserved");
+            assert_eq!(file_hashes(&root), hashes, "{state}: original artifacts unchanged");
+            assert!(!native.with_extension("executed").exists(), "{state}: zero mock CLI dispatches");
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_other_exact_cache_cannot_replace_existing_nodes() {
+        for state in ["queued", "submitting", "running", "received", "interrupted", "submission_unknown", "failed", "rejected", "completed"] {
+            let (_directory, executor, request, snapshot, native) = fixture();
+            let job = executor.store.add_job("text", "original unresolved node", "codex", "local", &snapshot, state).unwrap();
+            executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(), &step_key(&request), &request.stage, &crate::pipeline::digest(&snapshot.to_string()), state, Some(&job), None, Some("original unresolved evidence")).unwrap();
+            let value = json!({"ok":true});
+            let cache = exact_cache(&executor, &snapshot, &value);
+            let root = executor.store.root.join("text-runs").join(&job);
+            std::fs::create_dir_all(&root).unwrap();
+            for name in ["wire-request.json", "cli-dispatch.json", "cli-prompt.txt", "result.json"] {
+                std::fs::write(root.join(name), format!("immutable {state}: {name}")).unwrap();
+            }
+            let original_job = executor.store.job(&job).unwrap();
+            let original_cache = executor.store.job(&cache).unwrap();
+            let original_steps = steps(&executor);
+            let original_files = file_hashes(&root);
+            let count = executor.store.jobs().unwrap().len();
+            // Exercise execute's pre-gate global-cache hit with a real SQL node,
+            // then the same atomic claim used by the post-readiness cache hit.
+            assert!(executor.execute(request.clone()).await.unwrap_err().contains("CODEX_CACHE_NODE_HELD"), "{state}: an independent accepted cache cannot resolve the original node");
+            for require_contract in [false, true] {
+                assert!(executor.claim_cli_cached_checkpoint(&request, &snapshot, &cache, &value, require_contract).unwrap_err().contains("CODEX_CACHE_NODE_HELD"), "{state}: both cache-entry contracts hold");
+            }
+            assert_eq!(executor.store.jobs().unwrap().len(), count);
+            assert_eq!(executor.store.job(&job).unwrap(), original_job);
+            assert_eq!(executor.store.job(&cache).unwrap(), original_cache);
+            assert_eq!(steps(&executor), original_steps, "{state}: no checkpoint UPSERT");
+            assert_eq!(file_hashes(&root), original_files);
+            assert!(!native.with_extension("executed").exists(), "{state}: zero mock CLI dispatches");
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_completed_cache_replays_without_dispatch_or_file_writes() {
+        let (_directory, executor, request, snapshot, native) = fixture();
+        let hash = crate::pipeline::digest(&snapshot.to_string());
+        let job = executor.store.add_job("text", "original", "codex", "local", &snapshot, "completed").unwrap();
+        let raw = json!({"ok":true});
+        executor.store.update_job(&job, "completed", &json!({"result":raw,"receipt":{"contract":"desktop-runner/v1","validation":"accepted"}})).unwrap();
+        executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(), &step_key(&request), &request.stage, &hash, "accepted", Some(&job), Some(&raw), None).unwrap();
+        let original = executor.store.job(&job).unwrap();
+        let original_steps = steps(&executor);
+        let count = executor.store.jobs().unwrap().len();
+        assert_eq!(executor.execute(request.clone()).await.unwrap(), raw);
+        for require_contract in [false, true] {
+            executor.claim_cli_cached_checkpoint(&request, &snapshot, &job, &raw, require_contract).unwrap();
+        }
+        assert_eq!(executor.store.job(&job).unwrap(), original);
+        assert_eq!(executor.store.jobs().unwrap().len(), count);
+        assert_eq!(steps(&executor), original_steps, "same original accepted job replays without a write");
+        let other_cache = exact_cache(&executor, &snapshot, &raw);
+        for require_contract in [false, true] {
+            assert!(executor.claim_cli_cached_checkpoint(&request, &snapshot, &other_cache, &raw, require_contract).unwrap_err().contains("CODEX_CACHE_NODE_HELD"));
+        }
+        assert_eq!(steps(&executor), original_steps, "an equivalent different job cannot replace an accepted original");
+        assert!(!executor.store.root.join("text-runs").exists());
+        assert!(!native.with_extension("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_cache_claim_and_allocation_are_one_atomic_boundary() {
+        let (_directory, executor, request, snapshot, native) = fixture();
+        let value = json!({"ok":true});
+        let cache = exact_cache(&executor, &snapshot, &value);
+        let count = executor.store.jobs().unwrap().len();
+        assert_eq!(executor.execute(request.clone()).await.unwrap(), value, "a fresh node can reuse an exact accepted cache");
+        let original_steps = steps(&executor);
+        assert_eq!(executor.execute(request.clone()).await.unwrap(), value);
+        assert_eq!(steps(&executor), original_steps);
+        let bound_job: String = executor.store.conn().unwrap().query_row("SELECT text_job_id FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2 AND state='accepted'", params![executor.workflow_id, step_key(&request)], |row|row.get(0)).unwrap();
+        assert_eq!(bound_job, cache);
+        assert_eq!(executor.store.jobs().unwrap().len(), count);
+        assert!(!executor.store.root.join("text-runs").exists());
+        assert!(!native.with_extension("executed").exists());
+
+        let (_directory, executor, request, snapshot, native) = fixture();
+        let cache = exact_cache(&executor, &snapshot, &value);
+        let original_cache = executor.store.job(&cache).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for cache_claim in [false, true] {
+            let executor = SavedTextExecutor { store: executor.store.clone(), settings: executor.settings.clone(), workflow_id: executor.workflow_id.clone() };
+            let request = request.clone(); let snapshot = snapshot.clone(); let value = value.clone(); let cache = cache.clone(); let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let accepted = if cache_claim {
+                    executor.claim_cli_cached_checkpoint(&request, &snapshot, &cache, &value, true).is_ok()
+                } else { executor.allocate_cli_text_job(&request, &snapshot).is_ok() };
+                (cache_claim, accepted)
+            }));
+        }
+        let outcomes: Vec<_> = workers.into_iter().map(|worker|worker.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|(_, accepted)|*accepted).count(), 1, "cache claim and new allocation cannot both replace/own the same node");
+        let (state, bound_job): (String, String) = executor.store.conn().unwrap().query_row("SELECT state,text_job_id FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2", params![executor.workflow_id, step_key(&request)], |row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let cache_won = outcomes.iter().any(|(cache_claim, accepted)|*cache_claim && *accepted);
+        if cache_won {
+            assert_eq!(state, "accepted"); assert_eq!(bound_job, cache);
+        } else {
+            assert_eq!(state, "running"); assert_ne!(bound_job, cache);
+            let original_steps = steps(&executor);
+            for require_contract in [false, true] {
+                assert!(executor.claim_cli_cached_checkpoint(&request, &snapshot, &cache, &value, require_contract).is_err(), "the selected cache cannot overwrite a node allocated during slot/readiness waiting");
+            }
+            assert_eq!(steps(&executor), original_steps);
+        }
+        assert_eq!(executor.store.job(&cache).unwrap(), original_cache);
+        assert!(!executor.store.root.join("text-runs").exists());
+        assert!(!native.with_extension("executed").exists());
+    }
+
+    #[test]
+    fn cli_rules_first_repair_and_revision_nodes_keep_original_rejected_node_intact() {
+        for version in ["author-domain-repair/v1", "finish-domain-repair/v1", "carrier-repair/v1"] {
+            let (_directory, executor, mut original, _snapshot, native) = fixture();
+            original.stage = "storyboardFinish".into(); original.skill = "episode-finishing-editor".into();
+            original.input["executionBatch"] = json!({"version":"related-range-finish/v1","id":"original-batch"});
+            let snapshot = executor.request_snapshot(&original).unwrap();
+            let job = executor.store.add_job("text", "original rejected", "codex", "local", &snapshot, "rejected").unwrap();
+            executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(), &step_key(&original), &original.stage, &crate::pipeline::digest(&snapshot.to_string()), "rejected", Some(&job), None, Some("original domain rejection")).unwrap();
+            let before = executor.store.job(&job).unwrap();
+            let mut next = original.clone();
+            next.input["executionBatch"] = json!({"version":version,"id":format!("{version}:existing-program-bound-attempt-1")});
+            let next_snapshot = executor.request_snapshot(&next).unwrap();
+            let allocation = executor.allocate_cli_text_job(&next, &next_snapshot).unwrap();
+            assert_ne!(allocation.node, step_key(&original));
+            assert_eq!(executor.store.job(&job).unwrap(), before);
+            let old_job: String = executor.store.conn().unwrap().query_row("SELECT text_job_id FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2", params![executor.workflow_id, step_key(&original)], |row|row.get(0)).unwrap();
+            assert_eq!(old_job, job, "new bounded node never replaces the rejected origin");
+            assert!(!native.with_extension("executed").exists(), "allocation-only test is not model authorization or dispatch");
+        }
+    }
+
+    #[test]
+    fn cli_rules_first_allocation_is_atomic_and_legacy_orphans_are_held() {
+        let (_directory, executor, request, snapshot, _native) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let executor = SavedTextExecutor { store: executor.store.clone(), settings: executor.settings.clone(), workflow_id: executor.workflow_id.clone() };
+            let request = request.clone(); let snapshot = snapshot.clone(); let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || { barrier.wait(); executor.allocate_cli_text_job(&request, &snapshot).is_ok() }));
+        }
+        assert_eq!(workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>(), 1);
+        let count: i64 = executor.store.conn().unwrap().query_row("SELECT count(*) FROM jobs WHERE kind='text'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "one atomic job/node allocation");
+        let (_directory, executor, request, snapshot, _native) = fixture();
+        executor.store.add_job("text", "legacy orphan", "codex", "local", &snapshot, "interrupted").unwrap();
+        assert!(executor.allocate_cli_text_job(&request, &snapshot).is_err());
+        assert_eq!(executor.store.jobs().unwrap().len(), 2, "unowned interrupted job is not another first attempt");
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_new_files_never_overwrite_wire_meta_schema_or_raw() {
+        for name in ["wire-request.json", "cli-dispatch.json", "cli-prompt.txt", "schema.json", "result.json"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join(name), b"existing immutable bytes").unwrap();
+            let before = file_hashes(directory.path());
+            assert!(save_new_cli_dispatch(directory.path(), "new", "new", &json!({}), Some(&json!({}))).await.unwrap_err().contains("CLI_FORMAT_ARTIFACT_HELD"));
+            assert_eq!(file_hashes(directory.path()), before, "{name}: neither overwrite nor partial new file");
+        }
+    }
+
+    #[cfg(windows)]
+    async fn stopped_origin(format: Option<&str>) -> (tempfile::TempDir, SavedTextExecutor, TextRequest, Value, PathBuf, String) {
+        // Reuse the established managed retry fixture. Its native package path
+        // is deliberately absent and is never created, resolved or executed.
+        let (directory, executor, request, job, snapshot, _) = managed_installation_resume_tests::stopped_text_fixture();
+        let native = offline_native(directory.path());
+        let origin = CliDispatchAllocation { job, request_hash:crate::pipeline::digest(&snapshot.to_string()), workflow:executor.workflow_id.clone(), node:step_key(&request), retry_origin:None };
+        let compiled = compile_codex_input(&request).unwrap();
+        let root = executor.store.root.join("text-runs").join(&origin.job);
+        std::fs::create_dir_all(&root).unwrap();
+        if format == Some(CLI_LEGACY_FORMAT) {
+            // A legacy marker is created by a permitted retry of an old job;
+            // it must not masquerade as a fresh rules-first allocation.
+            std::fs::write(root.join("wire-request.json"), json!({"provider":"codex","prompt":serde_json::from_str::<Value>(&compiled.prompt).unwrap(),"schema":serde_json::from_str::<Value>(&compiled.schema).unwrap()}).to_string()).unwrap();
+            let first_retry = executor.prepare_transport_request(request.clone()).await.unwrap();
+            let first_snapshot = executor.request_snapshot(&first_retry).unwrap();
+            assert!(snapshot["executorIdentity"]["version"].is_null(), "historical origin keeps its two-field identity");
+            assert_eq!(first_snapshot["executorIdentity"]["version"], executor.settings["textCliVersion"], "a fresh retry freezes the actual native version rather than relabeling its origin");
+            let first_allocation = executor.allocate_cli_text_job(&first_retry, &first_snapshot).unwrap();
+            let first_root = executor.store.root.join("text-runs").join(&first_allocation.job);
+            std::fs::create_dir_all(&first_root).unwrap();
+            let metadata = cli_dispatch_metadata(&first_allocation, CLI_LEGACY_FORMAT, &compiled.prompt, &compiled.schema);
+            save_new_cli_dispatch(&first_root, &compiled.prompt, &compiled.schema, &metadata, None).await.unwrap();
+            executor.store.event(&first_allocation.job, "cli_dispatch_frozen", &metadata).unwrap();
+            managed_installation_resume_tests::save_quota_failure(&executor, &first_retry, &first_allocation.job, &first_snapshot);
+            let held = executor.prepare_transport_request(request.clone()).await.unwrap();
+            assert_eq!(held.input["textTransportRetry"], first_retry.input["textTransportRetry"], "a saved native version does not authorize another quota retry before explicit resume");
+            managed_installation_resume_tests::save_explicit_text_resume(&executor);
+            let retry = executor.prepare_transport_request(request).await.unwrap();
+            assert_eq!(retry.input["textTransportRetry"]["originJobId"], first_allocation.job);
+            assert_eq!(retry.input["textTransportRetry"]["originRequestHash"], first_allocation.request_hash);
+            assert_eq!(retry.input["textTransportRetry"]["priorFailures"][0]["jobId"], origin.job);
+            assert_eq!(executor.store.job(&origin.job).unwrap()["snapshot"], snapshot, "the new native identity never changes the historical origin");
+            let retry_snapshot = executor.request_snapshot(&retry).unwrap();
+            return (directory, executor, retry, retry_snapshot, native, first_allocation.job);
+        }
+        if let Some(format) = format {
+            let prompt = if format == CLI_RULES_FIRST_FORMAT { rules_first_cli_prompt(&serde_json::from_str(&compiled.prompt).unwrap()).unwrap() } else { compiled.prompt.clone() };
+            let metadata = cli_dispatch_metadata(&origin, format, &prompt, &compiled.schema);
+            save_new_cli_dispatch(&root, &prompt, &compiled.schema, &metadata, None).await.unwrap();
+            executor.store.event(&origin.job, "cli_dispatch_frozen", &metadata).unwrap();
+        } else {
+            // Actual historical format has a semantic wire file and no marker.
+            std::fs::write(root.join("wire-request.json"), json!({"provider":"codex","prompt":serde_json::from_str::<Value>(&compiled.prompt).unwrap(),"schema":serde_json::from_str::<Value>(&compiled.schema).unwrap()}).to_string()).unwrap();
+        }
+        let retry = executor.prepare_transport_request(request).await.unwrap();
+        assert_eq!(retry.input["textTransportRetry"]["originJobId"], origin.job);
+        let retry_snapshot = executor.request_snapshot(&retry).unwrap();
+        (directory, executor, retry, retry_snapshot, native, origin.job)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cli_rules_first_retry_reuses_legacy_and_rules_first_origin_bytes_exactly() {
+        for original_format in [None, Some(CLI_RULES_FIRST_FORMAT), Some(CLI_LEGACY_FORMAT)] {
+            let (_directory, executor, retry, snapshot, native, origin) = stopped_origin(original_format).await;
+            let origin_root = executor.store.root.join("text-runs").join(&origin);
+            let originals = file_hashes(&origin_root);
+            let allocation = executor.allocate_cli_text_job(&retry, &snapshot).unwrap();
+            assert!(allocation.retry_origin.is_some());
+            mark_submitting(&executor, &allocation);
+            let expected = if original_format == Some(CLI_RULES_FIRST_FORMAT) {
+                std::fs::read_to_string(origin_root.join("cli-prompt.txt")).unwrap()
+            } else { compile_codex_input(&retry).unwrap().prompt };
+            let root = executor.store.root.join("text-runs").join(&allocation.job);
+            std::fs::create_dir_all(&root).unwrap();
+            executor.validate_cli_dispatch_allocation(&retry, &allocation.job, &allocation).unwrap();
+            let compiled = compile_codex_input(&retry).unwrap();
+            let (format, selected) = executor.cli_dispatch_prompt(&compiled, &allocation).unwrap();
+            let metadata = cli_dispatch_metadata(&allocation, &format, &selected, &compiled.schema);
+            save_new_cli_dispatch(&root, &selected, &compiled.schema, &metadata, None).await.unwrap();
+            // The supervised transport is the explicit offline native fixture,
+            // never the deliberately absent managed package used by proof tests.
+            let output = root.join("result.json");
+            let mut command = tokio::process::Command::new(&native);
+            command.args(cli_arguments(&retry, &root.join("schema.json"), &output)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+            #[cfg(windows)] command.creation_flags(0x08000000);
+            supervise_cli(&mut command, &Arc::new(CliChildren::default()), selected.into_bytes(), &output, &retry.stage, CliRunPolicy::default(), Arc::new(|_,_|Ok(()))).await.unwrap();
+            assert_eq!(std::fs::read_to_string(root.join("result.stdin")).unwrap(), expected);
+            let metadata: Value = serde_json::from_slice(&std::fs::read(root.join("cli-dispatch.json")).unwrap()).unwrap();
+            assert_eq!(metadata["freshSemanticNode"], false);
+            assert_eq!(metadata["retryOrigin"]["jobId"], origin);
+            assert_eq!(metadata["format"], original_format.unwrap_or(CLI_LEGACY_FORMAT));
+            assert_eq!(file_hashes(&origin_root), originals, "no old wire/meta/raw rewrites");
+            assert!(executor.allocate_cli_text_job(&retry, &snapshot).is_err(), "retry node cannot mint a third job");
+            assert_eq!(std::fs::read_to_string(native.with_extension("executed")).unwrap(), "dispatch\n");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cli_rules_first_retry_tampering_and_unproven_fresh_claims_hold() {
+        for mutation in ["format", "hash", "job", "event", "prompt", "schema", "schema_file", "partial", "both_files"] {
+            let (_directory, executor, retry, snapshot, native, origin) = stopped_origin(Some(CLI_RULES_FIRST_FORMAT)).await;
+            let allocation = executor.allocate_cli_text_job(&retry, &snapshot).unwrap();
+            mark_submitting(&executor, &allocation);
+            let root = executor.store.root.join("text-runs").join(&origin);
+            let path = root.join("cli-dispatch.json");
+            let mut metadata: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match mutation {
+                "format" => { metadata["format"] = json!("unknown-format"); std::fs::write(&path, metadata.to_string()).unwrap(); },
+                "hash" => { metadata["requestHash"] = json!("different"); std::fs::write(&path, metadata.to_string()).unwrap(); },
+                "job" => { metadata["jobId"] = json!("different"); std::fs::write(&path, metadata.to_string()).unwrap(); },
+                "event" => { executor.store.conn().unwrap().execute("DELETE FROM events WHERE job_id=?1 AND type='cli_dispatch_frozen'", [&origin]).unwrap(); },
+                "prompt" => { std::fs::write(root.join("cli-prompt.txt"), "{}").unwrap(); },
+                "schema" => { metadata["schemaSha256"] = json!("different"); std::fs::write(&path, metadata.to_string()).unwrap(); },
+                "schema_file" => { std::fs::write(root.join("schema.json"), "{}").unwrap(); },
+                "partial" => { std::fs::remove_file(&path).unwrap(); },
+                "both_files" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::remove_file(root.join("cli-prompt.txt")).unwrap();
+                    let event_exists: bool = executor.store.conn().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='cli_dispatch_frozen')", [&origin], |row|row.get(0)).unwrap();
+                    assert!(event_exists, "deleting both local files does not erase the frozen SQL format evidence");
+                },
+                _ => unreachable!(),
+            }
+            let before = file_hashes(&root);
+            assert!(executor.cli_dispatch_prompt(&compile_codex_input(&retry).unwrap(), &allocation).is_err(), "{mutation}");
+            assert_eq!(file_hashes(&root), before, "{mutation}: no repair of original evidence");
+            assert!(!native.with_extension("executed").exists(), "{mutation}: zero dispatch");
+        }
+        let (_directory, executor, mut request, snapshot, native) = fixture();
+        request.input["textTransportRetry"] = json!({"version":"stopped-text-transport-retry/v1","originJobId":"unproven","originRequestHash":"unproven"});
+        assert!(executor.allocate_cli_text_job(&request, &snapshot).is_err());
+        assert_eq!(executor.store.jobs().unwrap().len(), 1);
+        assert!(!native.with_extension("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_rules_first_allocation_binds_request_job_and_original_checkpoint_before_io() {
+        for mutation in ["source", "rules", "schema", "model", "node", "received", "unknown"] {
+            let (_directory, executor, mut request, snapshot, native) = fixture();
+            let allocation = executor.allocate_cli_text_job(&request, &snapshot).unwrap();
+            mark_submitting(&executor, &allocation);
+            match mutation {
+                "source" => request.input["locked"] = json!("changed source"),
+                "rules" => request.rule_snapshot["primary"]["content"] = json!("changed rules"),
+                "schema" => request.schema["extra"] = json!(true),
+                "model" => request.model = "changed model".into(),
+                "node" => { executor.store.checkpoint(executor.workflow_id.as_deref().unwrap(), &allocation.node, &request.stage, &allocation.request_hash, "running", None, None, None).unwrap(); },
+                "received" | "unknown" => { executor.store.update_job(&allocation.job, if mutation == "received" { "received" } else { "submission_unknown" }, &json!({})).unwrap(); },
+                _ => unreachable!(),
+            }
+            assert!(executor.cli(&request, &allocation.job, &native, &allocation).await.unwrap_err().contains("CLI_NEW_DISPATCH_UNPROVEN"), "{mutation}");
+            assert!(!executor.store.root.join("text-runs").exists(), "{mutation}: held before artifact writes");
+            assert!(!native.with_extension("executed").exists(), "{mutation}: zero dispatch");
+        }
+    }
+}
 
 #[path = "text_executor_finish_assets.rs"]
 mod finish_assets;
