@@ -64,3 +64,25 @@ test('legacy CLI projection blocks fresh Stage3 across episode selections while 
   assert.ok(replay); assert.doesNotMatch(replay, /^<button[^>]*disabled=""/);
   assert.equal(requests, 0);
 });
+
+test('unknown submission keeps the original shutdown error only inside collapsed history', () => {
+  const oldError = '客户端正在关闭，未启动新的文本任务';
+  for (const [unknown, state, label] of [
+    [true, 'partially_blocked', '原中断记录（保留原文）'],
+    [true, 'running', '原中断记录（保留原文）'],
+    [false, 'running', '上次中断记录 · 当前正在继续'],
+  ] as const) {
+    const workspace = view(unknown);
+    workspace.jobs[0].status = state; workspace.jobs[0].error = oldError;
+    const before = JSON.stringify(workspace); let requests = 0;
+    const html = renderToStaticMarkup(React.createElement(WorkflowProgress, { workspace, stage: 'storyboard', writable: true, mutate: async () => { requests++; return workspace; } }));
+    const history = (html.match(/<details\b[^>]*>[\s\S]*?<\/details>/g) || []).find(value => value.includes(`<summary>${label}</summary>`));
+    assert.ok(history, label);
+    assert.doesNotMatch(history, /^<details[^>]*\bopen(?:=|\s|>)/, 'old interruption is collapsed initially');
+    assert.ok(history.includes(oldError), 'preserve the exact original error');
+    const current = html.replace(history, '');
+    assert.ok(!current.includes(oldError), 'historical shutdown does not masquerade as the current warning');
+    assert.equal(current.includes('原提交待核对'), unknown);
+    assert.equal(JSON.stringify(workspace), before); assert.equal(requests, 0);
+  }
+});
