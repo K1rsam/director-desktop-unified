@@ -12,6 +12,13 @@ export function matchesStage(value: unknown, stage: 'foundation' | 'storyboard')
 export function stageJobs(workspace: Workspace, stage: 'foundation' | 'storyboard'): Job[] {
   return workspace.jobs.filter(job => job.kind === 'workflow' && (matchesStage(record(job.snapshot).stage, stage) || matchesStage(job.entityId, stage) || matchesStage(job.stage, stage)));
 }
+/** Only project-owned text-production workers share the pipeline lease.
+ * Historical failures may resume; media queue/account reads do not own it. */
+export function projectProductionBusy(workspace: Workspace): boolean {
+  const stages = ['foundation.run', 'storyboard.run', 'storyboard.refine', 'images.design', 'images.produce', 'units.regenerate'];
+  return workspace.jobs.some(job => job.kind === 'workflow' && ['queued', 'running'].includes(job.status)
+    && [record(job.snapshot).stage, job.entityId, job.stage].some(value => stages.some(stage => words(value) === stage || words(value).startsWith(`${stage}:`))));
+}
 export function productionDirection(workspace: Workspace): string { return words(workspace.foundation?.productionDirection); }
 export function sourceEpisodes(workspace: Workspace) {
   return (workspace.source?.episodes || []).flatMap((episode, index) => episode.id ? [{ ...episode, id: episode.id, title: episode.title || `第 ${episode.number || index + 1} 集` }] : []);

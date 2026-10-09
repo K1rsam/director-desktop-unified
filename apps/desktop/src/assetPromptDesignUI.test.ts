@@ -44,11 +44,12 @@ function fixture() {
     { id: 'inline-design', name: '随镜表现', kind: 'PROP', variantId: 'inline', version: 1, prompt: '', preparation: { mode: 'INLINE' } },
   ], media: [], units: [], jobs: [] as any[], settings: {}, providers: [], rules: [] };
 }
-async function view(options: { writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale' } = {}) {
+async function view(options: { writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale'; imageReady?: boolean } = {}) {
   const workspace = fixture(), calls: { action: string; payload: any }[] = [], reads: any[] = [];
   if (options.prompt !== undefined) workspace.assets[0].prompt = options.prompt;
   if (options.mode) workspace.assets[0].preparation.mode = options.mode;
   if (options.jobs) workspace.jobs = options.jobs;
+  if (options.imageReady) Object.assign(workspace, { settings: { imageProvider: 'bh', imageModel: 'synthetic-image', imageResolution: '2k', ratio: '16:9', bhAccountId: 'offline-account', trialApproved: true }, providers: [{ id: 'bh', models: [{ id: 'synthetic-image', kind: 'image', adapted: true, ratios: ['16:9'], resolutions: ['2k'] }] }] });
   shared.__promptApi = async value => { reads.push(value); assert.equal(value.action, 'assets.get'); const asset = structuredClone(workspace.assets.find(asset => asset.id === value.assetId)); if (options.detail === 'missing') throw Error('Synthetic missing detail'); if (asset && options.detail === 'stale') asset.version--; return asset; };
   const props = { workspace, writable: options.writable ?? true, mutate: async (action: string, payload: any) => { calls.push({ action, payload }); return workspace; }, inspect() {}, onNotice() {}, onError(message: string) { throw Error(message); }, onTasks() {} };
   const host = new HookHost(); const render = () => host.render(AssetPanel, props);
@@ -114,4 +115,22 @@ test('单项及批量设计继续受实际executionAction离线门禁约束', as
     }
     assert.equal(ui.calls.length, 0);
   } finally { installExecutionPolicy(standard); }
+});
+
+test('其他阶段占用项目时设计和一键制作均零派发，仍可阅读和使用独立媒体队列', async () => {
+  const ui = await view({ imageReady: true });
+  assert.equal(button(ui.render(), '一键制作当前资产').disabled, false, 'otherwise valid account/model/input');
+  for (const entityId of ['foundation.run', 'storyboard.run', 'storyboard.refine']) {
+    ui.workspace.jobs = [{ id: 'busy-project', kind: 'workflow', provider: 'local', entityId, status: 'running' }];
+    for (const label of ['重新设计提示词', '一键设计提示词', '一键制作当前资产']) {
+      const action = button(ui.render(), label); assert.equal(action.disabled, true); action.onClick(); await new Promise(done => setImmediate(done));
+    }
+    assert.equal(button(ui.render(), '复制设计正文').disabled, false);
+    assert.equal(button(ui.render(), '生成图片').disabled, false, 'independent media queue is not pipeline ownership');
+    assert.deepEqual(ui.calls, [], 'no settings save and no generation mutation');
+  }
+  ui.workspace.jobs = [];
+  await ui.click('一键制作当前资产');
+  assert.deepEqual(ui.calls.map(call => call.action), ['settings.save', 'images.produce']);
+  assert.deepEqual(ui.calls[1].payload.assetIds, ['child-design']);
 });

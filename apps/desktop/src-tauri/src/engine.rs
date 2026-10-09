@@ -1435,6 +1435,7 @@ impl Engine {
                 return Ok(workspace);
             }
             "storyboard.refinement.adopt" => {
+                let _pipeline_lease = self.acquire_pipeline(&store)?;
                 let run = s(&request, "workflowId");
                 let old = store.job(run)?;
                 if old["entityId"] != "storyboard.refine" { return Err("请选择原导演精修记录".into()); }
@@ -1550,6 +1551,20 @@ impl Engine {
         F: FnOnce() -> Result<()> + Send + 'static,
     {
         let guard = self.acquire_keys(keys)?;
+        Self::spawn_owned(guard, work)
+    }
+    fn acquire_pipeline(self: &Arc<Self>, store: &Store) -> Result<ActiveGuard> {
+        self.acquire_keys(project_worker_keys(store, vec![format!("pipeline:{}", s(&store.project()?, "id"))])?)
+    }
+    fn spawn_owned<F>(guard: ActiveGuard, work: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        // A lease may span a slow preflight. Keep the old post-preflight exit
+        // gate before transferring ownership to a new worker.
+        if guard.engine.stop.load(Ordering::SeqCst) {
+            return Err("客户端正在退出".into());
+        }
         std::thread::spawn(move || {
             let _guard = guard;
             let _ = work();
@@ -2783,6 +2798,7 @@ impl Engine {
         )
     }
     fn spawn_foundation_choices(self: &Arc<Self>, store: Store, request: &Value) -> Result<()> {
+        let pipeline_lease = self.acquire_pipeline(&store)?;
         let view = store.foundation_choices()?;
         if request["expectedSourceVersion"] != view["sourceVersion"]
             || request["expectedFoundationVersion"] != view["foundationVersion"]
@@ -2828,10 +2844,16 @@ impl Engine {
         let snapshot = json!({"runnerVersion":"desktop-runner/v1","foundationMethod":pipeline::foundation_delivery::METHOD_VERSION,"foundationPhase":"APPLY_DECISION","stage":"foundation.run","sourceVersion":input["source"]["version"],"selection":input["selection"],"input":input,"guard":guard,"rules":production_rules("foundation.run")});
         store.ensure_workflow_storage()?;
         let job = store.reserve_foundation_choice_workflow(&snapshot)?;
-        self.execute_production(store, &job, snapshot)
+        self.execute_production_owned(store, &job, snapshot, pipeline_lease)
     }
     fn spawn_production(self: &Arc<Self>, store: Store, request: Value) -> Result<()> {
         let stage = s(&request, "action");
+        // New refinement must own the project before reading its adopted basis,
+        // inspecting an account, or reserving any workflow/budget. Move this
+        // same lease into the worker; a check followed by reacquisition races.
+        let refinement_lease = if stage == "storyboard.refine" {
+            Some(self.acquire_pipeline(&store)?)
+        } else { None };
         // Serialize each foundation/Stage3 start before a workflow or preflight
         // is reserved. The existing pipeline key still owns actual execution.
         let _production_start = if ["foundation.run","storyboard.run"].contains(&stage) {
@@ -2859,6 +2881,12 @@ impl Engine {
                 StoryboardStartBoundary::Hold(reason) => return Err(reason),
             }
         }
+        // Existing workflows return through their original resume path above.
+        // Every genuinely new production holds ownership through reservation.
+        let pipeline_lease = match refinement_lease {
+            Some(lease) => lease,
+            None => self.acquire_pipeline(&store)?,
+        };
         // Only a genuinely new writer/refinement gets the scene contract. The
         // resume returns above and saved-snapshot recovery keep their exact input.
         if matches!(stage, "storyboard.run" | "storyboard.refine") {
@@ -2911,7 +2939,7 @@ impl Engine {
             store.add_job("workflow", stage, "local", "local", &snapshot, "queued")?
         };
         self.bind_native_workflow(&store,&native_receipt,&job)?;
-        self.execute_production(store, &job, snapshot)
+        self.execute_production_owned(store, &job, snapshot, pipeline_lease)
     }
     fn resume_production_checked(self: &Arc<Self>, store: Store, request: &Value, creative_ready: bool) -> Result<()> {
         if self.standard_native {
@@ -2926,6 +2954,7 @@ impl Engine {
             if s(request,"action")!="workflows.resume" || s(&job,"kind")!="workflow" || !["failed","interrupted","partially_blocked","blocked"].contains(&s(&job,"status")) {
                 return Err("请选择中断的原资产文字设计流程".into());
             }
+            let pipeline_lease = self.acquire_pipeline(&store)?;
             let snapshot=job["snapshot"].clone();
             let original=&snapshot["stage2Context"];
             if !original.is_object() || original["designRuleSha256"].as_str().is_none() || snapshot["sourceVersion"]!=store.source()?["version"] {
@@ -2944,7 +2973,7 @@ impl Engine {
                 if chain(original["assets"].as_array().unwrap(),asset)?!=chain(&current_assets,updated)? {return Err("原设计直接来源链已变化，未重发".into());}
             }
             store.event(id,"asset_design_resume_requested",&json!({"sameWorkflow":true,"snapshotSha256":pipeline::digest(&snapshot.to_string()),"newWorkflowCreated":false}))?;
-            return self.execute_asset_stage(store,id.to_string(),snapshot);
+            return self.execute_asset_stage_owned(store,id.to_string(),snapshot,pipeline_lease);
         }
         // Early Stage2 records incorrectly called a wholly/partly blocked
         // image-production run completed. Resume is an explicit continuation
@@ -2953,6 +2982,7 @@ impl Engine {
             if s(request, "action") != "workflows.resume" {
                 return Err("图片制作流程不能采用分镜创作选择".into());
             }
+            let pipeline_lease = self.acquire_pipeline(&store)?;
             if job["snapshot"]["sourceVersion"] != store.source()?["version"] {
                 return Err("图片流程原文版本已变化，请从当前原文明确重新启动图片阶段".into());
             }
@@ -2960,7 +2990,7 @@ impl Engine {
             resumed["action"] = json!("images.produce");
             resumed["imageResumeOrigin"] = json!({"version":"image-production-resume/v1","workflowId":id,"snapshotSha256":pipeline::digest(&job["snapshot"].to_string())});
             store.event(id,"image_production_resume_requested",&json!({"version":"image-production-resume/v1","sourceVersion":job["snapshot"]["sourceVersion"],"originalStatus":job["status"],"snapshotSha256":pipeline::digest(&job["snapshot"].to_string()),"preserveOriginalRecord":true}))?;
-            return self.spawn_stage(store, resumed);
+            return self.reserve_asset_stage_owned(store, resumed, pipeline_lease);
         }
         if s(&job, "kind") != "workflow"
             || !matches!(
@@ -2974,6 +3004,9 @@ impl Engine {
         if snapshot["runnerVersion"] != "desktop-runner/v1" {
             return Err("此记录来自旧执行方式，请保留历史并重新启动阶段".into());
         }
+        // A busy project is not a failed attempt. Acquire before resume events
+        // or decisions change, retaining the same frozen workflow and budget.
+        let pipeline_lease = self.acquire_pipeline(&store)?;
         let rule_migration =
             workflow_resume_rule_audit(&job, &production_rules_for_snapshot(&snapshot)?)?;
         if s(request, "action") == "storyboard.decision.resolve" {
@@ -3019,18 +3052,17 @@ impl Engine {
                 "maximumQuotaAttempts":1
             }))?;
         }
-        self.execute_production(store, id, snapshot)
+        self.execute_production_owned(store, id, snapshot, pipeline_lease)
     }
-    fn execute_production(
+    fn execute_production_owned(
         self: &Arc<Self>,
         store: Store,
         run: &str,
         snapshot: Value,
+        lease: ActiveGuard,
     ) -> Result<()> {
         let run = run.to_owned();
-        let failure_store = store.clone();
-        let failure_run = run.clone();
-        let result=self.spawn_exclusive(format!("pipeline:{}",s(&store.project()?,"id")),move||{
+        Self::spawn_owned(lease,move||{
             let runtime=tokio::runtime::Runtime::new().map_err(|e|e.to_string())?;
             let result:Result<Value>=runtime.block_on(async {
                 let stage=s(&snapshot,"stage");let mut input=snapshot["input"].clone();
@@ -3099,17 +3131,18 @@ impl Engine {
                 Ok(value)=>{let status=match s(&value,"status"){"waiting_decision"=>"waiting_decision","partially_blocked"=>"partially_blocked",_=>"completed"};store.update_job(&run,status,&json!({"result":value}))},
                 Err(error)=>store.update_job(&run,"failed",&json!({"error":error}))
             }
-        });
-        if let Err(error) = &result {
-            failure_store.update_job(&failure_run, "failed", &json!({"error":error}))?;
-        }
-        result
+        })
     }
-    fn spawn_stage(self: &Arc<Self>, store: Store, mut r: Value) -> Result<()> {
+    fn spawn_stage(self: &Arc<Self>, store: Store, r: Value) -> Result<()> {
         let stage = s(&r, "action").to_owned();
         if stage == "foundation.run" || stage == "storyboard.run" || stage == "storyboard.refine" {
             return self.spawn_production(store, r);
         }
+        let pipeline_lease = self.acquire_pipeline(&store)?;
+        self.reserve_asset_stage_owned(store, r, pipeline_lease)
+    }
+    fn reserve_asset_stage_owned(self: &Arc<Self>, store: Store, mut r: Value, pipeline_lease: ActiveGuard) -> Result<()> {
+        let stage = s(&r, "action").to_owned();
         let all_assets = store.values("assets")?;
         let (wanted, _) = image_closure(&store, &all_assets, r["assetIds"].as_array());
         let (saved_settings, original_context) = if let Some(origin) = r.get("imageResumeOrigin") {
@@ -3219,9 +3252,9 @@ impl Engine {
             "queued",
         )?;
         self.bind_native_workflow(&store,&native_receipt,&job)?;
-        self.execute_asset_stage(store,job,snapshot)
+        self.execute_asset_stage_owned(store,job,snapshot,pipeline_lease)
     }
-    fn execute_asset_stage(self:&Arc<Self>,store:Store,job:String,snapshot:Value)->Result<()> {
+    fn execute_asset_stage_owned(self:&Arc<Self>,store:Store,job:String,snapshot:Value,lease:ActiveGuard)->Result<()> {
         let stage=s(&snapshot,"stage").to_string();
         let r=snapshot["request"].clone();
         let execution_settings=snapshot["settings"].clone();
@@ -3229,9 +3262,7 @@ impl Engine {
         let version=snapshot["sourceVersion"].clone();
         let engine=self.clone();
         store.ensure_workflow_storage()?;
-        let status_store = store.clone();
-        let status_job = job.clone();
-        let result=self.spawn_exclusive(format!("pipeline:{}",s(&store.project()?,"id")),move||{
+        Self::spawn_owned(lease,move||{
             let runtime=tokio::runtime::Runtime::new().map_err(|e|e.to_string())?;
             let result:Result<Value>=runtime.block_on(async{
                 store.update_job(&job,"running",&json!({}))?;let settings=execution_settings;let exec=SavedTextExecutor{store:store.clone(),settings:settings.clone(),workflow_id:Some(job.clone())};
@@ -3298,11 +3329,7 @@ impl Engine {
                     _=>Err("未知阶段".into())
                 }
             });match result{Ok(v)=>if stage=="images.design"{Ok(())}else{store.update_job(&job,image_stage_completion_state(&v),&json!({"result":v}))},Err(e)=>store.update_job(&job,"failed",&json!({"error":e}))}
-        });
-        if let Err(e) = &result {
-            status_store.update_job(&status_job, "failed", &json!({"error":e}))?;
-        }
-        result
+        })
     }
     fn restore_backup(&self, store: &Store, path: &Path) -> Result<Value> {
         let source = fs::canonicalize(path).map_err(|e| e.to_string())?;

@@ -1710,6 +1710,40 @@ fn stage2_restart_resume_uses_original_settings_and_final_submission_snapshot() 
 }
 
 #[test]
+fn stage2_busy_new_and_resume_preserve_original_jobs_events_and_frozen_budgets() {
+    let f = Fixture::new(Duration::ZERO);
+    let source_version = f.store.source().unwrap()["version"].clone();
+    let mut originals = Vec::new();
+    for stage in ["images.design", "images.produce"] {
+        let snapshot = json!({"runnerVersion":"stage2-runner/v1","stage":stage,"sourceVersion":source_version,
+            "settings":f.store.settings().unwrap(),"request":{"action":stage,"assetIds":["original-target"]},
+            "nativeAcceptance":{"reservationId":"original-offline-budget","attemptLimit":1}});
+        let run = f.store.add_job("workflow", &format!("{stage}:"), "local", "local", &snapshot, "partially_blocked").unwrap();
+        f.store.update_job(&run,"partially_blocked",&json!({"error":"original diagnostic", "result":{"status":"partially_blocked","blocked":[{"assetId":"original-target","reason":"original reason"}]},"receipt":{"originalRaw":"unchanged","budgetConsumed":1}})).unwrap();
+        originals.push((run.clone(), raw_job_record(&f.store, &run)));
+    }
+    let unknown = f.store.add_job("image", "original-target", "offline", "original-account", &json!({"originalFrozen":true}), "submission_unknown").unwrap();
+    originals.push((unknown.clone(), raw_job_record(&f.store, &unknown)));
+    let jobs = f.store.jobs().unwrap();
+    let events: u64 = f.store.conn().unwrap().query_row("SELECT count(*) FROM events", [], |row|row.get(0)).unwrap();
+    let lease = f.engine.acquire_pipeline(&f.store).unwrap();
+    for stage in ["images.design", "images.produce"] {
+        let error = f.engine.spawn_stage(f.store.clone(), json!({"action":stage,"assetIds":["original-target"]})).unwrap_err();
+        assert!(error.contains("本项目的文字制作流程正在执行"), "{stage}: {error}");
+    }
+    for (run, _) in originals.iter().take(2) {
+        let error = f.engine.resume_production(f.store.clone(), &json!({"action":"workflows.resume","workflowId":run})).unwrap_err();
+        assert!(error.contains("本项目的文字制作流程正在执行"), "{error}");
+    }
+    assert_eq!(f.store.jobs().unwrap(), jobs, "no new or failed workflow, no attempt or media request");
+    for (run, raw) in originals { assert_eq!(raw_job_record(&f.store, &run), raw, "all original persisted columns remain exact"); }
+    assert_eq!(f.store.conn().unwrap().query_row("SELECT count(*) FROM events", [], |row|row.get::<_,u64>(0)).unwrap(), events);
+    assert_eq!(f.channels.calls.load(Ordering::SeqCst), 0);
+    drop(lease);
+    assert!(f.engine.active.lock().unwrap().is_empty());
+}
+
+#[test]
 fn stage2_direct_images_existing_prompt_cannot_bypass_unassigned_facts() {
     let f = Fixture::new(Duration::ZERO);
     let source=f.store.source().unwrap();
