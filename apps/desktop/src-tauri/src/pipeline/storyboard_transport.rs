@@ -466,11 +466,16 @@ fn expand(value: &Value, input: &Value) -> Result<Value, String> {
                 })
             });
             let continuity_unit = pointer == "/acceptedContinuity/unit";
+            let continuity_field = pointer.starts_with("/acceptedContinuity/unit/");
             if !pointer.starts_with("/plan/") && pointer != "/acceptedContinuity"
-                && !continuity_unit && !asset_prompt {
+                && !continuity_unit && !continuity_field && !asset_prompt {
                 return Err("整编无损运输引用越出完整规划目录".into());
             }
             let target = input.pointer(pointer).ok_or("整编无损运输引用目标不存在")?;
+            if continuity_field && input.pointer("/acceptedContinuity/unit")
+                .is_none_or(|unit| !unit.is_object() || has_notation(unit)) {
+                return Err("整编前稿子字段必须来自完整无引用单元".into());
+            }
             if continuity_unit && !target.is_object() {
                 return Err("整编前稿单元等值目标必须为完整对象".into());
             }
@@ -825,7 +830,32 @@ pub(crate) fn compile_storyboard_transport(
 pub(crate) fn compile_storyboard_dispatch_transport(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
-    compile_dispatch_transport(request, true)
+    let original = compile_dispatch_transport(request, true)?;
+    let (old_input, old_schema) = original.as_ref().map(|wire|(&wire.input,&wire.schema)).unwrap_or((&request.input,&request.schema));
+    // Only recover a previously undispatchable editor. Every fitting historical
+    // wire, its cache seal and grouping remain byte-for-byte unchanged.
+    if request.stage != "storyboardFinish" || !supported_request(request)
+        || crate::text_executor::codex_wire_characters(request,old_input,old_schema) <= STORYBOARD_TRANSPORT_LIMIT
+        || has_notation(&request.input) || request.input.get("losslessInputRule").is_some() {
+        return Ok(original);
+    }
+    let mut input=old_input.clone();
+    input.as_object_mut().ok_or("整编输入不是对象")?.remove("losslessInputRule");
+    compact_partial_continuity(&mut input,&request.input);
+    if expand(&input,&input)? != request.input {return Err("整编连续态重复资料反解未完整还原；未派发请求".into());}
+    input["losslessInputRule"]=old_input.get("losslessInputRule").cloned().unwrap_or_else(||json!(shared_row_rule()));
+    let before=crate::text_executor::transport_payload_characters(request,old_input,old_schema);
+    let after=crate::text_executor::transport_payload_characters(request,&input,old_schema);
+    if before.checked_sub(after).is_none_or(|saving|saving<2_048)
+        || crate::text_executor::codex_wire_characters(request,&input,old_schema)>STORYBOARD_TRANSPORT_LIMIT {
+        return Ok(original);
+    }
+    Ok(Some(CompiledStoryboardTransport{profile:PROFILE,input,schema:old_schema.clone()}))
+}
+
+#[cfg(test)]
+pub(super) fn compile_dispatch_before_partial_continuity(request:&TextRequest)->Result<Option<CompiledStoryboardTransport>,String> {
+    compile_dispatch_transport(request,true)
 }
 
 #[cfg(test)]
@@ -833,6 +863,55 @@ pub(super) fn compile_dispatch_before_finish_repetitions(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
     compile_dispatch_transport(request, false)
+}
+
+/// Share only unchanged parts of two independently preserved continuity units.
+/// The current accepted unit stays literal. Changed fields keep the plan's exact
+/// old values; incoming aliases protect their complete targets from new chains.
+fn compact_partial_continuity(input:&mut Value, canonical:&Value) {
+    fn targets(value:&Value,out:&mut Vec<String>) {
+        if let Some(path)=value.get("$same").and_then(Value::as_str).and_then(|v|v.strip_prefix('#')) {out.push(path.into());}
+        match value {Value::Object(map)=>map.values().for_each(|v|targets(v,out)),Value::Array(items)=>items.iter().for_each(|v|targets(v,out)),_=>{}}
+    }
+    fn within(path:&str,ancestor:&str)->bool {path==ancestor || path.strip_prefix(ancestor).is_some_and(|tail|tail.starts_with('/'))}
+    fn visit(wire:&mut Value,old:&Value,accepted:&Value,local:&str,target:&str,protected:&[String]) {
+        if protected.iter().any(|p|within(local,p)) {return;}
+        let incoming_child=protected.iter().any(|p|within(p,local));
+        if old==accepted && !has_notation(accepted) && !incoming_child {
+            let reference=reference_if_shorter(accepted,target);
+            if reference.to_string().encode_utf16().count()<wire.to_string().encode_utf16().count() {*wire=reference;return;}
+        }
+        match (wire,old,accepted) {
+            (Value::Object(w),Value::Object(a),Value::Object(b))=>for (key,value) in w {
+                if let (Some(old),Some(accepted))=(a.get(key),b.get(key)) {
+                    let key=key.replace('~',"~0").replace('/',"~1");
+                    visit(value,old,accepted,&format!("{local}/{key}"),&format!("{target}/{key}"),protected);
+                }
+            },
+            (Value::Array(w),Value::Array(a),Value::Array(b))=>for (i,value) in w.iter_mut().enumerate() {
+                if let (Some(old),Some(accepted))=(a.get(i),b.get(i)) {visit(value,old,accepted,&format!("{local}/{i}"),&format!("{target}/{i}"),protected);}
+            },_=>{}
+        }
+    }
+    let mut protected=Vec::new();targets(input,&mut protected);
+    if let (Some(old),Some(accepted),Some(literal))=(canonical.pointer("/plan/acceptedContinuity/unit"),canonical.pointer("/acceptedContinuity/unit"),input.pointer("/acceptedContinuity/unit")) {
+        if accepted==literal && !has_notation(literal) {
+            if let Some(wire)=input.pointer_mut("/plan/acceptedContinuity/unit") {visit(wire,old,accepted,"/plan/acceptedContinuity/unit","/acceptedContinuity/unit",&protected);}
+        }
+    }
+    let mut copies=vec![("/acceptedContinuity/sourceRefs".to_string(),"/acceptedContinuity/unit/sourceRefs".to_string()),("/plan/acceptedContinuity/sourceRefs".to_string(),"/acceptedContinuity/unit/sourceRefs".to_string())];
+    for index in 0..canonical["plan"]["workPackages"].as_array().map_or(0,Vec::len) {
+        copies.push(("/scopedAuthorDecisions/productionSourceRefs".into(),format!("/plan/workPackages/{index}/sourceRefs")));
+    }
+    for (local,target) in copies {
+        if protected.iter().any(|p|within(&local,p)||within(p,&local)) {continue;}
+        let (Some(old),Some(accepted),Some(literal))=(canonical.pointer(&local),canonical.pointer(&target),input.pointer(&target)) else {continue;};
+        if old!=accepted || accepted!=literal || has_notation(literal) {continue;}
+        let reference=reference_if_shorter(accepted,&target);
+        if let Some(wire)=input.pointer_mut(&local) {
+            if reference.to_string().encode_utf16().count()<wire.to_string().encode_utf16().count() {*wire=reference;}
+        }
+    }
 }
 
 /// The oversized editor, or an explicitly opted-in new editor with a proven
@@ -1124,6 +1203,63 @@ mod tests {
         crate::text_executor::codex_wire_characters(request,input,schema)
     }
 
+    fn partial_continuity_fixture(target:usize)->TextRequest {
+        let mut request=finish_repetition_fixture(150_000);
+        request.input["plan"]["acceptedContinuity"]["unit"]["exitState"]=json!("必须保留的旧状态，与已整编前稿不同");
+        for _ in 0..3 {
+            let old=compile_dispatch_before_partial_continuity(&request).unwrap().unwrap();
+            let chars=crate::text_executor::codex_wire_characters(&request,&old.input,&old.schema);
+            let old_padding=request.input["previousDraft"]["units"][0]["unitDirection"].as_str().unwrap().encode_utf16().count();
+            let padding=(old_padding as isize+target as isize-chars as isize) as usize;
+            request.input["previousDraft"]["units"][0]["unitDirection"]=json!("全".repeat(padding));
+        }
+        request
+    }
+
+    #[test]
+    fn overflow_partial_continuity_restores_changed_old_fields_and_full_frozen_input() {
+        let request=partial_continuity_fixture(208_543);
+        let before=serde_json::to_vec(&request).unwrap();let old=compile_dispatch_before_partial_continuity(&request).unwrap().unwrap();
+        assert_eq!(crate::text_executor::codex_wire_characters(&request,&old.input,&old.schema),208_543);
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema)<=STORYBOARD_TRANSPORT_LIMIT);
+        assert_eq!(wire.input["plan"]["acceptedContinuity"]["unit"]["exitState"],request.input["plan"]["acceptedContinuity"]["unit"]["exitState"]);
+        assert_eq!(wire.input["plan"]["acceptedContinuity"]["unit"]["shots"],json!({"$same":"#/acceptedContinuity/unit/shots"}));
+        for field in ["acceptedContinuity","previousDraft","settings"] {assert_eq!(wire.input[field],old.input[field]);}
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),before);
+    }
+
+    #[test]
+    fn overflow_partial_continuity_fitting_wires_remain_byte_exact() {
+        for size in [190_000,199_999,200_000] {
+            let request=partial_continuity_fixture(size);let bytes=|w:Option<CompiledStoryboardTransport>|serde_json::to_vec(&w.map(|w|json!([w.profile,w.input,w.schema]))).unwrap();
+            assert_eq!(bytes(compile_dispatch_before_partial_continuity(&request).unwrap()),bytes(compile_storyboard_dispatch_transport(&request).unwrap()));
+        }
+    }
+
+    #[test]
+    fn overflow_partial_continuity_preserves_incoming_alias_targets_and_escapes_paths() {
+        let same=json!({"quoted/key~":"必须原样保留的完整值🙂".repeat(1_000)});
+        let mut canonical=json!({"acceptedContinuity":{"unit":{"same":same,"changed":"new"}},"plan":{"acceptedContinuity":{"unit":{"same":same,"changed":"old"}}},"kept":same});
+        let mut wire=canonical.clone();wire["kept"]=json!({"$same":"#/plan/acceptedContinuity/unit/same"});
+        compact_partial_continuity(&mut wire,&canonical);
+        assert_eq!(wire["plan"]["acceptedContinuity"]["unit"]["same"],canonical["plan"]["acceptedContinuity"]["unit"]["same"]);
+        assert_eq!(expand(&wire,&wire).unwrap(),canonical);
+        canonical.as_object_mut().unwrap().remove("kept");
+        canonical["plan"]["acceptedContinuity"]["unit"]["same"]["different"]=json!(false);
+        wire=canonical.clone();compact_partial_continuity(&mut wire,&canonical);
+        assert_eq!(wire["plan"]["acceptedContinuity"]["unit"]["same"]["quoted/key~"],json!({"$same":"#/acceptedContinuity/unit/same/quoted~1key~0"}));
+        assert_eq!(expand(&wire,&wire).unwrap(),canonical);
+    }
+
+    #[test]
+    fn overflow_partial_continuity_does_not_publish_a_still_oversized_candidate() {
+        let request=partial_continuity_fixture(250_000);
+        let old=compile_dispatch_before_partial_continuity(&request).unwrap().unwrap();let new=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(serde_json::to_vec(&json!([old.input,old.schema])).unwrap(),serde_json::to_vec(&json!([new.input,new.schema])).unwrap());
+    }
+
     #[test]
     fn gain_gated_fitting_finish_restores_every_value_and_keeps_frozen_grouping() {
         let mut request = finish_repetition_fixture(0);
@@ -1315,14 +1451,18 @@ mod tests {
     }
 
     #[test]
-    fn finish_repetition_decoder_accepts_only_the_exact_literal_unit_object_target() {
+    fn finish_repetition_decoder_accepts_only_the_literal_unit_and_its_exact_fields() {
         let unit=json!({"id":"literal-original-unit","shots":[{"picture":"完整原镜头🙂","sourceRefs":["original-row"]}],"exitState":"保留原末态","futureField":{"literal":"完整未知扩展也原样保留"}});
         let reference=json!({"$same":"#/acceptedContinuity/unit"});
         let original=json!({"acceptedContinuity":{"unit":unit},"plan":{"acceptedContinuity":{"unit":reference}}});
         assert_eq!(expand(&original,&original).unwrap()["plan"]["acceptedContinuity"]["unit"],unit);
-        for pointer in ["#/acceptedContinuity/unit/shots","#/acceptedContinuity/unit/shots/0","#/acceptedContinuity/unit/exitState","#/acceptedContinuity/executionBatchId","#/acceptedContinuity/unit/","#/acceptedContinuity//unit","#/acceptedContinuity/unit~1shots"] {
+        for path in ["/shots","/shots/0","/exitState","/futureField"] {
+            let input=json!({"acceptedContinuity":{"unit":unit},"local":{"$same":format!("#/acceptedContinuity/unit{path}")}});
+            assert_eq!(expand(&input,&input).unwrap()["local"],*unit.pointer(path).unwrap());
+        }
+        for pointer in ["#/acceptedContinuity/executionBatchId","#/acceptedContinuity/unit/","#/acceptedContinuity/unit/missing","#/acceptedContinuity/unit/shots/01","#/acceptedContinuity//unit","#/acceptedContinuity/unit~1shots"] {
             let input=json!({"acceptedContinuity":{"unit":unit,"executionBatchId":"batch"},"local":{"$same":pointer}});
-            assert!(expand(&input,&input).is_err(),"arbitrary child path is not authorized: {pointer}");
+            assert!(expand(&input,&input).is_err(),"missing or out-of-unit path is not authorized: {pointer}");
         }
         for target in [Value::Null,json!("not a unit"),json!([]),json!(1),json!(true),
             json!({"$same":"#/plan/original"}),
@@ -1337,6 +1477,10 @@ mod tests {
         assert!(expand(&extra,&extra).is_err());
         let missing=json!({"acceptedContinuity":{},"local":reference});
         assert!(expand(&missing,&missing).is_err());
+        for marker in [json!({"$same":"#/plan/value"}),json!({"$rowIds":[]}),json!({"$sourceRows":{}}),json!({"$sourceFingerprints":"SHA256_UTF8_ROWS"})] {
+            let nested=json!({"acceptedContinuity":{"unit":{"literal":"retained","nested":marker}},"plan":{"value":"retained"},"local":{"$same":"#/acceptedContinuity/unit/literal"}});
+            assert!(expand(&nested,&nested).is_err(),"even sibling notation makes the continuity catalogue non-literal");
+        }
     }
 
     #[test]
