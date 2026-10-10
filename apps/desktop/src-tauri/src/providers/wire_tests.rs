@@ -7,12 +7,12 @@ use std::{
     thread,
 };
 
-struct Fixture {
-    endpoint: String,
-    requests: Arc<Mutex<Vec<(String, String)>>>,
-    thread: thread::JoinHandle<()>,
+pub(super) struct Fixture {
+    pub(super) endpoint: String,
+    pub(super) requests: Arc<Mutex<Vec<(String, String)>>>,
+    pub(super) thread: thread::JoinHandle<()>,
 }
-fn fixture(replies: Vec<Value>) -> Fixture {
+pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));

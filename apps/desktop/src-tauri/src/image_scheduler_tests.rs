@@ -9,6 +9,21 @@ use tempfile::TempDir;
 
 const WAIT: Duration = Duration::from_secs(8);
 
+#[test]
+fn failed_chrome_original_task_cannot_be_bypassed_by_batch_or_provider_switch() {
+    let f = Fixture::new();
+    f.asset("original-chrome", None);
+    let key=f.store.add_job("image","original-chrome","chrome","original-account",&json!({"frozenOriginal":true}),"failed").unwrap();
+    f.store.update_job(&key,"failed",&json!({"providerTaskId":"original-chrome-task","receipt":{"original":true}})).unwrap();
+    let before=f.raw(&key);
+    let result=f.queue_assets(&["original-chrome".into()]);
+    assert_eq!(result["queuedCount"],0);
+    assert_eq!(result["reusedCount"],1);
+    assert_eq!(result["reused"][0]["jobId"],key);
+    assert_eq!(f.raw(&key),before);
+    assert_eq!(f.channels.total_submits(),0);
+}
+
 #[derive(Default)]
 struct Gate {
     held: Mutex<bool>,

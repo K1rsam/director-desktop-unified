@@ -87,12 +87,27 @@ pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabiliti
 }
 
 fn owned_client(config: &ProviderConfig, client: &Client, id: &str) -> ProviderResult<Value> {
-    let token = format!("director-desktop-{id}");
+    owned_client_for(config, client, id, false)
+}
+fn owned_client_for(config: &ProviderConfig, client: &Client, id: &str, recovering: bool) -> ProviderResult<Value> {
+    original_client_for(config, client, id, recovering, None)
+}
+fn original_client_for(config: &ProviderConfig, client: &Client, id: &str, recovering: bool, original_source: Option<&str>) -> ProviderResult<Value> {
+    let token = format!("bridge-director-desktop-{id}");
+    let legacy_token = format!("director-desktop-{id}");
     let matches: Vec<_> = clients(config, client)?
         .into_iter()
-        .filter(|c| c.get("launchToken").and_then(Value::as_str) == Some(token.as_str()))
+        .filter(|c| {
+            let launch = c["launchToken"].as_str().unwrap_or("");
+            launch == token || launch == legacy_token || recovering
+                && original_source.is_some_and(|source| !source.is_empty() && c["id"] == source)
+                && (launch.is_empty() || launch.starts_with("bridge-reload-"))
+        })
         .collect();
-    if matches.len() != 1 || !usable(&matches[0]) {
+    let ready = matches.len() == 1 && (usable(&matches[0]) || recovering
+        && matches[0]["ready"] == true && matches[0]["compatible"] != false
+        && matches[0]["quarantined"] != true && matches[0]["activeRequest"]["requestId"] == id);
+    if !ready {
         return Err(ProviderError::new(
             "OWNED_TAB_UNAVAILABLE",
             "本任务专属标签页尚未就绪或身份不唯一；不会重复打开或发送。",
@@ -140,11 +155,12 @@ pub(super) fn prepare(
     }
     let client = wire::client(45)?;
     let available = clients(config, &client)?;
-    let launch = format!("director-desktop-{}", request.request_id);
+    let launch = format!("bridge-director-desktop-{}", request.request_id);
+    let legacy_launch = format!("director-desktop-{}", request.request_id);
     // Existing owned tabs represent an earlier prepare or submit. Only read-only reconciliation is safe.
     if available
         .iter()
-        .any(|c| c.get("launchToken").and_then(Value::as_str) == Some(launch.as_str()))
+        .any(|c| matches!(c.get("launchToken").and_then(Value::as_str), Some(t) if t==launch || t==legacy_launch))
     {
         return Err(ProviderError::new(
             "EXISTING_TAB_REQUIRES_RECONCILIATION",
@@ -465,40 +481,19 @@ pub(super) fn query_with_prepared(
         ));
     }
     let status = turn["status"].as_str().unwrap_or("unknown");
-    if [
-        "failed",
-        "interrupted",
-        "cancelled",
-        "completed_without_artifact",
-    ]
-    .contains(&status)
-    {
-        return Ok(QueryResult {
-            task_id: id.into(),
-            status: "failed".into(),
-            result_urls: vec![],
-            error: Some("网页任务结束但没有可验证的原图。".into()),
-            actual_cost: None,
-            raw,
-        });
+    // A missing DOM anchor can keep a completed image in running until bridge timeout.
+    // Read the original native branch even before the legacy bridge reports completed.
+    let original_source = prepared.and_then(|p| p.wire["sourceClientId"].as_str())
+        .or_else(|| turn["input"]["sourceClientId"].as_str());
+    let source = original_client_for(config, &client, id, true, original_source)?;
+    let conversation = owned_conversation(&source)?;
+    if let Some(original) = turn["output"]["response"]["session"]["id"].as_str() {
+        if original != conversation { return Err(ProviderError::new("IMAGE_PROVENANCE", "原任务与当前会话身份不一致。")); }
     }
-    if status != "completed" {
-        return Ok(QueryResult {
-            task_id: id.into(),
-            status: "processing".into(),
-            result_urls: vec![],
-            error: None,
-            actual_cost: None,
-            raw,
-        });
-    }
-    let source = owned_client(config, &client, id)?;
-    let conversation = turn["output"]["response"]["session"]["id"]
-        .as_str()
-        .ok_or_else(|| ProviderError::new("IMAGE_PROVENANCE", "图片会话记录缺失。"))?;
     // Stable request ID + owned tab + native conversation permit exact source reconciliation.
     if prepared
         .is_some_and(|p| p.request.request_id != id || p.wire["sourceClientId"] != source["id"])
+        || turn["input"]["sourceClientId"].as_str().is_some_and(|original| source["id"] != original)
     {
         return Err(ProviderError::new(
             "IMAGE_PROVENANCE",
@@ -534,7 +529,7 @@ pub(super) fn query_with_prepared(
         &client,
         "/browser/recover-latest",
         Some(
-            &json!({"sourceClientId":source["id"],"index":1,"timeoutMs":40000,"reconcileConversation":{"mode":"image_record_v1","requestId":id,"conversationId":conversation,"promptSha256":hash,"imageCount":1}}),
+            &json!({"sourceClientId":source["id"],"index":1,"timeoutMs":40000,"reconcileConversation":{"mode":"image_record_v1","requestId":id,"conversationId":conversation,"promptSha256":hash,"imageCount":1,"allowReleasedRequest":true,"allowReloadedOriginalTab":original_source.is_some_and(|original|source["id"]==original)}}),
         ),
         false,
     )?;
@@ -545,15 +540,66 @@ pub(super) fn query_with_prepared(
             "原生记录的提示词哈希不匹配。",
         ));
     }
-    let urls = verify_result(turn, proof, &source, id)?;
+    if proof["status"] != "matched_complete" {
+        if proof["status"] == "matched_incomplete" && !["failed","interrupted","cancelled","completed_without_artifact"].contains(&status) {
+            return Ok(QueryResult { task_id:id.into(),status:"processing".into(),result_urls:vec![],error:None,actual_cost:None,
+                raw:json!({"turn":turn,"nativeProof":proof,"progress":{"phase":"waiting_image","message":"网页仍在生成，已核对本次原任务；完成后自动回收原图。","checkedAt":now()}}) });
+        }
+        return Err(ProviderError::new("IMAGE_RECOVERY_PENDING",format!("原图回收尚未完成（{}）：保留原任务，检查网页连接后恢复查询，不会重新生成。",proof["reason"].as_str().unwrap_or("来源校验未通过"))));
+    }
+    let recovered_turn = verified_recovery_turn(turn, &recovered["result"], &source, id, &hash)?;
+    let urls = verify_result(&recovered_turn, proof, &source, id)?;
     Ok(QueryResult {
         task_id: id.into(),
         status: "succeeded".into(),
         result_urls: urls,
         error: None,
         actual_cost: None,
-        raw: json!({"turn":turn,"nativeProof":proof}),
+        raw: json!({"turn":turn,"recoveredResponse":recovered["result"],"nativeProof":proof,"progress":{"phase":"image_verified","message":"网页原图已核对，正在下载并保存到资产。","checkedAt":now()}}),
     })
+}
+
+fn owned_conversation(source: &Value) -> ProviderResult<String> {
+    let url = source["url"].as_str().and_then(|s|reqwest::Url::parse(s).ok())
+        .filter(|u|u.origin().ascii_serialization()=="https://chatgpt.com" && u.query().is_none() && u.fragment().is_none())
+        .ok_or_else(||ProviderError::new("IMAGE_PROVENANCE","任务标签页尚未进入原生成会话。"))?;
+    let id = url.path().strip_prefix("/c/").filter(|s|!s.is_empty() && !s.contains('/'))
+        .ok_or_else(||ProviderError::new("IMAGE_PROVENANCE","任务标签页没有明确的原会话身份。"))?;
+    Ok(id.into())
+}
+
+fn verified_recovery_turn(original: &Value, response: &Value, source: &Value, id: &str, hash: &str) -> ProviderResult<Value> {
+    let proof=&response["reconciliation"];
+    let standalone = response["requestId"].is_null() || response["requestId"] == "";
+    if original["id"] != id || response["sourceClientId"] != source["id"]
+        || proof["source"] != "conversation-record" || proof["version"] != 1 || proof["proofVersion"] != 2
+        || proof["status"] != "matched_complete" || proof["promptSha256"] != hash
+        || proof["requestId"] != id || proof["backendStatus"] != "finished_successfully" || proof["endTurn"] != true
+        || response["session"]["id"] != owned_conversation(source)?
+        || proof["assistantMessageId"] != response["turnKey"]
+        || !standalone && response["requestId"] != id {
+        return Err(ProviderError::new("IMAGE_PROVENANCE","原生回收记录、提示词或会话身份不匹配，未采用图片。"));
+    }
+    // This is a local verification envelope, never an edit to the original bridge receipt.
+    // Protocol 5 clears the outer requestId and the coordinator substitutes
+    // "recovered" on artifacts. Only an unbound standalone reply may adopt the
+    // original identity from the native proof. Never rewrite a different task.
+    let mut verified_response=response.clone();
+    verified_response["requestId"]=json!(id);
+    let mut artifacts=response["artifacts"].clone();
+    let images=artifacts.as_array_mut().ok_or_else(||ProviderError::new("IMAGE_PROVENANCE","原图来源记录缺失。"))?;
+    for image in images {
+        let request=&image["requestId"];
+        if request != id && !(standalone && (request.is_null() || request == "" || request == "recovered")) {
+            return Err(ProviderError::new("IMAGE_PROVENANCE","回收图片属于其他任务，未采用图片。"));
+        }
+        image["requestId"]=json!(id);
+    }
+    let verified=json!({"id":id,"status":"completed","output":{"response":verified_response,"artifacts":artifacts}});
+    // Validate file, assistant, source, session and byte bindings before returning
+    // the local envelope. The original raw bridge response remains untouched.
+    verify_result(&verified,proof,source,id)?;
+    Ok(verified)
 }
 pub(super) fn download(
     config: &ProviderConfig,
@@ -604,6 +650,100 @@ pub(super) fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn recovered_fixture(id: &str, hash: &str) -> (Value, Value) {
+        let source=json!({"id":"original-tab","ready":true,"url":"https://chatgpt.com/c/conversation","launchToken":format!("bridge-director-desktop-{id}"),"activeRequest":null});
+        let image=json!({"id":"OriginalImage","kind":"image","phase":"READY","downloadable":true,"generatedImage":true,"requestId":id,"sourceTurnKey":"assistant","sourceClientId":"original-tab","sessionId":"conversation","mime":"image/png","size":12,"url":"https://chatgpt.com/backend-api/estuary/content?id=file-original"});
+        let proof=json!({"source":"conversation-record","version":1,"proofVersion":2,"status":"matched_complete","requestId":id,"promptSha256":hash,"conversationId":"conversation","assistantMessageId":"assistant","backendStatus":"finished_successfully","endTurn":true,"bindings":[{"imageFileId":"file-original","bytesSha256":"a".repeat(64),"size":12,"mime":"image/png"}]});
+        let response=json!({"sourceClientId":"original-tab","requestId":id,"turnKey":"assistant","url":source["url"],"session":{"id":"conversation"},"artifacts":[image],"reconciliation":proof});
+        (source,response)
+    }
+    #[test]
+    fn running_and_timed_out_original_images_are_recovered_without_submit() {
+        let id="12345678-1234-1234-1234-123456789abc";
+        let hash="b".repeat(64);
+        for status in ["running","failed","reloaded"] {
+            let (mut source,mut response)=recovered_fixture(id,&hash);
+            if status=="running" {source["activeRequest"]=json!({"requestId":id});}
+            if status=="reloaded" {source["launchToken"]=json!("bridge-reload-original");response["requestId"]=json!("");response["artifacts"][0]["requestId"]=json!("recovered");}
+            let turn=json!({"id":id,"status":status,"error":{"code":"CANONICAL_DEADLINE_EXCEEDED"},"input":{"sourceClientId":"original-tab","metadata":{"promptSha256":hash}}});
+            let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"turn":turn}),json!({"ok":true,"clients":[source]}),json!({"ok":true,"result":response})]);
+            let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
+            std::env::set_var(&env,"synthetic-not-a-real-credential");
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            let result=query(&config,id).unwrap();
+            std::env::remove_var(env);
+            fixture.thread.join().unwrap();
+            assert_eq!(result.status,"succeeded");
+            assert_eq!(result.result_urls.len(),1);
+            assert_eq!(result.raw["turn"]["status"],status,"original receipt must remain untouched");
+            if status=="reloaded" {
+                assert_eq!(result.raw["recoveredResponse"]["requestId"],"");
+                assert_eq!(result.raw["recoveredResponse"]["artifacts"][0]["requestId"],"recovered");
+            }
+            let requests=fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(),3);
+            assert!(requests[0].0.starts_with("GET /turns/"));
+            assert!(requests[1].0.starts_with("GET /browser/clients"));
+            assert!(requests[2].0.starts_with("POST /browser/recover-latest"));
+            let body:Value=serde_json::from_str(&requests[2].1).unwrap();
+            assert_eq!(body["reconcileConversation"]["requestId"],id);
+            assert_eq!(body["reconcileConversation"]["promptSha256"],hash);
+            assert_eq!(body["reconcileConversation"]["allowReleasedRequest"],true);
+        }
+    }
+    #[test]
+    fn reloaded_tab_requires_original_source_and_rejects_competing_ownership() {
+        let id="12345678-1234-1234-1234-123456789abc";
+        for (client_id,launch,active,original,allowed) in [
+            ("original-tab","bridge-reload-original",Value::Null,Some("original-tab"),true),
+            ("original-tab","",Value::Null,Some("original-tab"),true),
+            ("different-tab","bridge-reload-original",Value::Null,Some("original-tab"),false),
+            ("original-tab","bridge-director-desktop-other",Value::Null,Some("original-tab"),false),
+            ("original-tab","bridge-reload-original",json!({"requestId":"other"}),Some("original-tab"),false),
+            ("original-tab","bridge-reload-original",Value::Null,None,false),
+        ] {
+            let source=json!({"id":client_id,"launchToken":launch,"activeRequest":active,"ready":true});
+            let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"clients":[source]})]);
+            let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
+            std::env::set_var(&env,"synthetic-not-a-real-credential");
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            assert_eq!(original_client_for(&config,&wire::client(5).unwrap(),id,true,original).is_ok(),allowed);
+            std::env::remove_var(env);
+            fixture.thread.join().unwrap();
+        }
+    }
+    #[test]
+    fn recovered_images_reject_changed_prompt_tab_branch_and_completion_proof() {
+        let id="original-task";let hash="b".repeat(64);
+        let (source,response)=recovered_fixture(id,&hash);
+        let original=json!({"id":id,"status":"failed"});
+        assert!(verified_recovery_turn(&original,&response,&source,id,&hash).is_ok());
+        for (pointer,value) in [("/sourceClientId",json!("other-tab")),("/requestId",json!("other-task")),("/session/id",json!("other-conversation")),("/turnKey",json!("other-message")),("/reconciliation/promptSha256",json!("c".repeat(64))),("/reconciliation/proofVersion",json!(1)),("/reconciliation/endTurn",json!(false)),("/reconciliation/backendStatus",json!("in_progress"))] {
+            let mut changed=response.clone();*changed.pointer_mut(pointer).unwrap()=value;
+            assert!(verified_recovery_turn(&original,&changed,&source,id,&hash).is_err(),"{pointer}");
+        }
+        for url in ["https://evil.test/c/conversation","https://chatgpt.com/","https://chatgpt.com/c/conversation?other=1","https://chatgpt.com/c/conversation#different"] {
+            assert!(owned_conversation(&json!({"url":url})).is_err());
+        }
+    }
+    #[test]
+    fn standalone_artifact_identity_requires_full_original_proof() {
+        let id="original-task";let hash="b".repeat(64);
+        let (source,mut response)=recovered_fixture(id,&hash);
+        let original=json!({"id":id,"status":"failed"});
+        response["requestId"]=json!("");
+        for marker in [Value::Null,json!(""),json!("recovered"),json!(id)] {
+            response["artifacts"][0]["requestId"]=marker.clone();
+            let verified=verified_recovery_turn(&original,&response,&source,id,&hash).unwrap();
+            assert_eq!(verified["output"]["artifacts"][0]["requestId"],id);
+            assert_eq!(response["artifacts"][0]["requestId"],marker);
+        }
+        response["artifacts"][0]["requestId"]=json!("recovered");
+        for (pointer,value) in [("/requestId",json!(id)),("/requestId",json!(5)),("/artifacts/0/requestId",json!("different-task")),("/artifacts/0/requestId",json!(false)),("/artifacts/0/sourceTurnKey",json!("different-assistant")),("/artifacts/0/sourceClientId",json!("different-tab")),("/artifacts/0/url",json!("https://chatgpt.com/backend-api/estuary/content?id=different-file")),("/artifacts/0/size",json!(99)),("/reconciliation/conversationId",json!("different-conversation")),("/reconciliation/promptSha256",json!("c".repeat(64)))] {
+            let mut changed=response.clone();*changed.pointer_mut(pointer).unwrap()=value;
+            assert!(verified_recovery_turn(&original,&changed,&source,id,&hash).is_err(),"{pointer}");
+        }
+    }
     #[test]
     fn unrelated_image_is_rejected() {
         let turn =

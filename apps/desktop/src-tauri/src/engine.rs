@@ -2682,7 +2682,7 @@ impl Engine {
         }
         let mut dependency_jobs: std::collections::HashMap<String, String> = jobs
             .iter()
-            .filter(|j| s(j, "kind") == "image" && is_active_generation(s(j, "status")))
+            .filter(|j| s(j, "kind") == "image" && retains_image_generation(j))
             .map(|j| (s(j, "entityId").to_owned(), s(j, "id").to_owned()))
             .collect();
         for a in order
@@ -2706,7 +2706,7 @@ impl Engine {
             if let Some(job) = jobs.iter().find(|j| {
                 s(j, "entityId") == s(a, "id")
                     && s(j, "kind") == "image"
-                    && is_active_generation(s(j, "status"))
+                    && retains_image_generation(j)
             }) {
                 if s(job, "status") == "submission_unknown" {
                     blocked.push(json!({"assetId":a["id"],"jobId":job["id"],"status":job["status"],"reason":"原图片任务提交结果未知，保留原记录等待核对，不会再次提交生成"}));
@@ -3548,6 +3548,10 @@ fn is_active_generation(state: &str) -> bool {
         "succeeded",
     ]
     .contains(&state)
+}
+fn retains_image_generation(job: &Value) -> bool {
+    is_active_generation(s(job, "status")) || s(job, "provider") == "chrome"
+        && s(job, "status") == "failed" && !s(job, "providerTaskId").is_empty()
 }
 fn require_account(store: &Store, provider: &str) -> Result<()> {
     if ["dreamina", "bh", "chrome"].contains(&provider)

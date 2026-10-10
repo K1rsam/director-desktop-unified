@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWorkspacePoller, executionSummary, hasActiveWorkspaceTasks, selectWorkflowProgress, storyboardCompletion, storyboardNodeTitle, workflowNodeResolution } from './workflowProgressModel.ts';
 import type { Workspace } from './types.ts';
+import { workspacePollIntervalMs } from './generationState.ts';
 
 const stamp = Date.parse('2026-10-05T23:00:00Z');
 const episodeId = 'episode:source:508';
@@ -142,6 +143,26 @@ test('同一只读请求未返回时不会再启动另一轮', async () => {
   const pending = deferred<Workspace>(), h = harness(fixture(), () => pending.promise);
   const first = h.poll(); await h.poll(); assert.equal(h.reads, 1);
   pending.resolve(fixture()); await first; assert.equal(h.applied, 1);
+});
+test('Chrome fast reads retain hidden-task refresh, single pending read and busy/unknown gates', async () => {
+  const current = fixture();
+  current.workflowProgress = [];
+  current.jobs = [{ id: 'original-image', provider: 'chrome', kind: 'image', status: 'processing', providerTaskId: 'same-original-task' }];
+  const pending = deferred<Workspace>(), h = harness(current, () => pending.promise);
+  assert.equal(workspacePollIntervalMs(current.jobs), 2000);
+  h.setBusy(true); await h.poll(); assert.equal(h.reads, 0);
+  h.setBusy(false);
+  const first = h.poll();
+  await Promise.all(Array.from({ length: 30 }, () => h.poll()));
+  assert.equal(h.reads, 1, 'faster ticks cannot start concurrent workspace reads');
+  const saved = { ...current, jobs: [{ ...current.jobs[0], status: 'downloaded' }] };
+  pending.resolve(saved); await first;
+  assert.equal(h.applied, 1);
+  assert.equal(workspacePollIntervalMs(h.current!.jobs), 8000);
+  await h.poll(); assert.equal(h.reads, 1, 'hidden idle tasks pause after the final saved result');
+  const unknown = { ...current, jobs: [{ ...current.jobs[0], submissionUnknown: true }] };
+  h.setCurrent(unknown); await h.poll(); assert.equal(h.reads, 1, 'unknown identity is not executed or queried as active');
+  assert.equal(unknown.jobs[0].providerTaskId, 'same-original-task');
 });
 function videoReadiness(ready: number): Workspace {
   const workspace = fixture(); workspace.workflowProgress = [];

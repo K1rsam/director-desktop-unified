@@ -11,6 +11,7 @@ import { TextExecutionSummary } from './TextExecutionSettings';
 import { ProjectLibrary } from './ProjectLibrary';
 import { InlineProjectCreate } from './InlineProjectCreate';
 import { createWorkspacePoller } from './workflowProgressModel';
+import { workspacePollIntervalMs } from './generationState';
 import type { ProjectFilter, ProjectLifecycleAction } from './ProjectLibrary';
 import { Button, Empty, Icon, jobActive, MediaPreview, messageOf, Modal, providerName } from './components';
 import type { IconName } from './components';
@@ -221,7 +222,15 @@ export default function App() {
       fail: (reason, projectId, failedAt) => setWorkspace(current => current?.project.id === projectId ? { ...current, readState: { ...current.readState, failedAt, error: messageOf(reason) } } : current),
     });
     // A hidden desktop is still producing work. Only idle projects may pause background reads.
-    const timer = window.setInterval(() => void poll(), 8000);
+    // Keep one poller (and its in-flight lock) when job activity changes.
+    // The lightweight clock ticks every 2s; idle workspace reads remain every 8s.
+    let lastRead = Date.now();
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      if (now - lastRead < workspacePollIntervalMs(workspaceRef.current?.jobs || [])) return;
+      lastRead = now;
+      void poll();
+    }, 2000);
     const visible = () => { if (!document.hidden) void poll(true); };
     window.addEventListener('focus', visible);
     document.addEventListener('visibilitychange', visible);

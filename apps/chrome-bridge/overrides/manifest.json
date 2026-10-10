@@ -1,0 +1,27 @@
+{
+  "version": "chrome-native-recovery/v1",
+  "componentVersion": "6.4.0",
+  "files": [
+    {
+      "path": "extension/content.js",
+      "beforeSha256": "8779dae98672677bc78ba8f42e51fa0e67dc13f72b828dcf54c7a4790fcfc987",
+      "afterSha256": "5a33dba87b2310714cc90738cc9c4d36e54794a17d5dfc63b0a5a555615d8d55"
+    },
+    {
+      "path": "extension/content/featureRuntime.js",
+      "beforeSha256": "641182404b79ad25c41eb763123ff1b9faeec319fd98327cc8b362cf84fedc15",
+      "afterSha256": "e7c988e020dca36d1cc0a565c86c0b54f545f8cb5a5e940022c1c611070365a8"
+    },
+    {
+      "path": "extension/content/conversationReconciliation.js",
+      "beforeSha256": "f82342b48c333aa8d86e6296716543d85b0abaffeb561b0db02518d55083a892",
+      "afterSha256": "09810908e5f758eee8e0bc1db965649c166a6d6c07545bba6ded7889191165be",
+      "previousAfterSha256": "bc4649edfb72316a63119f5a436a38750fa105c25bb800b54e58da419c890153"
+    },
+    {
+      "path": "extension/content/responseRecovery.js",
+      "beforeSha256": "72b0ba9924fed4b96383587d0b921d97182ef7e726e05d2553b7480cea730c7b",
+      "afterSha256": "6c3f9adee837ffcabeb593648c769f1df694f29e4437ec0c04db7bb83e4d51a3"
+    }
+  ]
+}
