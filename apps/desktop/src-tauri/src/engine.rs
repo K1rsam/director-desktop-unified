@@ -956,10 +956,16 @@ impl Engine {
             .map(|r| json!({"id":r.id,"version":r.version,"sha256":r.sha256}))
             .collect();
         let mut display_settings=self.effective_settings(store)?;
+        // Match the execution gate without exposing credential references or
+        // hashes. Global Chrome/BH identities need no user-entered account label.
+        let credential_status: serde_json::Map<String, Value> = ["bh", "chrome"]
+            .into_iter()
+            .map(|provider| (provider.into(), json!({"configured": self.require_account(store, provider).is_ok()})))
+            .collect();
         if let Some(object)=display_settings.as_object_mut(){object.remove(crate::app_settings::SCOPE);}
         if self.standard_native {if let Some(global)=crate::app_settings::load(&self.home)? {for (_,entry) in global["catalogs"].as_object().into_iter().flatten(){let cap=entry["capabilities"].clone();providers.retain(|p|p["provider"]!=cap["provider"]);providers.push(cap);}}}
         Ok(
-            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report}),
+            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report}),
         )
     }
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }

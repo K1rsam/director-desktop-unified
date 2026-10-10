@@ -211,6 +211,10 @@ fn global_api_channels_use_credential_identity_without_user_account_label() {
         .dispatch(json!({"action":"projects.create","title":"no account label"}))
         .unwrap();
     let store = e.store(s(&p, "id")).unwrap();
+    let before = fs::read(store.root.join("project.sqlite")).unwrap();
+    let empty = e.workspace(&store, None).unwrap();
+    assert_eq!(empty["credentialStatus"]["chrome"]["configured"], false);
+    assert_eq!(empty["credentialStatus"]["bh"]["configured"], false);
     save(
         &e,
         json!({"bhEndpoint":"https://fixture.invalid","bhToken":"synthetic-bh","chromeEndpoint":"http://127.0.0.1:9","chromeToken":"synthetic-chrome"}),
@@ -222,6 +226,15 @@ fn global_api_channels_use_credential_identity_without_user_account_label() {
         let report=e.queue_images_frozen(&store,&json!({"provider":provider,"model":"fixture","assetIds":[],"imageProductionPolicy":"automatic"}),&e.effective_settings(&store).unwrap(),|_,account|Ok(account.into())).unwrap();
         assert_eq!(report["queued"], json!([]));
     }
+    let workspace = e.workspace(&store, None).unwrap();
+    for provider in ["bh", "chrome"] {
+        assert_eq!(workspace["credentialStatus"][provider], json!({"configured":true}));
+        assert!(s(&workspace["settings"], &format!("{provider}AccountId")).is_empty());
+    }
+    let public = workspace.to_string();
+    assert!(!public.contains("synthetic-bh") && !public.contains("synthetic-chrome"));
+    assert!(!public.contains("credentialRefs") && !public.contains("credentialHashes"));
+    assert_eq!(fs::read(store.root.join("project.sqlite")).unwrap(), before);
     assert_eq!(channels.media.load(Ordering::SeqCst), 0);
 }
 

@@ -44,12 +44,12 @@ function fixture() {
     { id: 'inline-design', name: '随镜表现', kind: 'PROP', variantId: 'inline', version: 1, prompt: '', preparation: { mode: 'INLINE' } },
   ], media: [], units: [], jobs: [] as any[], settings: {}, providers: [], rules: [] };
 }
-async function view(options: { writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale'; imageReady?: boolean } = {}) {
+async function view(options: { writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale'; imageReady?: boolean; imageProvider?: string } = {}) {
   const workspace = fixture(), calls: { action: string; payload: any }[] = [], reads: any[] = [];
   if (options.prompt !== undefined) workspace.assets[0].prompt = options.prompt;
   if (options.mode) workspace.assets[0].preparation.mode = options.mode;
   if (options.jobs) workspace.jobs = options.jobs;
-  if (options.imageReady) Object.assign(workspace, { settings: { imageProvider: 'bh', imageModel: 'synthetic-image', imageResolution: '2k', ratio: '16:9', bhAccountId: 'offline-account', trialApproved: true }, providers: [{ id: 'bh', models: [{ id: 'synthetic-image', kind: 'image', adapted: true, ratios: ['16:9'], resolutions: ['2k'] }] }] });
+  if (options.imageReady) Object.assign(workspace, { settings: { imageProvider: options.imageProvider || 'bh', imageModel: 'synthetic-image', imageResolution: '2k', ratio: '16:9', bhAccountId: 'offline-account', trialApproved: true }, providers: [{ id: options.imageProvider || 'bh', models: [{ id: 'synthetic-image', kind: 'image', adapted: true, ratios: ['16:9'], resolutions: ['2k'] }] }] });
   shared.__promptApi = async value => { reads.push(value); assert.equal(value.action, 'assets.get'); const asset = structuredClone(workspace.assets.find(asset => asset.id === value.assetId)); if (options.detail === 'missing') throw Error('Synthetic missing detail'); if (asset && options.detail === 'stale') asset.version--; return asset; };
   const props = { workspace, writable: options.writable ?? true, mutate: async (action: string, payload: any) => { calls.push({ action, payload }); return workspace; }, inspect() {}, onNotice() {}, onError(message: string) { throw Error(message); }, onTasks() {} };
   const host = new HookHost(); const render = () => host.render(AssetPanel, props);
@@ -133,4 +133,29 @@ test('其他阶段占用项目时设计和一键制作均零派发，仍可阅�
   await ui.click('一键制作当前资产');
   assert.deepEqual(ui.calls.map(call => call.action), ['settings.save', 'images.produce']);
   assert.deepEqual(ui.calls[1].payload.assetIds, ['child-design']);
+});
+
+test('Chrome and BH image actions use authoritative credential readiness without requiring an account label', async () => {
+  for (const provider of ['chrome', 'bh']) {
+    const ui = await view({ imageReady: true, imageProvider: provider });
+    Object.assign(ui.workspace.settings, { imageProvider: provider, [`${provider}AccountId`]: '' });
+    (ui.workspace as any).credentialStatus = { [provider]: { configured: true } };
+    let tree = ui.render();
+    assert.equal(button(tree, '生成图片').disabled, false);
+    assert.equal(button(tree, '一键制作当前资产').disabled, false);
+    assert.ok(!text(tree).includes('稳定账户标签'));
+    await ui.click('生成图片');
+    assert.deepEqual(ui.calls.map(call => call.action), ['settings.save', 'images.run']);
+    assert.equal(ui.calls[1].payload.provider, provider);
+    ui.calls.length = 0;
+    (ui.workspace as any).credentialStatus[provider].configured = false;
+    Object.assign(ui.workspace.settings, { [`${provider}AccountId`]: 'stale-label' });
+    tree = ui.render();
+    for (const label of ['生成图片', '一键制作当前资产']) {
+      const action = button(tree, label); assert.equal(action.disabled, true); action.onClick();
+    }
+    await new Promise(done => setImmediate(done));
+    assert.deepEqual(ui.calls, [], 'a stale label cannot override missing current credentials');
+    assert.ok(text(tree).includes(provider === 'chrome' ? '连接本机 Chrome' : 'BH API 地址和凭据'));
+  }
 });
