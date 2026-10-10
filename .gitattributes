@@ -3,3 +3,5 @@
 *.ico binary
 *.icns binary
 *.woff2 binary
+# Component overlays are byte-pinned; retain upstream line endings and whitespace.
+apps/chrome-bridge/overrides/extension/** -text -whitespace
