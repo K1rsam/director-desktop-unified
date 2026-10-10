@@ -1714,6 +1714,7 @@ impl Engine {
                     .push(s(job, "id").to_owned());
             }
             let mut served = HashSet::new();
+            let mut chrome_new_work_waiting = false;
             for j in jobs {
                 let state = s(&j, "status");
                 let provider = s(&j, "provider");
@@ -1751,6 +1752,17 @@ impl Engine {
                     continue;
                 }
                 let key = s(&j, "id").to_owned();
+                let chrome_generation = provider == "chrome" && s(&j, "kind") == "image"
+                    && ["queued", "ready"].contains(&state) && s(&j, "providerTaskId").is_empty();
+                if chrome_generation {
+                    if chrome_new_work_waiting { continue; }
+                    if !self.chrome_image_queue_ready(&store, &key)? {
+                        // One cross-project scan per queue pass, not per waiting image.
+                        // Do not mark the provider served: original queries still run.
+                        chrome_new_work_waiting = true;
+                        continue;
+                    }
+                }
                 let (cfg, account) = self.generation_config(&store,&j)?;
                 let st = store.clone();
                 let channels = self.channels.clone();
@@ -1773,6 +1785,12 @@ impl Engine {
                 )?;
                 let engine = self.clone();
                 let spawned = self.spawn_exclusive_keys(locks, move || {
+                    // The channel reservation alone ends after submit returns.
+                    // Recheck durable ownership inside it to close cross-project
+                    // races before account preflight or browser preparation.
+                    if chrome_generation && !engine.chrome_image_queue_ready(&st, &key)? {
+                        return Ok(());
+                    }
                     let account = match engine.checked_account(&cfg, &account) {
                         Ok(account) => account,
                         Err(error) => {
@@ -1843,6 +1861,36 @@ impl Engine {
             }
         }
         Ok(())
+    }
+    fn chrome_image_queue_ready(&self, store: &Store, key: &str) -> Result<bool> {
+        let state = s(&store.job(key)?, "status").to_owned();
+        if !["queued", "ready"].contains(&state.as_str()) { return Ok(false); }
+        let current_project = s(&store.project()?, "id").to_owned();
+        let result = (|| -> Result<Option<String>> {
+            let registry = self.registry()?;
+            for project in registry.as_array().ok_or("项目索引损坏")? {
+                let except = if s(project, "id") == current_project { key } else { "" };
+                if let Some(blocker) = Store::chrome_image_blocker(
+                    Path::new(s(project, "rootPath")), s(project, "id"), except,
+                )? { return Ok(Some(blocker)); }
+            }
+            Ok(None)
+        })();
+        match result {
+            Ok(None) => Ok(true),
+            Ok(Some(_)) => {
+                // Keep the frozen request and queued/ready state untouched.
+                // A durable delay also prevents a busy channel waking tight loops.
+                store.defer_browser_queue(key, &state)?;
+                Ok(false)
+            }
+            Err(error) => {
+                store.claim_job_fields(key, &state, &state,
+                    &json!({"error":format!("Chrome 队列等待核对原任务：{error}"),
+                        "nextAttemptAt":chrono::Utc::now().timestamp()+10}))?;
+                Ok(false)
+            }
+        }
     }
     fn wake_images(&self) {
         let (pending, signal) = &self.image_wake;
@@ -6626,6 +6674,9 @@ mod repair_tests;
 #[cfg(test)]
 #[path = "image_scheduler_tests.rs"]
 mod image_scheduler_tests;
+#[cfg(test)]
+#[path = "chrome_queue_scheduler_tests.rs"]
+mod chrome_queue_scheduler_tests;
 
 #[cfg(test)]
 #[path = "project_lifecycle_tests.rs"]

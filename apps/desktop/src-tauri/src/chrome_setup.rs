@@ -107,6 +107,29 @@ fn get(client: &reqwest::blocking::Client, url: &str, token: &str) -> Result<Val
     if bytes.len()>1024*1024 { return Err("Chrome 状态响应超出限制。".into()); }
     serde_json::from_slice(&bytes).map_err(|_|"Chrome 状态返回格式无效。".into())
 }
+/// Multiple tabs in one extension runtime share the same browser profile.
+/// This selects an opener only; generation still gets its own owned empty tab.
+/// Never infer a shared runtime from tab IDs, URL, or an absent epoch.
+pub(crate) fn execution_client(clients: &[Value]) -> Option<&Value> {
+    let usable: Vec<_> = clients.iter().filter(|c| c["ready"] == true
+        && c["compatible"] != false && c["quarantined"] != true
+        && c["activeRequest"].is_null()).collect();
+    let selected: Vec<_> = usable.iter().copied().filter(|c| c["selected"] == true).collect();
+    if selected.len() == 1 { return Some(selected[0]); }
+    if selected.len() > 1 { return None; }
+    if usable.len() == 1 { return Some(usable[0]); }
+    let first = *usable.first()?;
+    let epoch = first["backgroundEpoch"].as_str().filter(|s| !s.is_empty())?;
+    if !usable.iter().all(|c| c["transport"] == "extension"
+        && c["backgroundEpoch"] == epoch && c["extensionBundleId"] == first["extensionBundleId"]
+        && c["serverInstanceId"] == first["serverInstanceId"]) { return None; }
+    usable.into_iter().min_by_key(|c| (
+        c["url"] != "https://chatgpt.com/",
+        c["launchToken"].as_str().unwrap_or("").starts_with("bridge-director-desktop-"),
+        c["id"].as_str().unwrap_or(""),
+    ))
+}
+
 pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let base = endpoint(settings)?.as_str().trim_end_matches('/').to_string();
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(3)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"无法检查 Chrome 连接。")?;
@@ -117,14 +140,20 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     if response["ok"] != true { return Err("Chrome 浏览器列表不可用。".into()); }
     let clients = response["clients"].as_array().ok_or("Chrome 浏览器列表格式无效。")?;
     let usable: Vec<_> = clients.iter().filter(|c| c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true && c["activeRequest"].is_null()).collect();
-    let selected = usable.iter().any(|c|c["selected"]==true);
-    let busy = health["pendingRequests"].as_u64().unwrap_or(0)>0 || clients.iter().any(|c|!c["activeRequest"].is_null());
+    let opener = execution_client(clients);
+    let busy = health["pendingRequests"].as_u64().unwrap_or(0)>0
+        || health["pendingCommands"].as_u64().unwrap_or(0)>0
+        || clients.iter().any(|c|!c["activeRequest"].is_null());
+    // Upstream health.ok describes its generic selected-client fallback. An
+    // explicitly bound opener is usable when only that fallback is ambiguous.
+    let connected = health["ok"] == true || health["needsSelection"] == true && opener.is_some();
     let (state,message) = if busy {("busy","浏览器正在执行已有任务，完成后可继续。")}
-        else if usable.len()>1 && !selected {("needs_selection","已连接多个网页，请在浏览器桥接面板中选定一个。")}
-        else if !usable.is_empty() && health["ok"]==true {("ready","Chrome 网页已连接，可在图片资产中选择 Chrome 网页生成。")}
+        else if usable.len()>1 && opener.is_none() {("needs_selection","发现不同的浏览器连接，请在桥接面板选定执行浏览器；同一浏览器的多个页面无需选择。")}
+        else if !usable.is_empty() && connected {("ready","Chrome 网页已连接，可在图片资产中选择 Chrome 网页生成。")}
         else {("waiting_browser","桥接已启动。请打开 Chrome 的 ChatGPT 页面并连接扩展。")};
     let mut value=report(state,message,component().is_some(),true);
     value["clients"]=json!(clients.len()); value["usableClients"]=json!(usable.len());
+    value["pendingRequests"] = health["pendingRequests"].clone();
     Ok(value)
 }
 pub fn check(home: &Path, settings: &Value, token: &str) -> Result<Value> {

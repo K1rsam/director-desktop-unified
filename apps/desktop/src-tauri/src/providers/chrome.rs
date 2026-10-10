@@ -1,6 +1,10 @@
 use super::*;
 use reqwest::blocking::Client;
 
+#[cfg(test)]
+#[path = "chrome_background_tests.rs"]
+mod background_tests;
+
 fn json_request(
     config: &ProviderConfig,
     client: &Client,
@@ -44,11 +48,57 @@ fn usable(value: &Value) -> bool {
         && value.get("activeRequest").is_none_or(Value::is_null)
 }
 
+pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &PreparedRequest, result: &QueryResult) -> ProviderResult<Value> {
+    let task = result.task_id.as_str();
+    let proof = &result.raw["nativeProof"];
+    if prepared.provider != "chrome" || prepared.request.kind != "image" || prepared.request.request_id != task
+        || result.status != "succeeded" || result.result_urls.is_empty()
+        || proof["status"] != "matched_complete" || proof["proofVersion"] != 2 || proof["requestId"] != task
+        || proof["promptSha256"] != prepared.wire["metadata"]["promptSha256"] {
+        return Err(ProviderError::new("TAB_CLEANUP_IDENTITY", "任务身份未核对，保留工作页。"));
+    }
+    let original_conversation = proof["conversationId"].as_str().filter(|s| !s.is_empty())
+        .ok_or_else(|| ProviderError::new("TAB_CLEANUP_IDENTITY", "原会话证明缺失，保留页面。"))?;
+    let source = prepared.wire["sourceClientId"].as_str().filter(|s| !s.is_empty())
+        .ok_or_else(|| ProviderError::new("TAB_CLEANUP_IDENTITY", "原工作页身份缺失，保留页面。"))?;
+    let client = wire::client(12)?;
+    let available = clients(config, &client)?;
+    let matches: Vec<_> = available.iter().filter(|c| c["id"] == source).collect();
+    if matches.is_empty() { return Ok(json!({"status":"already_closed"})); }
+    if matches.len() != 1 { return Err(ProviderError::new("TAB_CLEANUP_IDENTITY", "工作页身份不唯一，保留页面。")); }
+    let owned = matches[0];
+    let launch = format!("bridge-director-desktop-{task}");
+    if owned["launchToken"] != launch || !usable(owned) {
+        return Ok(json!({"status":"retained","reason":"ownership_or_idle_not_proven"}));
+    }
+    if owned["focused"] != false || owned["visibilityState"] != "hidden" {
+        return Ok(json!({"status":"retained","reason":"user_viewing_or_visibility_unknown"}));
+    }
+    if !available.iter().any(|c| c["id"] != source && usable(c)) {
+        return Ok(json!({"status":"retained","reason":"last_connected_page"}));
+    }
+    let url = owned_conversation(owned)?;
+    if url != original_conversation {
+        return Ok(json!({"status":"retained","reason":"conversation_changed"}));
+    }
+    let response = json_request(config, &client, "/browser/tabs/close", Some(&json!({
+        "sourceClientId":source,"expectedLaunchToken":launch,
+        "expectedUrl":format!("https://chatgpt.com/c/{url}"),"timeoutMs":8000
+    })), false)?;
+    if response["ok"] != true {
+        return Err(ProviderError::new("TAB_CLEANUP_UNCONFIRMED", "关闭工作页未确认，已生成图片仍已保存。"));
+    }
+    Ok(json!({"status":"close_requested","sourceClientId":source}))
+}
+
 pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
     let health = crate::chrome_setup::inspect(
         &json!({"chromeEndpoint":wire::base(config,true)?}),
         &wire::credential(config,true)?,
     ).map_err(|message|ProviderError::new("BRIDGE_OFFLINE",message))?;
+    if health["status"] == "busy" {
+        return Err(ProviderError::new("BRIDGE_BUSY", "浏览器正在执行已有任务，图片保持排队等待。"));
+    }
     if health["status"] != "ready" {
         return Err(ProviderError::new("BRIDGE_BROWSER_NOT_READY",health["message"].as_str().unwrap_or("Chrome 网页尚未就绪。")));
     }
@@ -167,18 +217,7 @@ pub(super) fn prepare(
             "任务标签页已存在，请核对原关联码；不会重复创建或发送。",
         ));
     }
-    let usable_clients: Vec<_> = available.iter().filter(|c| usable(c)).collect();
-    let opener = usable_clients
-        .iter()
-        .find(|c| c.get("selected").and_then(Value::as_bool) == Some(true))
-        .copied()
-        .or_else(|| {
-            if usable_clients.len() == 1 {
-                Some(usable_clients[0])
-            } else {
-                None
-            }
-        })
+    let opener = crate::chrome_setup::execution_client(&available)
         .ok_or_else(|| {
             ProviderError::new(
                 "BROWSER_SELECTION_REQUIRED",
@@ -194,7 +233,7 @@ pub(super) fn prepare(
         &client,
         "/browser/tabs/open",
         Some(
-            &json!({"url":"https://chatgpt.com/","sourceClientId":opener_id,"active":true,"select":false,"launchToken":launch,"timeoutMs":12000,"allowSystemFallback":false}),
+            &json!({"url":"https://chatgpt.com/","sourceClientId":opener_id,"active":false,"select":false,"launchToken":launch,"timeoutMs":12000,"allowSystemFallback":false}),
         ),
         false,
     )?;

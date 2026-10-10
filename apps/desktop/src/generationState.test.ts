@@ -4,6 +4,15 @@ import { assetGenerationJob, generationBlocksNewJob, generationProgress, isLocal
 import type { Job } from './types.ts';
 
 const job = (status: string, extra: Partial<Job> = {}): Job => ({ id: status, provider: 'dreamina', kind: 'image', assetId: 'a', status, ...extra });
+test('Chrome queued and ready images say not submitted instead of pretending to poll an original task', () => {
+  for (const status of ['queued', 'ready', 'preparing']) {
+    const pending = job(status, { provider: 'chrome', result: { raw: { progress: { message: 'old signal' } } } });
+    const shown = generationProgress(pending);
+    assert.match(shown, /尚未提交/);assert.doesNotMatch(shown, /old signal|正在核对.*原任务|云端正在生成/);
+  }
+  assert.match(generationProgress(job('queued', { provider: 'chrome', providerTaskId: 'original-task' })), /核对.*原任务/);
+  assert.equal(generationProgress(job('queued')), '图片任务已排队，等待当前渠道。');
+});
 test('explicit local video preparation is distinguished from any submit, identity or unknown state', () => {
   const local = job('ready', { kind: 'video', snapshot: { autoSubmit: false } });
   assert.equal(isLocalVideoPreparation(local), true);

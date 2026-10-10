@@ -64,6 +64,11 @@ function chromeProgress(job: Job, now: number): string {
 export function generationProgress(job: Job, now = Date.now()): string {
   if (job.submissionUnknown || job.status === 'submission_unknown') return '上次提交未取得云端回执，暂时不能再生成。到任务记录核对：找到任务 ID 后绑定原任务；确认未受理后可关闭这条记录，再明确发起新试稿。';
   if (job.provider === 'chrome' && job.kind === 'image' && job.status === 'failed' && job.providerTaskId) return '网页原任务需要恢复核对；请查询原任务或恢复下载，不要重复生成。';
+  if (job.provider === 'chrome' && job.kind === 'image' && !job.providerTaskId) {
+    if (job.status === 'queued') return '等待浏览器工作队列 · 尚未提交。前一任务完成并保存后自动继续；未决原任务会优先保留。';
+    if (job.status === 'ready') return '图片参数已冻结，等待浏览器工作队列 · 尚未提交。';
+    if (job.status === 'preparing') return '正在后台准备独立工作页与素材 · 尚未提交。';
+  }
   if (activeChromeImage(job)) return chromeProgress(job, now);
   const messages: Record<string, string> = {
     recovery_paused: '自动恢复已多次失败并暂停；检查连接后，到任务记录恢复原任务，不能重新提交生成。',

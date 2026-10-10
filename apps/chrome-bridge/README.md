@@ -11,3 +11,5 @@
 Rust provider 兼容 Protocol 5 独立恢复回包的空外层 requestId 与 artifact 的 `recovered` 标记，仅在完整 native proof 验证后建立本地关联。不同任务 ID 必须拒绝；原桥接回包完整保留。
 
 验证：`node --test apps/chrome-bridge/tests/native-recovery.test.cjs`。这些合成测试不代表新任务真实生成通过。当前真实原任务的恢复、下载与资产采用证据见对应 handoff 文档。
+
+桌面 Chrome 渠道另已适配后台专属工作页、单客户端跨项目持久队列和成功入库后的安全回收；同一扩展 runtime 的多个空闲页面可自动选择 opener，跨 runtime 仍需明确绑定。普通网页忙碌保持排队，未知提交仅恢复原任务。实现、Windows 检查、暂存发布和真实后台生成未验收的范围见 [后台队列记录](../../docs/handoff/CHROME_BACKGROUND_QUEUE_20261010.md)。本轮没有改动或重新部署扩展覆盖文件。

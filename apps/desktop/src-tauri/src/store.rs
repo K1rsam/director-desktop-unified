@@ -1274,6 +1274,37 @@ impl Store {
             Ok(job)
         }).collect()
     }
+    /// Read-only cross-project queue gate. Archived projects must retain unresolved
+    /// browser submissions without opening/migrating their original databases.
+    pub fn chrome_image_blocker(root: &Path, project_id: &str, except_job: &str) -> Result<Option<String>> {
+        let connection = Connection::open_with_flags(
+            root.join("project.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).map_err(|e| format!("无法核对 Chrome 原任务：{e}"))?;
+        connection.busy_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?;
+        let actual: String = connection.query_row("SELECT id FROM project LIMIT 1", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if actual != project_id { return Err("Chrome 队列核对时项目目录与登记身份不一致".into()); }
+        // Queued/ready with no receipt is waiting work, never a channel owner.
+        // Completion means original bytes have reached the project, not merely
+        // that the website reported succeeded. Legacy failed IDs also stay held.
+        connection.query_row(r#"
+            SELECT id FROM jobs WHERE kind='image' AND provider='chrome' AND id<>?1 AND (
+                state IN ('preparing','submitting','submitted','processing','succeeded',
+                    'query_failed','download_failed','downloading','submission_unknown')
+                OR (state IN ('auth_required','failed','recovery_paused','queued','ready')
+                    AND (COALESCE(task_id,'')<>'' OR COALESCE(receipt,'') NOT IN ('','null','{}')))
+            ) ORDER BY created_at,rowid LIMIT 1
+        "#, [except_job], |row| row.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    /// Waiting for another browser owner is not a state transition. Preserve FIFO
+    /// timestamps and avoid one history/dirty event per queued image per tick.
+    pub fn defer_browser_queue(&self, key: &str, expected_state: &str) -> Result<()> {
+        if !["queued", "ready"].contains(&expected_state) { return Ok(()); }
+        self.conn()?.execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2 AND state=?3 AND provider='chrome' AND kind='image'",
+            params![chrono::Utc::now().timestamp()+5,key,expected_state]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
     /// The scheduler has no history cap; old active cloud identities remain recoverable.
     pub fn pending_jobs(&self) -> Result<Vec<Value>> {
         let c = self.conn()?;

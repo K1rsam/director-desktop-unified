@@ -9,6 +9,10 @@ use crate::{
 use serde_json::{json, Value};
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "tasks_chrome_queue_tests.rs"]
+mod chrome_queue_tests;
+
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
     fn prepare(&self, c: &ProviderConfig, r: &GenerationRequest)
@@ -39,6 +43,10 @@ pub trait Channels: Send + Sync {
         path: &Path,
     ) -> ProviderResult<DownloadReceipt>;
     fn reconcile(&self, c: &ProviderConfig, id: &str) -> ProviderResult<QueryResult>;
+    /// Called only after local media import/link/adoption commits. Cleanup never submits.
+    fn release_completed_tab(&self, _c: &ProviderConfig, _p: &PreparedRequest, _result: &QueryResult) -> ProviderResult<Value> {
+        Ok(json!({"status":"not_applicable"}))
+    }
 }
 pub struct RealChannels;
 impl Channels for RealChannels {
@@ -79,6 +87,9 @@ impl Channels for RealChannels {
     }
     fn reconcile(&self, c: &ProviderConfig, id: &str) -> ProviderResult<QueryResult> {
         providers::reconcile_unknown(c, id)
+    }
+    fn release_completed_tab(&self, c: &ProviderConfig, p: &PreparedRequest, result: &QueryResult) -> ProviderResult<Value> {
+        providers::release_completed_tab(c, p, result)
     }
 }
 fn error_state(e: &ProviderError) -> &str {
@@ -254,7 +265,7 @@ fn prepare_generation(
                     if !unsubmitted(&current) {
                         return Ok(false);
                     }
-                    store.claim_job_fields(key, "preparing", "ready", &json!({"prepared":p}))
+                    store.claim_job_fields(key, "preparing", "ready", &json!({"prepared":p,"error":"","nextAttemptAt":0}))
                 })();
                 match saved {
                     Ok(true) => j = store.job(key)?,
@@ -272,6 +283,15 @@ fn prepare_generation(
             }
             Err(e) => {
                 if unsubmitted(&store.job(key)?) {
+                    if cfg.kind == "chrome" && e.code == "BRIDGE_BUSY" && !e.submission_unknown && !e.auth_required {
+                        // This error originates before tab creation or submission. Wait durably,
+                        // without consuming recovery attempts or retrying unknown side effects.
+                        store.claim_job_fields(key, "preparing", "queued", &json!({"error":e.message,"nextAttemptAt":chrono::Utc::now().timestamp()+5}))?;
+                        if j["error"] != e.message {
+                            store.event(key, "browser_queue_wait", &json!({"code":e.code,"generationCalled":false}))?;
+                        }
+                        return Ok(None);
+                    }
                     store.claim_job_fields(
                         key,
                         "preparing",
@@ -630,6 +650,21 @@ pub fn download_result(
         }
     }
     store.complete_download(key,&json!({"taskId":result.task_id,"resultUrls":result.result_urls,"mediaIds":media_ids,"actualCost":result.actual_cost,"raw":result.raw}),&media_ids)?;
+    if cfg.kind == "chrome" {
+        // Completion is durable before any browser side effect. Failure to close a tab
+        // must never turn imported media back into a download/generation retry.
+        let completed = store.job(key)?;
+        if s(&completed, "status") == "downloaded" && !media_ids.is_empty() {
+            let cleanup = serde_json::from_value::<PreparedRequest>(completed["prepared"].clone())
+                .map_err(|_| "原准备快照无法核对，保留工作页。".to_owned())
+                .and_then(|p| channels.release_completed_tab(cfg, &p, result).map_err(|e| e.message));
+            let event = match cleanup {
+                Ok(details) => json!({"details":details,"generationCalled":false}),
+                Err(message) => json!({"status":"retained","message":message,"generationCalled":false}),
+            };
+            let _ = store.event(key, "browser_tab_cleanup", &event);
+        }
+    }
     Ok(())
 }
 pub fn reconcile(

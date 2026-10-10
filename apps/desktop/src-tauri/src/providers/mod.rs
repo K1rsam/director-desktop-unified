@@ -250,6 +250,11 @@ pub fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
         )),
     }
 }
+/// The task layer proves durable download completion before calling this adapter.
+pub fn release_completed_tab(config: &ProviderConfig, prepared: &PreparedRequest, result: &QueryResult) -> ProviderResult<Value> {
+    if config.kind == "chrome" { chrome::release_completed_tab(config, prepared, result) }
+    else { Ok(json!({"status":"not_applicable"})) }
+}
 /// Current official CLI account identity and credit balance, with no raw UID or OAuth tokens.
 pub fn dreamina_account(config: &ProviderConfig) -> ProviderResult<Value> {
     if config.kind != "dreamina" {
