@@ -51,7 +51,7 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
 ];
 pub const CREDENTIAL_FIELDS: &[&str] = &["bhToken", "chromeToken", "textApiKey"];
 pub const STANDARD_ACTIONS: &[&str] = &[
-    "chrome.connect", "chrome.check", "chrome.open",
+    "chrome.connect", "chrome.check", "chrome.open", "chrome.bind",
     "runtime.prepare",
     "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
     "workflows.resume", "providers.refresh", "videos.preflight", "videos.prepare", "videos.submit",

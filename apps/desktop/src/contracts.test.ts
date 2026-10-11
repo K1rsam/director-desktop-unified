@@ -138,6 +138,36 @@ test('已保存图片模型优先，非法旧模型和用户当前参数不会�
   workspace.settings.ratio = 'old-ratio'; workspace.settings.imageResolution = 'old-size';
   assert.deepEqual(initializeImageParameters(workspace, 'dreamina', { model: '', ratio: '', resolution: '' }), { model: '5.0', ratio: 'old-ratio', resolution: 'old-size' });
 });
+test('Chrome 真实唯一可用图片目录补齐空模型与原生尺寸，缺失和歧义目录不猜测', () => {
+  const empty = { model: '', ratio: '', resolution: '' };
+  const capability = { id: 'chatgpt-image', kind: 'image', adapted: true, ratios: ['16:9', '1:1'], resolutions: ['native'] };
+  const workspace = { ...fixture(), settings: { imageProvider: 'chrome' }, providers: [{ id: 'chrome', models: [capability] }] };
+  const initialized = { model: 'chatgpt-image', ratio: '16:9', resolution: 'native' };
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', empty), initialized);
+  assert.equal(generationChoices(workspace, 'chrome', 'image', initialized).valid, true);
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', { ...empty, ratio: '1:1' }), { ...initialized, ratio: '1:1' });
+  for (const models of [[], ['chatgpt-image'], [{ ...capability, kind: 'video' }], [{ ...capability, adapted: false }], [{ ...capability, available: false }], [{ ...capability, id: 'unrecognized' }], [capability, capability], [capability, { ...capability, id: 'another-image' }]]) {
+    const changed: Workspace = { ...workspace, providers: [{ id: 'chrome', models }] };
+    assert.deepEqual(initializeImageParameters(changed, 'chrome', empty), empty);
+  }
+  assert.deepEqual(initializeImageParameters({ ...workspace, providers: [{ id: 'bh', models: [capability] }] }, 'chrome', empty), empty);
+  assert.deepEqual(initializeImageParameters({ ...workspace, providers: [{ id: 'bh', models: [capability] }] }, 'bh', empty), empty);
+});
+test('Chrome 默认值保留已保存非法值、用户选择及已有尺寸，不将其他渠道旧值带入', () => {
+  const empty = { model: '', ratio: '', resolution: '' };
+  const workspace: Workspace = { ...fixture(), settings: { imageProvider: 'chrome' }, providers: [{ id: 'chrome', models: [{ id: 'chatgpt-image', kind: 'image', adapted: true, available: true, ratios: ['16:9', '1:1'], resolutions: ['native'] }] }] };
+  workspace.settings.imageModel = 'retired-model';
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', empty), { ...empty, model: 'retired-model' });
+  workspace.settings.imageModel = 'chatgpt-image'; workspace.settings.imageResolution = 'old-size'; workspace.settings.ratio = 'old-ratio';
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', empty), { model: 'chatgpt-image', ratio: 'old-ratio', resolution: 'old-size' });
+  const selected = { model: 'chosen-model', ratio: 'chosen-ratio', resolution: 'chosen-size' };
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', selected), selected);
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', { model: 'chatgpt-image', ratio: '1:1', resolution: 'chosen-size' }), { model: 'chatgpt-image', ratio: '1:1', resolution: 'chosen-size' });
+  workspace.settings = { imageProvider: 'bh', imageModel: 'bh-model', imageResolution: '2k' };
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', empty), { model: 'chatgpt-image', ratio: '16:9', resolution: 'native' });
+  (workspace.providers as { models: { resolutions: string[] }[] }[])[0].models[0].resolutions = ['2k'];
+  assert.deepEqual(initializeImageParameters(workspace, 'chrome', empty), { model: 'chatgpt-image', ratio: '16:9', resolution: '' });
+});
 test('缺目录发现合并图片视频渠道，字符串与错误类型目录不能冒充核实能力', () => {
   const workspace = fixture();
   assert.deepEqual(missingCatalogs(workspace).map(item => [item.provider, item.kinds]), [['dreamina', ['image', 'video']]]);
@@ -147,6 +177,15 @@ test('缺目录发现合并图片视频渠道，字符串与错误类型目录�
   assert.equal(missingCatalogs(workspace).length, 0);
   workspace.settings.imageProvider = 'bh';
   assert.deepEqual(missingCatalogs(workspace).map(item => item.provider), ['bh']);
+});
+test('Chrome 绑定变更允许目录重新核实，其他渠道和轮询状态不触发重复检查', () => {
+  const workspace=fixture();workspace.settings.imageProvider='chrome';
+  const key=(provider: string)=>missingCatalogs(workspace).find(item=>item.provider===provider)?.key;
+  const before=key('chrome'),dreamina=key('dreamina');
+  workspace.settings.chromeProfileId='b84d4521-56ba-4f84-9948-090f82d639e7';workspace.settings.chromeProfileEndpoint='http://127.0.0.1:53179';workspace.settings.chromeProfileBundleId='bundle';
+  const bound=key('chrome');assert.notEqual(bound,before);assert.equal(key('dreamina'),dreamina);
+  workspace.settings.chromeToken='synthetic-never-real';workspace.settings.chromeCheckedAt='later';assert.equal(key('chrome'),bound);
+  workspace.settings.chromeProfileId='f913ed04-6d73-4f40-bd74-040418327d79';assert.notEqual(key('chrome'),bound);
 });
 test('目录自动读取失败只执行一次，项目与稳定配置变更可独立检查，预览不访问渠道', async () => {
   let workspace = fixture(), enabled = false, calls = 0; const states: string[] = [];

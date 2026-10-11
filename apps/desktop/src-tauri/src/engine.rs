@@ -595,7 +595,7 @@ impl Engine {
         } else {
             settings["dreaminaPath"].clone()
         };
-        let cfg:ProviderConfig=serde_json::from_value(json!({"kind":provider,"endpoint":match provider{"bh"=>settings.get("bhEndpoint"),"chrome"=>settings.get("chromeEndpoint"),_=>None},"credentialEnv":if provider=="bh"{Some(env.clone())}else{None},"bridgeTokenEnv":if provider=="chrome"{Some(env.clone())}else{None},"cliPath":cli,"timeoutSeconds":settings.get("providerTimeoutSeconds").cloned().unwrap_or(json!(120)),"adaptedModels":settings.get("adaptedModels").cloned().unwrap_or(json!([]))})).map_err(|e|e.to_string())?;
+        let cfg:ProviderConfig=serde_json::from_value(json!({"kind":provider,"endpoint":match provider{"bh"=>settings.get("bhEndpoint"),"chrome"=>settings.get("chromeEndpoint"),_=>None},"credentialEnv":if provider=="bh"{Some(env.clone())}else{None},"bridgeTokenEnv":if provider=="chrome"{Some(env.clone())}else{None},"chromeBinding":if provider=="chrome"{crate::chrome_setup::browser_binding(settings)?}else{None},"cliPath":cli,"timeoutSeconds":settings.get("providerTimeoutSeconds").cloned().unwrap_or(json!(120)),"adaptedModels":settings.get("adaptedModels").cloned().unwrap_or(json!([]))})).map_err(|e|e.to_string())?;
         let account_key = format!("{provider}AccountId");
         let explicit = s(&settings, &account_key);
         let endpoint = cfg.endpoint.as_deref().unwrap_or("official-cli");
@@ -628,10 +628,62 @@ impl Engine {
         }
         if let Some(path)=job["snapshot"]["providerConfig"]["cliPath"].as_str() {settings["dreaminaPath"]=json!(path);}
         let (config,account)=self.config_with_settings(store,provider,&settings)?;
-        let config = if job["snapshot"]["providerConfig"].is_object() {
+        let mut config: ProviderConfig = if job["snapshot"]["providerConfig"].is_object() {
             serde_json::from_value(job["snapshot"]["providerConfig"].clone()).map_err(|e|format!("冻结图片渠道配置无效：{e}"))?
         } else {config};
+        if provider=="chrome" && s(job,"kind")=="image" && config.chrome_binding.is_none() {
+            config.chrome_binding=self.legacy_chrome_execution_binding(store,job,&settings,&config,&account)?;
+        }
         Ok((config,account))
+    }
+    /// Only untouched legacy queue entries may acquire an execution identity.
+    /// The request and its old channel config remain byte-for-byte frozen.
+    fn legacy_chrome_execution_binding(&self,store:&Store,job:&Value,frozen:&Value,config:&ProviderConfig,account:&str)->Result<Option<crate::chrome_setup::BrowserBinding>> {
+        use rusqlite::OptionalExtension;
+        let key=format!("legacy_chrome_execution_binding:{}",s(job,"id"));
+        // The existing parent-image resolver fills only references after the
+        // direct parent lands. All immutable request/channel identity stays bound.
+        let mut identity=job["snapshot"].clone();
+        if let Some(fields)=identity.as_object_mut(){fields.remove("references");}
+        let snapshot_hash=pipeline::digest(&identity.to_string());
+        let config_hash=pipeline::digest(&serde_json::to_string(config).map_err(|e|e.to_string())?);
+        let decode=|raw:String|->Result<Option<crate::chrome_setup::BrowserBinding>> {
+            let saved:Value=serde_json::from_str(&raw).map_err(|_|"旧Chrome队列执行绑定记录损坏，未重新绑定。")?;
+            if saved["version"]!="legacy-chrome-execution-binding/v1" || saved["snapshotHash"]!=snapshot_hash
+                || saved["configHash"]!=config_hash || saved["accountId"]!=account || saved["accountId"]!=job["accountId"] {
+                return Err("旧Chrome队列的原请求或渠道身份已变化，未重新绑定。".into());
+            }
+            let binding:crate::chrome_setup::BrowserBinding=serde_json::from_value(saved["binding"].clone()).map_err(|_|"旧Chrome队列执行绑定无效。")?;
+            crate::chrome_setup::browser_binding(&crate::chrome_setup::binding_settings(config.endpoint.as_deref().unwrap_or(""),Some(&binding)))
+        };
+        let c=store.conn()?;
+        if let Some(raw)=c.query_row("SELECT value FROM metadata WHERE key=?1",[&key],|r|r.get::<_,String>(0)).optional().map_err(|e|e.to_string())? {return decode(raw);}
+        if !["queued","waiting_dependency","failed","auth_required"].contains(&s(job,"status"))
+            || !s(job,"providerTaskId").is_empty() || !job["prepared"].is_null()
+            || !(job["receipt"].is_null() || job["receipt"]==json!({}) || job["receipt"]=="")
+            || job["submissionUnknown"]==true || job["result"]["dispatchStarted"]==true || job["result"]["submissionUnknown"]==true {
+            return Ok(None);
+        }
+        let prior_dispatch:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND (type LIKE '%dispatch%started%' OR json_extract(data,'$.state') IN ('submitting','submitted','submission_unknown','processing','succeeded','downloaded') OR json_extract(data,'$.from') IN ('submitting','submitted','submission_unknown','processing','succeeded','downloaded')))",[s(job,"id")],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if prior_dispatch {return Ok(None);}
+        let current=self.effective_settings(store)?;
+        let Some(binding)=crate::chrome_setup::browser_binding(&current)? else {return Ok(None);};
+        let pid=s(&store.project()?,"id").to_owned();
+        let (frozen_config,_)=self.config_with_settings(store,"chrome",frozen)?;
+        let (current_config,current_account)=self.config_with_settings(store,"chrome",&current)?;
+        if config.endpoint!=current_config.endpoint || config.endpoint.as_deref()!=Some(binding.endpoint.as_str())
+            || config.bridge_token_env!=frozen_config.bridge_token_env || account!=current_account || job["accountId"]!=account
+            || crate::app_settings::reference(frozen,&pid,"chrome")?!=crate::app_settings::reference(&current,&pid,"chrome")? {
+            return Err("旧Chrome队列与当前全局渠道的地址或原凭据身份不一致，未迁移或提交。".into());
+        }
+        let saved=json!({"version":"legacy-chrome-execution-binding/v1","snapshotHash":snapshot_hash,"configHash":config_hash,
+            "accountId":account,"binding":binding,"fixedAt":now()});
+        // CAS against the complete original request and empty remote/preparation
+        // evidence. A racing submit or a previous migration always wins.
+        c.execute("INSERT OR IGNORE INTO metadata(key,value) SELECT ?1,?2 FROM jobs j WHERE j.id=?3 AND j.snapshot=?4 AND j.account_id=?5 AND j.provider='chrome' AND j.kind='image' AND j.state IN ('queued','waiting_dependency','failed','auth_required') AND COALESCE(j.task_id,'')='' AND j.prepared IS NULL AND (j.receipt IS NULL OR j.receipt IN ('','null','{}')) AND NOT EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND (e.type LIKE '%dispatch%started%' OR json_extract(e.data,'$.state') IN ('submitting','submitted','submission_unknown','processing','succeeded','downloaded') OR json_extract(e.data,'$.from') IN ('submitting','submitted','submission_unknown','processing','succeeded','downloaded')))",
+            rusqlite::params![key,saved.to_string(),s(job,"id"),job["snapshot"].to_string(),account]).map_err(|e|e.to_string())?;
+        let raw:Option<String>=c.query_row("SELECT value FROM metadata WHERE key=?1",[&key],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        raw.map(decode).transpose().map(Option::flatten)
     }
     fn dreamina_config(&self, store: &Store) -> Result<ProviderConfig> {
         self.dreamina_config_with_settings(&self.effective_settings(store)?)
@@ -1859,6 +1911,7 @@ impl Engine {
                 // next slot to its sibling class; absent/future work never idles
                 // the other class. Existing due/backoff checks remain above.
             }
+            self.schedule_browser_tab_cleanup(&store)?;
         }
         Ok(())
     }
@@ -1911,6 +1964,22 @@ impl Engine {
             return store.update_job(key, s(&job, "status"), &json!({"error":error.message,"queryAttempts":attempts+1,"nextAttemptAt":chrono::Utc::now().timestamp()+10*(attempts as i64+1)}));
         }
         Self::account_preflight_failed(store, key, error)
+    }
+    fn schedule_browser_tab_cleanup(self: &Arc<Self>, store: &Store) -> Result<()> {
+        if self.active.lock().map_err(|e|e.to_string())?.contains("channel:chrome") {return Ok(());}
+        for key in tasks::due_browser_tab_cleanups(store)? {
+            let job=store.job(&key)?;
+            let (config,_)=match self.generation_config(store,&job) {Ok(config)=>config,Err(_)=>continue};
+            let st=store.clone();
+            let channels=self.channels.clone();
+            let locks=project_worker_keys(store,vec!["channel:chrome".into(),format!("job:{key}")])?;
+            if self.spawn_exclusive_keys(locks,move || tasks::run_browser_tab_cleanup(&st,&key,&config,channels.as_ref())).is_ok() {
+                // One cleanup occupies the existing channel reservation. Remaining
+                // durable entries are available on the next scheduler pass.
+                break;
+            }
+        }
+        Ok(())
     }
     fn schedule_image_operation(self: &Arc<Self>, store: &Store, job: &Value) -> Result<()> {
         let state = s(job, "status");
@@ -6677,6 +6746,12 @@ mod image_scheduler_tests;
 #[cfg(test)]
 #[path = "chrome_queue_scheduler_tests.rs"]
 mod chrome_queue_scheduler_tests;
+#[cfg(test)]
+#[path = "chrome_legacy_binding_tests.rs"]
+mod chrome_legacy_binding_tests;
+#[cfg(test)]
+#[path = "chrome_cleanup_scheduler_tests.rs"]
+mod chrome_cleanup_scheduler_tests;
 
 #[cfg(test)]
 #[path = "project_lifecycle_tests.rs"]

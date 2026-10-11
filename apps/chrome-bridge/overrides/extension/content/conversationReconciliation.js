@@ -128,13 +128,16 @@
   async function nativeBoundary(record, expected, snapshot, facts) {
     const fail = reason => result(expected,'mismatch',reason);
     if(!/^[a-f0-9]{64}$/.test(expected.promptSha256||'')||!Number.isInteger(expected.imageCount)||expected.imageCount<1||expected.imageCount>4)return fail('invalid_expectation');
-    if(facts.userCount!==1||facts.assistantCount!==1||await digest(facts.userText)!==expected.promptSha256)return fail('dom_user_boundary');
+    if(facts.userCount!==1||![0,1].includes(facts.assistantCount)||await digest(facts.userText)!==expected.promptSha256)return fail('dom_user_boundary');
     if(snapshot.stopVisible||snapshot.streamingVisible||snapshot.hasError||snapshot.needsContinue||snapshot.needsConfirmation)return result(expected,'matched_incomplete','dom_generation_not_complete');
     const branch=branchOf(record,expected.conversationId);if(!branch)return result(expected,'unavailable','unsupported_branch');
     const users=branch.filter(n=>n.message?.author?.role==='user');if(users.length!==1)return fail('backend_user_boundary');
     const user=users[0].message,parts=user.content?.parts;if(typeof user.id!=='string'||!user.id)return fail('native_user_identity');
     if(!Array.isArray(parts))return result(expected,'unavailable','unsupported_user_content');
     const textParts=parts.filter(p=>typeof p==='string');if(!textParts.length||await digest(textParts.join('\n'))!==expected.promptSha256)return fail('backend_prompt');
+    // A fresh, submitted conversation can have its exact user turn before the
+    // assistant node exists. It cannot yield image adoption or byte bindings.
+    if(facts.assistantCount===0)return result(expected,'matched_incomplete','assistant_not_created');
     const userIndex=branch.indexOf(users[0]);const outputs=branch.slice(0,userIndex);const assistant=outputs.find(n=>n.message?.author?.role==='assistant')?.message;
     const schemaFacts=outputs.map(n=>({role:n.message?.author?.role,contentType:n.message?.content?.content_type,status:n.message?.status,endTurn:n.message?.end_turn}));
     if(!assistant?.id||assistant.status!=='finished_successfully'||assistant.end_turn!==true||(assistant.recipient&&assistant.recipient!=='all')||(assistant.channel&&assistant.channel!=='final'))return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts});
@@ -172,7 +175,8 @@
     try {
       const dom=globalThis.ChatGptTurnDom.createTurnDom(),turns=dom.getTurnNodes(),users=turns.filter(n=>dom.role(n)==='user'),assistants=turns.filter(n=>dom.role(n)==='assistant');
       const facts={userCount:users.length,assistantCount:assistants.length,userText:users[0]?.innerText||users[0]?.textContent||'',assistantText:normalize(assistants[0]?.innerText||assistants[0]?.textContent)};
-      if(facts.userCount!==1||facts.assistantCount!==1||await digest(facts.userText)!==expected.promptSha256)return result(expected,'mismatch','dom_user_boundary');
+      const pendingAssistant=facts.assistantCount===0 && deps.getActiveRequest?.()?.requestId===expected.requestId;
+      if(facts.userCount!==1||!(facts.assistantCount===1||pendingAssistant)||await digest(facts.userText)!==expected.promptSha256)return result(expected,'mismatch','dom_user_boundary',{domFacts:{userCount:facts.userCount,assistantCount:facts.assistantCount,promptMatches:await digest(facts.userText)===expected.promptSha256}});
       if(expected.mode!=='image_record_probe' && !deps.getActiveRequest?.() && !normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。'))return unavailable('released_task_marker');
       const endpoint=`${page.origin}/backend-api/conversation/${encodeURIComponent(expected.conversationId)}`;let response=await fetch(endpoint,options);
       if([401,403,404].includes(response.status)){const session=await fetch(`${page.origin}/api/auth/session`,options);if(!session.ok)return unavailable('authentication_unavailable');const token=(await session.json())?.accessToken;if(typeof token!=='string'||!token)return unavailable('authentication_unavailable');authHeaders={Authorization:`Bearer ${token}`};response=await fetch(endpoint,{...options,headers:authHeaders});}

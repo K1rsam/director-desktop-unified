@@ -4,6 +4,9 @@ use reqwest::blocking::Client;
 #[cfg(test)]
 #[path = "chrome_background_tests.rs"]
 mod background_tests;
+#[cfg(test)]
+#[path = "chrome_control_page_tests.rs"]
+mod control_page_tests;
 
 fn json_request(
     config: &ProviderConfig,
@@ -48,6 +51,60 @@ fn usable(value: &Value) -> bool {
         && value.get("activeRequest").is_none_or(Value::is_null)
 }
 
+fn control_launch(binding:&crate::chrome_setup::BrowserBinding)->String {
+    format!("bridge-director-control-{}",binding.profile_id)
+}
+fn same_browser_runtime(value:&Value,source:&Value,binding:&crate::chrome_setup::BrowserBinding)->bool {
+    value["transport"]=="extension" && value["browserIncognito"]==false
+        && value["browserProfileId"]==binding.profile_id && value["extensionBundleId"]==binding.bundle_id
+        && source["backgroundEpoch"].as_str().is_some_and(|s|!s.is_empty()) && value["backgroundEpoch"]==source["backgroundEpoch"]
+        && source["serverInstanceId"].as_str().is_some_and(|s|!s.is_empty()) && value["serverInstanceId"]==source["serverInstanceId"]
+}
+fn explicit_idle(value:&Value)->bool {usable(value) && value.get("activeRequest")==Some(&Value::Null)}
+fn same_idle_owned_source(value:&Value,source:&Value,binding:&crate::chrome_setup::BrowserBinding)->bool {
+    value["id"]==source["id"] && value["launchToken"]==source["launchToken"] && value["url"]==source["url"]
+        && same_browser_runtime(value,source,binding) && explicit_idle(value)
+        && value["focused"]==false && value["visibilityState"]=="hidden"
+}
+fn compatible_profile_clients(available:&[Value],source:&Value,binding:&crate::chrome_setup::BrowserBinding)->bool {
+    // Reject a copied profile even if the second runtime is busy or not ready.
+    available.iter().filter(|c|c["browserProfileId"]==binding.profile_id)
+        .all(|c|same_browser_runtime(c,source,binding))
+}
+fn keep_profile_control(config:&ProviderConfig,client:&Client,source:&Value,available:&[Value],binding:&crate::chrome_setup::BrowserBinding)->ProviderResult<bool> {
+    let launch=control_launch(binding);
+    let controls:Vec<_>=available.iter().filter(|c|c["launchToken"]==launch).collect();
+    if controls.len()>1 || controls.iter().any(|c|!same_browser_runtime(c,source,binding) || !explicit_idle(c)) {return Ok(false);}
+    if available.iter().any(|c|c["id"]!=source["id"] && same_browser_runtime(c,source,binding) && explicit_idle(c)) {return Ok(true);}
+    if !controls.is_empty(){return Ok(false);}
+    // The controller-specific extension operation durably holds uncertain opens;
+    // serialize local checks too, without storing or changing a generation job.
+    static OPENS:std::sync::OnceLock<std::sync::Mutex<()>>=std::sync::OnceLock::new();
+    let _guard=OPENS.get_or_init(Default::default).lock().map_err(|_|ProviderError::new("TAB_CONTROL_UNCONFIRMED","控制页创建状态未确认，保留完成页。"))?;
+    // Re-read under the local open guard. An earlier completed cleanup may have
+    // already established the one control page since our first client snapshot.
+    let latest=clients(config,client)?;
+    if !compatible_profile_clients(&latest,source,binding){return Ok(false);}
+    let controls:Vec<_>=latest.iter().filter(|c|c["launchToken"]==launch).collect();
+    if !controls.is_empty(){return Ok(controls.len()==1 && same_browser_runtime(controls[0],source,binding) && explicit_idle(controls[0]));}
+    let originals:Vec<_>=latest.iter().filter(|c|c["id"]==source["id"]).collect();
+    if originals.len()!=1 || !same_idle_owned_source(originals[0],source,binding) {return Ok(false);}
+    let opened=match json_request(config,client,"/browser/tabs/open",Some(&json!({"url":"https://chatgpt.com/","sourceClientId":source["id"],"active":false,"select":false,"launchToken":launch,"timeoutMs":8000,"allowSystemFallback":false})),false){Ok(value)=>value,Err(_)=>return Ok(false)};
+    let page=&opened["client"];
+    if opened["ok"]!=true || page["launchToken"]!=launch || page["id"]==source["id"]
+        || !page["id"].as_str().is_some_and(|s|!s.is_empty()) || page["url"]!="https://chatgpt.com/"
+        || !same_browser_runtime(page,source,binding) || !explicit_idle(page)
+        || page["focused"]!=false || page["visibilityState"]!="hidden"
+        || opened["tabState"]["active"]!=false || opened["tabState"]["autoDiscardable"]!=false || opened["tabState"]["discarded"]!=false {return Ok(false);}
+    let verified=clients(config,client)?;
+    if !compatible_profile_clients(&verified,source,binding){return Ok(false);}
+    let controls:Vec<_>=verified.iter().filter(|c|c["launchToken"]==launch).collect();
+    let originals:Vec<_>=verified.iter().filter(|c|c["id"]==source["id"]).collect();
+    if controls.len()!=1 || controls[0]["id"]!=page["id"] || !same_browser_runtime(controls[0],source,binding) || !explicit_idle(controls[0])
+        || originals.len()!=1 || !same_idle_owned_source(originals[0],source,binding) {return Ok(false);}
+    Ok(true)
+}
+
 pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &PreparedRequest, result: &QueryResult) -> ProviderResult<Value> {
     let task = result.task_id.as_str();
     let proof = &result.raw["nativeProof"];
@@ -68,18 +125,27 @@ pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &Prepared
     if matches.len() != 1 { return Err(ProviderError::new("TAB_CLEANUP_IDENTITY", "工作页身份不唯一，保留页面。")); }
     let owned = matches[0];
     let launch = format!("bridge-director-desktop-{task}");
-    if owned["launchToken"] != launch || !usable(owned) {
-        return Ok(json!({"status":"retained","reason":"ownership_or_idle_not_proven"}));
+    if owned["launchToken"] != launch {
+        return Ok(json!({"status":"retained","reason":"ownership_changed"}));
+    }
+    if !explicit_idle(owned) {
+        return Ok(json!({"status":"retained","reason":"idle_not_proven"}));
     }
     if owned["focused"] != false || owned["visibilityState"] != "hidden" {
         return Ok(json!({"status":"retained","reason":"user_viewing_or_visibility_unknown"}));
     }
-    if !available.iter().any(|c| c["id"] != source && usable(c)) {
-        return Ok(json!({"status":"retained","reason":"last_connected_page"}));
-    }
     let url = owned_conversation(owned)?;
     if url != original_conversation {
         return Ok(json!({"status":"retained","reason":"conversation_changed"}));
+    }
+    let Some(binding)=config.chrome_binding.as_ref() else {return Ok(json!({"status":"retained","reason":"last_connected_page"}));};
+    if crate::chrome_setup::browser_binding(&crate::chrome_setup::binding_settings(&wire::base(config,true)?,Some(binding))).is_err()
+        || prepared.wire.get("browserBinding").is_some_and(|frozen|serde_json::to_value(binding).ok().as_ref()!=Some(frozen))
+        || !same_browser_runtime(owned,owned,binding) || !compatible_profile_clients(&available,owned,binding) {
+        return Ok(json!({"status":"retained","reason":"ownership_changed"}));
+    }
+    if !keep_profile_control(config,&client,owned,&available,binding)? {
+        return Ok(json!({"status":"retained","reason":"last_connected_page"}));
     }
     let response = json_request(config, &client, "/browser/tabs/close", Some(&json!({
         "sourceClientId":source,"expectedLaunchToken":launch,
@@ -93,7 +159,7 @@ pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &Prepared
 
 pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
     let health = crate::chrome_setup::inspect(
-        &json!({"chromeEndpoint":wire::base(config,true)?}),
+        &crate::chrome_setup::binding_settings(&wire::base(config,true)?,config.chrome_binding.as_ref()),
         &wire::credential(config,true)?,
     ).map_err(|message|ProviderError::new("BRIDGE_OFFLINE",message))?;
     if health["status"] == "busy" {
@@ -217,13 +283,11 @@ pub(super) fn prepare(
             "任务标签页已存在，请核对原关联码；不会重复创建或发送。",
         ));
     }
-    let opener = crate::chrome_setup::execution_client(&available)
-        .ok_or_else(|| {
-            ProviderError::new(
-                "BROWSER_SELECTION_REQUIRED",
-                "请在 Chrome Bridge 中选择一个已连接的 ChatGPT 标签页。",
-            )
-        })?;
+    let binding=config.chrome_binding.as_ref().ok_or_else(||ProviderError::new("BROWSER_BINDING_REQUIRED","请在软件设置连接并绑定 Chrome 执行浏览器；旧任务只核对原页面，不重新发送。"))?;
+    crate::chrome_setup::browser_binding(&crate::chrome_setup::binding_settings(&wire::base(config,true)?,Some(binding)))
+        .map_err(|message|ProviderError::new("BROWSER_BINDING_REQUIRED",message))?;
+    let opener=crate::chrome_setup::profile_execution_client(&available,binding)
+        .map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?;
     let opener_id = opener
         .get("id")
         .and_then(Value::as_str)
@@ -242,6 +306,8 @@ pub(super) fn prepare(
         .ok_or_else(|| ProviderError::new("TAB_OPEN_UNKNOWN", "标签页创建回执未确认。"))?;
     if opened.get("ok").and_then(Value::as_bool) != Some(true)
         || tab.get("launchToken").and_then(Value::as_str) != Some(launch.as_str())
+        || tab["browserProfileId"] != binding.profile_id || tab["browserIncognito"] != false
+        || tab["extensionBundleId"] != binding.bundle_id || tab["backgroundEpoch"] != opener["backgroundEpoch"]
         || !usable(tab)
     {
         return Err(ProviderError::new(
@@ -343,7 +409,7 @@ pub(super) fn prepare(
         request: frozen,
         capability_version: caps.version,
         upload_receipts: receipts,
-        wire: json!({"id":request.request_id,"message":message,"attachments":attachments,"newSession":false,"sourceClientId":source_id,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
+        wire: json!({"id":request.request_id,"message":message,"attachments":attachments,"newSession":false,"sourceClientId":source_id,"browserBinding":binding,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
         estimated_cost: None,
         prepared_at: now(),
     })
@@ -360,6 +426,12 @@ pub(super) fn submit(
             "TAB_IDENTITY_CHANGED",
             "任务标签页身份已变化。",
         ));
+    }
+    if let Some(frozen)=prepared.wire.get("browserBinding") {
+        if source["browserProfileId"]!=frozen["profileId"] || source["extensionBundleId"]!=frozen["bundleId"] || source["browserIncognito"]!=false
+            || serde_json::to_value(&config.chrome_binding).ok().as_ref()!=Some(frozen) {
+            return Err(ProviderError::new("BROWSER_BINDING_CHANGED","任务原浏览器绑定已变化，未发送请求；请核对原工作页。"));
+        }
     }
     let mut body = prepared.wire.clone();
     body.as_object_mut()
@@ -525,10 +597,6 @@ pub(super) fn query_with_prepared(
     let original_source = prepared.and_then(|p| p.wire["sourceClientId"].as_str())
         .or_else(|| turn["input"]["sourceClientId"].as_str());
     let source = original_client_for(config, &client, id, true, original_source)?;
-    let conversation = owned_conversation(&source)?;
-    if let Some(original) = turn["output"]["response"]["session"]["id"].as_str() {
-        if original != conversation { return Err(ProviderError::new("IMAGE_PROVENANCE", "原任务与当前会话身份不一致。")); }
-    }
     // Stable request ID + owned tab + native conversation permit exact source reconciliation.
     if prepared
         .is_some_and(|p| p.request.request_id != id || p.wire["sourceClientId"] != source["id"])
@@ -538,6 +606,13 @@ pub(super) fn query_with_prepared(
             "IMAGE_PROVENANCE",
             "保存的准备快照与任务标签页身份不一致。",
         ));
+    }
+    if let Some(pending) = homepage_preparation_pending(turn, &source, id, prepared)? {
+        return Ok(pending);
+    }
+    let conversation = owned_conversation(&source)?;
+    if let Some(original) = turn["output"]["response"]["session"]["id"].as_str() {
+        if original != conversation { return Err(ProviderError::new("IMAGE_PROVENANCE", "原任务与当前会话身份不一致。")); }
     }
     let prompt_hash = prepared
         .and_then(|p| p.wire["metadata"]["promptSha256"].as_str())
@@ -596,6 +671,44 @@ pub(super) fn query_with_prepared(
         actual_cost: None,
         raw: json!({"turn":turn,"recoveredResponse":recovered["result"],"nativeProof":proof,"progress":{"phase":"image_verified","message":"网页原图已核对，正在下载并保存到资产。","checkedAt":now()}}),
     })
+}
+
+// The bridge can accept a turn while its owned blank page is still uploading
+// references or creating the first conversation. This is not native image proof:
+// only exact frozen inputs may wait, with a fixed original-start deadline.
+fn homepage_preparation_pending(turn: &Value, source: &Value, id: &str, prepared: Option<&PreparedRequest>) -> ProviderResult<Option<QueryResult>> {
+    let homepage = source["url"].as_str().and_then(|s| reqwest::Url::parse(s).ok())
+        .is_some_and(|u| u.origin().ascii_serialization() == "https://chatgpt.com"
+            && u.path() == "/" && u.query().is_none() && u.fragment().is_none());
+    if !homepage { return Ok(None); }
+    let invalid = || ProviderError::new("IMAGE_PROVENANCE", "首页等待缺少本次原任务的完整身份，保留记录，不会重新发送。");
+    let p = prepared.ok_or_else(invalid)?;
+    let message = p.wire["message"].as_str().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    let hash = hex_hash(message.split_whitespace().collect::<Vec<_>>().join(" ").as_bytes());
+    if p.provider != "chrome" || p.request.kind != "image" || p.request.request_id != id
+        || p.wire["id"] != id || turn["id"] != id
+        || p.wire["sourceClientId"] != source["id"] || turn["input"]["sourceClientId"] != source["id"]
+        || source["launchToken"] != format!("bridge-director-desktop-{id}")
+        || p.wire["metadata"]["jobId"] != id || turn["input"]["metadata"]["jobId"] != id
+        || p.wire["metadata"]["promptSha256"] != hash || turn["input"]["metadata"]["promptSha256"] != hash
+        || turn["input"]["message"].as_str() != Some(message.trim())
+        || !p.wire["attachments"].is_array() || turn["input"]["attachments"] != p.wire["attachments"]
+        || !["running", "queued"].contains(&turn["status"].as_str().unwrap_or(""))
+        || !turn["error"].is_null() && turn["error"] != json!({})
+        || turn["output"]["response"]["session"]["id"].as_str().is_some_and(|s| !s.is_empty())
+        || turn["input"]["sessionId"].as_str().is_some_and(|s| !s.is_empty()) {
+        return Err(invalid());
+    }
+    let started = turn["createdAt"].as_str().unwrap_or(&p.prepared_at);
+    let started = chrono::DateTime::parse_from_rfc3339(started).map_err(|_| invalid())?;
+    let age = chrono::Utc::now().signed_duration_since(started);
+    if age < chrono::Duration::zero() || age >= chrono::Duration::minutes(5) {
+        return Err(ProviderError::new("IMAGE_PREPARATION_TIMEOUT", "原任务超过 5 分钟仍未进入生成会话，需检查网页上传或连接；保留原任务，不会重新发送。"));
+    }
+    Ok(Some(QueryResult { task_id:id.into(), status:"processing".into(), result_urls:vec![],
+        error:None, actual_cost:None, raw:json!({"turn":turn,"progress":{"phase":"preparing_submission",
+            "message":"网页正在上传参考图或创建本次会话，完成后自动继续回收原图。","checkedAt":now(),
+            "preparationDeadline":(started + chrono::Duration::minutes(5)).to_rfc3339()}}) }))
 }
 
 fn owned_conversation(source: &Value) -> ProviderResult<String> {
@@ -708,7 +821,7 @@ mod tests {
             let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"turn":turn}),json!({"ok":true,"clients":[source]}),json!({"ok":true,"result":response})]);
             let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
             std::env::set_var(&env,"synthetic-not-a-real-credential");
-            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
             let result=query(&config,id).unwrap();
             std::env::remove_var(env);
             fixture.thread.join().unwrap();
@@ -745,7 +858,7 @@ mod tests {
             let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"clients":[source]})]);
             let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
             std::env::set_var(&env,"synthetic-not-a-real-credential");
-            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
             assert_eq!(original_client_for(&config,&wire::client(5).unwrap(),id,true,original).is_ok(),allowed);
             std::env::remove_var(env);
             fixture.thread.join().unwrap();

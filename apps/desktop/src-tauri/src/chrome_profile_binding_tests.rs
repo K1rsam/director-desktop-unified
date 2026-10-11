@@ -1,0 +1,49 @@
+//! Profile identity fixtures only; no real browser, account, or project is touched.
+use super::*;
+const PROFILE: &str="b84d4521-56ba-4f84-9948-090f82d639e7";
+const OTHER: &str="f913ed04-6d73-4f40-bd74-040418327d79";
+fn page(id: &str, profile: &str, epoch: &str) -> Value {
+    json!({"id":id,"url":"https://chatgpt.com/","ready":true,"transport":"extension","compatible":true,
+        "browserProfileId":profile,"browserIncognito":false,"backgroundEpoch":epoch,"extensionBundleId":"bundle","serverInstanceId":"server"})
+}
+fn binding() -> BrowserBinding {BrowserBinding{profile_id:PROFILE.into(),endpoint:"http://127.0.0.1:53179".into(),bundle_id:"bundle".into()}}
+#[test] fn chrome_binding_tracks_profile_across_new_tabs_and_worker_epochs_without_switching_profiles() {
+    let mut other=page("other",OTHER,"other-epoch");other["selected"]=json!(true);
+    for epoch in ["before-restart","after-restart"] {
+        let pages=vec![page("new-home",PROFILE,epoch),page("new-other",PROFILE,epoch),other.clone()];
+        let chosen=profile_execution_client(&pages,&binding()).unwrap();
+        assert_eq!(chosen["browserProfileId"],PROFILE);assert_ne!(chosen["id"],"other");
+    }
+    assert!(profile_execution_client(&[other],&binding()).is_err());
+}
+#[test] fn chrome_binding_refuses_uuid_collisions_hidden_incognito_legacy_and_wrong_bundle() {
+    let mut busy_duplicate=page("copy",PROFILE,"another-epoch");busy_duplicate["activeRequest"]=json!({"id":"old-task"});
+    assert!(profile_execution_client(&[page("one",PROFILE,"epoch"),busy_duplicate],&binding()).is_err());
+    for (field,value) in [("browserIncognito",json!(true)),("browserProfileId",json!("")),("extensionBundleId",json!("other-bundle")),("backgroundEpoch",json!("")),("serverInstanceId",json!(""))] {
+        let mut wrong=page("one",PROFILE,"epoch");wrong[field]=value;
+        assert!(profile_execution_client(&[wrong],&binding()).is_err(),"{field}");
+    }
+}
+#[test] fn chrome_binding_auto_suggestion_is_unique_complete_and_manual_choice_checks_collision() {
+    let settings=json!({"chromeEndpoint":binding().endpoint});
+    let one=profiles(&[page("one",PROFILE,"epoch"),page("two",PROFILE,"epoch")]);
+    let observed=json!({"browserProfiles":one,"unidentifiedClients":0});
+    let patch=binding_patch(&settings,&observed,None).unwrap().unwrap();assert_eq!(patch["chromeProfileId"],PROFILE);
+    assert!(binding_patch(&settings,&json!({"browserProfiles":profiles(&[page("a",PROFILE,"a"),page("b",OTHER,"b")]),"unidentifiedClients":0}),None).unwrap().is_none());
+    assert!(binding_patch(&settings,&json!({"browserProfiles":observed["browserProfiles"],"unidentifiedClients":1}),None).unwrap().is_none());
+    assert!(binding_patch(&settings,&json!({"browserProfiles":profiles(&[page("a",PROFILE,"a"),page("copy",PROFILE,"b")]),"unidentifiedClients":0}),Some(PROFILE)).is_err());
+    assert!(binding_patch(&settings,&observed,Some(OTHER)).is_err());
+    assert!(binding_patch(&binding_settings(&binding().endpoint,Some(&binding())),&observed,None).unwrap().is_none());
+}
+#[test] fn chrome_binding_global_roundtrip_does_not_change_old_settings_and_rejects_partial_endpoint_switch() {
+    let home=tempfile::tempdir().unwrap();let doc=crate::app_settings::initialize(home.path(),&json!([]),None).unwrap();
+    let old=json!({"chromeEndpoint":"http://127.0.0.1:53179","sourceClientId":"original-tab","originalPrepared":{"task":"old"}});
+    let patch=json!({"chromeProfileId":PROFILE,"chromeProfileEndpoint":binding().endpoint,"chromeProfileBundleId":"bundle"});
+    let saved=crate::app_settings::save(home.path(),&patch,doc["revision"].as_u64().unwrap()).unwrap();
+    let reopened=crate::app_settings::load(home.path()).unwrap().unwrap();assert_eq!(saved,reopened);
+    assert_eq!(old["originalPrepared"]["task"],"old");assert!(old.get("chromeProfileId").is_none());
+    let effective=crate::app_settings::effective_from(&saved,&old);assert_eq!(browser_binding(&effective).unwrap().unwrap().profile_id,PROFILE);
+    assert!(browser_binding(&json!({"chromeEndpoint":"http://127.0.0.1:9999","chromeProfileId":PROFILE,"chromeProfileEndpoint":binding().endpoint,"chromeProfileBundleId":"bundle"})).is_err());
+    assert!(crate::app_settings::save(home.path(),&json!({"chromeProfileId":OTHER}),saved["revision"].as_u64().unwrap()).is_err());
+    assert!(browser_binding(&old).unwrap().is_none());
+}

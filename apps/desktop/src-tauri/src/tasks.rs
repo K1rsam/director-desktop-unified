@@ -12,6 +12,9 @@ use std::path::Path;
 #[cfg(test)]
 #[path = "tasks_chrome_queue_tests.rs"]
 mod chrome_queue_tests;
+#[cfg(test)]
+#[path = "tasks_chrome_cleanup_tests.rs"]
+pub(crate) mod chrome_cleanup_tests;
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
@@ -651,20 +654,103 @@ pub fn download_result(
     }
     store.complete_download(key,&json!({"taskId":result.task_id,"resultUrls":result.result_urls,"mediaIds":media_ids,"actualCost":result.actual_cost,"raw":result.raw}),&media_ids)?;
     if cfg.kind == "chrome" {
-        // Completion is durable before any browser side effect. Failure to close a tab
-        // must never turn imported media back into a download/generation retry.
-        let completed = store.job(key)?;
-        if s(&completed, "status") == "downloaded" && !media_ids.is_empty() {
-            let cleanup = serde_json::from_value::<PreparedRequest>(completed["prepared"].clone())
-                .map_err(|_| "原准备快照无法核对，保留工作页。".to_owned())
-                .and_then(|p| channels.release_completed_tab(cfg, &p, result).map_err(|e| e.message));
-            let event = match cleanup {
-                Ok(details) => json!({"details":details,"generationCalled":false}),
-                Err(message) => json!({"status":"retained","message":message,"generationCalled":false}),
-            };
-            let _ = store.event(key, "browser_tab_cleanup", &event);
-        }
+        // Persist the independent cleanup intent before the side effect. A busy
+        // page or restart cannot strand it or re-enter generation/download.
+        queue_browser_tab_cleanup(store, key)?;
+        let _ = run_browser_tab_cleanup(store, key, cfg, channels);
     }
+    Ok(())
+}
+
+fn cleanup_key(job: &str) -> String { format!("browser_tab_cleanup:{job}") }
+
+pub(crate) fn queue_browser_tab_cleanup(store: &Store, key: &str) -> Result<()> {
+    let pending = json!({"status":"pending","nextAttemptAt":0,"attempts":0,"outcome":null});
+    store.conn()?.execute("INSERT OR IGNORE INTO metadata(key,value) SELECT ?1,?2 FROM jobs j WHERE j.id=?3 AND j.provider='chrome' AND j.kind='image' AND j.state='downloaded' AND COALESCE(j.task_id,'')<>'' AND EXISTS(SELECT 1 FROM job_media WHERE job_id=j.id)",rusqlite::params![cleanup_key(key),pending.to_string(),key]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+/// Backfill historical completions once. Only compact receipts are inspected here;
+/// original files are verified by the due worker, never on every scheduler tick.
+pub(crate) fn due_browser_tab_cleanups(store: &Store) -> Result<Vec<String>> {
+    let c=store.conn()?;
+    let pending=json!({"status":"pending","nextAttemptAt":0,"attempts":0,"outcome":null,"legacyBackfill":true}).to_string();
+    c.execute("INSERT OR IGNORE INTO metadata(key,value) SELECT 'browser_tab_cleanup:'||j.id,?1 FROM jobs j WHERE j.provider='chrome' AND j.kind='image' AND j.state='downloaded' AND COALESCE(j.task_id,'')<>'' AND j.prepared IS NOT NULL AND json_extract(j.result,'$.raw.nativeProof.status')='matched_complete' AND EXISTS(SELECT 1 FROM job_media WHERE job_id=j.id)",[pending]).map_err(|e|e.to_string())?;
+    let mut q=c.prepare("SELECT j.id FROM metadata m JOIN jobs j ON m.key='browser_tab_cleanup:'||j.id WHERE json_extract(m.value,'$.status')='pending' AND COALESCE(json_extract(m.value,'$.nextAttemptAt'),0)<=?1 AND j.provider='chrome' AND j.kind='image' AND j.state='downloaded' ORDER BY COALESCE(json_extract(m.value,'$.nextAttemptAt'),0),j.updated_at,j.rowid").map_err(|e|e.to_string())?;
+    let ids=q.query_map([chrono::Utc::now().timestamp()],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    Ok(ids)
+}
+
+fn completed_browser_material(store: &Store, job: &Value) -> Result<(PreparedRequest,QueryResult)> {
+    if s(job,"provider")!="chrome" || s(job,"kind")!="image" || s(job,"status")!="downloaded" || s(job,"providerTaskId").is_empty() {
+        return Err("completion_not_proven".into());
+    }
+    let prepared: PreparedRequest=serde_json::from_value(job["prepared"].clone()).map_err(|_|"prepared_identity_missing")?;
+    let frozen_request=generation_request(&job["snapshot"]).map_err(|_|"prepared_identity_missing")?;
+    let task=s(job,"providerTaskId");
+    let proof=&job["result"]["raw"]["nativeProof"];
+    if prepared.provider!="chrome" || prepared.request.kind!="image" || prepared.request.request_id!=task
+        || s(&job["result"],"taskId")!=task || s(&job["snapshot"],"requestId")!=task
+        || proof["status"]!="matched_complete" || proof["proofVersion"]!=2 || proof["requestId"]!=task
+        || proof["promptSha256"]!=prepared.wire["metadata"]["promptSha256"]
+        || s(proof,"promptSha256").is_empty()
+        || serde_json::to_value(&prepared.request).map_err(|_|"prepared_identity_missing")?!=serde_json::to_value(&frozen_request).map_err(|_|"prepared_identity_missing")?
+        || s(proof,"conversationId").is_empty() || s(&prepared.wire,"sourceClientId").is_empty() {
+        return Err("completed_identity_mismatch".into());
+    }
+    let urls=job["result"]["resultUrls"].as_array().ok_or("completed_outputs_missing")?.iter().map(|url|url.as_str().filter(|s|!s.is_empty()).map(str::to_owned).ok_or("completed_outputs_missing")).collect::<std::result::Result<Vec<_>,_>>()?;
+    let ids=job["resultMediaIds"].as_array().filter(|ids|!ids.is_empty()).ok_or("completed_media_missing")?;
+    if urls.is_empty() || ids.len()<urls.len() {return Err("completed_media_missing".into());}
+    let c=store.conn()?;
+    for id in ids {
+        let id=id.as_str().ok_or("completed_media_missing")?;
+        let linked:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM job_media WHERE job_id=?1 AND media_id=?2)",rusqlite::params![s(job,"id"),id],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let media=store.get("media",id).map_err(|_|"completed_media_missing")?;
+        if !linked || s(&media,"kind")!="image" || store.verify_media(&media).is_err() {return Err("completed_media_invalid".into());}
+    }
+    Ok((prepared,QueryResult{task_id:task.into(),status:"succeeded".into(),result_urls:urls,error:None,actual_cost:job["result"]["actualCost"].as_f64(),raw:job["result"]["raw"].clone()}))
+}
+
+/// Cleanup-only: this function has no query, submit, prepare or download path.
+pub(crate) fn run_browser_tab_cleanup(store: &Store, key: &str, cfg: &ProviderConfig, channels: &dyn Channels) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[cleanup_key(key)],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+    let Some(raw)=raw else{return Ok(());};
+    let mut state:Value=serde_json::from_str(&raw).map_err(|e|e.to_string())?;
+    if state["status"]!="pending" || state["nextAttemptAt"].as_i64().unwrap_or(0)>chrono::Utc::now().timestamp() {return Ok(());}
+    let job=store.job(key)?;
+    let (status,outcome)=match completed_browser_material(store,&job) {
+        Err(reason)=>("retained",json!({"status":"retained","reason":reason})),
+        Ok((prepared,result)) if cfg.kind=="chrome" => match channels.release_completed_tab(cfg,&prepared,&result) {
+            Ok(mut details)=>{
+                let status=match (s(&details,"status"),s(&details,"reason")) {
+                    ("already_closed",_) if state["closeRequested"]==true=>"done",
+                    ("already_closed",_)=>{details["reason"]=json!("page_absence_unproven");"retained"},
+                    ("closed",_)=>"done",
+                    ("close_requested",_)=>"pending",
+                    ("retained","idle_not_proven"|"user_viewing_or_visibility_unknown"|"last_connected_page")=>"pending",
+                    _=>"retained",
+                };
+                (status,details)
+            },
+            Err(error)=>{
+                let terminal=matches!(error.code.as_str(),"TAB_CLEANUP_IDENTITY"|"IMAGE_PROVENANCE"|"TAB_IDENTITY_CHANGED"|"INVALID_ENDPOINT"|"INVALID_CREDENTIAL_ENV");
+                (if terminal {"retained"} else {"pending"},json!({"status":"retained","reason":error.code}))
+            }
+        },
+        _=>("retained",json!({"status":"retained","reason":"provider_mismatch"})),
+    };
+    let changed=state["status"]!=status || state["outcome"]!=outcome;
+    state["status"]=json!(status);
+    if outcome["status"]=="close_requested" {state["closeRequested"]=json!(true);}
+    state["attempts"]=json!(state["attempts"].as_u64().unwrap_or(0)+1);
+    state["nextAttemptAt"]=json!(if status=="pending" {chrono::Utc::now().timestamp()+if outcome["status"]=="close_requested" {15} else {60}} else {0});
+    state["outcome"]=outcome.clone();
+    let mut c=store.conn()?;
+    let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    let written=tx.execute("UPDATE metadata SET value=?2 WHERE key=?1 AND value=?3",rusqlite::params![cleanup_key(key),state.to_string(),raw]).map_err(|e|e.to_string())?;
+    if written==1 && changed {tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'browser_tab_cleanup',?2,?3)",rusqlite::params![key,json!({"status":status,"details":outcome,"generationCalled":false}).to_string(),now()]).map_err(|e|e.to_string())?;}
+    tx.commit().map_err(|e|e.to_string())?;
     Ok(())
 }
 pub fn reconcile(

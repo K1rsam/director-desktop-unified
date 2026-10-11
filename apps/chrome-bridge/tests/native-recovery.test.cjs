@@ -32,7 +32,7 @@ async function fixture(options = {}) {
   const image = { isConnected: true, src: options.blob ? 'blob:https://chatgpt.com/synthetic' : '', currentSrc: '', naturalWidth: 0, naturalHeight: 0, closest: () => ({}), getAttribute: () => '' };
   const user = { isConnected: true, innerText: options.domPrompt || prompt, querySelectorAll: () => [] };
   const assistant = { isConnected: true, innerText: '', querySelectorAll: () => [image] };
-  const turns = [user, assistant];
+  const turns = [user, ...(options.noAssistant ? [] : [assistant]), ...(options.extraUser ? [user] : []), ...(options.extraAssistant ? [assistant] : [])];
   let reads = 0;
   const context = vm.createContext({ URL, AbortController, TextEncoder, TextDecoder, Uint8Array, Response, crypto: webcrypto, setTimeout, clearTimeout,
     location: { href: `https://chatgpt.com/c/${conversationId}`, pathname: `/c/${conversationId}` }, document: { title: 'Synthetic owned tab' },
@@ -42,6 +42,7 @@ async function fixture(options = {}) {
       assert.equal(init.method || 'GET', 'GET', 'recovery cannot submit prompts or create jobs');
       if (url.endsWith(`/backend-api/conversation/${conversationId}`)) {
         const value = record();
+        if(options.noAssistant){value.current_node='user-node';delete value.mapping['assistant-node'];}
         reads++;
         if (options.backendPrompt) value.mapping['user-node'].message.content.parts = [options.backendPrompt];
         if (options.status) value.mapping['assistant-node'].message.status = options.status;
@@ -96,6 +97,19 @@ test('released task downloads its native original bytes only after exact branch 
     f.user.innerText = 'edited after proof';
     assert.equal(f.proof.downloadBytes(artifact, originalUrl), null, 'edited DOM revokes byte binding');
     assert.equal(f.proof.key(f.user), '');
+  }
+});
+
+test('exact active user turn waiting for its first assistant is processing, never image success', async () => {
+  const f=await fixture({noAssistant:true,active:{requestId}});
+  const r=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(r.status,'matched_incomplete');assert.equal(r.reason,'assistant_not_created');
+  assert.equal(f.calls.length,1);assert.equal(f.proof.imageReady(f.image),false);
+  for(const options of [{noAssistant:true},{noAssistant:true,active:{requestId},backendPrompt:'other'},
+    {noAssistant:true,active:{requestId},domPrompt:'other'},{extraUser:true,active:{requestId}},
+    {extraAssistant:true,active:{requestId}}]){
+    const rejected=await fixture(options),proof=await rejected.proof.read(rejected.expected,rejected.snapshot(),rejected.deps);
+    assert.equal(proof.status,'mismatch');assert.equal(rejected.proof.imageReady(rejected.image),false);
   }
 });
 

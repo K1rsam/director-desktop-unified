@@ -80,7 +80,7 @@ test('channel cards keep one connection flow and save current input before check
     const policy = await server.ssrLoadModule('/src/executionPolicy.ts');
     const { SettingsPanel, ProjectSettingsPanel } = await server.ssrLoadModule('/src/Panels.tsx');
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
-    policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['files.choose', 'runtime.status', 'chrome.status', 'chrome.check', 'chrome.connect', 'chrome.open', 'settings.global.save', 'providers.refresh', 'textCli.login', 'dreamina.login', 'dreamina.status', 'readiness.check', 'runtime.prepare'] });
+    policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['files.choose', 'runtime.status', 'chrome.status', 'chrome.check', 'chrome.connect', 'chrome.open', 'chrome.bind', 'settings.global.save', 'providers.refresh', 'textCli.login', 'dreamina.login', 'dreamina.status', 'readiness.check', 'runtime.prepare'] });
     const makeSettings = () => ({ schemaVersion: 'app-settings/v1', revision: 0, providers: structuredClone(previewWorkspace.providers), rules: [], settings: { textProvider: 'api', bhEndpoint: 'https://old.example.test', bhAccountId: 'stable-bh', chromeAccountId: 'stable-chrome', codexPath: '/synthetic/codex', textSdkNodePath: '/synthetic/node', dreaminaPath: '/synthetic/dreamina' } });
 
     await t.test('one card for each channel, with no Canvas or editable program paths', async () => {
@@ -393,6 +393,24 @@ test('channel cards keep one connection flow and save current input before check
         const nodes = view.render(React.createElement(SettingsPanel, { appSettings, writable: true, mutate }));
         assert.equal(check(nodes, 'bh').props.disabled, false, 'cancelled operation cannot leave the controls stuck busy');
       } finally { view.unmount(); }
+    });
+    await t.test('Chrome profile selection binds once globally and preserves the returned revision without touching projects', async () => {
+      const first='b84d4521-56ba-4f84-9948-090f82d639e7',second='f913ed04-6d73-4f40-bd74-040418327d79';
+      const view=hookRenderer(),appSettings=makeSettings(),writes: any[]=[];
+      let bound='';
+      chromeRespond=async()=>({...chromeReport,status:bound?'ready':'needs_selection',clients:2,usableClients:2,boundProfileId:bound,browserProfiles:[{profileId:first,bundleId:'bundle',collision:false},{profileId:second,bundleId:'bundle',collision:true}]});
+      const mutate=async(action: string,values: any)=>{writes.push({action,...values});if(action==='chrome.bind')bound=values.profileId;return {...appSettings,revision:5,settings:{...appSettings.settings,chromeProfileId:first,chromeProfileEndpoint:'http://127.0.0.1:53179',chromeProfileBundleId:'bundle'}};};
+      const element=React.createElement(SettingsPanel,{appSettings,writable:true,mutate});
+      try {
+        view.render(element);await settle();let nodes=view.render(element);
+        const select=nodes.find(node=>node.type==='select'&&node.props['aria-label']==='Chrome 执行浏览器');assert.ok(select);
+        assert.equal(nodes.find(node=>node.type==='option'&&node.props.value===second)?.props.disabled,true);
+        select.props.onChange({target:{value:first}});await settle();nodes=view.render(element);
+        assert.equal(writes.length,1);assert.deepEqual(writes[0],{action:'chrome.bind',profileId:first});assert.equal((writes[0] as Record<string,unknown>).projectId,undefined);
+        assert.equal(nodes.find(node=>node.type==='select'&&node.props['aria-label']==='Chrome 执行浏览器')?.props.value,first);
+        const form=nodes.find(node=>node.type==='form');assert.ok(form);await form.props.onSubmit({preventDefault(){}});await settle();
+        assert.equal(writes[1].expectedRevision,5);assert.equal(writes[1].settings.chromeProfileId,first);
+      } finally {view.unmount();}
     });
     await t.test('project production saves include fantasy preferences and exclude software connections', async () => {
       const view = hookRenderer(), writes: any[] = [];

@@ -621,6 +621,7 @@ mod tests {
             credential_env: None,
             cli_path: None,
             bridge_token_env: None,
+            chrome_binding: None,
             timeout_seconds: 10,
             adapted_models: Vec::new(),
         }

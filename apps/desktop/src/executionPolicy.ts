@@ -62,7 +62,7 @@ const GENERATION_ACTIONS = new Set([
   'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',
 ]);
 const PROVIDER_ACTIONS = new Set([
-  'runtime.prepare', 'chrome.connect', 'chrome.check', 'chrome.open', 'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
+  'runtime.prepare', 'chrome.connect', 'chrome.check', 'chrome.open', 'chrome.bind', 'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
 ]);
 const CREDENTIAL_ACTIONS = new Set([
   'canvas.login', 'canvas.loginStatus', 'canvas.openAuthorization', 'canvas.cancelLogin', 'canvas.logout',

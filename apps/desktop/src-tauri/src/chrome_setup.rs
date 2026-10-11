@@ -1,6 +1,7 @@
 //! Restore the installed browser bridge without opening a turn or replaying a job.
 //! Legacy configuration is read only. A newly started bridge uses app-owned data.
 use crate::store::{atomic_json, s, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, io::Read, net::{SocketAddr, TcpStream}, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Duration, Instant}};
 
@@ -8,6 +9,67 @@ const VERSION: &str = "chrome-setup/v1";
 const COMPONENT: &str = "Programs/Director-3008-ChatGPT-Bridge/671815e";
 const CONNECTION: &str = "chrome-connection.json";
 const STATUS: &str = "chrome-status.json";
+#[cfg(test)]
+#[path = "chrome_profile_binding_tests.rs"]
+mod profile_binding_tests;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserBinding { pub profile_id: String, pub endpoint: String, pub bundle_id: String }
+pub fn browser_binding(settings: &Value) -> Result<Option<BrowserBinding>> {
+    let id=s(settings,"chromeProfileId"); let bound_endpoint=s(settings,"chromeProfileEndpoint"); let bundle=s(settings,"chromeProfileBundleId");
+    if id.is_empty() && bound_endpoint.is_empty() && bundle.is_empty() { return Ok(None); }
+    if !valid_profile_id(id) || bundle.is_empty() || bound_endpoint.is_empty()
+        || endpoint(settings)?.as_str().trim_end_matches('/') != bound_endpoint {
+        return Err("Chrome 执行浏览器绑定与当前连接不一致，请在软件设置重新选择；未改用其他浏览器。".into());
+    }
+    Ok(Some(BrowserBinding{profile_id:id.into(),endpoint:bound_endpoint.into(),bundle_id:bundle.into()}))
+}
+pub fn binding_settings(base: &str, binding: Option<&BrowserBinding>) -> Value {
+    let mut settings=json!({"chromeEndpoint":base});
+    if let Some(binding)=binding {settings["chromeProfileId"]=json!(binding.profile_id);settings["chromeProfileEndpoint"]=json!(binding.endpoint);settings["chromeProfileBundleId"]=json!(binding.bundle_id);}
+    settings
+}
+fn valid_profile_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==value)
+}
+fn profile_clients(clients: &[Value]) -> Vec<&Value> {
+    clients.iter().filter(|c| c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true
+        && c["transport"]=="extension" && c["browserIncognito"]==false
+        && c["browserProfileId"].as_str().is_some_and(valid_profile_id)
+        && c["backgroundEpoch"].as_str().is_some_and(|s|!s.is_empty())
+        && c["extensionBundleId"].as_str().is_some_and(|s|!s.is_empty())
+        && c["serverInstanceId"].as_str().is_some_and(|s|!s.is_empty())).collect()
+}
+fn profile_collision(clients: &[Value], profile: &str) -> bool {
+    let runtimes: std::collections::BTreeSet<_>=profile_clients(clients).iter().filter(|c|c["browserProfileId"]==profile)
+        .map(|c|(c["backgroundEpoch"].to_string(),c["extensionBundleId"].to_string(),c["serverInstanceId"].to_string())).collect();
+    runtimes.len()>1
+}
+pub(crate) fn profile_execution_client<'a>(clients: &'a [Value], binding: &BrowserBinding) -> Result<&'a Value> {
+    if profile_collision(clients,&binding.profile_id) {return Err("Chrome 浏览器身份出现多个运行实例，已停止新提交；请核对复制的浏览器配置。".into());}
+    let filtered: Vec<Value>=profile_clients(clients).into_iter().filter(|c|c["browserProfileId"]==binding.profile_id && c["extensionBundleId"]==binding.bundle_id).cloned().collect();
+    let chosen=execution_client(&filtered).ok_or("已绑定的 Chrome 浏览器未连接或正在忙碌，请重新连接原浏览器；未改用其他浏览器。")?;
+    clients.iter().find(|c|c["id"]==chosen["id"]).ok_or("Chrome 执行页面身份未确认。".into())
+}
+fn profiles(clients: &[Value]) -> Vec<Value> {
+    let mut groups=std::collections::BTreeMap::new();
+    for client in profile_clients(clients) {
+        let id=s(client,"browserProfileId");
+        groups.entry(id.to_owned()).or_insert_with(||json!({"profileId":id,"bundleId":client["extensionBundleId"],"collision":profile_collision(clients,id)}));
+    }
+    groups.into_values().collect()
+}
+pub fn binding_patch(settings: &Value, observed: &Value, explicit: Option<&str>) -> Result<Option<Value>> {
+    let candidates=observed["browserProfiles"].as_array().ok_or("Chrome 浏览器身份列表不可用，请重新检查连接。")?;
+    if explicit.is_none() && browser_binding(settings)?.is_some() {return Ok(None);}
+    let chosen=if let Some(id)=explicit {candidates.iter().find(|c|c["profileId"]==id).ok_or("所选 Chrome 浏览器不再连接，请重新检查。")?}
+        else if candidates.len()==1 && observed["unidentifiedClients"].as_u64()==Some(0) {&candidates[0]} else {return Ok(None)};
+    if chosen["collision"]!=false {return Err("Chrome 浏览器身份冲突，未绑定或发送任务。".into());}
+    let profile=s(chosen,"profileId");let bundle=s(chosen,"bundleId");
+    if !valid_profile_id(profile)||bundle.is_empty(){return Err("Chrome 浏览器身份尚未核实，请重新连接扩展。".into());}
+    Ok(Some(json!({"chromeProfileId":profile,"chromeProfileEndpoint":endpoint(settings)?.as_str().trim_end_matches('/'),"chromeProfileBundleId":bundle})))
+}
 
 fn bounded(path: &Path, limit: u64) -> Result<String> {
     if !crate::runtime_setup::safe_absolute(path) { return Err("Chrome 配置路径包含外链，未读取。".into()); }
@@ -90,7 +152,7 @@ pub fn status(home: &Path, settings: &Value) -> Value {
     value
 }
 fn fingerprint(settings:&Value)->Value {
-    json!(crate::pipeline::digest(&format!("{}:{}",s(settings,"chromeEndpoint"),settings[crate::app_settings::SCOPE]["credentialRefs"]["chrome"])))
+    json!(crate::pipeline::digest(&format!("{}:{}:{}:{}:{}",s(settings,"chromeEndpoint"),settings[crate::app_settings::SCOPE]["credentialRefs"]["chrome"],s(settings,"chromeProfileId"),s(settings,"chromeProfileEndpoint"),s(settings,"chromeProfileBundleId"))))
 }
 fn endpoint(settings: &Value) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(s(settings,"chromeEndpoint")).map_err(|_| "请先连接 Chrome 桥接。")?;
@@ -140,26 +202,51 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     if response["ok"] != true { return Err("Chrome 浏览器列表不可用。".into()); }
     let clients = response["clients"].as_array().ok_or("Chrome 浏览器列表格式无效。")?;
     let usable: Vec<_> = clients.iter().filter(|c| c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true && c["activeRequest"].is_null()).collect();
-    let opener = execution_client(clients);
+    let browser_profiles=profiles(clients);
+    let unidentified=clients.iter().filter(|c|c["ready"]==true && c["transport"]=="extension" && c["browserIncognito"]!=true
+        && !profile_clients(clients).iter().any(|p|p["id"]==c["id"])).count();
+    let binding=browser_binding(settings);
+    let suggestion=browser_profiles.first().filter(|_|browser_profiles.len()==1 && unidentified==0)
+        .filter(|p|p["collision"]==false).map(|p|BrowserBinding{profile_id:s(p,"profileId").into(),bundle_id:s(p,"bundleId").into(),endpoint:base.clone()});
+    let selected_binding=binding.as_ref().ok().and_then(|b|b.as_ref()).or(suggestion.as_ref());
+    let opener=selected_binding.and_then(|b|profile_execution_client(clients,b).ok());
     let busy = health["pendingRequests"].as_u64().unwrap_or(0)>0
         || health["pendingCommands"].as_u64().unwrap_or(0)>0
         || clients.iter().any(|c|!c["activeRequest"].is_null());
     // Upstream health.ok describes its generic selected-client fallback. An
     // explicitly bound opener is usable when only that fallback is ambiguous.
     let connected = health["ok"] == true || health["needsSelection"] == true && opener.is_some();
-    let (state,message) = if busy {("busy","浏览器正在执行已有任务，完成后可继续。")}
-        else if usable.len()>1 && opener.is_none() {("needs_selection","发现不同的浏览器连接，请在桥接面板选定执行浏览器；同一浏览器的多个页面无需选择。")}
+    let (state,message) = if binding.is_err() {("needs_selection","执行浏览器绑定与当前连接不一致，请在软件设置重新选择。")}
+        else if selected_binding.is_some_and(|b|profile_collision(clients,&b.profile_id)) {("needs_selection","浏览器身份出现多个运行实例，已停止新提交；请核对复制的配置。")}
+        else if selected_binding.is_none() && browser_profiles.iter().any(|p|p["collision"]==true) {("needs_selection","浏览器身份出现多个运行实例，未绑定或发送任务；请核对复制的配置。")}
+        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy {("waiting_browser","已绑定浏览器未连接，请重新打开原浏览器；未改用其他配置。")}
+        else if browser_profiles.len()>1 && selected_binding.is_none() {("needs_selection","发现多个浏览器配置，请在软件设置绑定执行浏览器一次。")}
+        else if busy && selected_binding.is_some_and(|b|profile_clients(clients).iter().any(|c|c["browserProfileId"]==b.profile_id && c["extensionBundleId"]==b.bundle_id)) {("busy","浏览器正在执行已有任务，完成后可继续。")}
+        else if opener.is_none() && !usable.is_empty() {("waiting_browser","浏览器尚未提供持久身份，请重新连接扩展；隐身页面不用于新生成。")}
+        else if busy {("busy","浏览器正在执行已有任务，完成后可继续。")}
         else if !usable.is_empty() && connected {("ready","Chrome 网页已连接，可在图片资产中选择 Chrome 网页生成。")}
         else {("waiting_browser","桥接已启动。请打开 Chrome 的 ChatGPT 页面并连接扩展。")};
     let mut value=report(state,message,component().is_some(),true);
     value["clients"]=json!(clients.len()); value["usableClients"]=json!(usable.len());
     value["pendingRequests"] = health["pendingRequests"].clone();
+    value["browserProfiles"]=json!(browser_profiles);value["unidentifiedClients"]=json!(unidentified);
+    value["boundProfileId"]=settings["chromeProfileId"].clone();
     Ok(value)
 }
 pub fn check(home: &Path, settings: &Value, token: &str) -> Result<Value> {
     let mut value=inspect(settings,token).unwrap_or_else(|e|report("offline",&e,component().is_some(),true));
-    value["checkedAt"]=json!(crate::store::now()); value["endpoint"]=settings["chromeEndpoint"].clone();
-    value["configFingerprint"]=fingerprint(settings);
+    let mut effective=settings.clone();
+    if let Ok(Some(patch))=binding_patch(settings,&value,None) {
+        if let Some(doc)=crate::app_settings::load(home)? {
+            let current=crate::app_settings::effective_from(&doc,&json!({}));
+            if fingerprint(&current)!=fingerprint(settings) {return Err("Chrome 设置在检查期间变化，请重新检查。".into());}
+            let updated=crate::app_settings::save(home,&patch,doc["revision"].as_u64().unwrap_or(0))?;
+            effective=crate::app_settings::effective_from(&updated,&json!({}));
+            value["boundProfileId"]=patch["chromeProfileId"].clone();
+        }
+    }
+    value["checkedAt"]=json!(crate::store::now()); value["endpoint"]=effective["chromeEndpoint"].clone();
+    value["configFingerprint"]=fingerprint(&effective);
     atomic_json(&home.join(STATUS),&value)?;
     value.as_object_mut().unwrap().remove("endpoint");value.as_object_mut().unwrap().remove("configFingerprint"); Ok(value)
 }
@@ -295,7 +382,7 @@ pub fn connect(home: &Path, settings: &Value, token: Option<&str>, source: Optio
         });(json!({"chromeEndpoint":endpoint}),join)
     }
     #[test] fn connected_server_is_not_mistaken_for_a_ready_browser() {
-        for (clients,expected) in [(json!([]),"waiting_browser"),(json!([{"id":"one","ready":true}]),"ready"),(json!([{"id":"one","ready":true},{"id":"two","ready":true}]),"needs_selection"),(json!([{"id":"one","ready":true,"activeRequest":{"id":"existing"}}]),"busy")] {
+        for (clients,expected) in [(json!([]),"waiting_browser"),(json!([{"id":"one","ready":true}]),"waiting_browser"),(json!([{"id":"one","ready":true},{"id":"two","ready":true}]),"waiting_browser"),(json!([{"id":"one","ready":true,"activeRequest":{"id":"existing"}}]),"busy")] {
             let (settings,server)=fixture(json!({"ok":true,"pendingRequests":0}),Some(clients));
             let result=inspect(&settings,"fixture-credential").unwrap();assert_eq!(result["status"],expected);assert!(!result.to_string().contains("fixture-credential"));server.join().unwrap();
         }

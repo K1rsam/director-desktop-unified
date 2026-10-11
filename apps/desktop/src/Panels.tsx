@@ -17,10 +17,11 @@ import { Badge, Button, costText, Empty, formatDate, Icon, JsonDetails, kindName
 import type { AppSettings, DreaminaAccount, GlobalMutation, Job, Media, Mutation, Settings, Workspace } from './types';
 
 type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; onError?: (error: string) => void; onNotice?: (notice: string) => void };
-type ChromeSetup = { schemaVersion: 'chrome-setup/v1'; installed: boolean; configured: boolean; status: 'unconfigured' | 'offline' | 'waiting_browser' | 'ready' | 'busy' | 'needs_selection' | 'error'; message: string; clients: number; usableClients: number; componentVersion?: string; extensionPath?: string; checkedAt?: string | null };
+type ChromeSetup = { schemaVersion: 'chrome-setup/v1'; installed: boolean; configured: boolean; status: 'unconfigured' | 'offline' | 'waiting_browser' | 'ready' | 'busy' | 'needs_selection' | 'error'; message: string; clients: number; usableClients: number; componentVersion?: string; extensionPath?: string; checkedAt?: string | null; boundProfileId?: string; browserProfiles?: { profileId: string; bundleId: string; collision: boolean }[] };
 function chromeSetup(value: unknown): ChromeSetup {
   const result = value as ChromeSetup | null;
   if (!result || result.schemaVersion !== 'chrome-setup/v1' || typeof result.installed !== 'boolean' || typeof result.configured !== 'boolean' || !['unconfigured', 'offline', 'waiting_browser', 'ready', 'busy', 'needs_selection', 'error'].includes(result.status) || typeof result.message !== 'string' || !Number.isSafeInteger(result.clients) || result.clients < 0 || !Number.isSafeInteger(result.usableClients) || result.usableClients < 0 || result.usableClients > result.clients) throw new Error('Chrome 连接状态无效，请重新检查。');
+  if (result.browserProfiles !== undefined && (!Array.isArray(result.browserProfiles) || result.browserProfiles.length > 64 || result.browserProfiles.some(profile => !profile || typeof profile.profileId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(profile.profileId) || typeof profile.bundleId !== 'string' || !profile.bundleId || typeof profile.collision !== 'boolean'))) throw new Error('Chrome 浏览器身份列表无效，请重新检查。');
   return result;
 }
 
@@ -240,7 +241,7 @@ export function SettingsPanel({ appSettings, writable, mutate, onError }: { appS
       if (mounted.current && currentRevision === revision.current) { channelOperation.current = null; setChannelBusy(''); }
     }
   }
-  async function connectChrome(action: 'chrome.connect' | 'chrome.open', values: { sourceConfigPath?: string } = {}) {
+  async function connectChrome(action: 'chrome.connect' | 'chrome.open' | 'chrome.bind', values: { sourceConfigPath?: string; profileId?: string } = {}) {
     if (!mounted.current || !writableRef.current || channelOperation.current !== null || actionBlockReason(action)) return;
     const currentRevision = revision.current;
     channelOperation.current = 'chrome'; setChannelBusy('chrome'); setChannelError(null);
@@ -250,7 +251,7 @@ export function SettingsPanel({ appSettings, writable, mutate, onError }: { appS
         if (!next || !mounted.current || currentRevision !== revision.current) return false;
         // Connecting can update the global revision itself. Adopt it inside
         // the write queue before another channel saves its discovered paths.
-        const edits = Object.fromEntries(Object.entries(settingsRef.current).filter(([key, value]) => !Object.is(value, savedBase.current.settings[key]) && (action !== 'chrome.connect' || !['chromeEndpoint', 'chromeAccountId', 'chromeToken'].includes(key))));
+        const edits = Object.fromEntries(Object.entries(settingsRef.current).filter(([key, value]) => !Object.is(value, savedBase.current.settings[key]) && (action === 'chrome.open' || !['chromeEndpoint', 'chromeAccountId', 'chromeToken', 'chromeProfileId', 'chromeProfileEndpoint', 'chromeProfileBundleId'].includes(key))));
         savedBase.current = { revision: next.revision, settings: cleanSettings(next.settings) };
         settingsRef.current = { ...savedBase.current.settings, ...edits }; setSettings(settingsRef.current);
         return true;
@@ -297,10 +298,11 @@ export function SettingsPanel({ appSettings, writable, mutate, onError }: { appS
           {isBh && <details className="details"><summary>账户标识</summary><label>账户名称<input aria-label="BH API 账户名称" value={String(settings.bhAccountId || '')} onChange={event => update('bhAccountId', event.target.value)} placeholder="例如：BH 主账户"/></label><p className="control-hint">同一账户保留这个名称；更换账户时改用新名称。</p></details>}
         </div>;
         return <section className="surface channel-provider-card" key={id} aria-label={title}>
-          <div className="section-heading compact"><h3>{title}</h3><Badge status={changed ? 'draft' : !isBh && chrome ? chrome.status === 'ready' ? 'available' : chrome.status : provider.available ? 'available' : provider.status || 'not_configured'}>{changed ? '有未检查的修改' : !isBh && chrome ? ({ ready: '已连接', busy: '网页正忙', waiting_browser: '等待网页连接', offline: '组件未运行', unconfigured: '尚未连接', needs_selection: '需要选择网页', error: '连接异常' }[chrome.status]) : undefined}</Badge></div>
+          <div className="section-heading compact"><h3>{title}</h3><Badge status={changed ? 'draft' : !isBh && chrome ? chrome.status === 'ready' ? 'available' : chrome.status : provider.available ? 'available' : provider.status || 'not_configured'}>{changed ? '有未检查的修改' : !isBh && chrome ? ({ ready: '已连接', busy: '网页正忙', waiting_browser: '等待网页连接', offline: '连接待检查', unconfigured: '尚未连接', needs_selection: '需要选择浏览器', error: '连接异常' }[chrome.status]) : undefined}</Badge></div>
           <p className="muted">{changed ? '保存并检查后更新连接状态。' : !isBh && chrome ? chrome.message : provider.message || (provider.configured ? '已保存配置' : isBh ? '填写服务地址和凭据后连接。' : '连接本机 Chrome 组件，在专用浏览器登录后用于网页出图。')}</p>
           {!isBh && <><div className="channel-component-status"><span>{chrome?.installed ? `本机组件已安装${chrome.componentVersion ? ' · ' + chrome.componentVersion : ''}` : chrome ? '未找到本机组件' : '正在检查本机组件…'}</span><span className="muted">{chrome?.usableClients ? `${chrome.usableClients} 个网页可用` : '尚无可用网页'}</span></div><div className="actions"><Button executionAction="chrome.connect" data-chrome-connect icon="refresh" disabled={!writable || saving || !!channelBusy} onClick={() => void connectChrome('chrome.connect')}>{channelBusy === 'chrome' ? '正在处理…' : '连接本机 Chrome'}</Button><Button executionAction="chrome.open" disabled={!writable || saving || !!channelBusy || !chrome?.installed} onClick={() => void connectChrome('chrome.open')}>打开专用浏览器</Button></div></>}
           {!isBh && chrome?.checkedAt && <p className="control-hint">上次检查：{formatDate(chrome.checkedAt)}</p>}
+          {!isBh && !!chrome?.browserProfiles?.length && <label>执行浏览器<select aria-label="Chrome 执行浏览器" disabled={!writable || saving || !!channelBusy} value={chrome.boundProfileId || ''} onChange={event => { if (event.target.value) void connectChrome('chrome.bind', { profileId: event.target.value }); }}><option value="">请选择浏览器配置</option>{chrome.boundProfileId && !chrome.browserProfiles.some(profile => profile.profileId === chrome.boundProfileId) && <option value={chrome.boundProfileId}>已绑定浏览器（未连接）</option>}{chrome.browserProfiles.map((profile, index) => <option key={profile.profileId} value={profile.profileId} disabled={profile.collision}>Chrome 配置 {index + 1} · {profile.profileId.slice(0, 8)}{profile.collision ? '（身份冲突）' : ''}</option>)}</select><small className="control-hint">全局绑定一次，同配置的其他 ChatGPT 页面不会改变执行目标。隐身页面不用于新生成。</small></label>}
           {isBh ? configuration : <details className="details"><summary>手动连接设置</summary><Button executionAction="chrome.connect" data-chrome-import icon="upload" disabled={!writable || saving || !!channelBusy} onClick={() => void importChromeConfiguration()}>导入已有连接配置</Button><p className="control-hint">选择旧版的 bridge.env，直接恢复连接，无需复制凭据。</p>{configuration}</details>}
           {channelError?.provider === id && <p className="warning" role="alert">{channelError.message}</p>}
           <div className="actions"><Button executionAction={isBh ? 'providers.refresh' : 'chrome.check'} data-provider-check={id} icon="refresh" disabled={!writable || saving || !!channelBusy} onClick={() => void checkProvider(id)}>{channelBusy === id ? '正在检查…' : changed ? '保存并检查连接' : '检查连接与模型'}</Button></div>

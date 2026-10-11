@@ -136,7 +136,7 @@ export function missingCatalogs(workspace: Workspace) {
     // Public configuration and stable account identity only: polling timestamps
     // and secrets must not turn a failed inspection into an automatic retry loop.
     const settings = workspace.settings;
-    const configuration = { path: provider === 'dreamina' ? settings.dreaminaPath : settings[provider + 'Endpoint'], account: settings[provider + 'AccountId'], timeout: settings.providerTimeoutSeconds, adaptedModels: provider === 'bh' ? settings.adaptedModels : undefined, accountReady: provider === 'dreamina' ? workspace.dreaminaAccount?.status === 'authenticated' && workspace.dreaminaAccount.ready === true : undefined, accountKey: provider === 'dreamina' ? workspace.dreaminaAccount?.accountKey || null : undefined };
+    const configuration = { path: provider === 'dreamina' ? settings.dreaminaPath : settings[provider + 'Endpoint'], account: settings[provider + 'AccountId'], browserProfile: provider === 'chrome' ? [settings.chromeProfileId || null, settings.chromeProfileEndpoint || null, settings.chromeProfileBundleId || null] : undefined, timeout: settings.providerTimeoutSeconds, adaptedModels: provider === 'bh' ? settings.adaptedModels : undefined, accountReady: provider === 'dreamina' ? workspace.dreaminaAccount?.status === 'authenticated' && workspace.dreaminaAccount.ready === true : undefined, accountKey: provider === 'dreamina' ? workspace.dreaminaAccount?.accountKey || null : undefined };
     return [{ provider, kinds, key: JSON.stringify([workspace.project.id, provider, kinds, configuration]) }];
   });
 }
@@ -174,10 +174,15 @@ export function initializeImageParameters(workspace: Workspace, provider: string
   const sameProvider = String(workspace.settings.imageProvider || 'dreamina') === provider;
   let model = current.model || (sameProvider ? workspace.settings.imageModel || '' : '');
   if (!model && provider === 'dreamina') { const candidate = generationChoices(workspace, provider, 'image', { ...current, model: '5.0' }).selected; if (candidate?.adapted === true && candidate.available !== false) model = '5.0'; }
+  if (!model && provider === 'chrome') {
+    const candidates = generationChoices(workspace, provider, 'image', current).models.filter(candidate => candidate.adapted === true && candidate.available !== false);
+    if (candidates.length === 1 && candidates[0].id === 'chatgpt-image') model = candidates[0].id;
+  }
   const choices = generationChoices(workspace, provider, 'image', { ...current, model });
   if (!choices.selected || choices.selected.adapted !== true || choices.selected.available === false) return { ...current, model };
   const savedResolution = sameProvider ? String(workspace.settings.imageResolution || '') : '';
-  return { model, ratio: current.ratio || String(workspace.settings.ratio || '') || (choices.ratios.includes('16:9') ? '16:9' : ''), resolution: current.resolution || savedResolution || (choices.resolutions.includes('2k') ? '2k' : '') };
+  const defaultResolution = provider === 'chrome' ? (choices.resolutions.includes('native') ? 'native' : '') : (choices.resolutions.includes('2k') ? '2k' : '');
+  return { model, ratio: current.ratio || String(workspace.settings.ratio || '') || (choices.ratios.includes('16:9') ? '16:9' : ''), resolution: current.resolution || savedResolution || defaultResolution };
 }
 const COMMON_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '3:2', '2:3', '21:9'];
 export function generationChoices(workspace: Workspace, provider: string, kind: 'image' | 'video', parameters: GenerationParameters) {

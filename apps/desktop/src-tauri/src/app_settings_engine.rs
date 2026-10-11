@@ -73,6 +73,7 @@ impl Engine {
             "chrome.status",
             "chrome.connect",
             "chrome.check",
+            "chrome.bind",
             "chrome.open",
             "readiness.check",
             "textSdk.status",
@@ -121,12 +122,20 @@ impl Engine {
                 let updated = app_settings::save(&self.home, &request["settings"], expected)?;
                 self.global_settings_view(&updated)
             }
-            "chrome.connect" | "chrome.check" => {
+            "chrome.connect" | "chrome.check" | "chrome.bind" => {
                 if !self.standard_native || !self.live_accounts {
                     return Err("Chrome 连接只由本机标准桌面显式触发。".into());
                 }
                 let _guard = self.acquire_keys(vec!["channel:chrome".into()])?;
                 let token = app_settings::credential(&settings, "global", "chrome").ok();
+                if action=="chrome.bind" {
+                    let token=token.as_deref().ok_or("请先连接 Chrome 网页。")?;
+                    let observed=crate::chrome_setup::inspect(&settings,token)?;
+                    let profile=request["profileId"].as_str().filter(|s|!s.is_empty()).ok_or("请选择执行浏览器。")?;
+                    let patch=crate::chrome_setup::binding_patch(&settings,&observed,Some(profile))?.ok_or("所选浏览器无法绑定。")?;
+                    let updated=app_settings::save(&self.home,&patch,doc["revision"].as_u64().unwrap_or(0))?;
+                    return crate::chrome_setup::check(&self.home,&app_settings::effective_from(&updated,&json!({})),token);
+                }
                 if action == "chrome.check" {
                     return crate::chrome_setup::check(
                         &self.home,

@@ -20,6 +20,9 @@ pub const FIELDS: &[&str] = &[
     "bhAccountId",
     "chromeEndpoint",
     "chromeAccountId",
+    "chromeProfileId",
+    "chromeProfileEndpoint",
+    "chromeProfileBundleId",
     "providerTimeoutSeconds",
     "textConcurrency",
     "episodeConcurrency",
@@ -237,6 +240,14 @@ fn validate_patch(patch: &Value) -> Result<()> {
             .is_some_and(|v| v.len() > 32768 || v.chars().any(|c| c == '\0'))
         {
             return Err(format!("{key} 设置过长或无效。"));
+        }
+    }
+    if patch.get("chromeProfileId").is_some() || patch.get("chromeProfileEndpoint").is_some() || patch.get("chromeProfileBundleId").is_some() {
+        let complete=["chromeProfileId","chromeProfileEndpoint","chromeProfileBundleId"].iter().all(|key|patch[*key].as_str().is_some());
+        if !complete {return Err("Chrome 浏览器绑定必须完整保存，未修改原绑定。".into());}
+        if !["chromeProfileId","chromeProfileEndpoint","chromeProfileBundleId"].iter().all(|key|s(patch,key).is_empty()) {
+            let mut settings=patch.clone();settings["chromeEndpoint"]=patch["chromeProfileEndpoint"].clone();
+            crate::chrome_setup::browser_binding(&settings)?;
         }
     }
     Ok(())

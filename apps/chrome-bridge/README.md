@@ -12,4 +12,8 @@ Rust provider 兼容 Protocol 5 独立恢复回包的空外层 requestId 与 art
 
 验证：`node --test apps/chrome-bridge/tests/native-recovery.test.cjs`。这些合成测试不代表新任务真实生成通过。当前真实原任务的恢复、下载与资产采用证据见对应 handoff 文档。
 
-桌面 Chrome 渠道另已适配后台专属工作页、单客户端跨项目持久队列和成功入库后的安全回收；同一扩展 runtime 的多个空闲页面可自动选择 opener，跨 runtime 仍需明确绑定。普通网页忙碌保持排队，未知提交仅恢复原任务。实现、Windows 检查、暂存发布和真实后台生成未验收的范围见 [后台队列记录](../../docs/handoff/CHROME_BACKGROUND_QUEUE_20261010.md)。本轮没有改动或重新部署扩展覆盖文件。
+桌面 Chrome 渠道使用全局 Chrome profile 绑定、后台专属工作页和跨项目持久单图队列。普通页面增减不改变执行浏览器；网页忙碌保持排队，未知提交仅恢复原任务。CLI/API 继续并行并等待直接父图入库。
+
+完成图片会话在原图入库后安全回收。最后连接页需要先核实一个同 profile 后台首页控制页；控制页不提交创作请求，每个 profile 保留一页，未知创建不会重复打开。仅本程序工作页及控制页禁止普通 Memory Saver 自动丢弃，用户页面不改动。完整 Chrome 重启、电脑休眠及历史缺失归属页面的处理边界单独保留。
+
+最初实现范围见 [后台队列记录](../../docs/handoff/CHROME_BACKGROUND_QUEUE_20261010.md)，本轮实际部署、四图生成/恢复、父链、页面回收及 Windows 发布证据见 [后台链路验收](../../docs/handoff/CHROME_BACKGROUND_ACCEPTANCE_20261011.md)。扩展维护前必须确认零活跃任务，只刷新本程序页面，并保全 launch 身份；不能用全浏览器刷新替代。

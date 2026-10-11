@@ -10,7 +10,9 @@ const pending=manifest.files.map(f=>{
  const relative=path.normalize(f.path);if(path.isAbsolute(relative)||relative.startsWith('..'))throw Error('Unsafe overlay path');
  const destination=path.join(target,relative);if(fs.lstatSync(destination).isSymbolicLink())throw Error('Linked overlay target');
  const before=fs.readFileSync(destination),after=fs.readFileSync(path.join(source,relative));
- if(hash(after)!==f.afterSha256||![f.beforeSha256,f.previousAfterSha256,f.afterSha256].includes(hash(before)))throw Error('Chrome component changed; refusing overwrite: '+relative);
+ const prior=f.previousAfterSha256s||[];
+ if(!Array.isArray(prior)||prior.some(s=>typeof s!=='string'||!/^[a-f0-9]{64}$/.test(s)))throw Error('Invalid pinned overlay history');
+ if(hash(after)!==f.afterSha256||![f.beforeSha256,f.previousAfterSha256,...prior,f.afterSha256].includes(hash(before)))throw Error('Chrome component changed; refusing overwrite: '+relative);
  return {f,destination,before,after,unchanged:hash(before)===f.afterSha256};
 });
 for(const item of pending){

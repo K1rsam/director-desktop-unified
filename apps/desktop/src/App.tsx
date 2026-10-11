@@ -26,7 +26,7 @@ const stages: { id: Page; number: string; title: string; subtitle: string; icon:
 function freshWorkspace(value: Workspace, checkedAt = new Date().toISOString()): Workspace {
   return { ...normalize(value), readState: { checkedAt } };
 }
-const SOFTWARE_DISPLAY_FIELDS = ['textProvider', 'textModel', 'reasoning', 'textEndpoint', 'codexPath', 'textSdkNodePath', 'dreaminaPath', 'dreaminaCanvasPath', 'bhEndpoint', 'bhAccountId', 'chromeEndpoint', 'chromeAccountId', 'providerTimeoutSeconds', 'textConcurrency', 'episodeConcurrency', 'videoConcurrency', 'chromeConcurrency'] as const;
+const SOFTWARE_DISPLAY_FIELDS = ['textProvider', 'textModel', 'reasoning', 'textEndpoint', 'codexPath', 'textSdkNodePath', 'dreaminaPath', 'dreaminaCanvasPath', 'bhEndpoint', 'bhAccountId', 'chromeEndpoint', 'chromeAccountId', 'chromeProfileId', 'chromeProfileEndpoint', 'chromeProfileBundleId', 'providerTimeoutSeconds', 'textConcurrency', 'episodeConcurrency', 'videoConcurrency', 'chromeConcurrency'] as const;
 /** Render current software connections without changing project records or frozen jobs. */
 export function projectWorkspaceView(workspace: Workspace | null, appSettings: AppSettings | null): Workspace | null {
   if (!workspace || !appSettings || !isAppSettings(appSettings)) return workspace;

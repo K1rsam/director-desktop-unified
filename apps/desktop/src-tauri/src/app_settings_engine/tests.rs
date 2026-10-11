@@ -145,6 +145,9 @@ fn global_chrome_connect_then_status_keeps_cache_and_rotation_invalidates_it() {
                 }
                 Err(e) => panic!("{e}"),
             };
+            // Accepted Windows sockets can inherit the listener's nonblocking mode.
+            // Reading a not-yet-arrived header must honor the explicit timeout.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
@@ -168,7 +171,7 @@ fn global_chrome_connect_then_status_keeps_cache_and_rotation_invalidates_it() {
                 json!({"ok":true,"pendingRequests":0})
             } else {
                 assert!(request.starts_with("GET /browser/clients "));
-                json!({"ok":true,"clients":[{"ready":true,"selected":true}]})
+                json!({"ok":true,"clients":[{"id":"fixture-tab","url":"https://chatgpt.com/","ready":true,"selected":true,"transport":"extension","browserProfileId":"b84d4521-56ba-4f84-9948-090f82d639e7","browserIncognito":false,"backgroundEpoch":"fixture-epoch","extensionBundleId":"fixture-bundle","serverInstanceId":"fixture-server"}]})
             }
             .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
@@ -186,6 +189,7 @@ fn global_chrome_connect_then_status_keeps_cache_and_rotation_invalidates_it() {
         .dispatch(json!({"action":"chrome.connect","scope":"global"}))
         .unwrap();
     assert_eq!(connected["status"], "ready");
+    assert_eq!(get(&e)["settings"]["chromeProfileId"],"b84d4521-56ba-4f84-9948-090f82d639e7");
     let cached = e
         .dispatch(json!({"action":"chrome.status","scope":"global"}))
         .unwrap();

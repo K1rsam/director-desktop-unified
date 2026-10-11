@@ -42,10 +42,10 @@ fn fixture(state: &str) -> (tempfile::TempDir, Store, String, ProviderConfig, Qu
     let key=store.add_job("image","asset","chrome","offline-account",&snapshot,state).unwrap();
     let request=generation_request(&snapshot).unwrap();
     let p=PreparedRequest{provider:"chrome".into(),request,capability_version:"fixture".into(),
-        upload_receipts:vec![],wire:json!({"sourceClientId":"original-tab"}),estimated_cost:None,prepared_at:now()};
+        upload_receipts:vec![],wire:json!({"sourceClientId":"original-tab","metadata":{"promptSha256":"frozen-hash"}}),estimated_cost:None,prepared_at:now()};
     if state!="queued" {store.update_job(&key,state,&json!({"prepared":p,"providerTaskId":"original-task","receipt":{"original":true}})).unwrap();}
-    let cfg=ProviderConfig{kind:"chrome".into(),endpoint:None,credential_env:None,cli_path:None,bridge_token_env:None,timeout_seconds:5,adapted_models:vec![]};
-    let result=QueryResult{task_id:"original-task".into(),status:"succeeded".into(),result_urls:vec!["fixture".into()],error:None,actual_cost:None,raw:json!({"original":true})};
+    let cfg=ProviderConfig{kind:"chrome".into(),endpoint:None,credential_env:None,cli_path:None,bridge_token_env:None,timeout_seconds:5,adapted_models:vec![],chrome_binding:None};
+    let result=QueryResult{task_id:"original-task".into(),status:"succeeded".into(),result_urls:vec!["fixture".into()],error:None,actual_cost:None,raw:json!({"original":true,"nativeProof":{"status":"matched_complete","proofVersion":2,"requestId":"original-task","promptSha256":"frozen-hash","conversationId":"frozen-conversation"}})};
     (temp,store,key,cfg,result)
 }
 #[test]

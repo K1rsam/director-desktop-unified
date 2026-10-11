@@ -1,0 +1,94 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+const token=id=>`bridge-director-desktop-00000000-0000-4000-8000-${String(id).padStart(12,'0')}`;
+function fixture(options={}){
+  const writes=[],plans=[],queries=[],remembered=[],navigated=[],reloaded=[],tabs=[{id:1,url:'https://chatgpt.com/c/own-one'},{id:2,url:'https://chatgpt.com/c/own-two'},{id:3,url:'https://chatgpt.com/c/user'},...(options.tabs||[])],records={1:{launchToken:token(1)},2:{launchToken:token(2)},...options.records};
+  const local={},session={
+    'chatgptBridgeLaunchedTab:1':records[1],
+    'chatgptBridgeLaunchedTab:2':records[2],
+    ...options.session,
+  };
+  const context=vm.createContext({URL,URLSearchParams,Date,Math,console:{info(){},warn(){},error(){}},setTimeout(){return 0;},
+    chrome:{tabs:{query:async q=>{queries.push(q);return tabs;},get:async id=>tabs.find(t=>t.id===id),reload:async()=>{}},storage:{
+      local:{set:async value=>{writes.push(value);Object.assign(local,value);},get:async key=>({[key]:local[key]}),remove:async key=>{delete local[key];}},
+      session:{get:async()=>{if(options.sessionReadError)throw Error('session unavailable');return {...session};}},
+    }}});
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/extensionReloadCoordinator.js'),'utf8').replace(/export /g,''),context);
+  const coordinator=context.createExtensionReloadCoordinator({backgroundState:{read:async id=>({lease:options.busyId===id?{requestId:'original'}:null,commands:{},outbox:[]})},
+    maintenanceOperations:{plan:async(type,p)=>{plans.push(p);return {accepted:true,state:{active:{operationId:'operation'}}};},dispatch:async()=>({accepted:true}),succeed:async()=>{},fail:async()=>{}},
+    safeBridgeServerUrl:u=>u,readLaunchedTab:async id=>records[id],launchTokenPattern:/^bridge-/,
+    rememberLaunchedTab:async(id,record)=>{remembered.push({id,record});records[id]=record;session[`chatgptBridgeLaunchedTab:${id}`]=record;},
+    navigateTab:async(id,url)=>navigated.push({id,url}),reloadTab:async id=>reloaded.push(id),reloadRuntime(){}});
+  return {coordinator,writes,plans,queries,local,records,session,remembered,navigated,reloaded};
+}
+test('owned-only extension maintenance refreshes its original pages while leaving user pages untouched',async()=>{
+  const f=fixture();const r=await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:true,ownedTabsOnly:true,temporaryServerUrl:'http://127.0.0.1:53179'});
+  assert.equal(r.tabCount,2);assert.deepEqual(Array.from(f.writes[0].bridgePendingExtensionReload.tabIds),[1,2]);
+  assert.ok(!Object.hasOwn(f.writes[0].bridgePendingExtensionReload.targetUrls,'3'));
+});
+test('owned-only maintenance rejects a user source and any active original lease before write',async()=>{
+  for(const options of [{source:3},{busyId:3,source:1},{busyId:2,source:1}]){
+    const f=fixture(options);await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:options.source,commandId:'command',reloadTabs:true,ownedTabsOnly:true}));
+    assert.equal(f.writes.length,0);assert.equal(f.plans.length,0);
+  }
+});
+test('initial source-only reload never enumerates or refreshes other ChatGPT pages',async()=>{
+  const f=fixture();const r=await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+  assert.equal(r.tabCount,1);assert.equal(f.queries.length,0);assert.deepEqual(Array.from(f.writes[0].bridgePendingExtensionReload.tabIds),[1]);
+  assert.equal(r.preservedLaunchCount,2);
+  assert.deepEqual(Object.keys(f.writes[0].bridgePendingExtensionReload.launchRecords),['1','2']);
+});
+
+test('source-only recovery restores every owned identity but refreshes only its source',async()=>{
+  const f=fixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false,temporaryServerUrl:'http://127.0.0.1:53179'});
+  for(const key of Object.keys(f.records))delete f.records[key];
+  for(const key of Object.keys(f.session))delete f.session[key];
+  const result=await f.coordinator.recoverPendingExtensionReload();
+  assert.equal(result.recovered,true);assert.equal(result.tabCount,1);
+  assert.deepEqual(f.remembered.map(r=>r.id),[1,2]);
+  assert.equal(f.records[2].launchToken,token(2));
+  assert.equal(f.session['chatgptBridgeLaunchedTab:2'].launchToken,token(2));
+  assert.deepEqual(f.navigated.map(t=>t.id),[1]);assert.deepEqual(f.reloaded,[]);
+  assert.equal(f.queries.length,0);assert.ok(!Object.hasOwn(f.local,'bridgePendingExtensionReload'));
+});
+
+test('session snapshot and recovery reject user tokens, fake prefixes and invalid tab keys',async()=>{
+  const f=fixture({session:{
+    'chatgptBridgeLaunchedTab:3':{launchToken:'user-page'},
+    'chatgptBridgeLaunchedTab:4':{launchToken:'bridge-director-desktop-fake'},
+    'chatgptBridgeLaunchedTab:5':{launchToken:'bridge-reload-temporary'},
+    'chatgptBridgeLaunchedTab:6':{launchToken:'bridge-director-desktop-00000000-0000-0000-0000-000000000006'},
+    'chatgptBridgeLaunchedTab:01':{launchToken:token(1)},
+    'chatgptBridgeLaunchedTab:-6':{launchToken:token(6)},
+    'chatgptBridgeLaunchedTab:7.5':{launchToken:token(7)},
+    'chatgptBridgeLaunchedTab:9007199254740992':{launchToken:token(8)},
+    'other:9':{launchToken:token(9)},
+  }});
+  await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+  const pending=f.local.bridgePendingExtensionReload;
+  assert.deepEqual(Object.keys(pending.launchRecords),['1','2']);
+  Object.assign(pending.launchRecords,{'3':{launchToken:'user-page'},'4':{launchToken:'bridge-director-desktop-fake'},'01':{launchToken:token(1)},'-6':{launchToken:token(6)}});
+  await f.coordinator.recoverPendingExtensionReload();
+  assert.deepEqual(f.remembered.map(r=>r.id),[1,2]);
+  assert.deepEqual(f.reloaded,[1]);assert.deepEqual(f.navigated,[]);
+});
+
+test('failed session snapshot blocks runtime maintenance before any plan or durable write',async()=>{
+  const f=fixture({sessionReadError:true});
+  await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false}),error=>error.code==='MAINTENANCE_SESSION_READ_FAILED');
+  assert.equal(f.plans.length,0);assert.equal(f.writes.length,0);
+  assert.deepEqual(f.navigated,[]);assert.deepEqual(f.reloaded,[]);
+});
+test('controller ownership survives source-only runtime reload without refreshing its page',async()=>{
+  const controller='bridge-director-control-b84d4521-56ba-4f84-9948-090f82d639e7';
+  const f=fixture({session:{'chatgptBridgeLaunchedTab:4':{launchToken:controller}}});
+  const scheduled=await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+  assert.equal(scheduled.preservedLaunchCount,3);assert.deepEqual(Array.from(f.local.bridgePendingExtensionReload.tabIds),[1]);
+  await f.coordinator.recoverPendingExtensionReload();assert.deepEqual(f.remembered.map(r=>r.id),[1,2,4]);assert.deepEqual(f.reloaded,[1]);
+});
+test('owned-only maintenance accepts the idle original controller and still excludes user pages',async()=>{
+  const controller='bridge-director-control-b84d4521-56ba-4f84-9948-090f82d639e7';
+  const f=fixture({records:{4:{launchToken:controller}},session:{'chatgptBridgeLaunchedTab:4':{launchToken:controller}},tabs:[{id:4,url:'https://chatgpt.com/'}]});
+  await f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:true,ownedTabsOnly:true});
+  assert.deepEqual(Array.from(f.local.bridgePendingExtensionReload.tabIds),[1,2,4]);
+  assert.ok(!Object.hasOwn(f.local.bridgePendingExtensionReload.targetUrls,'3'));
+});

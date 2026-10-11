@@ -64,6 +64,8 @@ pub struct ProviderConfig {
     pub cli_path: Option<PathBuf>,
     #[serde(default)]
     pub bridge_token_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_binding: Option<crate::chrome_setup::BrowserBinding>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     /// Reserved for a future reviewed registry. It does not bypass built-in wire adaptation.
