@@ -12,6 +12,10 @@ Rust provider 兼容 Protocol 5 独立恢复回包的空外层 requestId 与 art
 
 验证：`node --test apps/chrome-bridge/tests/native-recovery.test.cjs`。这些合成测试不代表新任务真实生成通过。当前真实原任务的恢复、下载与资产采用证据见对应 handoff 文档。
 
+2026-10-11 续测修复：最终交付只取当前已完成分支最新的图片输出，中间渲染不算额外交付；最终多图、错分支或身份不一致仍保持 hold。诊断模式缓存的原图字节不会获得后台采用资格，后续真实恢复会重新校验原任务、图片字节和分支。完整 native proof 可进入原 pending request 的 canonical terminal/release；历史终态不改写，未知任务不重发。安全边界回归使用 `node --test apps/chrome-bridge/tests/*.test.cjs`，本轮 44 项通过。
+
+生成中关闭重开、三图批量入库和直接父图引用的续测证据见 [重开与恢复验收](../../docs/handoff/CHROME_RESTART_RECOVERY_ACCEPTANCE_20261011.md)。运行时重载会使其他页面的旧扩展连接失效；用户正在查看的控制页不刷新。最后一个可用连接页会保留，直到有其他同 profile 的可靠连接，不能把保留当成图片生成失败。
+
 桌面 Chrome 渠道使用全局 Chrome profile 绑定、后台专属工作页和跨项目持久单图队列。普通页面增减不改变执行浏览器；网页忙碌保持排队，未知提交仅恢复原任务。CLI/API 继续并行并等待直接父图入库。
 
 完成图片会话在原图入库后安全回收。最后连接页需要先核实一个同 profile 后台首页控制页；控制页不提交创作请求，每个 profile 保留一页，未知创建不会重复打开。仅本程序工作页及控制页禁止普通 Memory Saver 自动丢弃，用户页面不改动。完整 Chrome 重启、电脑休眠及历史缺失归属页面的处理边界单独保留。

@@ -116,7 +116,7 @@
   function branchOf(record, conversationId) {
     if (!record || record.conversation_id !== conversationId || !record.mapping || Array.isArray(record.mapping) || typeof record.current_node !== 'string') return null;
     const branch=[],seen=new Set(),ids=new Set();let key=record.current_node;
-    while(key!==null){if(seen.has(key)||branch.length>1000)return null;seen.add(key);const n=record.mapping[key];if(!n||!Object.hasOwn(n,'parent')||n.parent!==null&&typeof n.parent!=='string')return null;if(n.message?.id){if(ids.has(n.message.id))return null;ids.add(n.message.id);}branch.push(n);key=n.parent;}
+    while(key!==null){if(seen.has(key)||branch.length>1000)return null;seen.add(key);const n=record.mapping[key];if(!n||!Object.hasOwn(n,'parent')||n.parent!==null&&typeof n.parent!=='string')return null;if(n.message?.id){if(ids.has(n.message.id))return null;ids.add(n.message.id);}branch.push({...n,nodeKey:key});key=n.parent;}
     return branch;
   }
   function imagePointers(value, output = new Set(), depth=0) {
@@ -141,9 +141,16 @@
     const userIndex=branch.indexOf(users[0]);const outputs=branch.slice(0,userIndex);const assistant=outputs.find(n=>n.message?.author?.role==='assistant')?.message;
     const schemaFacts=outputs.map(n=>({role:n.message?.author?.role,contentType:n.message?.content?.content_type,status:n.message?.status,endTurn:n.message?.end_turn}));
     if(!assistant?.id||assistant.status!=='finished_successfully'||assistant.end_turn!==true||(assistant.recipient&&assistant.recipient!=='all')||(assistant.channel&&assistant.channel!=='final'))return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts});
-    const pointers=new Set();for(const n of outputs)if(['assistant','tool'].includes(n.message?.author?.role))imagePointers(n.message.content,pointers);
+    if(outputs[0]?.message?.id!==assistant.id)return result(expected,'matched_incomplete','backend_current_node_not_final',{schemaFacts});
+    // Intermediate render attempts are history, not additional delivered images.
+    // Select only the newest image-bearing output, then corroborate its exact
+    // file IDs with the unique DOM image and an authenticated branch reread.
+    // Never fall back to an older match or select a subset of a multi-image output.
+    const imageOutputs=outputs.filter(n=>['assistant','tool'].includes(n.message?.author?.role)).map(n=>({node:n,pointers:imagePointers(n.message.content)})).filter(o=>o.pointers.size);
+    const delivery=imageOutputs[0];const pointers=delivery?.pointers || new Set();
+    if(delivery && delivery.node.message.status!=='finished_successfully')return result(expected,'matched_incomplete','backend_image_not_complete',{schemaFacts});
     if(pointers.size!==expected.imageCount)return result(expected,'mismatch','backend_image_identity',{schemaFacts,backendImageCount:pointers.size});
-    return {userMessageId:user.id,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:assistant.end_turn,pointers:[...pointers],schemaFacts,currentNode:record.current_node,branchIdentity:branch.map(n=>({parent:n.parent,id:n.message?.id || '',role:n.message?.author?.role || '',status:n.message?.status || '',endTurn:n.message?.end_turn}))};
+    return {userMessageId:user.id,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:assistant.end_turn,pointers:[...pointers],schemaFacts,currentNode:record.current_node,deliveryNode:delivery?.node.nodeKey,deliveryMessageId:delivery?.node.message.id,branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id || '',role:n.message?.author?.role || '',status:n.message?.status || '',endTurn:n.message?.end_turn}))};
   }
   async function evaluate(record,expected,snapshot,facts){
     const boundary=await nativeBoundary(record,expected,snapshot,facts);if(boundary.status)return boundary;
@@ -197,7 +204,10 @@
           const directNative=expected.mode!=='image_record_probe' && fileId(raw)===nativeId && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(expected.requestId);
           if(nativeOnly&&!strongIdentity)return unavailable('native_source_identity');
           if(directNative&&!strongIdentity)return unavailable('native_source_identity');
-          if((isBlob||nativeOnly||directNative)&&!imageSource(image)){
+          // A diagnostic probe may cache bytes without granting background
+          // adoption. A later real recovery must verify them again with the
+          // original request identity, rather than reuse that untrusted cache.
+          if((isBlob||nativeOnly||directNative)&&(!imageSource(image)||expected.mode!=='image_record_probe'&&!imageReady(image))){
             if(!authHeaders){const session=await fetch(page.origin+'/api/auth/session',options);const token=session.ok?(await session.json()).accessToken:'';if(!token)return unavailable('authentication_unavailable');authHeaders={Authorization:'Bearer '+token};}
             readStage='native_file_link';const link=await fetch(page.origin+'/backend-api/files/download/'+encodeURIComponent(nativeId)+'?conversation_id='+encodeURIComponent(expected.conversationId)+'&inline=false',{...options,headers:authHeaders});
             if(!link.ok)return unavailable('native_file_http_'+link.status);const originalUrl=(await link.json()).download_url;
@@ -237,7 +247,8 @@
       }
       const bindings=proof.bindings?.map(binding=>{const native=nativeDownloads.get(binding.imageFileId);return native && validImageBinding(native.image,native)?{...binding,bytesSha256:native.sha256,size:native.size,mime:native.mime,proofSource:native.proofSource,recordSha256:native.recordSha256,recordRecheckSha256:native.recordRecheckSha256}:binding;});
       const proofSource=bindings?.every(b=>b.proofSource==='native_record_download')?'native_record_download':bindings?.every(b=>b.proofSource==='dom_blob_bytes_equal')?'dom_blob_bytes_equal':bindings?.every(b=>b.proofSource==='dom_native_url_download')?'dom_native_url_download':'dom_native_url';
-      return {...proof,...(bindings?{bindings}:{}),proofSource,reason:proof.status==='matched_complete'&&proofSource==='native_record_download'?'exact_single_user_native_download':proof.status==='matched_complete'&&proofSource==='dom_blob_bytes_equal'?'exact_single_user_blob_bytes':proof.reason,checkedAt:Date.now()};
+      const galleryImageFacts=expected.mode==='image_record_probe' ? [...assistants[0]?.querySelectorAll('img') || []].map(img=>({gallery:Boolean(img.closest?.('[data-testid="generated-image-gallery"]')),connected:img.isConnected,width:Number(img.naturalWidth||0),height:Number(img.naturalHeight||0),sourceKind:rawImageSource(img).startsWith('blob:')?'blob':fileId(rawImageSource(img))?'native':rawImageSource(img)?'other':'empty',fileId:fileId(rawImageSource(img))})) : undefined;
+      return {...proof,...(bindings?{bindings}:{}),...(galleryImageFacts?{galleryImageFacts}:{}),proofSource,reason:proof.status==='matched_complete'&&proofSource==='native_record_download'?'exact_single_user_native_download':proof.status==='matched_complete'&&proofSource==='dom_blob_bytes_equal'?'exact_single_user_blob_bytes':proof.reason,checkedAt:Date.now()};
     }catch{return unavailable(controller.signal.aborted?'timeout_or_cancelled_'+readStage:'record_unavailable_'+readStage);}finally{clearTimeout(timer);deps.signal?.removeEventListener('abort',cancel);}
   }
   globalThis.ChatGptImageRecordProof=Object.freeze({read,evaluate,preflight,digest,fileId,key,imageSource,imageReady,imageMetadata,downloadBytes});

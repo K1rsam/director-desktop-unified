@@ -15,11 +15,14 @@
     {
       "path": "extension/content/conversationReconciliation.js",
       "beforeSha256": "f82342b48c333aa8d86e6296716543d85b0abaffeb561b0db02518d55083a892",
-      "afterSha256": "72eba7c1405b95096d811cf1dc905de00e7ebcee2738ded7a6d2c1ed9e0ecdbf",
+      "afterSha256": "1d1fb489446368e4eb983106efb1a01c06286d453df043dcc3dbd3947986751b",
       "previousAfterSha256": "09810908e5f758eee8e0bc1db965649c166a6d6c07545bba6ded7889191165be",
       "previousAfterSha256s": [
         "340994c84a7dcdc8ea3485f13950d9f267dab797a46ef1b7cf6799df704d6695",
-        "34dcdd816a56fb5c080599319e14d98c3ef9573a93b67dc8acb2b219ecaf8c4f"
+        "34dcdd816a56fb5c080599319e14d98c3ef9573a93b67dc8acb2b219ecaf8c4f",
+        "72eba7c1405b95096d811cf1dc905de00e7ebcee2738ded7a6d2c1ed9e0ecdbf",
+        "955567495694f0e73960328d5d7e7f6b8a872779197fbfb0dcd206adb7f20344",
+        "16545bf49529ff9673fbe6ed1a1f10e799202a9109ee3ac6c8dacdad8e3ea012"
       ]
     },
     {
@@ -84,6 +87,14 @@
       "path": "src/routes.js",
       "beforeSha256": "4890d540e84c81b4ad8afc6363cca3a177fd6c71f2d4679c5905435b0ed5e0fe",
       "afterSha256": "8d507a2b000d9c34b68e7e6320fd6e3073c013d11e17ae5d31cdd067c257708f"
+    },
+    {
+      "path": "src/browserBridge.js",
+      "beforeSha256": "8be312921a938ce3d6d9bcab20a1886067586dce5bc804934b5900058a290d53",
+      "afterSha256": "8f29f53d2a99bd54a4c6080312021a57e1d0401789250d4bbe8bcfa02980b8b6",
+      "previousAfterSha256s": [
+        "74c087da3bae50314b261d06ce024ffdd5e36a1ab74cc1d1003cefe1c274bedc"
+      ]
     }
   ]
 }

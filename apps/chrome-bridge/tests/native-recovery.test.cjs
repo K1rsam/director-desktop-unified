@@ -46,6 +46,7 @@ async function fixture(options = {}) {
         reads++;
         if (options.backendPrompt) value.mapping['user-node'].message.content.parts = [options.backendPrompt];
         if (options.status) value.mapping['assistant-node'].message.status = options.status;
+        options.recordTransform?.(value);
         if (reads === 2 && options.changedBranch) value.mapping['assistant-node'].message.id = 'different-assistant';
         return new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
       }
@@ -65,7 +66,7 @@ async function fixture(options = {}) {
   const proof = context.ChatGptImageRecordProof;
   const snapshot = () => {
     observed.push({ turnKey: proof.key(assistant), source: proof.imageSource(image) });
-    return { answer: '', artifacts: proof.imageSource(image) ? [{ id: 'original-artifact', kind: 'image', generatedImage: true, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', messageId: proof.key(assistant), hasFinalMessage: true };
+    return { answer: '', artifacts: proof.imageSource(image) && (!options.hidden || proof.imageReady(image)) ? [{ id: 'original-artifact', kind: 'image', generatedImage: true, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', messageId: proof.key(assistant), hasFinalMessage: true };
   };
   const expected = { mode: 'image_record_v1', requestId, conversationId, promptSha256: await proof.digest(prompt), imageCount: 1, allowReleasedRequest: options.allowReleasedRequest !== false, allowReloadedOriginalTab: options.allowReloadedOriginalTab === true };
   const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => 'content-epoch', readLatestAssistantSnapshot: snapshot, onBound: () => {} };
@@ -97,6 +98,33 @@ test('released task downloads its native original bytes only after exact branch 
     f.user.innerText = 'edited after proof';
     assert.equal(f.proof.downloadBytes(artifact, originalUrl), null, 'edited DOM revokes byte binding');
     assert.equal(f.proof.key(f.user), '');
+  }
+});
+
+test('latest image delivery survives intermediate renders and user reference images, with exact bytes rechecked', async () => {
+  const f = await fixture({recordTransform: value => {
+    value.mapping['user-node'].message.content.parts.push({asset_pointer:'sediment://file-reference'});
+    value.mapping['old-render']={parent:'user-node',message:{id:'old-render',author:{role:'tool'},status:'finished_successfully',content:{parts:[{asset_pointer:'sediment://file-intermediate'}]}}};
+    value.mapping['latest-render']={parent:'old-render',message:{id:'latest-render',author:{role:'tool'},status:'finished_successfully',content:{parts:[{asset_pointer:`sediment://${imageId}`}]}}};
+    value.mapping['assistant-node'].parent='latest-render';
+    value.mapping['assistant-node'].message.content={content_type:'text',parts:['']};
+  }});
+  const r=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(r.status,'matched_complete');assert.equal(r.deliveryMessageId,'latest-render');
+  assert.equal(r.bindings[0].imageFileId,imageId);assert.equal(r.bindings[0].bytesSha256,hash(png));
+  assert.equal(f.reads,2);assert.equal(r.branchIdentity[0].nodeKey,'assistant-node');
+});
+
+test('latest multiple, incomplete, changed or wrong-branch image delivery never falls back to an older matching image', async () => {
+  for(const mode of ['multiple','incomplete','wrong-latest','wrong-branch']){
+    const f=await fixture({recordTransform:value=>{
+      value.mapping['latest-render']={parent:'assistant-node',message:{id:'latest-render',author:{role:'tool'},status:mode==='incomplete'?'in_progress':'finished_successfully',content:{parts:[{asset_pointer:'sediment://file-other'},...(mode==='multiple'?[{asset_pointer:`sediment://${imageId}`}]:[])]}}};
+      value.mapping['final']={parent:'latest-render',message:{...value.mapping['assistant-node'].message,id:'new-final',content:{content_type:'text',parts:['']}}};
+      value.current_node=mode==='wrong-branch'?'latest-render':'final';
+    }});
+    const r=await f.proof.read(f.expected,f.snapshot(),f.deps);
+    assert.notEqual(r.status,'matched_complete',mode);assert.equal(f.proof.imageReady(f.image),false,mode);
+    assert.equal(f.proof.downloadBytes({sourceTurnKey:assistantId,requestId},originalUrl),null,mode);
   }
 });
 
@@ -173,6 +201,16 @@ test('blob image bytes must equal the native original before trust is granted', 
   const different = await fixture({ blob: true, differentBlob: true });
   assert.equal((await different.proof.read(different.expected, different.snapshot(), different.deps)).reason, 'blob_original_bytes_differ');
   assert.equal(different.proof.imageReady(different.image), false);
+});
+
+test('diagnostic cached blob bytes cannot poison later background recovery or grant adoption by themselves', async () => {
+  const f=await fixture({blob:true,hidden:true});
+  const diagnostic=await f.proof.read({...f.expected,mode:'image_record_probe'},f.snapshot(),f.deps);
+  assert.notEqual(diagnostic.status,'matched_complete');assert.equal(f.proof.imageReady(f.image),false);
+  const priorReads=f.reads;
+  const real=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(real.status,'matched_complete');assert.equal(f.proof.imageReady(f.image),true);
+  assert.equal(real.bindings[0].bytesSha256,hash(png));assert.equal(f.reads,priorReads+2,'real recovery must authenticate and reread the branch again');
 });
 
 test('response recovery rereads the proof-bound snapshot and returns original request and native turn identity', async () => {
