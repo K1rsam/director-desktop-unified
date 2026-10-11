@@ -3339,7 +3339,7 @@ impl Engine {
             // comparisons remain those captured by the original workflow.
             design_input["foundation"]["directionConfirmed"] = original_context["foundation"]["directionConfirmed"].clone();
             design_input["foundation"]["productionDirection"] = original_context["foundation"]["productionDirection"].clone();
-            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD] {
+            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD] {
                 if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
             }
         } else {
@@ -3347,6 +3347,7 @@ impl Engine {
                 .unwrap_or_else(|| all_assets.iter().filter(|asset| independent_image(asset)).map(|asset| asset["id"].clone()).collect()));
             pipeline::asset_design_contract::freeze_identity_production_materials(&mut design_input)?;
             pipeline::asset_production_context::freeze(&mut design_input);
+            pipeline::asset_design_contract::freeze_inline_delta_profile(&mut design_input);
             let mut comparisons = json!({});
             for asset in &all_assets { comparisons[s(asset,"id")] = json!(pipeline::asset_design_contract::comparison_designs(&design_input,asset)); }
             design_input["comparisonDesignsByAssetId"] = comparisons;
@@ -3410,7 +3411,7 @@ impl Engine {
                         let policy=r["imageProductionPolicy"].as_str().filter(|p|["automatic","trialReview"].contains(p)).unwrap_or_else(||pipeline::image_production_policy(&settings));
                         let active_image_ids:Vec<_>=store.job_summaries()?.iter().filter(|j|s(j,"kind")=="image"&&is_active_generation(s(j,"status"))).map(|j|j["entityId"].clone()).collect();
                         let mut input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
-                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD] {
+                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD] {
                             if let Some(value) = stage2_context.get(key) { input[key] = value.clone(); }
                         }
                         let needs_design=all.iter().any(|a|wanted.iter().any(|id|id==s(a,"id"))&&pipeline::automatic_design_required(&input,a));

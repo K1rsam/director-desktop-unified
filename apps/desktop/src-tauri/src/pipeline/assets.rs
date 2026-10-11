@@ -8,6 +8,44 @@ use std::{
 
 const ASSET_DESIGN_CONCURRENCY: usize = 4;
 
+pub(crate) const INLINE_DELTA_PROFILE_FIELD: &str = "stage2InlineDeltaProfile";
+pub(crate) const INLINE_DELTA_PROFILE: &str = "asset-inline-effective-delta/v1";
+
+pub(crate) fn freeze_inline_delta_profile(input: &mut Value) {
+    input[INLINE_DELTA_PROFILE_FIELD] = json!(INLINE_DELTA_PROFILE);
+}
+
+fn inline_delta_enabled(input: &Value) -> Result<bool, String> {
+    match input.get(INLINE_DELTA_PROFILE_FIELD) {
+        None | Some(Value::Null) => Ok(false),
+        Some(value) if value == INLINE_DELTA_PROFILE => Ok(true),
+        _ => Err("INLINE 派生变化合同版本无效；保留原冻结请求，不自动升级".into()),
+    }
+}
+
+/// Only fresh opted-in requests change delta semantics. The actual donor is
+/// authoritative; a normal designed parent and its older ancestors stay out.
+pub(super) fn inline_delta_context(input: &Value, asset: &Value) -> Result<Option<Value>, String> {
+    if !inline_delta_enabled(input)? { return Ok(None); }
+    let assets = input["assets"].as_array().ok_or("缺少资产目录")?;
+    let Some(direct) = resolve_asset_dependency(assets, asset)? else { return Ok(None); };
+    let by_id: BTreeMap<_, _> = assets.iter().map(|a| (text(a,"id"), a)).collect();
+    let parents: BTreeMap<_, _> = assets.iter().filter_map(|a| resolve_asset_dependency(assets,a).ok().map(|p|(text(a,"id").to_owned(),p))).collect();
+    let donor = inline_reference_target(&direct, &by_id, &parents)?;
+    if donor == direct { return Ok(None); }
+    let mut skipped = Vec::new();
+    let mut cursor = direct.as_str();
+    while cursor != donor {
+        let ancestor = by_id.get(cursor).ok_or("INLINE 来源形象不存在")?;
+        // A different subject can be an explicit image reference, never a fact donor.
+        if asset_identity(ancestor) == asset_identity(asset) {
+            skipped.push(cursor.to_owned());
+        }
+        cursor = parents.get(cursor).and_then(|p| p.as_deref()).ok_or("INLINE 指定来源不存在")?;
+    }
+    Ok(Some(json!({"version":INLINE_DELTA_PROFILE,"directAssetId":direct,"reusedDesignAssetId":donor,"effectiveInlineAssetIds":skipped})))
+}
+
 /// A program scope marker locates text; it is not the text itself. If A15 found
 /// no appearance facts, give C/D the exact named scene instead of only its title.
 /// Existing fact-backed requests stay byte-for-byte stable for recovery.
@@ -41,6 +79,21 @@ pub(super) fn empty_design_scene_context<'a>(
 
 fn inline_asset(asset: &Value) -> bool {
     asset.pointer("/preparation/mode").and_then(Value::as_str) == Some("INLINE")
+}
+
+fn adopted_reference_available(assets: &[Value], parent: &str) -> bool {
+    let mut current = parent;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) { return false; }
+        let Ok(asset) = dependency_asset(assets, current) else { return false; };
+        if !text(asset,"adoptedMediaId").is_empty() { return true; }
+        if !inline_asset(asset) { return false; }
+        let Ok(Some(next)) = resolve_asset_dependency(assets,asset) else { return false; };
+        // Reborrow from the immutable catalogue rather than the temporary ID.
+        let Ok(next_asset) = dependency_asset(assets,&next) else { return false; };
+        current = text(next_asset,"id");
+    }
 }
 
 pub(super) fn inline_reference_target(
@@ -223,6 +276,13 @@ pub(super) fn design_facts(
     known_rows: &HashSet<&str>,
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
     let identity = asset_identity(asset);
+    let inline_context = inline_delta_context(input, asset)?;
+    let mut delta_variants = HashSet::from([text(asset, "variantId")]);
+    if let Some(context) = &inline_context {
+        for id in context["effectiveInlineAssetIds"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            delta_variants.insert(text(by_id.get(id).ok_or("INLINE 来源形象不存在")?, "variantId"));
+        }
+    }
     let owned: Vec<_> = input
         .pointer("/foundation/facts")
         .and_then(Value::as_array)
@@ -288,7 +348,7 @@ pub(super) fn design_facts(
         fact.as_object_mut()
             .ok_or("视觉事实必须为对象")?
             .remove("quotes");
-        if text(&fact, "variantId") == text(asset, "variantId") {
+        if delta_variants.contains(text(&fact, "variantId")) {
             delta.push(fact.clone());
         }
         facts.push(fact);
@@ -515,6 +575,7 @@ pub async fn run_asset_design(
     model: &str,
     reasoning: &str,
 ) -> Result<Value, String> {
+    inline_delta_enabled(input)?;
     let assets = input
         .get("assets")
         .and_then(Value::as_array)
@@ -703,6 +764,24 @@ pub async fn run_asset_design(
                 text(asset, "id").to_owned(),
                 reference_design_card(&design_basis, asset, None)?,
             );
+        } else if !text(asset, "prompt").trim().is_empty() {
+            // Historic INLINE AI designs are valid donors only under their
+            // exact accepted receipt. Never downgrade failed AI proof to prose.
+            let parent = parents.get(text(asset,"id")).and_then(|p|p.as_deref());
+            let mut evidence: HashSet<_> = asset["sourceRefs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if let Ok((facts, _)) = design_facts(&design_basis, asset, &by_id, &parents, &known_rows) {
+                for fact in &facts {
+                    evidence.extend(fact["sourceRefs"].as_array().into_iter().flatten().filter_map(Value::as_str));
+                }
+                let scope_context = empty_design_scene_context(&source, asset, &facts, &evidence);
+                evidence.extend(scope_context.iter().map(|row|row.id.as_str()));
+                let Ok(production_context) = super::asset_production_context::context(&design_basis,asset) else { continue; };
+                let production_rows = production_context.as_ref().map(|context|super::asset_production_context::evidence_rows(context,&source)).unwrap_or_default();
+                evidence.extend(production_rows.iter().map(String::as_str));
+                if let Some(design) = reusable_parent_design(&design_basis, asset, assets, &source.sha256, &known_rows, &evidence, parent) {
+                    available_designs.insert(text(asset,"id").to_owned(), reference_design_card(&design_basis,asset,Some(design))?);
+                }
+            }
         }
     }
     let mut in_flight: Vec<(
@@ -939,6 +1018,11 @@ pub async fn run_asset_design(
             }
             if reference_parent.as_deref() != parent {
                 design_input["inlineReference"] = json!({"directAssetId":parent,"reusedDesignAssetId":reference_parent,"instruction":"直接来源为INLINE覆盖态，parentDesign复用其明确来源形象；referenceVariantIds仍按指定直接来源id输出，不新增独立INLINE图片。"});
+                if let Some(context) = inline_delta_context(&design_basis, asset)? {
+                    design_input["inlineReference"] = context.clone();
+                    design_input["inlineReference"]["instruction"] = json!("parentDesign是实际复用祖先的已接受设计；deltaFacts已包含该设计之后被跳过INLINE层与当前子形象的全部当前有效变化，同属性以较近当前形象为准。按deltaFacts修改祖先稿，保留未变身份；referenceVariantIds仍只输出指定直接来源id，不新增INLINE图片或事实。");
+                    frozen_context["inlineDeltaContext"] = context;
+                }
             }
             if has_program_source_scope(asset)
                 || parent
@@ -1100,7 +1184,7 @@ pub async fn run_asset_design(
         .filter(|p| ["automatic", "trialReview"].contains(p))
         .unwrap_or_else(|| image_production_policy(&input["settings"]));
     let needs_trial = policy == "trialReview" && !trial_approved;
-    let image_plan:Vec<_>=designs.iter().map(|design|{let id=text(design,"assetId");let dependencies=design["referenceAssetIds"].clone();let missing:Vec<_>=dependencies.as_array().unwrap().iter().filter_map(Value::as_str).filter(|parent|by_id.get(parent).and_then(|a|a.get("adoptedMediaId")).and_then(Value::as_str).map(|id|id.is_empty()).unwrap_or(true)).collect();json!({"assetId":id,"variantId":design["variantId"],"dependencies":dependencies,"prompt":design["prompt"],"imageProductionPolicy":policy,"status":if needs_trial{"awaitingTrial"}else if !missing.is_empty(){"waitingAdoption"}else{"ready"},"missingAdoption":missing,"candidateCount":if needs_trial{1}else{input.pointer("/settings/imageCount").and_then(Value::as_u64).unwrap_or(1)}})}).collect();
+    let image_plan:Vec<_>=designs.iter().map(|design|{let id=text(design,"assetId");let dependencies=design["referenceAssetIds"].clone();let missing:Vec<_>=dependencies.as_array().unwrap().iter().filter_map(Value::as_str).filter(|parent|!adopted_reference_available(assets,parent)).collect();json!({"assetId":id,"variantId":design["variantId"],"dependencies":dependencies,"prompt":design["prompt"],"imageProductionPolicy":policy,"status":if needs_trial{"awaitingTrial"}else if !missing.is_empty(){"waitingAdoption"}else{"ready"},"missingAdoption":missing,"candidateCount":if needs_trial{1}else{input.pointer("/settings/imageCount").and_then(Value::as_u64).unwrap_or(1)}})}).collect();
     let updated: Vec<_> = designs
         .iter()
         .map(|design| {
@@ -1119,6 +1203,10 @@ pub async fn run_asset_design(
         json!({"schemaVersion":"asset-design-batch/v1","sourceSha256":source.sha256,"assets":updated,"designs":designs,"imagePlan":image_plan,"imageProductionPolicy":policy,"facts":visual["facts"],"visualFactBatches":visual["visualFactBatches"],"visualFactCacheReuses":visual["visualFactCacheReuses"].as_array().cloned().unwrap_or_default(),"blocked":blocked,"skipped":skipped,"trialApproved":trial_approved,"ruleSnapshots":[rule_snapshot("asset-visual-facts-extractor")?,rule_snapshot("asset-art-director")?,rule_snapshot("asset-image-production")?]}),
     )
 }
+
+#[cfg(test)]
+#[path = "assets_inline_delta_tests.rs"]
+mod inline_delta_tests;
 
 #[cfg(test)]
 mod tests {

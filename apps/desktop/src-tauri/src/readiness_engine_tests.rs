@@ -1,6 +1,45 @@
 //! Real synthetic native executables; no host account, provider, or model access.
 use super::*;
 use std::process::Command;
+
+fn fixture_compiler(
+    explicit: Option<std::ffi::OsString>,
+    cargo_home: Option<std::ffi::OsString>,
+    user_home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let executable = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+    if let Some(explicit) = explicit {
+        // An explicit compiler is authoritative, including a broken override.
+        return PathBuf::from(explicit);
+    }
+    cargo_home
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(user_home.map(|home| PathBuf::from(home).join(".cargo")))
+        .map(|home| home.join("bin").join(executable))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(executable))
+}
+
+#[test]
+fn fixture_compiler_keeps_explicit_override_and_resolves_user_shim_without_path_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let cargo = tempfile::tempdir().unwrap();
+    let executable = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+    let user_shim = home.path().join(".cargo").join("bin").join(executable);
+    fs::create_dir_all(user_shim.parent().unwrap()).unwrap();
+    fs::write(&user_shim, b"synthetic compiler identity").unwrap();
+    let home_value = Some(home.path().as_os_str().to_owned());
+    assert_eq!(fixture_compiler(None, None, home_value.clone()), user_shim);
+    let cargo_shim = cargo.path().join("bin").join(executable);
+    fs::create_dir_all(cargo_shim.parent().unwrap()).unwrap();
+    fs::write(&cargo_shim, b"explicit cargo home compiler").unwrap();
+    assert_eq!(fixture_compiler(None, Some(cargo.path().as_os_str().to_owned()), home_value.clone()), cargo_shim);
+    let unavailable = home.path().join("explicit-missing-compiler");
+    assert_eq!(fixture_compiler(Some(unavailable.as_os_str().to_owned()), Some(cargo.path().as_os_str().to_owned()), home_value), unavailable);
+    assert_eq!(fixture_compiler(None, None, None), PathBuf::from(executable));
+}
+
 pub(super) fn native_fixture(dir: &Path, kind: &str) -> PathBuf {
     let path = dir.join(if cfg!(windows) {
         format!("{kind}-fixture.exe")
@@ -43,25 +82,21 @@ fn main() {
     .replace("__BUILD__", &json!(json!({"version":"1d0bd17-dirty","commit":"1d0bd17","build_time":"2026-10-03T13:51:54Z"}).to_string()).to_string())
     .replace("__BAD_BUILD__", &json!(json!({"version":"1d0bd17-dirty","commit":"deadbee","build_time":"2026-10-03T13:51:54Z"}).to_string()).to_string());
     fs::write(&source, code).unwrap();
-    let compiler = std::env::var_os("RUSTC")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("CARGO_HOME")
-                .map(PathBuf::from)
-                .map(|home| {
-                    home.join("bin")
-                        .join(if cfg!(windows) { "rustc.exe" } else { "rustc" })
-                })
-                .filter(|path| path.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "rustc.exe" } else { "rustc" }));
+    // Explorer-context native runs do not inherit the packaged host's temporary
+    // PATH. Resolve the existing user rustup shim; never install a compiler or
+    // alter the process/global PATH just to make the fixture pass.
+    let compiler = fixture_compiler(
+        std::env::var_os("RUSTC"),
+        std::env::var_os("CARGO_HOME"),
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
+    );
     let output = Command::new(compiler)
         .args(["--edition=2021", "--crate-name", "readiness_fixture"])
         .arg(&source)
         .arg("-o")
         .arg(&path)
         .output()
-        .unwrap();
+        .unwrap_or_else(|error| panic!("synthetic native compiler could not start: {error}"));
     assert!(
         output.status.success(),
         "{}",
@@ -425,7 +460,7 @@ fn main() {{ let args=std::env::args().skip(1).collect::<Vec<_>>().join(" ");
 let mut log=std::fs::OpenOptions::new().create(true).append(true).open({}).unwrap(); writeln!(log,"{{}}",args).unwrap();
 match args.as_str() {{ {} _ => {{ writeln!(log,"FORBIDDEN").unwrap(); std::process::exit(91); }} }} }}"#,json!(dir.join(format!("{kind}-calls.txt"))),arms);
     let source=dir.join(format!("{kind}.rs"));fs::write(&source,code).unwrap();
-    let compiler=std::env::var_os("RUSTC").map(PathBuf::from).or_else(||std::env::var_os("CARGO_HOME").map(PathBuf::from).map(|home|home.join("bin").join(if cfg!(windows){"rustc.exe"}else{"rustc"}))).unwrap_or_else(||PathBuf::from("rustc"));
+    let compiler=fixture_compiler(std::env::var_os("RUSTC"),std::env::var_os("CARGO_HOME"),std::env::var_os(if cfg!(windows){"USERPROFILE"}else{"HOME"}));
     let output=Command::new(compiler).args(["--edition=2021","--crate-name","canvas_readiness_fixture"]).arg(&source).arg("-o").arg(&path).output().unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));path
 }

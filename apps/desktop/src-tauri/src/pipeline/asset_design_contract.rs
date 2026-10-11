@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
 
 pub const DESIGN_PROFILE: &str = "asset-design-context/v2";
+pub(crate) use super::assets::{freeze_inline_delta_profile, INLINE_DELTA_PROFILE_FIELD};
 pub const IDENTITY_MATERIAL_PROFILE: &str = "asset-identity-production-material/v1";
 pub const IDENTITY_MATERIAL_PROFILE_FIELD: &str = "stage2IdentityMaterialProfile";
 pub const IDENTITY_MATERIALS_FIELD: &str = "identityProductionMaterials";
@@ -538,6 +539,9 @@ pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
         .collect();
     facts.sort_by_key(Value::to_string);
     let mut basis = json!({"version":DESIGN_PROFILE,"ruleSha256":rule_snapshot("asset-art-director")?["sha256"],"sourceSha256":input["source"]["sha256"],"assetSemanticVersion":digest(&asset_semantics(asset).to_string()),"sourceChain":chain,"factsSha256":digest(&json!(facts).to_string()),"projectVisualStyle":project_visual_style(&input["settings"]),"productionDirection":production_direction(input),"imagePresentation":image_presentation(&input["settings"],asset)});
+    if let Some(context) = super::assets::inline_delta_context(input, asset)? {
+        basis["inlineDeltaContext"] = context;
+    }
     let materials = consumed_identity_materials(input, &subjects)?;
     if !materials.is_empty() {
         basis["identityProductionMaterialsSha256"] = json!(digest(&json!(materials).to_string()));
