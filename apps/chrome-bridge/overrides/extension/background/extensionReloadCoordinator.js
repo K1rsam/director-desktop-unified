@@ -1,6 +1,8 @@
 const PENDING_EXTENSION_RELOAD_KEY = 'bridgePendingExtensionReload';
 const PENDING_EXTENSION_RELOAD_TTL_MS = 2 * 60_000;
 const LAUNCHED_TAB_STORAGE_PREFIX = 'chatgptBridgeLaunchedTab:';
+const CONTROLLER_STATE_PREFIX = 'directorDesktop:controlTab:v1:';
+const CONTROLLER_SESSION_UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const DIRECTOR_LAUNCH_TOKEN_RE = /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const CONTROLLER_LAUNCH_TOKEN_RE = /^bridge-director-control-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ownedDesktopLaunch = (token) => DIRECTOR_LAUNCH_TOKEN_RE.test(token) || CONTROLLER_LAUNCH_TOKEN_RE.test(token);
@@ -126,6 +128,49 @@ export function createExtensionReloadCoordinator({
     }
   }
 
+  async function snapshotIdleControllers(launchRecords) {
+    const controllers = {};
+    for (const [rawId, record] of Object.entries(launchRecords)) {
+      if (!CONTROLLER_LAUNCH_TOKEN_RE.test(String(record?.launchToken || ''))) continue;
+      const tabId = Number(rawId);
+      const runtime = await backgroundState.read(tabId);
+      if (runtime.lease || Object.values(runtime.commands || {}).some((command) => !['succeeded', 'rejected'].includes(command.status))) {
+        const error = new Error('Controller recovery is blocked while original browser work is unresolved');
+        error.code = 'MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE';
+        throw error;
+      }
+      const stateKey = CONTROLLER_STATE_PREFIX + record.launchToken.slice('bridge-director-control-'.length);
+      const stored = await chrome.storage.local.get(stateKey);
+      const prior = stored?.[stateKey];
+      const tab = chrome.tabs?.get ? await chrome.tabs.get(tabId).catch(() => null) : null;
+      let rootPage = false;
+      try { const url = new URL(tab?.url || ''); rootPage = url.origin === 'https://chatgpt.com' && url.pathname === '/' && !url.search && !url.hash && !url.username && !url.password; } catch {}
+      // Unknown creates are not made replaceable by maintenance. Only the
+      // original confirmed idle control page can receive invalidation proof.
+      if (prior?.status !== 'opened' || prior.tabId !== tabId || prior.launchToken !== record.launchToken
+        || !CONTROLLER_SESSION_UUID_RE.test(prior.browserSession || '') || !rootPage || tab.incognito === true
+        || prior.serverUrl !== record.serverUrl || prior.requestedUrl !== record.requestedUrl) continue;
+      // This is proof of an already completed, currently idle creation, not
+      // permission to restore its old browser-session nonce after a restart.
+      controllers[stateKey] = { tabId, launchToken: prior.launchToken, browserSession: prior.browserSession,
+        serverUrl: prior.serverUrl, requestedUrl: prior.requestedUrl };
+    }
+    return controllers;
+  }
+
+  async function markReloadedControllers(pending) {
+    for (const [stateKey, proof] of Object.entries(pending.idleControllers || {})) {
+      const expectedKey = CONTROLLER_STATE_PREFIX + String(proof.launchToken || '').slice('bridge-director-control-'.length);
+      if (stateKey !== expectedKey || !CONTROLLER_LAUNCH_TOKEN_RE.test(proof.launchToken || '')) continue;
+      const stored = await chrome.storage.local.get(stateKey);
+      const prior = stored?.[stateKey];
+      if (prior?.status !== 'opened' || prior.tabId !== proof.tabId || prior.launchToken !== proof.launchToken
+        || prior.browserSession !== proof.browserSession || prior.serverUrl !== proof.serverUrl
+        || prior.requestedUrl !== proof.requestedUrl) continue;
+      await chrome.storage.local.set({ [stateKey]: { ...prior, reloadInvalidated: { ...proof, operationId: pending.operationId } } });
+    }
+  }
+
   async function snapshotOwnedLaunchRecords() {
     const storage = chrome.storage?.session;
     if (!storage?.get) {
@@ -182,6 +227,7 @@ export function createExtensionReloadCoordinator({
     const sourceTabId = Number.isInteger(pending.sourceTabId) ? pending.sourceTabId : null;
     const serverUrl = safeBridgeServerUrl(pending.temporaryServerUrl);
     await restorePendingLaunchRecords(pending);
+    await markReloadedControllers(pending);
     for (const tabId of pending.tabIds) {
       const targetUrl = String(pending.targetUrls?.[String(tabId)] || '');
       if (targetUrl) {
@@ -325,6 +371,7 @@ export function createExtensionReloadCoordinator({
     // Runtime reload clears session storage for every work page, even when only
     // the source page is refreshed. Preserve ownership without expanding tabs.
     const launchRecords = await snapshotOwnedLaunchRecords();
+    const idleControllers = await snapshotIdleControllers(launchRecords);
     const planned = await maintenanceOperations.plan('extension.reload', {
       preconditions: { expectedVersion: String(expectedVersion || ''), tabIds: tabs.map((tab) => tab.id).filter(Number.isInteger) },
     });
@@ -348,6 +395,7 @@ export function createExtensionReloadCoordinator({
       sourceTabId: Number.isInteger(sourceTabId) ? sourceTabId : null,
       temporaryServerUrl: safeBridgeServerUrl(temporaryServerUrl),
       launchRecords,
+      idleControllers,
       targetUrls,
       trampolineUrls,
       requestedAt: Date.now(),

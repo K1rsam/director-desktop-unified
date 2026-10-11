@@ -90,9 +90,12 @@ export function createTabController({
     if (stored['directorDesktop:browserProfileId:v1'] !== profileId) throw new Error('Controller token does not belong to this browser profile');
     const stateKey = CONTROLLER_STATE_PREFIX + profileId;
     const prior = stored[stateKey];
+    let retiredControllers = Array.isArray(prior?.retiredControllers) ? prior.retiredControllers : [];
+    const saveState = async (state) => await local.set({ [stateKey]: { ...state, ...(retiredControllers.length ? { retiredControllers } : {}) } });
     if (prior && (prior.launchToken !== launchToken || prior.serverUrl !== bridgeServerUrl || !controllerRootUrl(prior.requestedUrl))) {
       throw new Error('Controller persistent identity changed; original state was preserved');
     }
+    if (prior && prior.status !== 'opened') throw new Error('Controller creation remains unresolved; original reservation was preserved');
     const sessionRecords = await session.get(null);
     let browserSession = sessionRecords[CONTROLLER_BROWSER_SESSION_KEY];
     if (browserSession === undefined) {
@@ -104,7 +107,12 @@ export function createTabController({
     } else if (!CONTROLLER_SESSION_UUID_RE.test(browserSession)) {
       throw new Error('Controller browser session identity is damaged; original state was preserved');
     }
-    if (prior?.browserSession && prior.browserSession !== browserSession) {
+    const invalidated = prior?.reloadInvalidated;
+    const reloadProved = prior?.status === 'opened' && typeof invalidated?.operationId === 'string' && invalidated.operationId.length > 0
+      && invalidated.tabId === prior.tabId && invalidated.launchToken === launchToken
+      && invalidated.browserSession === prior.browserSession && invalidated.serverUrl === bridgeServerUrl
+      && invalidated.requestedUrl === requestedUrl;
+    if (prior?.browserSession && prior.browserSession !== browserSession && !reloadProved) {
       throw new Error('Controller belongs to a previous browser session; no replacement was opened');
     }
     const records = Object.entries(sessionRecords || {}).filter(([key, record]) => key.startsWith(LAUNCHED_TAB_PREFIX) && record?.launchToken === launchToken);
@@ -121,14 +129,35 @@ export function createTabController({
       const existing = tabs.find((tab) => tab.id === tabId);
       if (existing) {
         if (!controllerRootUrl(existing.url) || existing.incognito === true) throw new Error('Controller page has changed; no navigation or replacement was attempted');
-        await local.set({ [stateKey]: { launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId, browserSession, status: 'opened' } });
-        // Reuse never navigates or activates the existing page.
-        const updated = await updateTab(tabId, { autoDiscardable: false });
-        return { tabId, launchToken, requestedUrl, bridgeServerUrl, reused: true, openerTabId: port?.sender?.tab?.id ?? null,
-          ...controllerTabState(updated), tabState: controllerTabState(updated) };
+        const connected = Array.from(connections.values()).some((state) => state?.tabId === tabId
+          && state.closed !== true && state.protocolReady === true && state.ws?.readyState === 1
+          && safeBridgeServerUrl(state.serverUrl || '') === bridgeServerUrl);
+        if (reloadProved && !connected) {
+          // runtime.reload invalidated the old content script. Preserve a user
+          // viewing this page; retire only its confirmed idle controller role.
+          // A new browser-session nonce is never replaced with the old nonce.
+          const { retiredControllers: _history, ...retired } = prior;
+          retiredControllers = [...retiredControllers, { ...retired, retiredAt: Date.now(), reason: 'extension_runtime_invalidated' }];
+          await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, browserSession, status: 'reserved' });
+          const retirement = (await local.get(stateKey))[stateKey];
+          const archived = retirement?.retiredControllers?.at(-1);
+          if (retirement?.status !== 'reserved' || retirement.launchToken !== launchToken || retirement.browserSession !== browserSession
+            || archived?.tabId !== tabId || archived.browserSession !== prior.browserSession
+            || archived.reloadInvalidated?.operationId !== invalidated.operationId) throw new Error('Original controller retirement was not persisted');
+          await forgetLaunchedTab(tabId);
+          const removed = await session.get(LAUNCHED_TAB_PREFIX + tabId);
+          if (removed[LAUNCHED_TAB_PREFIX + tabId]) throw new Error('Retired controller ownership removal was not persisted');
+        } else {
+          await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId, browserSession, status: 'opened' });
+          // Reuse never navigates or activates the existing page.
+          const updated = await updateTab(tabId, { autoDiscardable: false });
+          return { tabId, launchToken, requestedUrl, bridgeServerUrl, reused: true, openerTabId: port?.sender?.tab?.id ?? null,
+            ...controllerTabState(updated), tabState: controllerTabState(updated) };
+        }
+      } else {
+        // The complete Chrome inventory proves that this known controller closed.
+        await forgetLaunchedTab(tabId);
       }
-      // The complete Chrome inventory proves that this known controller closed.
-      await forgetLaunchedTab(tabId);
     } else if (prior) {
       // onRemoved clears launched identity. Only a known opened tab from this
       // same browser session may be recreated after complete inventory proves
@@ -139,18 +168,18 @@ export function createTabController({
         throw new Error('Controller launch identity is missing or creation remains unknown; no replacement was opened');
       }
     }
-    await local.set({ [stateKey]: { launchToken, serverUrl: bridgeServerUrl, requestedUrl, browserSession, status: 'reserved' } });
+    await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, browserSession, status: 'reserved' });
     const verified = await local.get(stateKey);
     if (verified[stateKey]?.status !== 'reserved' || verified[stateKey]?.launchToken !== launchToken) throw new Error('Controller reservation was not persisted');
     const tab = await createTab({ url: 'about:blank', active: false });
     if (!Number.isInteger(tab?.id)) throw new Error('Controller creation has unknown tab identity');
     // Preserve even a navigation/storage failure as an unknown owned create.
-    await local.set({ [stateKey]: { launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId: tab.id, browserSession, status: 'reserved' } });
+    await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId: tab.id, browserSession, status: 'reserved' });
     await rememberLaunchedTab(tab.id, { launchToken, requestedUrl, createdAt: Date.now(), serverUrl: bridgeServerUrl });
     const recordsAfter = await session.get(LAUNCHED_TAB_PREFIX + tab.id);
     if (recordsAfter[LAUNCHED_TAB_PREFIX + tab.id]?.launchToken !== launchToken) throw new Error('Controller launch ownership was not persisted');
     const updated = await updateTab(tab.id, { url: requestedUrl, active: false, autoDiscardable: false });
-    await local.set({ [stateKey]: { launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId: tab.id, browserSession, status: 'opened' } });
+    await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, tabId: tab.id, browserSession, status: 'opened' });
     return { tabId: tab.id, launchToken, requestedUrl, bridgeServerUrl, openerTabId: port?.sender?.tab?.id ?? null,
       ...controllerTabState(updated), tabState: controllerTabState(updated) };
   }

@@ -12,8 +12,9 @@ function fixture(options={}) {
     const context=vm.createContext({URL,URLSearchParams,Date,Math,console,setTimeout,chrome,crypto});
     vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/tabController.js'),'utf8').replace(/export /g,''),context);
     const port={sender:{tab:{id:1,incognito:false}}};
-    const instance=context.createTabController({connections:new Map([[port,{serverUrl:BASE}]]),safeBridgeServerUrl:u=>u===BASE?u:'',
-      rememberLaunchedTab:async(id,record)=>{session[PREFIX+id]={...record};},readLaunchedTab:async id=>session[PREFIX+id],forgetLaunchedTab:async id=>{delete session[PREFIX+id];},isStableLaunchToken:()=>true});
+    const connections=new Map([[port,{serverUrl:BASE}],...(options.connectedTabs||[]).map(id=>[{}, {tabId:id,serverUrl:BASE,closed:false,protocolReady:true,ws:{readyState:1}}])]);
+    const instance=context.createTabController({connections,safeBridgeServerUrl:u=>u===BASE?u:'',
+      rememberLaunchedTab:async(id,record)=>{session[PREFIX+id]={...record};},readLaunchedTab:async id=>session[PREFIX+id],forgetLaunchedTab:async id=>{if(!options.forgetError)delete session[PREFIX+id];},isStableLaunchToken:()=>true});
     return {open:opt=>instance.openBridgeTab(port,{active:false,launchToken:TOKEN,...opt}),instance,port};
   }
   return {local,session,tabs,calls,controller};
@@ -68,4 +69,43 @@ test('closed controller still holds on browser restart, reserved unknown or live
     if(change==='reserved')f.local[STATE].status='reserved';
     await assert.rejects(f.controller().open());assert.equal(f.calls.filter(c=>c[0]==='create').length,1,change);
   }
+});
+
+const OLD_SESSION='1136648d-9df6-482d-b2dd-f0faad3df911',NEW_SESSION='d4674c87-bfea-47b9-bd7e-639c06b8503e';
+function reloadFixture(options={}) {
+  const record={launchToken:TOKEN,requestedUrl:'https://chatgpt.com/',serverUrl:BASE};
+  const prior={...record,status:'opened',tabId:122,browserSession:OLD_SESSION};
+  prior.reloadInvalidated={...record,tabId:122,browserSession:OLD_SESSION,operationId:'maintenance-original'};
+  return fixture({...options,session:{[PREFIX+122]:record,'directorDesktop:controllerBrowserSession:v1':NEW_SESSION,...options.session},
+    local:{[STATE]:prior,...options.local},tabs:[{id:122,url:'https://chatgpt.com/',active:true,incognito:false},...(options.tabs||[])]});
+}
+test('one worker serializes control recovery without refreshing old user page or restoring old nonce',async()=>{
+  const f=reloadFixture(),worker=f.controller();const [a,b]=await Promise.all([worker.open(),worker.open()]);
+  assert.equal(a.tabId,123);assert.equal(b.reused,true);assert.equal(f.calls.filter(c=>c[0]==='create').length,1);
+  assert.ok(!f.calls.some(c=>c[0]==='update'&&c[1]===122));assert.equal(f.tabs.get(122).active,true);assert.equal(f.tabs.get(122).url,'https://chatgpt.com/');
+  assert.equal(f.local[STATE].browserSession,NEW_SESSION);assert.equal(f.local[STATE].retiredControllers[0].browserSession,OLD_SESSION);
+  assert.equal(f.local[STATE].retiredControllers[0].tabId,122);assert.equal(f.local[STATE].retiredControllers[0].status,'opened');
+  assert.equal(f.session[PREFIX+122],undefined);assert.equal(f.session[PREFIX+123].launchToken,TOKEN);
+  assert.equal(f.calls.find(c=>c[0]==='create')[1].active,false);await f.controller().open();assert.equal(f.calls.filter(c=>c[0]==='create').length,1);
+});
+test('a controller reconnected after runtime reload is reused without navigation and with the current real session',async()=>{
+  const f=reloadFixture({connectedTabs:[122]});const result=await f.controller().open();
+  assert.equal(result.reused,true);assert.equal(result.tabId,122);assert.equal(f.calls.filter(c=>c[0]==='create').length,0);
+  assert.ok(f.calls.filter(c=>c[0]==='update').every(c=>!Object.hasOwn(c[2],'url')&&!Object.hasOwn(c[2],'active')));
+  assert.equal(f.local[STATE].browserSession,NEW_SESSION);assert.equal(f.local[STATE].reloadInvalidated,undefined);
+});
+test('invalidated controller replacement preserves unknown creates and failed retirement instead of creating twice',async()=>{
+  for(const option of [{unknownCreate:true},{updateError:true},{forgetError:true}]){
+    const f=reloadFixture(option);await assert.rejects(f.controller().open());assert.equal(f.local[STATE].status,'reserved');
+    await assert.rejects(f.controller().open());assert.equal(f.calls.filter(c=>c[0]==='create').length,option.forgetError?0:1);
+    assert.equal(f.tabs.get(122).url,'https://chatgpt.com/');assert.equal(f.local[STATE].retiredControllers.length,1);
+  }
+});
+test('forged invalidation identity and changed old user page cannot unlock a previous-session controller',async()=>{
+  for(const field of ['tabId','launchToken','browserSession','serverUrl','requestedUrl','operationId']){
+    const f=reloadFixture();f.local[STATE].reloadInvalidated[field]=field==='tabId'?999:'';
+    await assert.rejects(f.controller().open());assert.equal(f.calls.filter(c=>c[0]==='create').length,0);
+  }
+  const f=reloadFixture();f.tabs.get(122).url='https://chatgpt.com/c/user';await assert.rejects(f.controller().open());
+  assert.ok(f.calls.every(c=>!['create','update'].includes(c[0])));
 });

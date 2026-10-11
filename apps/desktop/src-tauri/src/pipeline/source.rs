@@ -288,9 +288,14 @@ const DISPLAY_PARSER_VERSION: &str = "source-parser/v5";
 const FIDELITY_PARSER_VERSION: &str = "source-parser/v6";
 const MULTILINE_DISPLAY_PARSER_VERSION: &str = "source-parser/v7";
 const JOINT_SPEAKER_PARSER_VERSION: &str = "source-parser/v8";
+const TITLE_METADATA_PARSER_VERSION: &str = "source-parser/v9";
+
+fn uses_joint_speaker_rules(version: &str) -> bool {
+    [JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&version)
+}
 
 fn uses_fidelity_rules(version: &str) -> bool {
-    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION].contains(&version)
+    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&version)
 }
 
 fn display_block_header(text: &str) -> bool {
@@ -344,7 +349,7 @@ fn display_enclosure_field(line: &str) -> Option<&str> {
 /// of speakers: the same labels outside that exact enclosure remain dialogue.
 /// Incomplete enclosures and explicit speech cues never grant an exemption.
 fn multiline_display_row_ids(source: &LockedSource, named: &HashSet<String>) -> HashSet<String> {
-    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION].contains(&source.parser_version.as_str()) {
+    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&source.parser_version.as_str()) {
         return HashSet::new();
     }
     let mut ids = HashSet::new();
@@ -440,6 +445,7 @@ fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
+        TITLE_METADATA_PARSER_VERSION,
     ]
     .contains(&source.parser_version.as_str())
     {
@@ -560,7 +566,7 @@ fn prior_display_parser_version(text: &str) -> &'static str {
 
 // Joint speech is a new import / explicit re-recognition contract. Never
 // reinterpret an already frozen v1-v7 source during load or recovery.
-fn fresh_parser_version(text: &str) -> &'static str {
+fn prior_joint_parser_version(text: &str) -> &'static str {
     let prior = prior_display_parser_version(text);
     static JOINT_HEAD: OnceLock<Regex> = OnceLock::new();
     let possible = JOINT_HEAD.get_or_init(|| Regex::new(r"^\s*[\p{L}\p{M}\p{N}·・_]{1,24}\s*[&＆、与和][^:：\r\n]*[：:]").unwrap());
@@ -571,6 +577,51 @@ fn fresh_parser_version(text: &str) -> &'static str {
         old.as_object_mut().unwrap().remove("parserVersion");
         new.as_object_mut().unwrap().remove("parserVersion");
         if old != new { return JOINT_SPEAKER_PARSER_VERSION; }
+    }
+    prior
+}
+
+// A cover title is metadata only with a completely explicit, local shape:
+// independent book-title line, optional edition/episode-count line, then an
+// actual positive episode heading. No arbitrary intervening preface is hidden.
+// Book references inside a scene, title-plus-action lines, and unknown prose
+// still require a source-bound decision. Original rows/bytes are never removed.
+fn title_metadata_row_indices(text: &str) -> HashSet<usize> {
+    let lines = raw_lines(text);
+    let mut nonempty = lines.iter().enumerate().filter(|(_, line)| !line.trim().is_empty());
+    let Some((title_index, title)) = nonempty.next() else { return HashSet::new(); };
+    let Some(title) = title.trim().strip_prefix('《').and_then(|value| value.strip_suffix('》')) else { return HashSet::new(); };
+    if title.trim().is_empty() || title.chars().count() > 80
+        || title.contains(['《', '》', '：', ':', '。', '！', '？', '!', '?', '△', '▲', '“', '”'])
+    { return HashSet::new(); }
+    let Some((next_index, next)) = nonempty.next() else { return HashSet::new(); };
+    static FORMAT: OnceLock<Regex> = OnceLock::new();
+    let format = FORMAT.get_or_init(|| Regex::new(r"^(?:共|全)?\s*([零〇一二三四五六七八九十百千\d]+)\s*集\s*(?:短剧漫剧|动画短剧|动画漫剧|短剧|漫剧|动画)?\s*剧本$").unwrap());
+    let format_row = format.captures(next.trim())
+        .and_then(|capture| number_value(capture.get(1)?.as_str()))
+        .is_some_and(|number| number > 0);
+    let episode_line = if format_row {
+        let Some((_, episode)) = nonempty.next() else { return HashSet::new(); };
+        episode.trim()
+    } else { next.trim() };
+    if !episode_heading_re().captures(episode_line)
+        .and_then(|capture| number_value(capture.get(1)?.as_str()))
+        .is_some_and(|number| number > 0)
+    { return HashSet::new(); }
+    let mut indices = HashSet::from([title_index]);
+    if format_row { indices.insert(next_index); }
+    indices
+}
+
+fn fresh_parser_version(text: &str) -> &'static str {
+    let prior = prior_joint_parser_version(text);
+    if title_metadata_row_indices(text).is_empty() { return prior; }
+    if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, TITLE_METADATA_PARSER_VERSION)) {
+        let mut old = serde_json::to_value(old).unwrap();
+        let mut new = serde_json::to_value(new).unwrap();
+        old.as_object_mut().unwrap().remove("parserVersion");
+        new.as_object_mut().unwrap().remove("parserVersion");
+        if old != new { return TITLE_METADATA_PARSER_VERSION; }
     }
     prior
 }
@@ -885,6 +936,7 @@ fn parse_dialogue_with_label(text: &str, start: usize, row_id: &str, parser_vers
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
+        TITLE_METADATA_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let (channel_text, channel_label) = if current_voice_rules {
@@ -1038,7 +1090,7 @@ fn joint_row_dialogue(row: &SourceRow, evidence: &JointSpeakerGrammar) -> Option
 }
 
 fn apply_joint_dialogues(source: &mut LockedSource) {
-    if source.parser_version != JOINT_SPEAKER_PARSER_VERSION { return; }
+    if !uses_joint_speaker_rules(&source.parser_version) { return; }
     let names = joint_speaker_grammar(source);
     for row in source.rows.iter_mut().filter(|row| row.kind == "body") {
         if let Some(dialogue) = joint_row_dialogue(row, &names) { row.dialogue = dialogue; }
@@ -1064,6 +1116,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
+        TITLE_METADATA_PARSER_VERSION,
     ]
     .contains(&parser_version)
     {
@@ -1075,6 +1128,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         FIDELITY_PARSER_VERSION,
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
+        TITLE_METADATA_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let fidelity = uses_fidelity_rules(parser_version);
@@ -1136,6 +1190,9 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
     let mut continued_metadata = HashSet::new();
     let mut previous_heading_number = None;
     let lines = raw_lines(text);
+    let title_metadata = if parser_version == TITLE_METADATA_PARSER_VERSION {
+        title_metadata_row_indices(text)
+    } else { HashSet::new() };
     let first_nonempty = lines.iter().position(|line| !line.trim().is_empty());
     for (index, raw) in lines.iter().enumerate() {
         let line = raw.trim();
@@ -1421,7 +1478,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         if continued_metadata.contains(&index) && !context {
             kind = "format";
         }
-        if title_before_context {
+        if title_before_context || title_metadata.contains(&index) {
             kind = "context";
         }
         if kind == "body" && (episode_id.is_none() || scene_id.is_none()) {
@@ -1700,7 +1757,7 @@ fn migrate_scene_edits(
 
 fn validate_integrity(source: &LockedSource) -> Result<(), String> {
     let display_ids = display_only_row_ids(source);
-    let joint_names = (source.parser_version == JOINT_SPEAKER_PARSER_VERSION).then(|| joint_speaker_grammar(source));
+    let joint_names = uses_joint_speaker_rules(&source.parser_version).then(|| joint_speaker_grammar(source));
     if source.schema_version != "locked-source/v1"
         || source.coordinate_system != "utf16"
         || source.sha256 != digest(&source.text)
@@ -2923,3 +2980,7 @@ mod display_tests;
 #[cfg(test)]
 #[path="source_joint_tests.rs"]
 mod joint_tests;
+
+#[cfg(test)]
+#[path = "source_title_tests.rs"]
+mod title_tests;

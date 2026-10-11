@@ -163,8 +163,11 @@ fn observation_delayed_supervisor_reports_overshoot_without_false_success_or_kil
 
     let dir = tempfile::tempdir().unwrap();
     let counter = dir.path().join("calls");
-    let mut process_policy = policy();
-    process_policy.run = Duration::from_millis(100);
+    let process_policy = policy();
+    // This test measures a deliberate control-loop stall, not the time Windows
+    // needs to initialize pipes and spawn under suite load. Keep the normal
+    // synthetic run budget and explicitly cross it after the first control tick.
+    let deliberate_stall = process_policy.run + Duration::from_millis(250);
     let checks = Arc::new(AtomicUsize::new(0));
     let checks_in_callback = checks.clone();
     let counter_in_callback = counter.clone();
@@ -173,7 +176,7 @@ fn observation_delayed_supervisor_reports_overshoot_without_false_success_or_kil
         // the fixture can finish while this single-threaded supervisor cannot
         // poll child exit, either pipe, or its already-expired run deadline.
         if checks_in_callback.fetch_add(1, Ordering::SeqCst) == 1 {
-            let marker_deadline = Instant::now() + Duration::from_millis(500);
+            let marker_deadline = Instant::now() + Duration::from_secs(2);
             while !counter_in_callback.exists() && Instant::now() < marker_deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -181,12 +184,15 @@ fn observation_delayed_supervisor_reports_overshoot_without_false_success_or_kil
                 counter_in_callback.exists(),
                 "fixture never reached its start marker"
             );
-            std::thread::sleep(Duration::from_millis(250));
+            // The fixture cannot finish before this control tick. It releases
+            // into its normal quiet exit while the supervisor is stalled.
+            fs::write(counter_in_callback.with_extension("release"), b"released").unwrap();
+            std::thread::sleep(deliberate_stall);
         }
         false
     });
     let (result, diagnostic) =
-        observed_fixture_result(command("quiet", &counter), process_policy, stopped);
+        observed_fixture_result(command("observation-gated", &counter), process_policy, stopped);
 
     let error = result.unwrap_err();
     assert_eq!(
@@ -195,7 +201,7 @@ fn observation_delayed_supervisor_reports_overshoot_without_false_success_or_kil
     );
     assert!(!error.auth_required);
     assert!(!error.submission_unknown);
-    assert!(checks.load(Ordering::SeqCst) >= 2);
+    assert!(checks.load(Ordering::SeqCst) >= 2, "control stall was not exercised: {diagnostic}");
     assert_eq!(fs::read(&counter).unwrap(), b"1");
     assert_eq!(diagnostic["timeout"]["kind"], "run");
     assert_eq!(diagnostic["preCleanup"]["state"], "exited");
@@ -205,7 +211,7 @@ fn observation_delayed_supervisor_reports_overshoot_without_false_success_or_kil
     assert_eq!(diagnostic["processExit"]["success"], true);
     assert_eq!(diagnostic["cleanup"]["killRequested"], false);
     assert_eq!(diagnostic["cleanup"]["reapConfirmed"], true);
-    assert!(observation_millis(&diagnostic["timeout"]["elapsedMs"]) >= 250);
+    assert!(observation_millis(&diagnostic["timeout"]["elapsedMs"]) >= deliberate_stall.as_millis() as u64);
     assert!(observation_millis(&diagnostic["timeout"]["overshootMs"]) >= 140);
-    assert!(observation_millis(&diagnostic["maxControlGapMs"]) >= 240);
+    assert!(observation_millis(&diagnostic["maxControlGapMs"]) >= deliberate_stall.as_millis() as u64 - 10);
 }

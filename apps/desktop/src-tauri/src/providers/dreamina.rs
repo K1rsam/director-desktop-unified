@@ -2674,7 +2674,7 @@ mod bounded_process_tests {
             let source = directory.path().join("fixture.rs");
             let executable = directory.path().join(if cfg!(windows) { "fixture.exe" } else { "fixture" });
             fs::write(&source, r#"
-use std::{io::Write,process::{Command,Stdio},time::Duration};
+use std::{io::Write,process::{Command,Stdio},time::{Duration,Instant}};
 fn main() {
     let args:Vec<String>=std::env::args().collect();
     let mode=&args[1];
@@ -2682,6 +2682,15 @@ fn main() {
     let counter=std::path::Path::new(&args[2]);
     std::fs::OpenOptions::new().create(true).append(true).open(counter).unwrap().write_all(b"1").unwrap();
     std::fs::write(counter.with_extension("pid"),std::process::id().to_string()).unwrap();
+    if mode=="observation-gated" {
+        let gate=counter.with_extension("release");
+        let deadline=Instant::now()+Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(Instant::now()<deadline,"supervisor never released offline observation fixture");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(180));
+    }
     if mode=="inherited" {
         let mut c=Command::new(std::env::current_exe().unwrap());
         c.arg("hold").stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());

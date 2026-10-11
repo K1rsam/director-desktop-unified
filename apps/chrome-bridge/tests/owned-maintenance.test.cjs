@@ -2,7 +2,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const token=id=>`bridge-director-desktop-00000000-0000-4000-8000-${String(id).padStart(12,'0')}`;
 function fixture(options={}){
   const writes=[],plans=[],queries=[],remembered=[],navigated=[],reloaded=[],tabs=[{id:1,url:'https://chatgpt.com/c/own-one'},{id:2,url:'https://chatgpt.com/c/own-two'},{id:3,url:'https://chatgpt.com/c/user'},...(options.tabs||[])],records={1:{launchToken:token(1)},2:{launchToken:token(2)},...options.records};
-  const local={},session={
+  const local={...options.local},session={
     'chatgptBridgeLaunchedTab:1':records[1],
     'chatgptBridgeLaunchedTab:2':records[2],
     ...options.session,
@@ -13,7 +13,7 @@ function fixture(options={}){
       session:{get:async()=>{if(options.sessionReadError)throw Error('session unavailable');return {...session};}},
     }}});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/extensionReloadCoordinator.js'),'utf8').replace(/export /g,''),context);
-  const coordinator=context.createExtensionReloadCoordinator({backgroundState:{read:async id=>({lease:options.busyId===id?{requestId:'original'}:null,commands:{},outbox:[]})},
+  const coordinator=context.createExtensionReloadCoordinator({backgroundState:{read:async id=>({lease:options.busyId===id?{requestId:'original'}:null,commands:options.commands?.[id]||{},outbox:[]})},
     maintenanceOperations:{plan:async(type,p)=>{plans.push(p);return {accepted:true,state:{active:{operationId:'operation'}}};},dispatch:async()=>({accepted:true}),succeed:async()=>{},fail:async()=>{}},
     safeBridgeServerUrl:u=>u,readLaunchedTab:async id=>records[id],launchTokenPattern:/^bridge-/,
     rememberLaunchedTab:async(id,record)=>{remembered.push({id,record});records[id]=record;session[`chatgptBridgeLaunchedTab:${id}`]=record;},
@@ -91,4 +91,35 @@ test('owned-only maintenance accepts the idle original controller and still excl
   await f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:true,ownedTabsOnly:true});
   assert.deepEqual(Array.from(f.local.bridgePendingExtensionReload.tabIds),[1,2,4]);
   assert.ok(!Object.hasOwn(f.local.bridgePendingExtensionReload.targetUrls,'3'));
+});
+
+const CONTROL='bridge-director-control-b84d4521-56ba-4f84-9948-090f82d639e7',CONTROL_STATE='directorDesktop:controlTab:v1:b84d4521-56ba-4f84-9948-090f82d639e7',OLD_SESSION='1136648d-9df6-482d-b2dd-f0faad3df911';
+function controllerFixture(options={}){
+  const record={launchToken:CONTROL,requestedUrl:'https://chatgpt.com/',serverUrl:'http://127.0.0.1:53179'};
+  return fixture({...options,records:{4:record,...options.records},session:{'chatgptBridgeLaunchedTab:4':record,...options.session},
+    local:{[CONTROL_STATE]:{...record,tabId:4,browserSession:OLD_SESSION,status:'opened'},...options.local},tabs:[{id:4,url:'https://chatgpt.com/',active:true},...(options.tabs||[])]});
+}
+test('source-only runtime recovery proves idle controller invalidation without copying its old session or touching its page',async()=>{
+  const f=controllerFixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+  const proof=f.local.bridgePendingExtensionReload.idleControllers[CONTROL_STATE];assert.equal(proof.tabId,4);assert.equal(proof.browserSession,OLD_SESSION);
+  for(const key of Object.keys(f.session))delete f.session[key];
+  await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated.operationId,'operation');
+  assert.equal(f.session['directorDesktop:controllerBrowserSession:v1'],undefined);assert.deepEqual(f.reloaded,[1]);assert.deepEqual(f.navigated,[]);
+  assert.equal(f.session['chatgptBridgeLaunchedTab:4'].launchToken,CONTROL);
+});
+test('idle controller snapshot blocks active leases and unconfirmed commands even on source-only maintenance',async()=>{
+  for(const options of [{busyId:4},{commands:{4:{open:{status:'uncertain'}}}},{commands:{4:{open:{status:'dispatched'}}}}]){
+    const f=controllerFixture(options);await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');
+    assert.equal(f.plans.length,0);assert.equal(f.writes.length,0);
+  }
+});
+test('reserved, missing, changed or conflicting controller identity never receives runtime replacement proof',async()=>{
+  for(const field of ['status','tabId','launchToken','browserSession','serverUrl','requestedUrl']){
+    const f=controllerFixture();f.local[CONTROL_STATE][field]=field==='tabId'?99:'';
+    await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+    assert.equal(Object.keys(f.local.bridgePendingExtensionReload.idleControllers).length,0);
+    await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated,undefined);
+  }
+  const f=controllerFixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+  f.local[CONTROL_STATE].serverUrl='http://127.0.0.1:9999';await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated,undefined);
 });

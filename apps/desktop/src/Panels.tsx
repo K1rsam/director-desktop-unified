@@ -10,6 +10,7 @@ import type { ReadinessCheck } from './ProviderReadiness';
 import { prepareRuntime, readRuntimeStatus } from './runtimeSetup';
 import type { RuntimeStatus } from './runtimeSetup';
 import './ChannelsSettings.css';
+import './ProjectSettings.css';
 import { ProductionSettings } from './ProductionSettings';
 import { generationProgress, isLocalVideoPreparation, videoPreparationLabel } from './generationState';
 import { generationChoices, ratioLabel, resolutionLabel } from './contracts';
