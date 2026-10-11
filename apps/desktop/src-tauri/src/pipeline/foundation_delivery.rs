@@ -4096,6 +4096,7 @@ fn sent_decision_evidence(input: &Value, original: &SourceRow) -> bool {
 fn automatic_receipts(
     value: &Value,
     source: &LockedSource,
+    application_source: &LockedSource,
     batch: &Batch,
     prior: &FoundationProposal,
     input: &Value,
@@ -4120,7 +4121,7 @@ fn automatic_receipts(
         &allowed_refs(input),
     )?);
     let context = json!({"projectId":input["projectId"],"sourceVersion":input["sourceVersion"],"foundation":{"version":input["foundationVersion"]}});
-    let view = auto_view(source, &combined, &context)?;
+    let view = auto_view(application_source, &combined, &context)?;
     let contracts = automatic_decisions(&view, &input["userReviewRequirements"])?;
     let expected: Vec<_> = contracts
         .iter()
@@ -4195,6 +4196,15 @@ fn automatic_receipts(
             .filter(|s| !s.trim().is_empty())
             .ok_or("自动解释缺实际采用依据")?;
         let refs = choice_strings(&contract["sourceRefs"], "自动解释原文证据")?;
+        // Offered contracts retain the locations frozen in this request. Only
+        // a new choice from this same Q1 may refer to a child scene established
+        // by its exact, validated split. Evidence bytes and sent row identities
+        // are always checked against the unmodified request source below.
+        let anchor_source = if offered.iter().any(|decision| decision["id"] == contract["id"]) {
+            source
+        } else {
+            application_source
+        };
         // Supporting evidence is not an application permission. A father's
         // earlier dialogue may support a later scene's interpretation without
         // authorizing an edit or applying that interpretation to the old scene.
@@ -4209,7 +4219,7 @@ fn automatic_receipts(
             })
             || !refs
                 .iter()
-                .filter_map(|id| source.rows.iter().find(|row| &row.id == id))
+                .filter_map(|id| anchor_source.rows.iter().find(|row| &row.id == id))
                 .any(|row| {
                     row.episode_id.as_ref().is_some_and(|ep| {
                         decision_contains_place(contract, ep, row.scene_id.as_deref())
@@ -4383,11 +4393,6 @@ fn apply_optimization_with_receipt_times(
     let applying =
         input.pointer("/delivery/phase").and_then(Value::as_str) == Some("APPLY_DECISION");
     let automatic = input["foundationDecisionPolicy"] == AUTO_INTERPRET_POLICY;
-    let auto_records = if automatic {
-        automatic_receipts(value, source, batch, prior, input, frozen_receipt_times)?
-    } else {
-        vec![]
-    };
     if automatic
         && input.pointer("/delivery/phase").and_then(Value::as_str) == Some("AUTO_INTERPRET")
         && value["changes"].as_object().is_none_or(|m| !m.is_empty())
@@ -4429,6 +4434,11 @@ fn apply_optimization_with_receipt_times(
         &allowed,
     )?);
     let projected_source = source_projection(source, &program_todos, &batch.scope)?;
+    let auto_records = if automatic {
+        automatic_receipts(value, source, &projected_source, batch, prior, input, frozen_receipt_times)?
+    } else {
+        vec![]
+    };
     let source = &projected_source;
     let mut next = prior.clone();
     let mut seen = HashSet::new();
@@ -9595,6 +9605,143 @@ mod tests {
         let mut receipt = empty_edit(&s, &batch);
         receipt["resolvedIssues"] = json!([next.issues[0].coordinate]);
         assert!(apply_optimization(&receipt, &s, &batch, &input, &next, None).is_err());
+    }
+    fn auto_split_choice_fixture() -> (LockedSource, Batch, FoundationProposal, Value, Value) {
+        let s = prepare_source("第1集\n场景：大厅\n小王：开始。\n△小王走到门外。\n小王：走。\n第2集\n场景：房间\n小王：回来。\n").unwrap();
+        let batch = plan_batches(&s, &[s.episodes[0].id.clone()]).unwrap().remove(0);
+        let prior = empty_foundation(&s);
+        let cut = s.rows.iter().find(|r| r.text.contains("走到门外")).unwrap();
+        let child = format!("{}__L{}", s.scenes[0].id, cut.number);
+        let context = json!({"projectId":"p","sourceVersion":1,"foundationDecisionPolicy":AUTO_INTERPRET_POLICY,"userReviewRequirements":[]});
+        let input = input_for("Q1", &s, &batch, &prior, &context, 0, 1, true, &[]);
+        let mut reply = empty_edit(&s, &batch);
+        reply["changes"] = json!({"sceneSplits":[{"episodeId":s.episodes[0].id,"sceneId":s.scenes[0].id,"cuts":[{"rowId":cut.id,"anchor":cut.text.trim_end_matches(['\r','\n'])}]}]});
+        reply["humanChoices"] = json!([{"decisionKey":"door/production","kind":"PRODUCTION_CHOICE","question":"门外如何制作？","reason":"拆场后的空间衔接","options":["保留原文并建立门外场","重写原文"],"recommended":"保留原文并建立门外场","recommendationReason":"逐字保留源文","evidence":"门外原句","episodes":batch.scope,"sourceRefs":[cut.id],"applicationScope":{"kind":"SCENES","scenes":[[s.episodes[0].id,child]]},"changeTargets":{"assetKeys":[],"assetFields":[],"sceneFields":["characters"]}}]);
+        reply["appliedDecisions"] = json!([{"decisionKey":"door/production","answer":"保留全部源句，仅记录门外空间的制作解释。","note":"引用已提供的精确门外原句，不改人物身份。"}]);
+        (s, batch, prior, input, reply)
+    }
+    #[test]
+    fn auto_choice_uses_exact_same_reply_split_without_mutating_frozen_evidence_or_receipt() {
+        let (source, batch, prior, input, reply) = auto_split_choice_fixture();
+        let before = (json!(source), input.clone(), reply.clone());
+        let (mut next, _) = apply_optimization(&reply, &source, &batch, &input, &prior, None).unwrap();
+        let records = prior_auto_records(&next);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["status"], "APPLIED");
+        assert_eq!(records[0]["applicationScope"]["scenes"], reply["humanChoices"][0]["applicationScope"]["scenes"]);
+        assert_eq!((json!(source), input.clone(), reply.clone()), before);
+        assert_eq!(source.scenes.len(), 2, "acceptance is only a PROGRAM proposal until publication");
+        let times = records.iter().map(|r| (r["id"].as_str().unwrap().to_owned(), r["appliedAt"].as_str().unwrap().to_owned())).collect::<HashMap<_, _>>();
+        let replayed = apply_optimization_with_receipt_times(&reply, &source, &batch, &input, &prior, None, Some(&times)).unwrap().0;
+        assert_eq!(prior_auto_records(&replayed), records);
+        next.updated_episode_ids = batch.scope.clone();
+        let revised = super::super::execute_foundation_scene_edits(&source, &mut next).unwrap().unwrap();
+        assert_eq!(revised.text, source.text);
+        assert_eq!(revised.sha256, source.sha256);
+        assert_eq!(revised.scenes.len(), source.scenes.len() + 1);
+        for (before, after) in source.rows.iter().zip(&revised.rows) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.text, after.text);
+            assert_eq!(json!(before.dialogue), json!(after.dialogue));
+        }
+        assert!(revised.scenes.iter().any(|s| json!([s.episode_id,s.id]) == records[0]["applicationScope"]["scenes"][0]));
+        assert_eq!(json!(source), before.0);
+        let mut false_receipt = empty_edit(&source, &batch);
+        false_receipt["appliedDecisions"] = json!([]);
+        let proposed = replayed.issues.iter().find(|i| i.details.as_ref().is_some_and(|d| d["owner"] == "PROGRAM")).unwrap();
+        false_receipt["resolvedIssues"] = json!([proposed.coordinate]);
+        assert!(apply_optimization(&false_receipt, &source, &batch, &input, &replayed, None).is_err());
+    }
+    #[test]
+    fn auto_split_choice_rejects_unknown_scope_invalid_plan_and_unfrozen_evidence() {
+        let (source, batch, prior, input, reply) = auto_split_choice_fixture();
+        let cut_id = reply["humanChoices"][0]["sourceRefs"][0].clone();
+        let mut bad_replies = vec![];
+        let mut bad = reply.clone(); bad["changes"] = json!({}); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["humanChoices"][0]["applicationScope"]["scenes"][0][1] = json!("future-scene__L999"); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["changes"]["sceneSplits"][0]["cuts"][0]["anchor"] = json!("伪造原句"); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["changes"]["sceneSplits"][0]["episodeId"] = json!(source.episodes[1].id); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["changes"]["sceneSplits"][0]["cuts"][0]["rowId"] = json!(source.rows.iter().find(|r| r.episode_id.as_ref() == Some(&source.episodes[1].id)).unwrap().id); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["humanChoices"][0]["applicationScope"]["scenes"][0][0] = json!(source.episodes[1].id); bad_replies.push(bad);
+        let mut bad = reply.clone(); bad["humanChoices"][0]["sourceRefs"] = json!([source.rows.iter().find(|r| r.text.contains("开始")).unwrap().id]); bad_replies.push(bad);
+        for (case, invalid) in bad_replies.into_iter().enumerate() {
+            assert!(apply_optimization(&invalid, &source, &batch, &input, &prior, None).is_err(), "invalid split/scope/anchor case {case}");
+        }
+        for field in ["text", "sceneId", "episodeId"] {
+            let mut bad_input = input.clone();
+            let column = bad_input["source"]["columns"].as_array().unwrap().iter().position(|c| c == field).unwrap();
+            let row = bad_input["source"]["rows"].as_array_mut().unwrap().iter_mut().find(|r| r[0] == cut_id).unwrap();
+            row[column] = json!("not-frozen");
+            assert!(apply_optimization(&reply, &source, &batch, &bad_input, &prior, None).is_err(), "frozen {field} must match the original source");
+        }
+        let mut auto_only = input.clone(); auto_only["delivery"]["phase"] = json!("AUTO_INTERPRET");
+        assert!(apply_optimization(&reply, &source, &batch, &auto_only, &prior, None).is_err());
+    }
+    #[test]
+    fn auto_split_preserves_offered_original_scene_contract_and_local_evidence() {
+        let (source, batch, mut prior, _, mut reply) = auto_split_choice_fixture();
+        let mut choice = reply["humanChoices"][0].clone();
+        choice["applicationScope"]["scenes"] = json!([[source.episodes[0].id,source.scenes[0].id]]);
+        prior.issues = supplemental_issues(&[choice], &[], &[], &batch, &batch.row_ids().into_iter().map(str::to_owned).collect()).unwrap();
+        let context = json!({"projectId":"p","sourceVersion":1,"foundationDecisionPolicy":AUTO_INTERPRET_POLICY,"userReviewRequirements":[]});
+        let input = input_for("Q1", &source, &batch, &prior, &context, 0, 1, true, &[]);
+        let offered = &input["automaticDecisions"][0];
+        reply["humanChoices"] = json!([]);
+        reply["appliedDecisions"] = json!([{"id":offered["id"],"answer":"保留原文并记录制作解释","note":"采用已冻结原场及源句"}]);
+        let next = apply_optimization(&reply, &source, &batch, &input, &prior, None).unwrap().0;
+        let records = prior_auto_records(&next);
+        assert_eq!(records[0]["applicationScope"], offered["applicationScope"]);
+        assert_eq!(records[0]["sourceRefs"], offered["sourceRefs"]);
+        assert_eq!(records[0]["id"], offered["id"]);
+    }
+    #[tokio::test]
+    #[ignore = "requires DIRECTOR_SPLIT_Q1_REAL_DB/WORKFLOW_ID/TEXT_JOB_ID; read-only frozen F2/Q1 validation and in-memory publication, zero model calls or production writes"]
+    async fn saved_actual_same_reply_split_q1_validates_full_delivery_without_generation() {
+        let required = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| panic!("required explicit variable: {key}"));
+        let connection = rusqlite::Connection::open_with_flags(required("DIRECTOR_SPLIT_Q1_REAL_DB"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let workflow_id = required("DIRECTOR_SPLIT_Q1_WORKFLOW_ID");
+        let q1_id = required("DIRECTOR_SPLIT_Q1_TEXT_JOB_ID");
+        let workflow: String = connection.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow'", [&workflow_id], |r| r.get(0)).unwrap();
+        let workflow: Value = serde_json::from_str(&workflow).unwrap();
+        let rows = connection.prepare("SELECT w.stage,j.snapshot,j.result FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND (w.stage='foundation:F2' AND w.state='accepted' OR w.stage='foundation:Q1' AND j.id=?2)").unwrap().query_map(rusqlite::params![workflow_id,q1_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(rows.len(), 2, "explicit one-F2/one-Q1 frozen workflow only");
+        struct ExactFrozenReplies { entries: HashMap<String,(Value,Value)>, calls: Mutex<Vec<String>> }
+        #[async_trait]
+        impl TextExecutor for ExactFrozenReplies {
+            async fn execute(&self, request: TextRequest) -> Result<Value,String> {
+                let (snapshot, reply) = self.entries.get(&request.stage).expect("no live fallback");
+                assert!(request.input == snapshot["input"], "frozen input must remain exact for {}", request.stage);
+                assert!(request.schema == snapshot["schema"], "frozen schema must remain exact for {}", request.stage);
+                self.calls.lock().unwrap().push(request.stage);
+                Ok(reply.clone())
+            }
+        }
+        let executor = ExactFrozenReplies { entries: rows.into_iter().map(|(stage,snapshot,raw)| (stage,(serde_json::from_str(&snapshot).unwrap(),serde_json::from_str(&raw).unwrap()))).collect(), calls: Mutex::new(vec![]) };
+        let q1 = &executor.entries["foundation:Q1"].0;
+        let original_raw = executor.entries["foundation:Q1"].1.clone();
+        let input = &workflow["input"];
+        let source: LockedSource = serde_json::from_value(input["source"].clone()).unwrap();
+        let original_source = json!(source);
+        let mut context = json!({"foundation":input["foundation"],"assets":input["assets"],"selection":input["selection"],"foundationModelInputProfile":input["foundationModelInputProfile"],"foundationPhase":input["foundationPhase"],"confirmedDecisions":input["confirmedDecisions"],"projectId":input["projectId"],"sourceVersion":input["sourceVersion"],"foundationDecisionPolicy":input["foundationDecisionPolicy"],"automaticDecisions":input["automaticDecisions"],"userReviewRequirements":input["userReviewRequirements"],"settings":{"confirmedDirection":input["foundation"]["productionDirection"]}});
+        super::super::asset_coverage::inherit(&mut context, input).unwrap();
+        let mut next = run_foundation_delivery(&source, &context, &executor, q1["model"].as_str().unwrap(), q1["reasoning"].as_str().unwrap()).await.unwrap();
+        assert_eq!(*executor.calls.lock().unwrap(), vec!["foundation:F2", "foundation:Q1"]);
+        assert_eq!(json!(source), original_source);
+        assert_eq!(executor.entries["foundation:Q1"].1, original_raw);
+        let projected = source_projection(&source, &next.issues, &next.updated_episode_ids).unwrap();
+        validate_foundation(&projected, &next).unwrap();
+        let revised = super::super::execute_foundation_scene_edits(&source, &mut next).unwrap().expect("frozen Q1 contains exact split plans");
+        validate_source(&revised).unwrap();
+        validate_foundation(&revised, &next).unwrap();
+        assert_eq!(revised.text, source.text);
+        assert_eq!(revised.sha256, source.sha256);
+        for (old,new) in source.rows.iter().zip(&revised.rows) {
+            assert_eq!(old.id,new.id); assert_eq!(old.number,new.number); assert_eq!(old.text,new.text); assert_eq!(json!(old.dialogue),json!(new.dialogue));
+        }
+        let adopted = prior_auto_records(&next);
+        assert!(!adopted.is_empty());
+        assert!(adopted.iter().all(|r| r["status"] == "APPLIED" && r["sourceSha256"] == source.sha256));
+        println!("read-only frozen full delivery passed: {} assets, {} adopted choices, {} original / {} published scenes; zero live calls", next.assets.len(), adopted.len(), source.scenes.len(), revised.scenes.len());
     }
     struct AcceptedCache {
         calls: Mutex<usize>,

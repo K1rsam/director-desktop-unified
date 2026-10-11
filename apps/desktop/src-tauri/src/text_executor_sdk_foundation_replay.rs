@@ -1,23 +1,48 @@
-//! One SDK F2 domain regression: revalidate original bytes, never dispatch again.
+//! Two exact SDK foundation regressions: revalidate original bytes, never dispatch again.
 use super::*;
 use crate::text_transport::{AttemptState, Backend, FrozenAttempt};
 
 const POLICY: &str = "sdk-f2-scene-episode-projection-replay/v1";
 const REJECTION: &str = "资产用途集号与本次场引用不一致";
+const Q1_POLICY: &str = "sdk-q1-confirmed-scene-split-replay/v1";
+const Q1_REJECTION: &str = "制作选择场范围不在当前原文";
+
+struct ReplayPolicy {
+    name: &'static str,
+    stage: &'static str,
+    rejection: &'static str,
+    accepted_event: &'static str,
+    rejected_event: &'static str,
+}
+
+const F2: ReplayPolicy = ReplayPolicy { name: POLICY, stage: "foundation:F2", rejection: REJECTION,
+    accepted_event: "sdk_f2_episode_replay_accepted", rejected_event: "sdk_f2_episode_replay_rejected" };
+const Q1: ReplayPolicy = ReplayPolicy { name: Q1_POLICY, stage: "foundation:Q1", rejection: Q1_REJECTION,
+    accepted_event: "sdk_q1_scene_split_replay_accepted", rejected_event: "sdk_q1_scene_split_replay_rejected" };
+
+fn policy(snapshot: &Value) -> Option<&'static ReplayPolicy> {
+    let input = &snapshot["input"];
+    if snapshot["executorIdentity"]["provider"] != "codex_sdk"
+        || input["method"] != "foundation-delivery/v2"
+        || input["modelInputProfile"] != "foundation-compact/v1"
+        || input["catalogueContract"] != "light-catalogue/v1"
+        || input["sourceReferenceEncoding"] != "row-coordinates/v1"
+        || input["delivery"]["method"] != "foundation-delivery/v2"
+        || input["delivery"]["scope"] != input["scope"]
+        || input["delivery"]["batchIndex"] != input["batchIndex"]
+    { return None; }
+    if snapshot["stage"] == F2.stage && snapshot["skill"] == "foundation-asset-catalog"
+        && input["delivery"]["stage"] == "F2" && input["delivery"]["phase"] == "GENERATE_F2"
+    { return Some(&F2); }
+    if snapshot["stage"] == Q1.stage && snapshot["skill"] == "foundation-finishing-editor"
+        && input["delivery"]["stage"] == "Q1" && input["delivery"]["phase"] == "EDIT"
+        && input["foundationDecisionPolicy"] == crate::pipeline::foundation_delivery::AUTO_INTERPRET_POLICY
+    { return Some(&Q1); }
+    None
+}
 
 fn eligible(snapshot: &Value) -> bool {
-    snapshot["stage"] == "foundation:F2"
-        && snapshot["skill"] == "foundation-asset-catalog"
-        && snapshot["executorIdentity"]["provider"] == "codex_sdk"
-        && snapshot["input"]["method"] == "foundation-delivery/v2"
-        && snapshot["input"]["modelInputProfile"] == "foundation-compact/v1"
-        && snapshot["input"]["catalogueContract"] == "light-catalogue/v1"
-        && snapshot["input"]["sourceReferenceEncoding"] == "row-coordinates/v1"
-        && snapshot["input"]["delivery"]["method"] == "foundation-delivery/v2"
-        && snapshot["input"]["delivery"]["stage"] == "F2"
-        && snapshot["input"]["delivery"]["phase"] == "GENERATE_F2"
-        && snapshot["input"]["delivery"]["scope"] == snapshot["input"]["scope"]
-        && snapshot["input"]["delivery"]["batchIndex"] == snapshot["input"]["batchIndex"]
+    policy(snapshot).is_some()
 }
 
 fn source_bound(snapshot: &Value, parent: &Value) -> bool {
@@ -84,9 +109,6 @@ fn source_bound(snapshot: &Value, parent: &Value) -> bool {
 
 fn audit_valid(audit: &Value) -> bool {
     if !audit.as_object().is_some_and(|f| f.len() == 21)
-        || audit["policy"] != POLICY
-        || audit["stage"] != "foundation:F2"
-        || audit["previousError"] != REJECTION
         || audit["generationRequestsSent"] != 0
         || audit["acceptedAutomatically"] != false
         || [
@@ -118,6 +140,9 @@ fn audit_valid(audit: &Value) -> bool {
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
+    let Some(policy) = policy(&snapshot) else { return false; };
+    if audit["policy"] != policy.name || audit["stage"] != policy.stage
+        || audit["previousError"] != policy.rejection { return false; }
     let rules = parent["rules"].as_array();
     let settings = &parent["input"]["settings"];
     eligible(&snapshot)
@@ -167,6 +192,10 @@ fn audit_valid(audit: &Value) -> bool {
                 && serde_json::from_str::<Value>(text).ok().as_ref()
                     == Some(&sdk_event["parsedJson"])
         })
+        && compile_model_transport(&request).ok().is_some_and(|wire| {
+            restore_model_output(&request, wire.as_ref(), sdk_event["parsedJson"].clone())
+                .ok().as_ref() == Some(&raw)
+        })
 }
 
 fn files_bound(root: &Path, audit: &Value) -> bool {
@@ -195,7 +224,7 @@ fn files_bound(root: &Path, audit: &Value) -> bool {
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
-    let Ok(compiled) = compile_codex_input(&request) else {
+    let Ok(compiled) = compile_sdk_attempt_input(&attempt) else {
         return false;
     };
     let Ok(bytes) = std::fs::read(base.join("sdk-compiled.json")) else {
@@ -224,9 +253,11 @@ fn database_bound(
     receipt: &Value,
     result: &Value,
 ) -> Result<bool> {
+    let snapshot: Value = serde_json::from_str(s(audit, "originalSnapshotJson")).map_err(|e|e.to_string())?;
+    let Some(policy) = policy(&snapshot) else { return Ok(false); };
     c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN jobs p ON p.id=w.workflow_id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.snapshot=?2 AND j.result=?3 AND j.prepared=?4 AND j.receipt=?5 AND j.state=?6 AND j.error IS ?7 AND w.workflow_id=?8 AND w.node_key=?9 AND w.stage='foundation:F2' AND w.request_hash=?10 AND w.state=?11 AND w.result=?12 AND w.error IS ?7 AND p.kind='workflow' AND p.entity_id='foundation.run' AND p.snapshot=?13 AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='text_received_raw' AND e.id=?14 AND e.data=?15 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='text_received_raw')) AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='sdk_raw_result' AND e.id=?16 AND e.data=?17 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='sdk_raw_result')))",
-        params![s(audit,"originalJobId"),s(audit,"originalSnapshotJson"),s(audit,"originalResultJson"),prepared.to_string(),receipt.to_string(),if accepted {"completed"} else {"rejected"},if accepted {None} else {Some(REJECTION)},s(audit,"workflowId"),s(audit,"nodeKey"),s(audit,"requestHash"),if accepted {"accepted"} else {"rejected"},result.to_string(),s(audit,"originalWorkflowSnapshotJson"),audit["originalRawEventId"].as_i64(),s(audit,"originalRawEventDataJson"),audit["originalSdkRawEventId"].as_i64(),s(audit,"originalSdkRawEventDataJson")],
+        "SELECT EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN jobs p ON p.id=w.workflow_id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.snapshot=?2 AND j.result=?3 AND j.prepared=?4 AND j.receipt=?5 AND j.state=?6 AND j.error IS ?7 AND w.workflow_id=?8 AND w.node_key=?9 AND w.stage=?18 AND w.request_hash=?10 AND w.state=?11 AND w.result=?12 AND w.error IS ?7 AND p.kind='workflow' AND p.entity_id='foundation.run' AND p.snapshot=?13 AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='text_received_raw' AND e.id=?14 AND e.data=?15 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='text_received_raw')) AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='sdk_raw_result' AND e.id=?16 AND e.data=?17 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='sdk_raw_result')))",
+        params![s(audit,"originalJobId"),s(audit,"originalSnapshotJson"),s(audit,"originalResultJson"),prepared.to_string(),receipt.to_string(),if accepted {"completed"} else {"rejected"},if accepted {None} else {Some(policy.rejection)},s(audit,"workflowId"),s(audit,"nodeKey"),s(audit,"requestHash"),if accepted {"accepted"} else {"rejected"},result.to_string(),s(audit,"originalWorkflowSnapshotJson"),audit["originalRawEventId"].as_i64(),s(audit,"originalRawEventDataJson"),audit["originalSdkRawEventId"].as_i64(),s(audit,"originalSdkRawEventDataJson"),policy.stage],
         |r|r.get(0)).map_err(|e|e.to_string())
 }
 
@@ -237,7 +268,8 @@ impl SavedTextExecutor {
         snapshot: &Value,
     ) -> Result<bool> {
         let receipt = &job["receipt"];
-        if receipt["migrationPolicy"] != POLICY {
+        let Some(policy) = policy(snapshot) else { return Ok(false); };
+        if receipt["migrationPolicy"] != policy.name {
             return Ok(false);
         }
         let audit = &receipt["migrationAudit"];
@@ -249,13 +281,20 @@ impl SavedTextExecutor {
         expected_prepared["sdkDomainResult"] = result.clone();
         expected_prepared["sdkDomainResultSha256"] =
             json!(crate::pipeline::digest(&result.to_string()));
+        let completed_event_bound = if policy.name == Q1_POLICY {
+            let expected = json!({"policy":policy.name,"migrationAudit":audit,"generationRequestsSent":0,
+                "validation":"accepted","error":null,"validatedResultSha256":crate::pipeline::digest(&result.to_string()),"originalEvidencePreserved":true});
+            self.store.conn()?.query_row("SELECT COUNT(*)=1 AND SUM(CASE WHEN type=?2 AND data=?4 THEN 1 ELSE 0 END)=1 FROM events WHERE job_id=?1 AND type IN (?2,?3)",
+                params![s(job,"id"),policy.accepted_event,policy.rejected_event,expected.to_string()],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())?
+        } else { true };
         Ok(audit_valid(audit)
+            && completed_event_bound
             && files_bound(&self.store.root, audit)
             && job["snapshot"] == *snapshot
             && snapshot.to_string() == s(audit, "originalSnapshotJson")
             && audit["originalJobId"] == job["id"]
             && receipt
-                == &json!({"contract":"desktop-runner/v1","validation":"accepted","migrationPolicy":POLICY,"migrationAudit":audit,"acceptedRequestHash":audit["requestHash"],"validatedResultSha256":crate::pipeline::digest(&result.to_string())})
+                == &json!({"contract":"desktop-runner/v1","validation":"accepted","migrationPolicy":policy.name,"migrationAudit":audit,"acceptedRequestHash":audit["requestHash"],"validatedResultSha256":crate::pipeline::digest(&result.to_string())})
             && job["prepared"] == expected_prepared
             && crate::pipeline::foundation_delivery::accepted_scope_reason_raw_matches(
                 &snapshot["input"],
@@ -280,7 +319,8 @@ impl SavedTextExecutor {
         value: &Value,
         reason: Option<&str>,
     ) -> Result<bool> {
-        if job["status"] != "rejected" || job["error"] != REJECTION || !eligible(snapshot) {
+        let Some(policy) = policy(snapshot) else { return Ok(false); };
+        if job["status"] != "rejected" || job["error"] != policy.rejection {
             return Ok(false);
         }
         let audit = self.sdk_f2_replay_audit(request, snapshot, job)?;
@@ -288,7 +328,7 @@ impl SavedTextExecutor {
             .store
             .commit_sdk_f2_episode_replay(&audit, value, reason)?
         {
-            return Err("SDK_F2_REPLAY_HELD: 原冻结节点变化；保留原任务且不重发".into());
+            return Err("SDK_FOUNDATION_REPLAY_HELD: 原冻结节点变化；保留原任务且不重发".into());
         }
         Ok(true)
     }
@@ -300,22 +340,30 @@ impl SavedTextExecutor {
         job: &Value,
     ) -> Result<Value> {
         let held = || {
-            "SDK_F2_REPLAY_HELD: 原 F2 请求、父流程、回包、回执或接收证据不匹配；保留原任务且不重发"
+            "SDK_FOUNDATION_REPLAY_HELD: 原请求、父流程、回包、回执或接收证据不匹配；保留原任务且不重发"
                 .to_string()
         };
+        let policy = policy(snapshot).ok_or_else(held)?;
         let run = self.workflow_id.as_deref().ok_or_else(held)?;
         let c = self.store.conn()?;
         let parent: String = c.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='foundation.run'",[run],|r|r.get(0)).map_err(|_|held())?;
         let (event_id,event):(i64,String) = c.query_row("SELECT id,data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",[s(job,"id")],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|held())?;
         let (sdk_id,sdk_event):(i64,String) = c.query_row("SELECT id,data FROM events WHERE job_id=?1 AND type='sdk_raw_result' ORDER BY id DESC LIMIT 1",[s(job,"id")],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|held())?;
         let path = self.store.root.join("text-runs").join(s(job, "id"));
-        let audit = json!({"policy":POLICY,"stage":"foundation:F2","previousError":REJECTION,
+        let audit = json!({"policy":policy.name,"stage":policy.stage,"previousError":policy.rejection,
             "workflowId":run,"nodeKey":step_key(request),"originalJobId":job["id"],"requestHash":crate::pipeline::digest(&snapshot.to_string()),
             "originalSnapshotJson":snapshot.to_string(),"originalResultJson":job["result"].to_string(),"originalPreparedJson":job["prepared"].to_string(),"originalReceiptJson":job["receipt"].to_string(),"originalWorkflowSnapshotJson":parent,
             "originalRawEventId":event_id,"originalRawEventDataJson":event,"originalSdkRawEventId":sdk_id,"originalSdkRawEventDataJson":sdk_event,
             "originalAttemptSha256":crate::store::hash_file(&path.join("sdk-attempt.json"))?.0,"originalCompiledSha256":crate::store::hash_file(&path.join("sdk-compiled.json"))?.0,"originalRawTextSha256":crate::store::hash_file(&path.join("result.json"))?.0,
             "generationRequestsSent":0,"acceptedAutomatically":false});
         Ok(audit)
+    }
+
+    pub(super) fn sdk_q1_replay_already_rejected(&self, job: &Value, snapshot: &Value) -> Result<bool> {
+        if !policy(snapshot).is_some_and(|p| p.name == Q1_POLICY)
+            || job["status"] != "rejected" || job["error"] != Q1_REJECTION { return Ok(false); }
+        self.store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type=?2)",
+            params![s(job,"id"), Q1.rejected_event], |r|r.get(0)).map_err(|e|e.to_string())
     }
 }
 
@@ -330,6 +378,10 @@ mod tests {
         String,
         Value,
     ) {
+        fixture_for(false)
+    }
+
+    fn fixture_for(q1: bool) -> (tempfile::TempDir, SavedTextExecutor, TextRequest, String, Value) {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("isolated")).unwrap();
         store
@@ -343,12 +395,15 @@ mod tests {
         let source = store.save_source(json!(locked)).unwrap();
         let locked: crate::pipeline::LockedSource = serde_json::from_value(source.clone()).unwrap();
         let settings = crate::text_sdk::offline_settings("happy");
-        let rules = crate::pipeline::snapshot("foundation-asset-catalog", &["screenplay-fidelity"])
+        let skill = if q1 { "foundation-finishing-editor" } else { "foundation-asset-catalog" };
+        let stage = if q1 { "foundation:Q1" } else { "foundation:F2" };
+        let rejection = if q1 { Q1_REJECTION } else { REJECTION };
+        let rules = crate::pipeline::snapshot(skill, &["screenplay-fidelity"])
             .unwrap();
         let scope: Vec<_> = locked.episodes.iter().map(|e| e.id.clone()).collect();
-        let request = TextRequest {
-            stage: "foundation:F2".into(),
-            skill: "foundation-asset-catalog".into(),
+        let mut request = TextRequest {
+            stage: stage.into(),
+            skill: skill.into(),
             model: "gpt-6.1-sol".into(),
             reasoning: "medium".into(),
             input: json!({"method":"foundation-delivery/v2","modelInputProfile":"foundation-compact/v1",
@@ -359,6 +414,11 @@ mod tests {
             schema: json!({"type":"object","properties":{"ok":{"type":"boolean"},"facts":{"type":"array","items":{"type":"string"}}},"required":["ok","facts"],"additionalProperties":false}),
             rule_snapshot: rules.clone(),
         };
+        if q1 {
+            request.input["delivery"]["stage"] = json!("Q1");
+            request.input["delivery"]["phase"] = json!("EDIT");
+            request.input["foundationDecisionPolicy"] = json!(crate::pipeline::foundation_delivery::AUTO_INTERPRET_POLICY);
+        }
         let parent_rules: Vec<_> = std::iter::once(rules["primary"].clone())
             .chain(rules["methods"].as_array().unwrap().iter().cloned())
             .collect();
@@ -375,7 +435,7 @@ mod tests {
             .store
             .add_job(
                 "text",
-                "foundation:F2",
+                stage,
                 "codex_sdk",
                 "codex_sdk",
                 &snapshot,
@@ -391,7 +451,7 @@ mod tests {
             "UPDATE jobs SET result=?1,error=?2,prepared=?3,receipt=?4 WHERE id=?5",
             params![
                 raw.to_string(),
-                REJECTION,
+                rejection,
                 prepared.to_string(),
                 receipt.to_string(),
                 job
@@ -407,7 +467,7 @@ mod tests {
                 hash,
                 job,
                 raw.to_string(),
-                REJECTION,
+                rejection,
                 now()
             ],
         )
@@ -623,10 +683,173 @@ mod tests {
         );
         assert_eq!(executor.sdk_job(&job).unwrap()["status"], "rejected");
     }
+
+    #[tokio::test]
+    async fn sdk_q1_split_replay_accept_restart_keeps_original_raw_and_zero_dispatch() {
+        let (_temp, executor, request, job, raw) = fixture_for(true);
+        let before = preserved(&executor, &job);
+        assert_eq!(executor.execute(request.clone()).await.unwrap(), raw);
+        executor.accept(&request, &raw).await.unwrap();
+        let adopted = executor.sdk_job(&job).unwrap();
+        assert_eq!(adopted["receipt"]["migrationPolicy"], Q1_POLICY);
+        assert_eq!(adopted["receipt"]["migrationAudit"]["previousError"], Q1_REJECTION);
+        let snapshot = executor.request_snapshot(&request).unwrap();
+        assert!(executor.sdk_f2_migrated_receipt_bound(&adopted, &snapshot).unwrap());
+        let restart = SavedTextExecutor { store: Store::open(executor.store.root.clone()).unwrap(),
+            settings: executor.settings.clone(), workflow_id: executor.workflow_id.clone() };
+        for _ in 0..2 {
+            assert_eq!(restart.execute(request.clone()).await.unwrap(), raw);
+            restart.accept(&request, &raw).await.unwrap();
+        }
+        assert_eq!(preserved(&restart, &job), before);
+        assert_eq!(restart.store.jobs().unwrap().len(), 2);
+        assert!(!restart.store.root.join("sdk-worker").exists());
+        let n:i64 = restart.store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type=?2",params![job,Q1.accepted_event],|r|r.get(0)).unwrap();
+        assert_eq!(n,1);
+    }
+
+    #[tokio::test]
+    async fn sdk_q1_second_domain_rejection_exhausts_replay_without_retry_or_promotion() {
+        let (_temp, executor, request, job, raw) = fixture_for(true);
+        let before = preserved(&executor, &job);
+        assert_eq!(executor.execute(request.clone()).await.unwrap(), raw);
+        executor.reject(&request, &raw, "合成仍未解决的领域错误").await.unwrap();
+        assert!(executor.execute(request.clone()).await.unwrap_err().contains("SDK_Q1_REPLAY_ALREADY_REJECTED"));
+        assert!(executor.accept(&request, &raw).await.unwrap_err().contains("REPLAY_HELD"));
+        assert!(executor.reject(&request, &raw, "另一个合成错误").await.is_err());
+        let original = executor.sdk_job(&job).unwrap();
+        assert_eq!(original["status"], "rejected");
+        assert_eq!(original["error"], Q1_REJECTION);
+        assert_eq!(original["receipt"], json!({"contract":"desktop-runner/v1","validation":"rejected"}));
+        assert_eq!(preserved(&executor,&job), before);
+        assert_eq!(executor.store.jobs().unwrap().len(), 2);
+        assert!(!executor.store.root.join("sdk-worker").exists());
+        let n:i64 = executor.store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type=?2",params![job,Q1.rejected_event],|r|r.get(0)).unwrap();
+        assert_eq!(n,1);
+    }
+
+    #[tokio::test]
+    async fn sdk_q1_accepted_cache_requires_one_exact_replay_event() {
+        let (_temp,executor,request,job,raw)=fixture_for(true);
+        executor.accept(&request,&raw).await.unwrap();
+        let original=preserved(&executor,&job);
+        let c=executor.store.conn().unwrap();
+        let data:String=c.query_row("SELECT data FROM events WHERE job_id=?1 AND type=?2",params![job,Q1.accepted_event],|r|r.get(0)).unwrap();
+        executor.store.event(&job,Q1.accepted_event,&serde_json::from_str::<Value>(&data).unwrap()).unwrap();
+        assert!(executor.execute(request.clone()).await.unwrap_err().contains("SDK_RAW_BINDING_MISMATCH"));
+        assert_eq!(preserved(&executor,&job),original);
+        assert!(!executor.store.root.join("sdk-worker").exists());
+    }
+
+    #[tokio::test]
+    async fn sdk_q1_replay_exact_contract_and_unknown_state_cannot_be_bypassed() {
+        let (_temp, executor, request, job, raw) = fixture_for(true);
+        let before = preserved(&executor, &job);
+        for change in ["phase","profile","decisionPolicy","stage","skill","source","rules","model","schema"] {
+            let mut changed=request.clone();
+            match change {
+                "phase" => changed.input["delivery"]["phase"]=json!("AUTO_INTERPRET"),
+                "profile" => changed.input["modelInputProfile"]=json!("other/v1"),
+                "decisionPolicy" => changed.input["foundationDecisionPolicy"]=json!("other/v1"),
+                "stage" => changed.stage="foundation:F2".into(),
+                "skill" => changed.skill="foundation-asset-catalog".into(),
+                "source" => changed.input["sourceSha256"]=json!("other"),
+                "rules" => changed.rule_snapshot["primary"]["content"]=json!("changed rules"),
+                "model" => changed.model="other".into(),
+                _ => changed.schema["additionalProperties"]=json!(true),
+            }
+            assert!(executor.accept(&changed,&raw).await.is_err(),"{change}");
+        }
+        assert!(executor.accept(&request,&json!({"ok":true,"facts":["改写事实"]})).await.unwrap_err().contains("DOMAIN_RESULT_CHANGED"));
+        executor.store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown' WHERE id=?1",[&job]).unwrap();
+        assert!(executor.accept(&request,&raw).await.is_err());
+        assert_eq!(preserved(&executor,&job),before);
+        assert!(!executor.store.root.join("sdk-worker").exists());
+    }
+
+    #[test]
+    fn sdk_q1_proof_parent_event_checkpoint_and_file_pollution_fail_closed() {
+        for changed in ["policy","stage","previousError","workflowId","nodeKey","originalJobId","requestHash",
+            "originalSnapshotJson","originalResultJson","originalPreparedJson","originalReceiptJson",
+            "originalWorkflowSnapshotJson","originalRawEventId","originalRawEventDataJson",
+            "originalSdkRawEventId","originalSdkRawEventDataJson","originalAttemptSha256",
+            "originalCompiledSha256","originalRawTextSha256","generationRequestsSent","acceptedAutomatically"] {
+            let (_temp,executor,request,job,raw)=fixture_for(true);
+            let snapshot=executor.request_snapshot(&request).unwrap();
+            let audit=executor.sdk_f2_replay_audit(&request,&snapshot,&executor.sdk_job(&job).unwrap()).unwrap();
+            assert!(audit_valid(&audit) && files_bound(&executor.store.root,&audit));
+            let mut forged=audit.clone(); forged[changed]=json!("polluted");
+            assert!(!executor.store.commit_sdk_f2_episode_replay(&forged,&raw,None).unwrap_or(false),"{changed}");
+            assert_eq!(executor.sdk_job(&job).unwrap()["status"],"rejected");
+        }
+        for changed in ["parent","checkpoint","rawEvent","sdkEvent","sdk-attempt.json","sdk-compiled.json","result.json"] {
+            let (_temp,executor,request,job,raw)=fixture_for(true);
+            let before=preserved(&executor,&job);
+            let snapshot=executor.request_snapshot(&request).unwrap();
+            let audit=executor.sdk_f2_replay_audit(&request,&snapshot,&executor.sdk_job(&job).unwrap()).unwrap();
+            let c=executor.store.conn().unwrap();
+            match changed {
+                "parent" => { c.execute("UPDATE jobs SET snapshot='{}' WHERE id=?1",[executor.workflow_id.as_ref().unwrap()]).unwrap(); }
+                "checkpoint" => { c.execute("UPDATE workflow_steps SET request_hash='changed' WHERE text_job_id=?1",[&job]).unwrap(); }
+                "rawEvent" => executor.store.event(&job,"text_received_raw",&json!({"requestHash":audit["requestHash"],"value":raw})).unwrap(),
+                "sdkEvent" => executor.store.event(&job,"sdk_raw_result",&serde_json::from_str::<Value>(s(&audit,"originalSdkRawEventDataJson")).unwrap()).unwrap(),
+                file => std::fs::write(executor.store.root.join("text-runs").join(&job).join(file),b"polluted file").unwrap(),
+            }
+            assert!(!executor.store.commit_sdk_f2_episode_replay(&audit,&raw,None).unwrap_or(false),"{changed}");
+            assert_eq!(executor.sdk_job(&job).unwrap()["status"],"rejected");
+            if matches!(changed,"parent"|"checkpoint"|"rawEvent"|"sdkEvent") { assert_eq!(preserved(&executor,&job),before); }
+            assert!(!executor.store.root.join("sdk-worker").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_q1_commit_failure_is_atomic_and_does_not_consume_original_result() {
+        let (_temp,executor,request,job,raw)=fixture_for(true);
+        let before=preserved(&executor,&job);
+        executor.store.conn().unwrap().execute_batch("CREATE TRIGGER replay_interrupted BEFORE UPDATE ON workflow_steps BEGIN SELECT RAISE(ROLLBACK,'synthetic checkpoint conflict'); END;").unwrap();
+        assert!(executor.accept(&request,&raw).await.unwrap_err().contains("synthetic checkpoint conflict"));
+        assert_eq!(executor.sdk_job(&job).unwrap()["status"],"rejected");
+        assert_eq!(preserved(&executor,&job),before);
+        let n:i64=executor.store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type=?2",params![job,Q1.accepted_event],|r|r.get(0)).unwrap();
+        assert_eq!(n,0);
+        assert!(!executor.store.root.join("sdk-worker").exists());
+    }
+
+    #[test]
+    #[ignore = "requires explicit captured SDK Q1 sqlite/root/job; source files read-only, isolated proof only, zero model or adoption"]
+    fn sdk_q1_captured_original_proof_is_bound_without_dispatch_or_adoption() {
+        let required = |name| std::env::var(name).expect("explicit private proof fixture path required");
+        let source_db=PathBuf::from(required("DIRECTOR_SDK_Q1_PROOF_DB"));
+        let source_root=PathBuf::from(required("DIRECTOR_SDK_Q1_PROOF_ROOT"));
+        let job=required("DIRECTOR_SDK_Q1_PROOF_JOB");
+        let temp=tempfile::tempdir().unwrap();
+        let root=temp.path().join("isolated"); std::fs::create_dir(&root).unwrap();
+        std::fs::copy(source_db,root.join("project.sqlite")).unwrap();
+        let store=Store::open(root.clone()).unwrap();
+        let c=store.conn().unwrap();
+        let (snapshot,parent,run):(String,String,String)=c.query_row(
+            "SELECT j.snapshot,p.snapshot,p.id FROM jobs j JOIN workflow_steps w ON w.text_job_id=j.id JOIN jobs p ON p.id=w.workflow_id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.state='rejected'",[&job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let snapshot:Value=serde_json::from_str(&snapshot).unwrap();
+        let parent:Value=serde_json::from_str(&parent).unwrap();
+        let request:TextRequest=serde_json::from_value(snapshot.clone()).unwrap();
+        let executor=SavedTextExecutor {store,settings:parent["input"]["settings"].clone(),workflow_id:Some(run)};
+        let target=root.join("text-runs").join(&job);std::fs::create_dir_all(&target).unwrap();
+        for name in ["sdk-attempt.json","sdk-compiled.json","result.json"] {
+            std::fs::copy(source_root.join("text-runs").join(&job).join(name),target.join(name)).unwrap();
+        }
+        let original=executor.sdk_job(&job).unwrap();
+        let audit=executor.sdk_f2_replay_audit(&request,&snapshot,&original).unwrap();
+        assert_eq!(audit["policy"],Q1_POLICY);
+        assert!(audit_valid(&audit),"captured exact parent/request/raw/rules proof must validate");
+        assert!(files_bound(&root,&audit),"captured completed attempt and immutable compilation must validate");
+        assert!(database_bound(&executor.store.conn().unwrap(),&audit,false,&original["prepared"],&original["receipt"],&original["result"]).unwrap());
+        assert_eq!(executor.sdk_job(&job).unwrap(),original);
+        assert!(!root.join("sdk-worker").exists());
+    }
 }
 
 impl Store {
-    /// Only the original SDK F2 node is advanced. Raw/request/transport files are never written.
+    /// Only the exact original SDK foundation node advances. Raw/request/transport files stay untouched.
     fn commit_sdk_f2_episode_replay(
         &self,
         audit: &Value,
@@ -647,6 +870,7 @@ impl Store {
         }
         let snapshot: Value =
             serde_json::from_str(s(audit, "originalSnapshotJson")).map_err(|e| e.to_string())?;
+        let policy = policy(&snapshot).ok_or("SDK_FOUNDATION_REPLAY_PROOF_INVALID")?;
         if reason.is_none()
             && !crate::pipeline::foundation_delivery::accepted_scope_reason_raw_matches(
                 &snapshot["input"],
@@ -667,17 +891,21 @@ impl Store {
         {
             return Ok(false);
         }
-        let event = json!({"policy":POLICY,"migrationAudit":audit,"generationRequestsSent":0,"validation":if reason.is_none(){"accepted"}else{"rejected"},"error":reason,"validatedResultSha256":crate::pipeline::digest(&result.to_string()),"originalEvidencePreserved":true});
+        if policy.name == Q1_POLICY && tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type IN (?2,?3))",
+            params![s(audit,"originalJobId"), policy.accepted_event, policy.rejected_event], |r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
+            return Ok(false);
+        }
+        let event = json!({"policy":policy.name,"migrationAudit":audit,"generationRequestsSent":0,"validation":if reason.is_none(){"accepted"}else{"rejected"},"error":reason,"validatedResultSha256":crate::pipeline::digest(&result.to_string()),"originalEvidencePreserved":true});
         let event_kind = if reason.is_none() {
-            "sdk_f2_episode_replay_accepted"
+            policy.accepted_event
         } else {
-            "sdk_f2_episode_replay_rejected"
+            policy.rejected_event
         };
         if reason.is_none() {
             let mut next = prepared;
             next["sdkDomainResult"] = result.clone();
             next["sdkDomainResultSha256"] = json!(crate::pipeline::digest(&result.to_string()));
-            let next_receipt = json!({"contract":"desktop-runner/v1","validation":"accepted","migrationPolicy":POLICY,"migrationAudit":audit,"acceptedRequestHash":audit["requestHash"],"validatedResultSha256":crate::pipeline::digest(&result.to_string())});
+            let next_receipt = json!({"contract":"desktop-runner/v1","validation":"accepted","migrationPolicy":policy.name,"migrationAudit":audit,"acceptedRequestHash":audit["requestHash"],"validatedResultSha256":crate::pipeline::digest(&result.to_string())});
             if tx.execute("UPDATE jobs SET state='completed',error=NULL,prepared=?1,receipt=?2,updated_at=?3 WHERE id=?4 AND state='rejected'",params![next.to_string(),next_receipt.to_string(),now(),s(audit,"originalJobId")]).map_err(|e|e.to_string())? != 1 { return Err("SDK_F2_REPLAY_CAS".into()); }
             if tx.execute("UPDATE workflow_steps SET state='accepted',error=NULL,result=?1,updated_at=?2 WHERE workflow_id=?3 AND node_key=?4 AND text_job_id=?5 AND state='rejected' AND request_hash=?6",params![result.to_string(),now(),s(audit,"workflowId"),s(audit,"nodeKey"),s(audit,"originalJobId"),s(audit,"requestHash")]).map_err(|e|e.to_string())? != 1 { return Err("SDK_F2_REPLAY_CHECKPOINT_CAS".into()); }
         }

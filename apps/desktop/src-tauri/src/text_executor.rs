@@ -11788,7 +11788,11 @@ impl SavedTextExecutor {
         self.sdk_checkpoint_binding(request, snapshot)?;
         if let Some(job) = self.sdk_find(snapshot)? {
             if ["received", "completed", "rejected"].contains(&s(&job, "status")) {
-                return self.sdk_raw(&job, snapshot);
+                let raw = self.sdk_raw(&job, snapshot)?;
+                if self.sdk_q1_replay_already_rejected(&job, snapshot)? {
+                    return Err("SDK_Q1_REPLAY_ALREADY_REJECTED: 原回包本轮再验收仍未通过；保留原拒绝与证据，不重发".into());
+                }
+                return Ok(raw);
             }
             // Only observe the original attempt, never execute it a second time.
             let original = FrozenAttempt::load(
