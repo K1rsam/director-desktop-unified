@@ -105,6 +105,15 @@
   };
   const nativeKeys = new WeakMap(), nativeImages = new WeakMap(), nativeDownloads = new Map();
   const rawImageSource = image => image.currentSrc || image.src || image.getAttribute?.('src') || '';
+  // The presentation-only user bubble now contains a Show more button. Read
+  // its one dedicated plaintext body; control labels are not submitted text.
+  // Ambiguous structure falls back to the original strict whole-turn check.
+  function userPromptText(node){
+    const bubble=node?.matches?.('.bg-user-message')?node:node?.querySelector?.('.bg-user-message');
+    const bodies=bubble?[...bubble.querySelectorAll('div.whitespace-pre-wrap')]:[];
+    if(bodies.length===1&&bodies[0].isConnected&&!bodies[0].querySelector?.('button, [role="button"], input, textarea'))return bodies[0].textContent||bodies[0].innerText||'';
+    return node?.innerText||node?.textContent||'';
+  }
   function validImageBinding(image,bound){return Boolean(bound && image.isConnected && location.href===bound.url && rawImageSource(image)===bound.raw && (!bound.valid || bound.valid()));}
   function imageSource(image){const bound=nativeImages.get(image);return validImageBinding(image,bound) ? bound.originalUrl : '';}
   function imageReady(image){const bound=nativeImages.get(image);return bound?.trustedForBackground===true && validImageBinding(image,bound);}
@@ -181,7 +190,7 @@
     let authHeaders,readStage='record';const options={method:'GET',credentials:'include',cache:'no-store',redirect:'error',signal:controller.signal};
     try {
       const dom=globalThis.ChatGptTurnDom.createTurnDom(),turns=dom.getTurnNodes(),users=turns.filter(n=>dom.role(n)==='user'),assistants=turns.filter(n=>dom.role(n)==='assistant');
-      const facts={userCount:users.length,assistantCount:assistants.length,userText:users[0]?.innerText||users[0]?.textContent||'',assistantText:normalize(assistants[0]?.innerText||assistants[0]?.textContent)};
+      const facts={userCount:users.length,assistantCount:assistants.length,userText:userPromptText(users[0]),assistantText:normalize(assistants[0]?.innerText||assistants[0]?.textContent)};
       const pendingAssistant=facts.assistantCount===0 && deps.getActiveRequest?.()?.requestId===expected.requestId;
       if(facts.userCount!==1||!(facts.assistantCount===1||pendingAssistant)||await digest(facts.userText)!==expected.promptSha256)return result(expected,'mismatch','dom_user_boundary',{domFacts:{userCount:facts.userCount,assistantCount:facts.assistantCount,promptMatches:await digest(facts.userText)===expected.promptSha256}});
       if(expected.mode!=='image_record_probe' && !deps.getActiveRequest?.() && !normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。'))return unavailable('released_task_marker');
@@ -226,7 +235,7 @@
             const reBoundary=await nativeBoundary(JSON.parse(new TextDecoder().decode(reBytes)),expected,snapshot,facts);
             if(reBoundary.status||JSON.stringify(reBoundary)!==JSON.stringify(boundary))return unavailable('native_branch_changed');
             if(!sameIdentity()||location.href!==page.href||rawImageSource(image)!==raw||!image.isConnected)return unavailable('image_changed_during_download');
-            const stillCurrent=()=>sameIdentity() && users[0].isConnected && assistants[0].isConnected && normalize(users[0].innerText||users[0].textContent)===normalize(facts.userText) && normalize(assistants[0].innerText||assistants[0].textContent)===facts.assistantText && dom.getTurnNodes().length===turns.length && dom.getTurnNodes().every((n,i)=>n===turns[i]);
+            const stillCurrent=()=>sameIdentity() && users[0].isConnected && assistants[0].isConnected && normalize(userPromptText(users[0]))===normalize(facts.userText) && normalize(assistants[0].innerText||assistants[0].textContent)===facts.assistantText && dom.getTurnNodes().length===turns.length && dom.getTurnNodes().every((n,i)=>n===turns[i]);
             if(!stillCurrent())return unavailable('dom_changed_during_proof');
             const binding={image,raw,url:page.href,originalUrl,...native,recordSha256,recordRecheckSha256:await byteDigest(reBytes),requestId:expected.requestId,assistantMessageId:boundary.assistantMessageId,proofSource:nativeOnly?'native_record_download':directNative?'dom_native_url_download':'dom_blob_bytes_equal',trustedForBackground:Boolean(strongIdentity)&&expected.mode!=='image_record_probe',valid:stillCurrent};
             nativeImages.set(image,binding);nativeDownloads.set(nativeId,binding);while(nativeDownloads.size>4)nativeDownloads.delete(nativeDownloads.keys().next().value);
@@ -236,7 +245,7 @@
       }
       let verifiedSnapshot;
       let proof=await evaluate(record,expected,snapshot,facts);if(expected.mode!=='image_record_probe'&&!requestMatches())return unavailable('active_request_identity');if(proof.status==='matched_complete'){
-        const current=dom.getTurnNodes();if(current.length!==turns.length||current.some((n,i)=>n!==turns[i])||await digest(users[0].innerText||users[0].textContent)!==expected.promptSha256)return unavailable('dom_changed_during_proof');
+        const current=dom.getTurnNodes();if(current.length!==turns.length||current.some((n,i)=>n!==turns[i])||await digest(userPromptText(users[0]))!==expected.promptSha256)return unavailable('dom_changed_during_proof');
         const currentSnapshot=deps.readLatestAssistantSnapshot?.(1);if(!currentSnapshot)return unavailable('snapshot_unavailable');
         const confirmed=await evaluate(record,expected,currentSnapshot,facts);if(confirmed.status!=='matched_complete'||JSON.stringify(confirmed.bindings)!==JSON.stringify(proof.bindings))return unavailable('image_changed_during_proof');
         if(!requestMatches())return unavailable('active_request_identity');
@@ -259,7 +268,7 @@
           || finalProof.bindings.some(binding=>!proof.bindings.some(original=>original.imageFileId===binding.imageFileId)))return unavailable('final_image_changed_during_proof');
         if(!sameIdentity() || !requestMatches() || location.href!==page.href
           || dom.getTurnNodes().length!==turns.length || dom.getTurnNodes().some((node,index)=>node!==turns[index])
-          || await digest(users[0].innerText||users[0].textContent)!==expected.promptSha256
+          || await digest(userPromptText(users[0]))!==expected.promptSha256
           || domFingerprint(users[0])!==nativeKeys.get(users[0]).fingerprint
           || domFingerprint(assistants[0])!==nativeKeys.get(assistants[0]).fingerprint)return unavailable('final_dom_changed_during_proof');
         proof={...finalProof,bindings:finalProof.bindings.map(binding=>({...binding,

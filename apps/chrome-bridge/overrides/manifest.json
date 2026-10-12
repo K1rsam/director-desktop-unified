@@ -15,7 +15,7 @@
     {
       "path": "extension/content/conversationReconciliation.js",
       "beforeSha256": "f82342b48c333aa8d86e6296716543d85b0abaffeb561b0db02518d55083a892",
-      "afterSha256": "627c9333fb97c90ffb633ebc6e264fcf627b0de1aafbeb2d1a933cc6ea92149b",
+      "afterSha256": "ce2a8cfec520c0014f7c5513c0b3f3e9f014ae3e732786d0929e9560d0809a6f",
       "previousAfterSha256": "09810908e5f758eee8e0bc1db965649c166a6d6c07545bba6ded7889191165be",
       "previousAfterSha256s": [
         "340994c84a7dcdc8ea3485f13950d9f267dab797a46ef1b7cf6799df704d6695",
@@ -23,7 +23,8 @@
         "72eba7c1405b95096d811cf1dc905de00e7ebcee2738ded7a6d2c1ed9e0ecdbf",
         "955567495694f0e73960328d5d7e7f6b8a872779197fbfb0dcd206adb7f20344",
         "16545bf49529ff9673fbe6ed1a1f10e799202a9109ee3ac6c8dacdad8e3ea012",
-        "1d1fb489446368e4eb983106efb1a01c06286d453df043dcc3dbd3947986751b"
+        "1d1fb489446368e4eb983106efb1a01c06286d453df043dcc3dbd3947986751b",
+        "627c9333fb97c90ffb633ebc6e264fcf627b0de1aafbeb2d1a933cc6ea92149b"
       ]
     },
     {
@@ -136,13 +137,14 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941",
+      "afterSha256": "cbd5a9123d694fcbc222923159622c0a2815e3dd9c61cc53be58f679fd2ae705",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
         "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
         "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed",
-        "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2"
+        "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2",
+        "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941"
       ]
     },
     {

@@ -31,6 +31,12 @@ async function fixture(options = {}) {
   const calls = [], observed = [], messages = [];
   const image = { isConnected: true, src: options.blob ? 'blob:https://chatgpt.com/synthetic' : '', currentSrc: '', naturalWidth: 0, naturalHeight: 0, closest: () => ({}), getAttribute: () => '' };
   const user = { isConnected: true, innerText: options.domPrompt || prompt, querySelectorAll: () => [] };
+  if(options.presentationControls){
+    user.innerText=prompt+'\n显示更多';user.matches=selector=>selector==='.bg-user-message';
+    const body={isConnected:true,textContent:options.bodyPrompt||prompt,querySelector:()=>null};
+    user.querySelectorAll=selector=>selector==='div.whitespace-pre-wrap'?(options.multiplePromptBodies?[body,{...body}]:[body]):[];
+    if(options.changeBodyDuringDownload)options.onBody=()=>{body.textContent='changed source text';};
+  }
   const assistant = { isConnected: true, innerText: '', querySelectorAll: () => [image] };
   const turns = [user, ...(options.noAssistant ? [] : [assistant]), ...(options.extraUser ? [user] : []), ...(options.extraAssistant ? [assistant] : [])];
   let reads = 0;
@@ -53,6 +59,7 @@ async function fixture(options = {}) {
       if (url.endsWith('/api/auth/session')) return Response.json({ accessToken: 'synthetic-token-never-persisted' });
       if (url.includes(`/backend-api/files/download/${imageId}`)) return Response.json({ download_url: options.wrongFile ? originalUrl.replace(imageId, 'file-other') : originalUrl });
       if (url === originalUrl || url === image.src && options.blob) {
+        options.onBody?.();
         if (options.newActiveDuringDownload) active = { requestId: 'other-request' };
         if (options.newLaunchDuringDownload) launch = 'different-owned-tab';
         if (options.changePromptDuringDownload) user.innerText = 'different prompt';
@@ -101,6 +108,16 @@ test('released task downloads its native original bytes only after exact branch 
     assert.equal(f.proof.downloadBytes(artifact, originalUrl), null, 'edited DOM revokes byte binding');
     assert.equal(f.proof.key(f.user), '');
   }
+});
+
+test('presentation bubble controls do not enter full prompt hash or prevent original image recovery',async()=>{
+ const f=await fixture({presentationControls:true});const result=await f.proof.read(f.expected,f.snapshot(),f.deps);
+ assert.equal(result.status,'matched_complete');assert.equal(result.promptSha256,f.expected.promptSha256);assert.equal(f.reads,2);
+});
+test('presentation prompt extraction still rejects changed multiple or drifting source bodies',async()=>{
+ for(const options of [{presentationControls:true,bodyPrompt:'different prompt'},{presentationControls:true,multiplePromptBodies:true},{presentationControls:true,changeBodyDuringDownload:true}]){
+  const f=await fixture(options);assert.notEqual((await f.proof.read(f.expected,f.snapshot(),f.deps)).status,'matched_complete');
+ }
 });
 
 test('latest image delivery survives intermediate renders and user reference images, with exact bytes rechecked', async () => {

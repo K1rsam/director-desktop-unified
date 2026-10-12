@@ -360,6 +360,7 @@ async function openConnectionOnce(state) {
       return;
     }
     void tabOperations.run(state.tabId, async () => {
+      if(state.ws!==ws||state.closed)return;
       const hello = state.pendingHelloReceipt;
       await handleServerEnvelope({
       state,
@@ -401,7 +402,7 @@ async function openConnectionOnce(state) {
   });
   ws.addEventListener('close', (event) => {
     if(state.ws!==ws||state.closed)return;
-    void tabOperations.run(state.tabId, () => backgroundState.transition(state.tabId, {
+    void tabOperations.run(state.tabId, () => state.ws!==ws||state.closed ? undefined : backgroundState.transition(state.tabId, {
       type: 'transport.disconnected', contentEpoch: state.contentEpoch,
     }), { label: 'transport.close', priority: TabOperationPriority.OWNER_INVALIDATION, critical: true }).catch(() => {});
     if (state.closed) return;

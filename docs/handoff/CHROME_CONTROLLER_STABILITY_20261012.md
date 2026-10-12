@@ -21,3 +21,11 @@
 - 本轮仅扩展补丁，客户端 EXE 字节未改，维持当前版及唯一备用。禁止视频、付费图片和替换渠道。
 
 本地证据位于 `.local/validation/chrome-batch-20261012/`：`controller-window-incident-final-tests.log`、`native-original-window-repair-reload/`、`native-reconciled-window-execution-proof/`、`native-extension-owner-inspection-05/`、原批次观察和原任务回执。最终数量与未验收范围以新增最终记录为准。
+
+## 续跑发现的提示词正文提取缺陷
+
+原批次推进到13张后，一项真实图片已经完成，但桥接仍显示 `waiting_for_user_turn`，不是正在生图。后台只读 layout 证明新版 presentation user bubble 含一个完整465字符正文节点及“显示更多”控件；原 native recovery 回包为 `dom_user_boundary`，userCount=1、assistantCount=1、promptMatches=false。
+
+修复只读取 `.bg-user-message` 内唯一的 `div.whitespace-pre-wrap` 正文，排除控件标签；多正文、不明结构、正文改变仍不能通过。原完整提示词 SHA、原任务关联码、native branch、原图字节和二次原生记录回读全部保留，未放松来源校验。
+
+补丁在零活跃请求后后台加载；同一原任务真实恢复返回 `matched_complete / exact_single_user_blob_bytes`、1个 artifact，modelSubmissions=0。无需再生成。新增对应合成回归，全套124 passed、0 failed，另补充旧 socket 已排队回调在新连接建立后不得污染当前状态的回归。原图片批次继续，未宣称全部完成。
