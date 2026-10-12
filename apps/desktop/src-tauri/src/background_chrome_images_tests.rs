@@ -165,7 +165,10 @@ fn background_chrome_failed_paused_original_query_is_bounded_and_keeps_retry_bud
 }
 
 fn failed_runtime_prepared(f:&Fixture,j:&Journal)->String{
-    let key=s(&j.jobs[0],"jobId").to_owned();let job=f.store.job(&key).unwrap();let (cfg,account)=f.engine.generation_config(&f.store,&job).unwrap();
+    failed_runtime_prepared_at(f,j,0)
+}
+fn failed_runtime_prepared_at(f:&Fixture,j:&Journal,index:usize)->String{
+    let key=s(&j.jobs[index],"jobId").to_owned();let job=f.store.job(&key).unwrap();let (cfg,account)=f.engine.generation_config(&f.store,&job).unwrap();
     assert_eq!(s(&job,"accountId"),account);assert!(f.store.claim_job(&key,"queued","preparing").unwrap());
     let p=f.fake.prepare(&cfg,&tasks::generation_request(&job["snapshot"]).unwrap()).unwrap();
     assert!(f.store.claim_job_fields(&key,"preparing","ready",&json!({"prepared":p})).unwrap());
@@ -184,12 +187,27 @@ fn background_chrome_epoch_refresh_preserves_original_request_prepared_history_a
     assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.count(),1);assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),1);
 }
 #[test]
+fn background_chrome_active_original_preserves_other_refresh_attempt_then_continues_same_batch(){
+    let f=Fixture::new(&[("first",None),("second",None)]);let j=f.queue();
+    let first=failed_runtime_prepared_at(&f,&j,0);let second=failed_runtime_prepared_at(&f,&j,1);let mut attempted=HashSet::new();
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    f.fake.pending.store(true,Ordering::SeqCst);
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    f.store.conn().unwrap().execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2",rusqlite::params![chrono::Utc::now().timestamp()+60,first]).unwrap();
+    assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    assert!(!attempted.contains(&format!("prepared:{second}")));assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),1);assert_eq!(f.count(),1);
+    f.fake.pending.store(false,Ordering::SeqCst);f.store.conn().unwrap().execute("UPDATE jobs SET next_attempt_at=0 WHERE id=?1",[&first]).unwrap();
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.store.job(&first).unwrap()["status"],"downloaded");
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.store.job(&second).unwrap()["status"],"ready");
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.count(),2);assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),2);
+}
+#[test]
 fn background_chrome_prepared_refresh_never_bypasses_another_unknown_submission(){
     let f=Fixture::new(&[("first",None),("unknown",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);
     let unknown=s(&j.jobs[1],"jobId");f.store.update_job(unknown,"submission_unknown",&json!({})).unwrap();
     let mut attempted=HashSet::new();
-    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
-    assert_eq!(f.store.job(&key).unwrap()["status"],"ready");assert_eq!(f.count(),0);
+    assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    assert_eq!(f.store.job(&key).unwrap()["status"],"failed");assert_eq!(f.count(),0);assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),0);
     assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
     assert_eq!(f.count(),0);assert_eq!(f.store.job(unknown).unwrap()["status"],"submission_unknown");
 }

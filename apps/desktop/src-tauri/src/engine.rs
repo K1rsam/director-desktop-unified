@@ -1929,22 +1929,10 @@ impl Engine {
     fn chrome_image_queue_ready(&self, store: &Store, key: &str) -> Result<bool> {
         let state = s(&store.job(key)?, "status").to_owned();
         if !["queued", "ready"].contains(&state.as_str()) { return Ok(false); }
-        let current_project = s(&store.project()?, "id").to_owned();
-        let result = (|| -> Result<Option<String>> {
-            let registry = self.registry()?;
-            for project in registry.as_array().ok_or("项目索引损坏")? {
-                let except = if s(project, "id") == current_project { key } else { "" };
-                if let Some(blocker) = Store::chrome_image_blocker(
-                    Path::new(s(project, "rootPath")), s(project, "id"), except,
-                )? { return Ok(Some(blocker)); }
-            }
-            Ok(None)
-        })();
+        let result = self.chrome_image_queue_blocker(store, key);
         match result {
             Ok(None) => Ok(true),
             Ok(Some(_)) => {
-                // Keep the frozen request and queued/ready state untouched.
-                // A durable delay also prevents a busy channel waking tight loops.
                 store.defer_browser_queue(key, &state)?;
                 Ok(false)
             }
@@ -1955,6 +1943,19 @@ impl Engine {
                 Ok(false)
             }
         }
+    }
+    // Read-only ownership check also used before refreshing a failed prepare.
+    // An active original must finish before another task spends its proof attempt.
+    fn chrome_image_queue_blocker(&self, store: &Store, key: &str) -> Result<Option<String>> {
+        let current_project = s(&store.project()?, "id").to_owned();
+            let registry = self.registry()?;
+            for project in registry.as_array().ok_or("项目索引损坏")? {
+                let except = if s(project, "id") == current_project { key } else { "" };
+                if let Some(blocker) = Store::chrome_image_blocker(
+                    Path::new(s(project, "rootPath")), s(project, "id"), except,
+                )? { return Ok(Some(blocker)); }
+            }
+            Ok(None)
     }
     fn wake_images(&self) {
         let (pending, signal) = &self.image_wake;

@@ -44,6 +44,12 @@ Windows 原生 Rust `background_chrome_` 35 passed、0 failed，覆盖恢复成�
 
 最终 Windows 原生组合：`director_core-f95efbd7b799e033.exe chrome_ --test-threads=1`，118 passed / 0 failed；原生 Job Object receipt success=true、exitCode=0、timedOut=false、进程树已空。Chrome JS最终125 passed / 0 failed。证据为 `native-prepared-refresh-tests-03/` 与 `final-js-stability-tests-03.log`；完整核心及前端未在本次仅后端恢复补丁重跑。
 
+`13dd41e` 已发布，当前EXE SHA `fcef5b7592bf70611994ead59b974e32b921f4e7ad0d8b05f5cae84e1519686f`，唯一备用为原 `085da0bd…`。原请求续跑由20张推进到21张；第一项完整旧prepared归档，零重新prepare/upload，预算不重置，所有冻结snapshot哈希不变、videoJobs=0。
+
+真实续跑暴露另一调度缺口：已知原任务处于processing但下一查询尚未到时，其他failed准备任务过早尝试证明，此时其他页面有活跃请求，被记为本轮held；当前原任务完成后这些一次性尝试已消耗，批次结束。修复抽取不依赖候选状态的只读跨项目owner检查，在刷新前先等待既有任务，不耗刷新标记；实际生成仍走原队列门禁。增加两份失败prepared同批次逐项恢复、当前processing有延迟时不消耗另一项机会的回归，同时未知提交会阻止刷新及提交。
+
+队列修复的最终Windows原生Chrome组合119 passed / 0 failed，receipt success=true、exitCode=0、timedOut=false、进程树已空，证据 `native-prepared-refresh-owner-tests-04/`。此前125项JS未受此纯Rust调度修改影响。
+
 ## 会话链接恢复的设计判断
 
 用户建议持久保存 `https://chatgpt.com/c/<conversationId>`，原工作页丢失时后台重开原会话进行只读恢复。采用这一方向，保留本地任务ID作为发送前与队列身份；会话URL是定位信息，完整提示词哈希、消息分支与原图文件身份是采用依据。现有实现已校验会话ID，但仍依赖原工作页且部分恢复要求正文任务标记，本补丁没有宣称链接重开或去标记已经完成。

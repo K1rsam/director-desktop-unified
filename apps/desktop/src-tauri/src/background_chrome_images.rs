@@ -403,6 +403,7 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         // The generation queue accepts queued/ready jobs, so a failed original
         // must first be restored; its eventual first submit still passes that gate.
         if generate && !engine.chrome_image_queue_ready(store,key)? {continue;}
+        if refresh_prepared && engine.chrome_image_queue_blocker(store,key)?.is_some() {continue;}
         if config.kind!="chrome" {return Err(HELD.into());}
         // Includes source/asset versions and exact adopted parent media hashes.
         binding::validate_generation_snapshot(store,&job["snapshot"])?;
