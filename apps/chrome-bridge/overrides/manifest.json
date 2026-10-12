@@ -44,7 +44,10 @@
     {
       "path": "extension/content/requestEffectReconciliation.js",
       "beforeSha256": "58e724ce81340f7f9866208e7f4d18dd74548c7b23c60bcdabcb0fbb9a35f32a",
-      "afterSha256": "dcb1f119158fbe903c808a899f341ee81b58fe8f878d11c390cc2be715ed06e0"
+      "afterSha256": "1439273cad7d41c7629f3939d9262d2ec889225a94c042c3e1815cb139f2d54f",
+      "previousAfterSha256s": [
+        "dcb1f119158fbe903c808a899f341ee81b58fe8f878d11c390cc2be715ed06e0"
+      ]
     },
     {
       "path": "extension/background/extensionReloadCoordinator.js",

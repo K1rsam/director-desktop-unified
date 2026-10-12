@@ -55,9 +55,9 @@ function fixture(options = {}) {
   }
   const runtime = context.ChatGptAttachmentCommands.createAttachmentCommands(deps);
   const state = (attachments = [{ name: 'parent.png', mime: 'image/png' }]) => context.ChatGptAttachmentCommands.readUploadState(deps.findComposerRoot(), attachments, deps);
-  async function reconcile(evidence = { attachments: [{ name: 'parent.png', mime: 'image/png' }], attachmentCount: 1 }) {
+  async function reconcile(evidence = { attachments: [{ name: 'parent.png', mime: 'image/png' }], attachmentCount: 1 },preconditions={}) {
     const recovery = context.ChatGptRequestEffectReconciliation.createRequestEffectReconciliation(deps);
-    await recovery.handleEffectReconcile({ requestId: 'synthetic-request', effectType: 'attachments.upload', evidence });
+    await recovery.handleEffectReconcile({ requestId: 'synthetic-request', effectType: 'attachments.upload', evidence,preconditions });
     return reconciliations.at(-1);
   }
   return { runtime, state, reconcile, events, diagnostics, img, root, get elapsed() { return now; } };
@@ -65,6 +65,14 @@ function fixture(options = {}) {
 
 const files = [{ name: 'parent.png', mime: 'image/png', contentBase64: 'AA==', size: 1 }];
 const request = { requestId: 'synthetic-request' };
+
+test('upload reconciliation uses frozen attachment preconditions and never treats missing evidence as zero requested files',async()=>{
+ const f=fixture(),conditions={attachments:[{name:'parent.png',mime:'image/png'}]};
+ const proof=await f.reconcile({},conditions);assert.equal(proof.reconciliationOutcome,'succeeded');assert.equal(proof.evidence.expectedAttachmentCount,1);
+ assert.equal((await f.reconcile({},{})).reconciliationOutcome,'uncertain');
+ assert.equal((await f.reconcile({attachments:[],attachmentCount:0},conditions)).reconciliationOutcome,'uncertain');
+ assert.equal((await f.reconcile({attachments:[],attachmentCount:0},{})).reconciliationOutcome,'succeeded');
+});
 
 test('exact composer image aria-label with loaded preview completes without waiting or upload-button false busy', async () => {
   const f = fixture();

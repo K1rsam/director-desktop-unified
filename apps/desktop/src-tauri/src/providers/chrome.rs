@@ -18,6 +18,8 @@ mod conversation_tests;
 mod execution_proof;
 #[path="chrome_conversation.rs"]
 pub(super) mod conversation;
+#[path="chrome_upload_settlement.rs"]
+mod upload_settlement;
 
 fn json_request(
     config: &ProviderConfig,
@@ -444,7 +446,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
             config,
             &client,
             "/files/from-path",
-            Some(&json!({"path":r.path,"name":format!("{}.{}",r.sha256,ext),"mime":mime})),
+            Some(&json!({"path":r.path,"name":reference_upload_name(&request.request_id,r.order,&ext),"mime":mime})),
             false,
         )?;
         let file_id = uploaded["file"]["id"]
@@ -748,6 +750,7 @@ pub(super) fn submit(
     })
 }
 
+fn reference_upload_name(request:&str,order:u32,ext:&str)->String{format!("{request}-ref-{order}.{ext}")}
 fn image_file_id(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     if parsed.origin().ascii_serialization() != "https://chatgpt.com"
@@ -910,6 +913,7 @@ fn query_inner(config:&ProviderConfig,id:&str,prepared:Option<&PreparedRequest>,
             "保存的准备快照与任务标签页身份不一致。",
         ));
     }
+    if let Some(p)=prepared{if let Some(failed)=upload_settlement::settle(config,&client,turn,&source,p)?{return Ok(failed);}}
     if let Some(pending) = homepage_preparation_pending(turn, &source, id, prepared)? {
         return Ok(pending);
     }

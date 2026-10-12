@@ -155,7 +155,9 @@
           }
         }
       } else if (effectType === 'attachments.upload') {
-        const expectedAttachments = Array.isArray(expected.attachments) ? expected.attachments : [];
+        const evidenceAttachments = Array.isArray(expected.attachments) ? expected.attachments : null;
+        const conditionAttachments = Array.isArray(preconditions.attachments) ? preconditions.attachments : null;
+        const expectedAttachments = evidenceAttachments || conditionAttachments || [];
         const expectedNames = expectedAttachments.map((item) => String(item?.name || '')).filter(Boolean);
         const expectedCount = Math.max(expectedNames.length, Number(expected.attachmentCount || preconditions.attachmentCount) || 0);
         const root = findComposerRootStrict?.() || findComposer?.()?.closest?.('form') || null;
@@ -165,7 +167,10 @@
         const visibleNames = state.visibleNames;
         Object.assign(evidence, { expectedAttachmentCount: expectedCount, expectedNames, visibleAttachmentCount: visibleCount,
           visibleNames, attachmentStateKnown: state.known, uploadBusy: state.busy, uploadError: state.error });
-        if (!expectedCount) {
+        const conflictingNames=evidenceAttachments&&conditionAttachments&&JSON.stringify(evidenceAttachments.map(a=>String(a?.name||'')))!==JSON.stringify(conditionAttachments.map(a=>String(a?.name||'')));
+        if (conflictingNames || !evidenceAttachments && !conditionAttachments && !Number.isFinite(expected.attachmentCount) && !Number.isFinite(preconditions.attachmentCount)) {
+          outcome='uncertain';reason='attachment_expectation_missing_or_conflicting';
+        } else if (!expectedCount) {
           outcome = 'succeeded'; reason = 'no_attachments_requested';
         } else if (state.error) {
           outcome = 'failed'; reason = 'attachment_upload_error_observed';

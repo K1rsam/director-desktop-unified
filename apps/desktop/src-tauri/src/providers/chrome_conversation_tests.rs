@@ -57,3 +57,17 @@ fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Value,Value,Value
  assert_eq!(release_completed_tab(&cfg,&p,&result).unwrap()["status"],"close_requested");f.thread.join().unwrap();let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),2);let body:Value=serde_json::from_str(&calls[1].1).unwrap();assert_eq!(body["sourceClientId"],alias["id"]);assert_eq!(body["expectedLaunchToken"],alias["launchToken"]);assert_ne!(body["sourceClientId"],p.wire["sourceClientId"]);
  let mut bad=result.clone();bad.raw["readOnlyRecovery"]["locator"]["userMessageId"]=json!("foreign");assert!(release_completed_tab(&cfg,&p,&bad).is_err());std::env::remove_var(cfg.bridge_token_env.unwrap());
 }
+#[test]fn chrome_upload_settlement_only_cancels_halted_original_between_two_native_empty_reads(){
+ let base=crate::chrome_terminal::tests::upload_fixture();let mut source=json!({"id":"worker","url":"https://chatgpt.com/"});source["focused"]=json!(false);
+ let mut proof=base["result"]["raw"]["uploadNotSubmitted"].clone();let task=s(&base,"providerTaskId");let prepared:PreparedRequest=serde_json::from_value({let mut p=base["prepared"].clone();p["capabilityVersion"]=json!("fixture");p["uploadReceipts"]=json!([]);p["preparedAt"]=json!("original");p["request"]["prompt"]=json!("synthetic image");p["request"]["ratio"]=json!("16:9");p["request"]["resolution"]=json!("native");p["request"]["references"]=json!([]);p["request"]["options"]=json!({});p}).unwrap();
+ proof["preparedSha256"]=json!(hex_hash(json!(prepared).to_string().as_bytes()));
+ let diagnostic=json!({"ok":true,"authoritative":true,"requests":{"state":proof["canonicalState"]}});
+ let f=fixture(vec![diagnostic.clone(),proof["nativeEmptyBefore"].clone(),json!({"ok":true,"turn":{"id":task,"status":"cancelled"}}),proof["nativeEmptyAfter"].clone()]);let(cfg,_,_,_,_,_)=setup(&f.endpoint);
+ let result=upload_settlement::settle(&cfg,&wire::client(5).unwrap(),&json!({"id":task,"status":"running"}),&source,&prepared).unwrap().unwrap();f.thread.join().unwrap();assert_eq!(result.status,"failed");assert!(crate::chrome_terminal::upload_not_submitted_valid(&result.raw["uploadNotSubmitted"],&json!(prepared),task));
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),4);assert!(calls[1].0.starts_with("POST /browser/recover-latest "));assert!(calls[2].0.starts_with(&format!("POST /turns/{task}/interrupt ")));assert!(calls[3].0.starts_with("POST /browser/recover-latest "));std::env::remove_var(cfg.bridge_token_env.unwrap());
+ let mut bad=diagnostic;bad["requests"]["state"]["effect"]["coordinator"]["lastResult"]["data"]["result"]["activeRequest"]["sentAt"]=json!(1);
+ let f=fixture(vec![bad]);let(cfg,_,_,_,_,_)=setup(&f.endpoint);assert!(upload_settlement::settle(&cfg,&wire::client(5).unwrap(),&json!({"id":task,"status":"running"}),&source,&prepared).unwrap().is_none());f.thread.join().unwrap();assert_eq!(f.requests.lock().unwrap().len(),1);std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
+#[test]fn chrome_reference_upload_names_are_unique_per_request_and_reference_while_bytes_identity_stays_in_receipts(){
+ assert_ne!(reference_upload_name("request-a",0,"png"),reference_upload_name("request-b",0,"png"));assert_ne!(reference_upload_name("request-a",0,"png"),reference_upload_name("request-a",1,"png"));assert_eq!(reference_upload_name("request-a",0,"png"),"request-a-ref-0.png");
+}
