@@ -174,6 +174,9 @@ fn native_resume_of_legacy_completed_but_blocked_image_production_preserves_reco
         .find(|job| job["kind"] == "workflow" && job["id"] != old)
         .unwrap();
     assert_eq!(resumed["status"], "completed");
+    assert!(resumed["snapshot"]["stage2Context"].get(pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD).is_none(),
+        "reconstructing missing legacy context must not opt a resume into a new comparison policy");
+    assert!(resumed["snapshot"]["stage2Context"].get(pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS).is_none());
     assert_eq!(resumed["snapshot"]["settings"], snapshot["settings"]);
     assert_eq!(
         resumed["snapshot"]["request"]["assetIds"],

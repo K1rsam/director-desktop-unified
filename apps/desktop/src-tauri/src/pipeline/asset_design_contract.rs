@@ -727,6 +727,24 @@ mod tests {
         assert!(!incremental_comparisons(&json!({})).unwrap());
         assert!(incremental_comparisons(&json!({COMPARISON_PROFILE_FIELD:"unknown"})).is_err());
     }
+    #[test]
+    fn incremental_comparison_cannot_upgrade_a_bound_legacy_resume_ancestor() {
+        let temp=tempfile::tempdir().unwrap();
+        let store=crate::store::Store::open(temp.path().join("project")).unwrap();
+        store.ensure_workflow_storage().unwrap();
+        // Covers both pre-context records and older frozen comparison maps.
+        for (index,context) in [Value::Null,json!({"comparisonDesignsByAssetId":{"a":[]}})].into_iter().enumerate() {
+            let original=store.add_job("workflow","images.produce","local","local",
+                &json!({"stage":"images.produce","stage2Context":context}),"completed").unwrap();
+            let before=store.job(&original).unwrap();
+            let resume=store.add_job("workflow",&format!("images.produce:{index}"),"local","local",
+                &json!({"stage":"images.produce","stage2Context":{COMPARISON_PROFILE_FIELD:COMPARISON_PROFILE},
+                    "request":{"imageResumeOrigin":{"workflowId":original,"snapshotSha256":digest(&before["snapshot"].to_string())}}}),"queued").unwrap();
+            assert!(frozen_comparison_requests(&store,&resume).unwrap_err().contains("缺少原工作流策略"),
+                "an accidental policy upgrade must fail closed, not resample or bypass the ancestor");
+            assert_eq!(store.job(&original).unwrap(),before);
+        }
+    }
     fn basis() -> Value {
         json!({"source":{"sha256":"locked"},"foundation":{"facts":[]},"settings":{"projectVisualStyle":"水墨国漫","ratio":"9:16"},"assets":[{"id":"a","identityId":"a","variantId":"base","kind":"CH","prompt":"成熟深肤色人物","promptOrigin":"MANUAL"}]})
     }

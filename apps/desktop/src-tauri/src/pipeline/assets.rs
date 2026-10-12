@@ -1843,6 +1843,32 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn incremental_comparison_legacy_nonempty_map_replays_original_request_after_partial_failure() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut input=comparison_fixture();
+        input.as_object_mut().unwrap().remove(super::super::asset_design_contract::COMPARISON_PROFILE_FIELD);
+        let original_comparison=json!([{"assetId":"previously-accepted","prompt":"原已采用角色的宽脸短发对照"}]);
+        input["comparisonDesignsByAssetId"]["a"]=original_comparison.clone();
+        let exec=ComparisonDesigner::default();
+        exec.accepted.lock().unwrap().insert("previously-accepted".into());
+        exec.fail_b.store(true,SeqCst);
+        let first=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert_eq!(first["blocked"].as_array().unwrap().len(),1);
+        let originals=exec.requests.lock().unwrap().clone();
+        assert_eq!(originals.iter().find(|r|r.input["asset"]["id"]=="a").unwrap().input["comparisonDesigns"],original_comparison);
+        exec.fail_b.store(false,SeqCst);
+        exec.requests.lock().unwrap().clear();
+        let restored=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert!(restored["blocked"].as_array().unwrap().is_empty());
+        assert_eq!(exec.generated.load(SeqCst),7,"previously accepted legacy requests must replay rather than regenerate");
+        for request in exec.requests.lock().unwrap().iter() {
+            let original=originals.iter().find(|r|r.input["asset"]["id"]==request.input["asset"]["id"]).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(),serde_json::to_value(original).unwrap(),
+                "the complete legacy request, including its frozen comparison map, must remain unchanged");
+            assert!(request.input.get(super::super::asset_design_contract::COMPARISON_PROFILE_FIELD).is_none());
+        }
+    }
+    #[tokio::test]
     async fn incremental_comparison_character_lane_respects_parent_topology_before_lexical_order() {
         let mut input=comparison_fixture();
         input["assets"][2]["sourceAssetId"]=json!("c");

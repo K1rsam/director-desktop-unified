@@ -3373,7 +3373,13 @@ impl Engine {
             let mut comparisons = json!({});
             for asset in &all_assets { comparisons[s(asset,"id")] = json!(pipeline::asset_design_contract::comparison_designs(&design_input,asset)); }
             design_input["comparisonDesignsByAssetId"] = comparisons;
-            design_input[pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(pipeline::asset_design_contract::COMPARISON_PROFILE);
+            // A missing legacy stage2Context needs reconstruction, but does not
+            // make its explicit resume a new workflow policy. Only genuinely
+            // new productions opt in; resumes retain their original comparison
+            // contract (including absence of a profile).
+            if r.get("imageResumeOrigin").is_none() {
+                design_input[pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(pipeline::asset_design_contract::COMPARISON_PROFILE);
+            }
         }
         let needs_visual_check =
             pipeline::asset_visual_facts::cached_visual_check_required(&design_input)?;
