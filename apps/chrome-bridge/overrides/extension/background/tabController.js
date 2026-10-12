@@ -78,17 +78,82 @@ export function createTabController({
   if (typeof isStableLaunchToken !== 'function') throw new TypeError('Tab controller requires launch-token validation');
   let controllerQueue = Promise.resolve();
 
+  async function provePreviousControllerRecovery(port, prior, profileId, stateKey, bridgeServerUrl) {
+    if (typeof readInventoryIdentity !== 'function' || !Number.isSafeInteger(prior?.tabId) || prior.tabId <= 0
+      || !CONTROLLER_SESSION_UUID_RE.test(prior.browserSession || '')) return null;
+    const connection = connections.get(port);
+    if (!connection || connection.closed || connection.protocolReady !== true || connection.ws?.readyState !== 1
+      || connection.activeRequest || safeBridgeServerUrl(connection.serverUrl) !== bridgeServerUrl) return null;
+    const before = await readInventoryIdentity(port);
+    if (before.profileId !== profileId || !/^[a-f0-9]{32}$/.test(before.bundleId || '') || !before.backgroundEpoch
+      || !before.serverInstanceId || !before.contentEpoch || before.sourceTabId !== port?.sender?.tab?.id
+      || before.sourceClientId !== connection.clientId || port?.sender?.tab?.incognito !== false) return null;
+    const read = async () => {
+      const [tabs, records, local] = await Promise.all([chrome.tabs.query({}), chrome.storage.session.get(null),
+        chrome.storage.local.get(['directorDesktop:browserProfileId:v1', stateKey])]);
+      if (!Array.isArray(tabs) || !records || typeof records !== 'object' || Array.isArray(records)
+        || tabs.some(tab => !Number.isSafeInteger(tab.id) || tab.id <= 0 || typeof tab.url !== 'string'
+          || typeof tab.incognito !== 'boolean' || typeof tab.active !== 'boolean')
+        || new Set(tabs.map(tab => tab.id)).size !== tabs.length) throw new Error('Previous controller complete inventory unavailable');
+      const source = tabs.find(tab => tab.id === before.sourceTabId);
+      if (!source || !controllerRootUrl(source.url) || source.incognito || source.active
+        || local['directorDesktop:browserProfileId:v1'] !== profileId || JSON.stringify(local[stateKey]) !== JSON.stringify(prior)) return null;
+      const launched = Object.entries(records).filter(([key]) => key.startsWith(LAUNCHED_TAB_PREFIX)).sort(([a], [b]) => a.localeCompare(b));
+      // Any ambiguous ownership is a hold, including orphaned/duplicate tokens.
+      for (const [key, record] of launched) {
+        const raw = key.slice(LAUNCHED_TAB_PREFIX.length), id = Number(raw);
+        if (!Number.isSafeInteger(id) || id <= 0 || String(id) !== raw || !record || typeof record !== 'object'
+          || !isStableLaunchToken(record.launchToken)) return null;
+        if (record.launchToken === prior.launchToken && (id !== prior.tabId || record.serverUrl !== bridgeServerUrl
+          || record.requestedUrl !== prior.requestedUrl)) return null;
+      }
+      if (launched.filter(([, record]) => record.launchToken === prior.launchToken).length > 1) return null;
+      // A live root with missing session ownership could be a reused user page.
+      // Persistent tabId alone never authorizes adopting or navigating it.
+      const existing = tabs.find(tab => tab.id === prior.tabId);
+      let targetRuntime = null;
+      if (existing) {
+        const record = launched.find(([key]) => key === LAUNCHED_TAB_PREFIX + prior.tabId)?.[1];
+        const target = Array.from(connections.entries()).find(([, state]) => state.tabId === prior.tabId
+          && !state.closed && state.protocolReady && state.ws?.readyState === 1 && !state.activeRequest
+          && safeBridgeServerUrl(state.serverUrl) === bridgeServerUrl);
+        if (!record || record.launchToken !== prior.launchToken || !controllerRootUrl(existing.url)
+          || existing.active || existing.incognito || !target) return null;
+        targetRuntime = await readInventoryIdentity(target[0]);
+        if (targetRuntime.sourceTabId !== prior.tabId || targetRuntime.sourceClientId !== target[1].clientId
+          || !targetRuntime.contentEpoch || !['profileId', 'bundleId', 'backgroundEpoch', 'serverInstanceId'].every(key => targetRuntime[key] === before[key])) return null;
+      }
+      return { tabs: tabs.map(tab => ({ id: tab.id, url: tab.url, incognito: tab.incognito, active: tab.active,
+        discarded: tab.discarded === true })).sort((a, b) => a.id - b.id), launched,
+        browserSession: records[CONTROLLER_BROWSER_SESSION_KEY], targetRuntime };
+    };
+    const first = await read(), second = await read(), after = await readInventoryIdentity(port);
+    if (!first || !second || JSON.stringify(first) !== JSON.stringify(second) || JSON.stringify(before) !== JSON.stringify(after)) return null;
+    const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(second))))]
+      .map(byte => byte.toString(16).padStart(2, '0')).join('');
+    return { reason: second.targetRuntime ? 'previous_session_live_owned_rebound' : 'previous_session_closed_inventory_verified',
+      matched: Boolean(second.targetRuntime), oldTabId: prior.tabId, oldBrowserSession: prior.browserSession,
+      browserSession: second.browserSession, runtime: before, inventorySha256: hash, observedAt: Date.now(),
+      enumerations: 2, ...(second.targetRuntime ? { targetRuntime: second.targetRuntime } : { absenceScope: 'current_browser_inventory_only' }) };
+  }
+
   async function lookupOwnedLaunch(port,options) {
     const version='director-owned-launch-inventory/v1';
     const expected=options.expectedRuntime||{},requestId=String(options.lookupRequestId||''),launchToken=`bridge-director-desktop-${requestId}`;
-    const unknown=reason=>({version,status:'unknown',reason,requestId,launchToken,complete:false});
-    if(!CONTROLLER_SESSION_UUID_RE.test(requestId) || options.launchToken!==launchToken || typeof readInventoryIdentity!=='function'
-      || !chrome.storage?.session?.get || !chrome.tabs?.query)return unknown('inventory_contract_unavailable');
+    const unknown=reason=>({version,status:'unknown',reason,requestId,lookupRequestId:requestId,launchToken,complete:false});
+    if(!CONTROLLER_SESSION_UUID_RE.test(requestId))return unknown('invalid_lookup_request_identity');
+    if(options.launchToken!==launchToken)return unknown('lookup_launch_token_mismatch');
+    if(typeof readInventoryIdentity!=='function')return unknown('inventory_runtime_reader_unavailable');
+    if(typeof globalThis.crypto?.subtle?.digest!=='function')return unknown('inventory_webcrypto_digest_unavailable');
+    if(typeof chrome.storage?.session?.get!=='function')return unknown('inventory_session_reader_unavailable');
+    if(typeof chrome.tabs?.query!=='function')return unknown('inventory_tab_enumerator_unavailable');
+    if(typeof globalThis.crypto?.randomUUID!=='function')return unknown('inventory_generation_uuid_unavailable');
+    if(typeof globalThis.TextEncoder!=='function')return unknown('inventory_text_encoder_unavailable');
     try {
       const before=await readInventoryIdentity(port);
       if(!CONTROLLER_SESSION_UUID_RE.test(before.profileId||'') || !/^[a-f0-9]{32}$/.test(before.bundleId||'')
         || !before.backgroundEpoch || !before.serverInstanceId || !before.contentEpoch
-        || !['profileId','bundleId','backgroundEpoch','serverInstanceId','sourceClientId','sourceTabId'].every(key=>before[key]===expected[key]))return unknown('runtime_mismatch');
+        || !['profileId','bundleId','backgroundEpoch','serverInstanceId','sourceClientId','sourceTabId','contentEpoch'].every(key=>before[key]===expected[key]))return unknown('runtime_mismatch');
       const serverUrl=safeBridgeServerUrl(connections.get(port)?.serverUrl||'');
       if(!serverUrl || port?.sender?.tab?.incognito!==false)return unknown('source_transport_unproved');
       const read=async()=>{
@@ -103,15 +168,40 @@ export function createTabController({
           || !Number.isSafeInteger(record.createdAt)))throw new Error('malformed launched inventory');
         // Compare full tab identity plus all launched records before deriving
         // absence. No connected-client list stands in for Chrome's inventory.
-        const tabFacts=tabs.map(tab=>({id:tab.id,url:tab.url,incognito:tab.incognito,active:tab.active===true,discarded:tab.discarded===true})).sort((a,b)=>a.id-b.id);
-        return {launched,tabs:tabFacts};
+        const tabFacts=tabs.map(tab=>({id:tab.id,url:tab.url,incognito:tab.incognito,active:tab.active===true,discarded:tab.discarded===true,
+          windowId:Number.isInteger(tab.windowId)?tab.windowId:null})).sort((a,b)=>a.id-b.id);
+        const source=tabFacts.find(tab=>tab.id===before.sourceTabId);
+        let sourceWindow=null,sourceWindowError='';
+        if(source?.active){
+          if(typeof chrome.windows?.get!=='function')sourceWindowError='source_native_window_reader_unavailable';
+          else if(!Number.isInteger(source.windowId)||source.windowId<=0)sourceWindowError='source_native_window_identity_missing';
+          else {
+            const window=await chrome.windows.get(source.windowId).catch(()=>null);
+            if(!window || window.id!==source.windowId || typeof window.focused!=='boolean'
+              || !['normal','minimized','maximized','fullscreen'].includes(window.state))sourceWindowError='source_native_window_unproved';
+            else sourceWindow={id:window.id,focused:window.focused,state:window.state};
+          }
+        }
+        return {launched,tabs:tabFacts,sourceWindow,sourceWindowError};
       };
       const first=await read(),second=await read(),after=await readInventoryIdentity(port);
+      if(first.sourceWindowError||second.sourceWindowError)return unknown(first.sourceWindowError||second.sourceWindowError);
       if(JSON.stringify(before)!==JSON.stringify(after) || JSON.stringify(first)!==JSON.stringify(second))return unknown('inventory_changed_during_read');
       const source=second.tabs.find(tab=>tab.id===before.sourceTabId),sourceRecord=second.launched.find(item=>item.key===LAUNCHED_TAB_PREFIX+before.sourceTabId)?.record;
-      if(!source || source.incognito || source.active || !controllerRootUrl(source.url) || !sourceRecord
+      if(!source || source.incognito || !controllerRootUrl(source.url) || !sourceRecord
         || sourceRecord.serverUrl!==serverUrl || !(sourceRecord.launchToken===`bridge-director-control-${before.profileId}`
           || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(sourceRecord.launchToken||'')))return unknown('source_owned_idle_root_unproved');
+      let sourceBackgroundProof;
+      if(source.active){
+        const document=options.sourceDocument;
+        if(!second.sourceWindow || second.sourceWindow.focused!==false)return unknown('source_native_window_foreground');
+        if(!document || document.visibilityState!=='hidden' || document.focused!==false
+          || !Number.isSafeInteger(document.sampledAt) || Date.now()-document.sampledAt<0
+          || Date.now()-document.sampledAt>30000)return unknown('source_current_document_background_unproved');
+        sourceBackgroundProof={version:'director-source-background-proof/v1',sourceTabId:source.id,sourceWindowId:source.windowId,nativeSamples:2,
+          native:{tabActive:true,windowFocused:false,windowState:second.sourceWindow.state},
+          content:{visibilityState:'hidden',focused:false,contentEpoch:before.contentEpoch,sampledAt:document.sampledAt}};
+      }
       const matches=second.launched.filter(item=>item.record?.launchToken===launchToken);
       if(matches.length>1)return unknown('duplicate_launch_token');
       let match,status='confirmed_absent';
@@ -126,12 +216,13 @@ export function createTabController({
       }
       const digest=async value=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))].map(byte=>byte.toString(16).padStart(2,'0')).join('');
       // Audit unrelated tabs by URL digest; never disclose their URLs/titles.
-      const inventory={tabs:await Promise.all(second.tabs.map(async tab=>({id:tab.id,urlSha256:await digest(tab.url),incognito:tab.incognito,active:tab.active,discarded:tab.discarded}))),
-        launchRecords:second.launched.map(item=>({key:item.key,recordSha256:null})),sourceTabId:before.sourceTabId};
+      const inventory={tabs:await Promise.all(second.tabs.map(async tab=>({id:tab.id,urlSha256:await digest(tab.url),incognito:tab.incognito,active:tab.active,discarded:tab.discarded,windowId:tab.windowId}))),
+        launchRecords:second.launched.map(item=>({key:item.key,recordSha256:null})),sourceTabId:before.sourceTabId,
+        ...(sourceBackgroundProof?{sourceBackgroundProof}:{})};
       for(let index=0;index<second.launched.length;index++)inventory.launchRecords[index].recordSha256=await digest(JSON.stringify(second.launched[index].record));
       if(JSON.stringify(before)!==JSON.stringify(await readInventoryIdentity(port)))return unknown('runtime_changed_during_digest');
       const inventoryCanonicalJson=JSON.stringify(inventory);
-      return {version,status,reason:status==='matched'?'unique_record_and_live_tab':'complete_inventory_no_matching_launch',requestId,launchToken,complete:true,
+      return {version,status,reason:status==='matched'?'unique_record_and_live_tab':'complete_inventory_no_matching_launch',requestId,lookupRequestId:requestId,launchToken,complete:true,
         runtime:before,inventoryGeneration:crypto.randomUUID(),inventorySha256:await digest(inventoryCanonicalJson),inventoryCanonicalJson,inventory,observedAt:Date.now(),
         absenceScope:'current_browser_inventory_only',...(match?{match}:{})};
     }catch{return unknown('inventory_enumeration_unavailable');}
@@ -172,8 +263,23 @@ export function createTabController({
       && invalidated.tabId === prior.tabId && invalidated.launchToken === launchToken
       && invalidated.browserSession === prior.browserSession && invalidated.serverUrl === bridgeServerUrl
       && invalidated.requestedUrl === requestedUrl;
+    let previousClosedProof = null;
     if (prior?.browserSession && prior.browserSession !== browserSession && !reloadProved) {
-      throw new Error('Controller belongs to a previous browser session; no replacement was opened');
+      previousClosedProof = await provePreviousControllerRecovery(port, prior, profileId, stateKey, bridgeServerUrl);
+      if (!previousClosedProof || previousClosedProof.browserSession !== browserSession) {
+        throw new Error('Controller belongs to a previous browser session; no replacement was opened');
+      }
+      const { retiredControllers: _history, ...retired } = prior;
+      retiredControllers = [...retiredControllers, { ...retired, retiredAt: Date.now(),
+        reason: previousClosedProof.reason, recoveryProof: previousClosedProof }];
+      if (!previousClosedProof.matched) {
+        await saveState({ launchToken, serverUrl: bridgeServerUrl, requestedUrl, browserSession, status: 'reserved' });
+        const reservation = (await local.get(stateKey))[stateKey];
+        if (reservation?.status !== 'reserved' || reservation.browserSession !== browserSession
+          || reservation.retiredControllers?.at(-1)?.recoveryProof?.inventorySha256 !== previousClosedProof.inventorySha256) {
+          throw new Error('Previous controller archival reservation was not persisted');
+        }
+      }
     }
     const records = Object.entries(sessionRecords || {}).filter(([key, record]) => key.startsWith(LAUNCHED_TAB_PREFIX) && record?.launchToken === launchToken);
     if (records.length > 1) throw new Error('Controller ownership is not unique; no page was opened');
@@ -222,7 +328,7 @@ export function createTabController({
       // onRemoved clears launched identity. Only a known opened tab from this
       // same browser session may be recreated after complete inventory proves
       // its exact tab id disappeared. Absence alone cannot resolve an unknown.
-      if (prior.status !== 'opened' || prior.browserSession !== browserSession
+      if (prior.status !== 'opened' || (prior.browserSession !== browserSession && !previousClosedProof)
         || !Number.isSafeInteger(prior.tabId) || prior.tabId <= 0
         || tabs.some((tab) => tab.id === prior.tabId)) {
         throw new Error('Controller launch identity is missing or creation remains unknown; no replacement was opened');

@@ -123,3 +123,20 @@ test('reserved, missing, changed or conflicting controller identity never receiv
   const f=controllerFixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
   f.local[CONTROL_STATE].serverUrl='http://127.0.0.1:9999';await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated,undefined);
 });
+
+const ownReloadCommand={commandId:'command',commandType:'extension.reload',scope:'standalone',requestId:'',mode:'result',operation:'maintenance',status:'dispatched'};
+test('current exact standalone extension reload can snapshot its own idle controller without self-deadlock',async()=>{
+  const command={...ownReloadCommand},f=controllerFixture({commands:{4:{command}}}),before=JSON.stringify(command);
+  const result=await f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:false,temporaryServerUrl:'http://127.0.0.1:53179'});
+  assert.equal(result.scheduled,true);assert.equal(f.plans.length,1);assert.equal(f.local.bridgePendingExtensionReload.idleControllers[CONTROL_STATE].tabId,4);
+  assert.equal(JSON.stringify(command),before);assert.equal(f.local[CONTROL_STATE].browserSession,OLD_SESSION);
+});
+test('self-maintenance exception never ignores other commands, unknown outcomes, leases or mismatched command contracts',async()=>{
+  const failures=[];
+  for(const [field,value] of [['commandId','other'],['commandType','prompt.send'],['scope','request'],['requestId','unknown-model'],['mode','effect'],['operation','control'],['status','uncertain'],['status','registered']])failures.push({commands:{4:{command:{...ownReloadCommand,[field]:value}}}});
+  failures.push({commands:{4:{command:{...ownReloadCommand},other:{commandId:'other',commandType:'extension.reload',scope:'standalone',requestId:'',mode:'result',operation:'maintenance',status:'dispatched'}}}});
+  failures.push({commands:{4:{other:{...ownReloadCommand}}}});
+  failures.push({busyId:4,commands:{4:{command:{...ownReloadCommand}}}});
+  for(const options of failures){const f=controllerFixture(options);await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');assert.equal(f.plans.length,0);assert.equal(f.writes.length,0);}
+  const other=controllerFixture({commands:{4:{command:{...ownReloadCommand}}}});await assert.rejects(other.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');assert.equal(other.plans.length,0);
+});

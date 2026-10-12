@@ -318,26 +318,52 @@ export class BrowserBridge {
         || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(client.launchToken||''))
       && client.browserProfileId===expected.profileId && client.extensionBundleId===expected.bundleId
       && client.backgroundEpoch===expected.backgroundEpoch && client.serverInstanceId===expected.serverInstanceId
+      && typeof client.contentEpoch==='string' && client.contentEpoch.length>0 && client.contentEpoch===source?.contentEpoch
+      && (!expected.contentEpoch || client.contentEpoch===expected.contentEpoch)
       && expected.serverInstanceId===this.#serverInstanceId;
     if(!matches(source) || before.pendingRequests || before.pendingCommands || before.clients.some(client=>client.activeRequest))return held('source_or_runtime_not_idle');
-    const runtime={...expected,sourceTabId:source.browserTabId};
+    const runtime={...expected,sourceTabId:source.browserTabId,contentEpoch:source.contentEpoch};
     let result;
-    try{result=await this.#sendCommand('browser.tab.identify',{mode:'owned_launch_inventory_v1',requestId,
+    try{result=await this.#sendCommand('browser.tab.identify',{mode:'owned_launch_inventory_v1',lookupRequestId:requestId,
       launchToken:`bridge-director-desktop-${requestId}`,expectedRuntime:runtime},{sourceClientId:source.id,timeoutMs:15000});}
     catch{return held('inventory_command_unavailable');}
     if(result?.status==='unknown')return held(result.reason||'inventory_unknown');
     const after=this.health();
     if(!matches(after.clients.find(client=>client.id===source.id)) || after.pendingRequests || after.clients.some(client=>client.activeRequest))return held('runtime_changed_after_inventory');
     let decodedInventory;
-    try{decodedInventory=JSON.parse(result.inventoryCanonicalJson);}catch{return held('inventory_receipt_mismatch');}
-    if(result?.version!=='director-owned-launch-inventory/v1' || !['matched','confirmed_absent'].includes(result.status)
-      || result.complete!==true || result.requestId!==requestId || result.launchToken!==`bridge-director-desktop-${requestId}`
-      || !['profileId','bundleId','backgroundEpoch','serverInstanceId','sourceClientId','sourceTabId'].every(key=>result.runtime?.[key]===runtime[key])
-      || !/^[a-f0-9-]{36}$/i.test(result.inventoryGeneration||'') || !Number.isSafeInteger(result.observedAt)
-      || Math.abs(Date.now()-result.observedAt)>30000 || !result.inventory
-      || JSON.stringify(decodedInventory)!==JSON.stringify(result.inventory)
-      || createHash('sha256').update(result.inventoryCanonicalJson).digest('hex')!==result.inventorySha256)return held('inventory_receipt_mismatch');
-    return {...result,componentVersion:BRIDGE_VERSION,sourceClientId:source.id};
+    try{decodedInventory=JSON.parse(result.inventoryCanonicalJson);}catch{return held('inventory_receipt_canonical_json_invalid');}
+    if(result?.version!=='director-owned-launch-inventory/v1')return held('inventory_receipt_version_mismatch');
+    if(!['matched','confirmed_absent'].includes(result.status))return held('inventory_receipt_status_invalid');
+    if(result.complete!==true)return held('inventory_receipt_incomplete');
+    if(result.lookupRequestId!==requestId)return held('inventory_receipt_lookup_identity_mismatch');
+    if(result.launchToken!==`bridge-director-desktop-${requestId}`)return held('inventory_receipt_launch_token_mismatch');
+    for(const key of ['profileId','bundleId','backgroundEpoch','serverInstanceId','sourceClientId','sourceTabId','contentEpoch']){
+      if(result.runtime?.[key]!==runtime[key])return held(`inventory_receipt_runtime_${key}_mismatch`);
+    }
+    if(!/^[a-f0-9-]{36}$/i.test(result.inventoryGeneration||''))return held('inventory_receipt_generation_invalid');
+    if(!Number.isSafeInteger(result.observedAt))return held('inventory_receipt_observed_at_invalid');
+    if(Math.abs(Date.now()-result.observedAt)>30000)return held('inventory_receipt_stale');
+    if(!result.inventory)return held('inventory_receipt_inventory_missing');
+    if(JSON.stringify(decodedInventory)!==JSON.stringify(result.inventory))return held('inventory_receipt_canonical_value_mismatch');
+    if(createHash('sha256').update(result.inventoryCanonicalJson).digest('hex')!==result.inventorySha256)return held('inventory_receipt_sha256_mismatch');
+    const sourceTabs=Array.isArray(result.inventory.tabs)?result.inventory.tabs.filter(tab=>tab.id===runtime.sourceTabId):[];
+    if(sourceTabs.length!==1 || sourceTabs[0].incognito!==false)return held('inventory_receipt_source_tab_unproved');
+    const sourceTab=sourceTabs[0];
+    if(sourceTab.active!==false){
+      const proof=result.inventory.sourceBackgroundProof;
+      if(sourceTab.active!==true || !proof || proof.version!=='director-source-background-proof/v1'
+        || proof.sourceTabId!==runtime.sourceTabId || !Number.isInteger(proof.sourceWindowId) || proof.sourceWindowId<=0
+        || proof.sourceWindowId!==sourceTab.windowId || proof.nativeSamples!==2
+        || proof.native?.tabActive!==true || proof.native.windowFocused!==false
+        || !['normal','minimized','maximized','fullscreen'].includes(proof.native.windowState)
+        || proof.content?.visibilityState!=='hidden' || proof.content.focused!==false
+        || proof.content.contentEpoch!==result.runtime.contentEpoch || proof.content.contentEpoch!==source.contentEpoch
+        || !Number.isSafeInteger(proof.content.sampledAt) || Date.now()-proof.content.sampledAt<0
+        || Date.now()-proof.content.sampledAt>30000)return held('inventory_receipt_source_background_unproved');
+    }
+    // Restore the HTTP domain field only after the independent identity has
+    // survived standalone command.result requestId='' and been verified.
+    return {...result,requestId,componentVersion:BRIDGE_VERSION,sourceClientId:source.id};
   }
 
   async requestForcedSnapshot(requestId, options = {}) {

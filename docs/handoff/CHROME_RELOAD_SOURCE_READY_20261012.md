@@ -28,16 +28,24 @@ extension reload 或 idle runtime compaction 可能使历史 server nonce 为空
 
 ## 验证与边界
 
-Windows 本次执行 `node --test apps/chrome-bridge/tests/*.test.cjs`：77 passed、0 failed、0 skipped。其中新增 11 项 source-ready 回归覆盖同文档完整 reload、错误 identity/nonce/version/bundle、late hold、有界一次恢复、持久化失败、合法 server restart、crash 后精确 proof 清理、legacy 历史保留及 scope 拒绝。
+首次 source-ready 候选执行 `node --test apps/chrome-bridge/tests/*.test.cjs` 为 77 passed、0 failed、0 skipped。其中新增 11 项 source-ready 回归覆盖同文档完整 reload、错误 identity/nonce/version/bundle、late hold、有界一次恢复、持久化失败、合法 server restart、crash 后精确 proof 清理、legacy 历史保留及 scope 拒绝。后续 controller/inventory/self-command 合并后的最终全 bridge 回归为 89 passed、0 failed、0 skipped。
 
 日志：`.local/validation/chrome-batch-20261012/reload-source-ready-all-tests.log`。这是离线行为回归；Chrome 自然 worker 唤醒、实际原页 hello、焦点和内存观察由主控记录，不能仅据这些测试标为真实链路已验收。
 
 扩展无 externally_connectable/onMessageExternal，当前无既有 Chrome debugging 通道。现有 `bridge.connection.watchdog` alarm 每分钟唤醒 worker；overlay 能否在真实 worker 停休后加载新模块须现场证明。无需也不得重启 Chrome、清 storage 或新开 maintenance 页。
 
-稳定候选 manifest SHA256：`76016e9d5abf009409db780831aa71f05feab82df5d37e729f9b24062ed8b65e`。
+## 当前 source 的维护自锁修复
+
+实际 canonical controller 作为 extension.reload source 时，snapshotIdleControllers 把当前 reload 自身已经 dispatched 的 command 也计为 unresolved，从而预 dispatch 拒绝。不是模型任务或服务 pending 问题。
+
+只排除当前精确 sourceTabId/map key/commandId、`commandType=extension.reload`、`scope=standalone`、`mode=result`、`operation=maintenance`、空 requestId、`status=dispatched` 的自身维护命令。其它 source/controller、其它 commandId、registered/uncertain、请求级 command、错误类型/mode/operation 和任何 lease 仍阻断。不会删除或修改 runtime command。
+
+两组新增回归验证自身实际 normalized command 合同能通过，并逐一验证其它命令、unknown 和 lease 不能绕过；该 source 成功路径保留原 command/nonce。实际最后 loader 安装可用已有临时 owned root 做一次后台 reload，避免用旧代码的 controller source 再触发自锁，无须操作用户页。
+
+最终稳定 manifest SHA256：`af915ed8dfa9650dff02e4d5f66a982d1ec2854a4bbc18244e8bbc5a397407d7`。
 
 - `extension/background.js`：`9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463`
-- `extension/background/extensionReloadCoordinator.js`：`e338bf9e5d8724ca21d39c177b113f148fe766b7854c508ad58340330c292c41`
+- `extension/background/extensionReloadCoordinator.js`：`28df2ceb4eebc30c954ff98d87a710f76e2858fe1974b4024c2b9fd4f4cc7a88`
 - `extension/background/outboxV5.js`：`f702f0788fedbaaeb0ef59ac9e6a136afb20d87645d35b25ec2ecc211c83c840`
 
 manifest 保存前候选 after hash，支持精确识别第一次 overlay 字节再升级；未知第三方变更仍拒绝整批。

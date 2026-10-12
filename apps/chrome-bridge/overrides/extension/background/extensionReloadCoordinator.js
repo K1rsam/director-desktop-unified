@@ -131,13 +131,19 @@ export function createExtensionReloadCoordinator({
     }
   }
 
-  async function snapshotIdleControllers(launchRecords) {
+  async function snapshotIdleControllers(launchRecords, currentMaintenance = {}) {
     const controllers = {};
     for (const [rawId, record] of Object.entries(launchRecords)) {
       if (!CONTROLLER_LAUNCH_TOKEN_RE.test(String(record?.launchToken || ''))) continue;
       const tabId = Number(rawId);
       const runtime = await backgroundState.read(tabId);
-      if (runtime.lease || Object.values(runtime.commands || {}).some((command) => !['succeeded', 'rejected'].includes(command.status))) {
+      const ownMaintenanceCommand = (key, command) => tabId === currentMaintenance.sourceTabId
+        && key === currentMaintenance.commandId && command.commandId === currentMaintenance.commandId
+        && command.commandType === 'extension.reload' && command.scope === 'standalone'
+        && command.mode === 'result' && command.operation === 'maintenance'
+        && command.requestId === '' && command.status === 'dispatched';
+      if (runtime.lease || Object.entries(runtime.commands || {}).some(([key, command]) =>
+        !['succeeded', 'rejected'].includes(command.status) && !ownMaintenanceCommand(key, command))) {
         const error = new Error('Controller recovery is blocked while original browser work is unresolved');
         error.code = 'MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE';
         throw error;
@@ -466,7 +472,7 @@ export function createExtensionReloadCoordinator({
     // Runtime reload clears session storage for every work page, even when only
     // the source page is refreshed. Preserve ownership without expanding tabs.
     const launchRecords = await snapshotOwnedLaunchRecords();
-    const idleControllers = await snapshotIdleControllers(launchRecords);
+    const idleControllers = await snapshotIdleControllers(launchRecords, { sourceTabId, commandId: terminalCommandId });
     const expectedRuntime = typeof readRuntimeIdentity === 'function' ? await readRuntimeIdentity(sourceTabId) : null;
     if (typeof readRuntimeIdentity === 'function' && (!CONTROLLER_SESSION_UUID_RE.test(String(expectedRuntime?.profileId || ''))
       || !expectedRuntime.bundleId || !expectedRuntime.extensionVersion || !expectedRuntime.backgroundEpoch || !expectedRuntime.serverInstanceId)) {
