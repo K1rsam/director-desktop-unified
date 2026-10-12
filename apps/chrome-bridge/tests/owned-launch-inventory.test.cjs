@@ -15,14 +15,19 @@ function fixture(options={}){
   if(options.missingTabQuery)delete context.chrome.tabs.query;
   const controller=context.createTabController({connections,safeBridgeServerUrl:x=>x===BASE?x:'',readLaunchedTab:async id=>records[PREFIX+id],
     rememberLaunchedTab:()=>assert.fail('no writes'),forgetLaunchedTab:()=>assert.fail('no cleanup'),isStableLaunchToken:()=>true,
-    readInventoryIdentity:options.missingRuntimeReader?undefined:async()=>({...runtime,...options.actualRuntime})});
-  return {context,controller,port,reads:()=>reads,windowReads:()=>windowReads,lookup:()=>controller.openBridgeTab(port,{lookupOnly:true,requestId:'ext-rpc-correlation',lookupRequestId:ID,launchToken:TOKEN,expectedRuntime:{...runtime,...options.expectedRuntime},...options.lookupOptions})};
+    readInventoryIdentity:options.missingRuntimeReader?undefined:async()=>({...runtime,...options.actualRuntime}),
+    readExecutionInventory:options.missingExecutionReader?undefined:async(_port,binding)=>executionFacts(binding,options.execution)});
+  return {context,controller,port,reads:()=>reads,windowReads:()=>windowReads,lookup:()=>controller.openBridgeTab(port,{lookupOnly:true,inventoryCommandId:'inventory-read-original',requestId:'ext-rpc-correlation',lookupRequestId:ID,launchToken:TOKEN,expectedRuntime:{...runtime,...options.expectedRuntime},...options.lookupOptions})};
 }
+function executionFacts(binding,change={}){return {sourceTabId:1,lease:null,ownCommand:{commandId:binding.inventoryCommandId,commandType:'browser.tab.identify',scope:'standalone',mode:'result',operation:'control',status:'dispatched',requestId:''},
+  otherUnresolvedCommands:[],ownAcceptedMessageIds:[],otherPendingOutbox:[],queue:{version:'tab-operation-snapshot/v1',tabId:1,
+    running:{sequence:1,label:'content:bridge.tab.open',meta:{type:'bridge.tab.open',requestId:binding.rpcRequestId}},queued:[]},...change};}
 const targetRecord={launchToken:TOKEN,requestedUrl:'https://chatgpt.com/',createdAt:2,serverUrl:BASE};
 
 test('lookup contract reports exact missing capability or identity without weakening guards or enumerating',async()=>{
   for(const [options,reason] of [[{lookupOptions:{lookupRequestId:''}},'invalid_lookup_request_identity'],
     [{lookupOptions:{launchToken:'other'}},'lookup_launch_token_mismatch'],[{missingRuntimeReader:true},'inventory_runtime_reader_unavailable'],
+    [{missingExecutionReader:true},'inventory_execution_reader_unavailable'],
     [{missingDigest:true},'inventory_webcrypto_digest_unavailable'],[{missingSessionGet:true},'inventory_session_reader_unavailable'],
     [{missingTabQuery:true},'inventory_tab_enumerator_unavailable']]){
     const f=fixture(options),out=await f.lookup();assert.equal(out.status,'unknown');assert.equal(out.complete,false);assert.equal(out.reason,reason);assert.equal(f.reads(),0);
@@ -69,7 +74,7 @@ test('inventory identify mode only calls the readonly lookup branch and keeps tr
 function serverFixture(result,override={}){
   const text=fs.readFileSync(path.join(__dirname,'../overrides/src/browserBridge.js'),'utf8'),start=text.indexOf('  async ownedLaunchInventory('),end=text.indexOf('  async requestForcedSnapshot(',start),method=text.slice(start,end);
   const context=vm.createContext({createHash,Date,BRIDGE_VERSION:'6.4.0'});
-  vm.runInContext(`class InventoryBridge { #serverInstanceId='server-original'; constructor(health,result){this.current=health;this.result=result;this.calls=[];} health(){return this.current;} async #sendCommand(...args){this.calls.push(args);return this.result;} ${method} };this.InventoryBridge=InventoryBridge`,context);
+  vm.runInContext(`class InventoryBridge { #serverInstanceId='server-original'; constructor(health,result){this.current=health;this.result=result;this.calls=[];} health(){return this.current;} async #sendCommand(...args){this.calls.push(args);const result=await this.result;return {commandId:result.inventoryCommandId,...result};} ${method} };this.InventoryBridge=InventoryBridge`,context);
   const source={id:runtime.sourceClientId,browserTabId:1,ready:true,compatible:true,browserIncognito:false,activeRequest:null,quarantined:false,focused:false,visibilityState:'hidden',
     url:'https://chatgpt.com/',launchToken:sourceRecord.launchToken,browserProfileId:PROFILE,extensionBundleId:runtime.bundleId,backgroundEpoch:runtime.backgroundEpoch,contentEpoch:runtime.contentEpoch,serverInstanceId:runtime.serverInstanceId,...override};
   return new context.InventoryBridge({clients:[source],pendingRequests:0,pendingCommands:0},result);
@@ -196,4 +201,31 @@ test('server validates canonical active-source window/content proof and continue
   for(const override of [{focused:true},{visibilityState:'visible'},{activeRequest:{requestId:'unknown'}},{quarantined:true},{contentEpoch:'other'}]){
     const b=serverFixture(receipt,override);assert.equal((await b.ownedLaunchInventory(ID,runtime)).status,'unknown');assert.equal(b.calls.length,0);
   }
+});
+
+test('live execution proof excludes only the exact current readonly RPC and its own accepted ACK',async()=>{
+  const rpc='ext-rpc-correlation',own=executionFacts({inventoryCommandId:'inventory-read-original',rpcRequestId:rpc});
+  own.ownAcceptedMessageIds=['ack-own-read'];own.queue.queued=[{sequence:2,label:'server:transport.ack:unknown',meta:{ackMessageId:'ack-own-read'}}];
+  const receipt=await fixture({execution:own}).lookup();assert.equal(receipt.status,'confirmed_absent');
+  assert.equal(receipt.inventory.sourceExecutionProof.rpcRequestId,rpc);assert.equal(receipt.inventory.sourceExecutionProof.ownCommand.commandId,receipt.inventoryCommandId);
+  assert.equal((await serverFixture(receipt).ownedLaunchInventory(ID,runtime)).status,'confirmed_absent');
+  for(const change of [{lease:{requestId:'unknown'}},{otherUnresolvedCommands:[{commandId:'other',status:'uncertain'}]},{otherPendingOutbox:[{messageId:'old-result'}]},
+    {ownCommand:{...own.ownCommand,commandId:'different'}},{ownCommand:{...own.ownCommand,scope:'request'}},{ownCommand:{...own.ownCommand,status:'uncertain'}},
+    {queue:{...own.queue,running:{...own.queue.running,meta:{type:'bridge.tab.open',requestId:'ext-other-rpc-id'}}}},
+    {queue:{...own.queue,queued:[{sequence:2,label:'content:bridge.effect.begin',meta:{requestId:'unknown'}}]}},
+    {queue:{...own.queue,queued:[{sequence:2,label:'server:transport.ack:unknown',meta:{ackMessageId:'foreign-ack'}}]}}]){
+    const f=fixture({execution:{...own,...change}}),out=await f.lookup();assert.equal(out.status,'unknown');assert.equal(out.reason,'source_native_execution_busy');assert.equal(out.complete,false);
+  }
+});
+
+test('server live idle receipt rejects stale, self-asserted or altered execution proof even after canonical hash recomputation',async()=>{
+  const receipt=await fixture().lookup();
+  const cases=[r=>{delete r.inventory.sourceExecutionProof},r=>{r.inventory.sourceExecutionProof.observedAt=Date.now()-6000},
+    r=>{r.inventory.sourceExecutionProof.nativeSamples=1},r=>{r.commandId='other'},r=>{r.inventoryCommandId='other'},r=>{r.rpcRequestId='ext-other-request'},
+    r=>{r.inventory.sourceExecutionProof.lease={requestId:'unknown'}},r=>{r.inventory.sourceExecutionProof.otherUnresolvedCommands=[{}]},
+    r=>{r.inventory.sourceExecutionProof.otherPendingOutbox=[{}]},r=>{r.inventory.sourceExecutionProof.ownCommand.status='uncertain'},
+    r=>{r.inventory.sourceExecutionProof.queue.running.meta.requestId='ext-wrong-request'},
+    r=>{r.inventory.sourceExecutionProof.queue.queued=[{label:'server:transport.ack:unknown',meta:{ackMessageId:'foreign'}}]}];
+  for(const mutate of cases){const bad=JSON.parse(JSON.stringify(receipt));mutate(bad);bad.inventoryCanonicalJson=JSON.stringify(bad.inventory);bad.inventorySha256=createHash('sha256').update(bad.inventoryCanonicalJson).digest('hex');
+    const out=await serverFixture(bad).ownedLaunchInventory(ID,runtime);assert.equal(out.status,'unknown');assert.equal(out.reason,'inventory_receipt_source_execution_unproved');assert.equal(out.complete,false);}
 });

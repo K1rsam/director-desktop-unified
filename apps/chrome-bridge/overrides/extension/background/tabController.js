@@ -69,6 +69,7 @@ export function createTabController({
   forgetLaunchedTab,
   isStableLaunchToken,
   readInventoryIdentity,
+  readExecutionInventory,
 } = {}) {
   if (!connections || typeof connections.get !== 'function') throw new TypeError('Tab controller requires connections');
   if (typeof safeBridgeServerUrl !== 'function') throw new TypeError('Tab controller requires safeBridgeServerUrl');
@@ -144,6 +145,7 @@ export function createTabController({
     if(!CONTROLLER_SESSION_UUID_RE.test(requestId))return unknown('invalid_lookup_request_identity');
     if(options.launchToken!==launchToken)return unknown('lookup_launch_token_mismatch');
     if(typeof readInventoryIdentity!=='function')return unknown('inventory_runtime_reader_unavailable');
+    if(typeof readExecutionInventory!=='function')return unknown('inventory_execution_reader_unavailable');
     if(typeof globalThis.crypto?.subtle?.digest!=='function')return unknown('inventory_webcrypto_digest_unavailable');
     if(typeof chrome.storage?.session?.get!=='function')return unknown('inventory_session_reader_unavailable');
     if(typeof chrome.tabs?.query!=='function')return unknown('inventory_tab_enumerator_unavailable');
@@ -182,7 +184,8 @@ export function createTabController({
             else sourceWindow={id:window.id,focused:window.focused,state:window.state};
           }
         }
-        return {launched,tabs:tabFacts,sourceWindow,sourceWindowError};
+        const execution=await readExecutionInventory(port,{inventoryCommandId:options.inventoryCommandId,rpcRequestId:options.requestId});
+        return {launched,tabs:tabFacts,sourceWindow,sourceWindowError,execution};
       };
       const first=await read(),second=await read(),after=await readInventoryIdentity(port);
       if(first.sourceWindowError||second.sourceWindowError)return unknown(first.sourceWindowError||second.sourceWindowError);
@@ -191,6 +194,25 @@ export function createTabController({
       if(!source || source.incognito || !controllerRootUrl(source.url) || !sourceRecord
         || sourceRecord.serverUrl!==serverUrl || !(sourceRecord.launchToken===`bridge-director-control-${before.profileId}`
           || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(sourceRecord.launchToken||'')))return unknown('source_owned_idle_root_unproved');
+      const execution=second.execution, own=execution?.ownCommand, queue=execution?.queue;
+      const inventoryCommandId=String(options.inventoryCommandId||''),rpcRequestId=String(options.requestId||'');
+      const ownAcceptedMessageIds=execution?.ownAcceptedMessageIds;
+      const ownAck=item=>item && item.label?.startsWith('server:transport.ack:')
+        && typeof item.meta?.ackMessageId==='string' && ownAcceptedMessageIds.includes(item.meta.ackMessageId);
+      if(!inventoryCommandId || !/^ext-[a-z0-9-]{8,127}$/i.test(rpcRequestId)
+        || execution?.sourceTabId!==source.id || execution.lease!==null
+        || own?.commandId!==inventoryCommandId || own.commandType!=='browser.tab.identify' || own.scope!=='standalone'
+        || own.mode!=='result' || own.operation!=='control' || own.status!=='dispatched' || own.requestId!==''
+        || !Array.isArray(execution.otherUnresolvedCommands) || execution.otherUnresolvedCommands.length
+        || !Array.isArray(execution.otherPendingOutbox) || execution.otherPendingOutbox.length
+        || !Array.isArray(ownAcceptedMessageIds) || ownAcceptedMessageIds.some(id=>typeof id!=='string'||!id)
+        || queue?.version!=='tab-operation-snapshot/v1' || queue.tabId!==source.id
+        || !Number.isSafeInteger(queue.running?.sequence) || queue.running.sequence<=0
+        || queue.running.label!=='content:bridge.tab.open' || queue.running.meta?.type!=='bridge.tab.open'
+        || queue.running.meta.requestId!==rpcRequestId || !Array.isArray(queue.queued)
+        || queue.queued.some(item=>!ownAck(item)))return unknown('source_native_execution_busy');
+      const sourceExecutionProof={version:'director-source-execution-idle/v1',sourceTabId:source.id,inventoryCommandId,rpcRequestId,
+        nativeSamples:2,observedAt:Date.now(),lease:null,ownCommand:own,otherUnresolvedCommands:[],otherPendingOutbox:[],ownAcceptedMessageIds,queue};
       let sourceBackgroundProof;
       if(source.active){
         const document=options.sourceDocument;
@@ -218,11 +240,11 @@ export function createTabController({
       // Audit unrelated tabs by URL digest; never disclose their URLs/titles.
       const inventory={tabs:await Promise.all(second.tabs.map(async tab=>({id:tab.id,urlSha256:await digest(tab.url),incognito:tab.incognito,active:tab.active,discarded:tab.discarded,windowId:tab.windowId}))),
         launchRecords:second.launched.map(item=>({key:item.key,recordSha256:null})),sourceTabId:before.sourceTabId,
-        ...(sourceBackgroundProof?{sourceBackgroundProof}:{})};
+        sourceExecutionProof,...(sourceBackgroundProof?{sourceBackgroundProof}:{})};
       for(let index=0;index<second.launched.length;index++)inventory.launchRecords[index].recordSha256=await digest(JSON.stringify(second.launched[index].record));
       if(JSON.stringify(before)!==JSON.stringify(await readInventoryIdentity(port)))return unknown('runtime_changed_during_digest');
       const inventoryCanonicalJson=JSON.stringify(inventory);
-      return {version,status,reason:status==='matched'?'unique_record_and_live_tab':'complete_inventory_no_matching_launch',requestId,lookupRequestId:requestId,launchToken,complete:true,
+      return {version,status,reason:status==='matched'?'unique_record_and_live_tab':'complete_inventory_no_matching_launch',requestId,lookupRequestId:requestId,inventoryCommandId,rpcRequestId,launchToken,complete:true,
         runtime:before,inventoryGeneration:crypto.randomUUID(),inventorySha256:await digest(inventoryCanonicalJson),inventoryCanonicalJson,inventory,observedAt:Date.now(),
         absenceScope:'current_browser_inventory_only',...(match?{match}:{})};
     }catch{return unknown('inventory_enumeration_unavailable');}

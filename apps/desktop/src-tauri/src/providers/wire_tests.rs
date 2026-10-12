@@ -14,12 +14,28 @@ pub(super) struct Fixture {
 }
 pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let saved = requests.clone();
     let thread = thread::spawn(move || {
         for mut reply in replies {
-            let (mut stream, _) = listener.accept().unwrap();
+            // A changed request sequence must fail the fixture instead of
+            // blocking thread.join forever waiting for an unused response.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline,
+                            "fixture expected another request; received {:?}", saved.lock().unwrap());
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            // Winsock may inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();

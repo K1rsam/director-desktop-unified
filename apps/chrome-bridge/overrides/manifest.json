@@ -69,7 +69,7 @@
     {
       "path": "extension/background/tabController.js",
       "beforeSha256": "e15ac5bb213847882e3e960dc77fdd268d646d208a6bd0dfe722b484d2e45b98",
-      "afterSha256": "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6",
+      "afterSha256": "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf",
       "previousAfterSha256s": [
         "b6b4c753e8320d4aeb51ccba086813969cdffcb1ff359dee6722f401c83a6ebb",
         "db568da46fddeccd02c7e61f6db69349ca22270fc9333b6b21c349db4555ec6f",
@@ -78,17 +78,19 @@
         "87cd194061471c9a98a80382a1b393853a40a99764de7b1a5e9406cb7f3bf763",
         "674461b82cf582acd782dcb3bed53399bd8c43eed50811ed34718e09b01a0807",
         "0877128584e8d1d69327469a190772f3755c12e242c2b638b0d3c4282811136d",
-        "d1c896b460a193066160699347a0aa1e21421ec35d9241270958a59198ae9ac8"
+        "d1c896b460a193066160699347a0aa1e21421ec35d9241270958a59198ae9ac8",
+        "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6"
       ]
     },
     {
       "path": "extension/content/sessionCommands.js",
       "beforeSha256": "968d87a9b0bd5c769730c5516c90b3c525794abc3eb9ab6e5e4039524cb9a76b",
-      "afterSha256": "f0bdb1611dacbf5a6ead1dfaa655cdb91b269c2f4408dcf6c5faf242d4c69e0f",
+      "afterSha256": "0214bb27f6ce6fb3717ec33677eff90c8f3f70521012ba4bdaf87e0e10b8de44",
       "previousAfterSha256s": [
         "f4404b4e1b61c81e4ddb371878ca3ac5f79636ed03e3688da82979dbf0cc9410",
         "fb50d34182e492fc1836d1a8fcf7e0072d5af7a63c18f2bbc7c606213b97f17f",
-        "6272a3ebe5995b53172f5f9de93467f104e4b625b67e940963ef8bc5e542d28b"
+        "6272a3ebe5995b53172f5f9de93467f104e4b625b67e940963ef8bc5e542d28b",
+        "f0bdb1611dacbf5a6ead1dfaa655cdb91b269c2f4408dcf6c5faf242d4c69e0f"
       ]
     },
     {
@@ -120,22 +122,29 @@
     {
       "path": "src/browserBridge.js",
       "beforeSha256": "8be312921a938ce3d6d9bcab20a1886067586dce5bc804934b5900058a290d53",
-      "afterSha256": "629196e7d03b3ccb0e316cf20dab1eec40487997394ba83704413fddac7bfa2d",
+      "afterSha256": "c8b22067044d3f3b2b13bb00f93973d2f047d9ae9adc1b2c3f1e782fa6edcf4c",
       "previousAfterSha256s": [
         "74c087da3bae50314b261d06ce024ffdd5e36a1ab74cc1d1003cefe1c274bedc",
         "8f29f53d2a99bd54a4c6080312021a57e1d0401789250d4bbe8bcfa02980b8b6",
         "fc83863b03ffde32b65e1174bc73618a6289c2013c00d5bb0f8a30db99d1a315",
         "8d129b5a33d60fe54d5e4d6a80c80891957ad58c6cbcfde90f7607df5e9bc4b6",
-        "b72dc8093a980110f2cf588feb205ddf6b1e21b278f1c973c9c5c8bec05894e5"
+        "b72dc8093a980110f2cf588feb205ddf6b1e21b278f1c973c9c5c8bec05894e5",
+        "629196e7d03b3ccb0e316cf20dab1eec40487997394ba83704413fddac7bfa2d"
       ]
     },
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
+      "afterSha256": "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
       "previousAfterSha256s": [
-        "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956"
+        "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
+        "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463"
       ]
+    },
+    {
+      "path": "extension/background/tabOperationQueue.js",
+      "beforeSha256": "b4671c946509ddde596c7aa2c0973fd95380dfdac94393842875a4def1d84fb0",
+      "afterSha256": "f4fe508a12877ab22e131cb610a7c77cb7d45b63e3a571521b58696c1e865659"
     }
   ]
 }

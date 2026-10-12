@@ -8,6 +8,8 @@ mod background_tests;
 #[cfg(test)]
 #[path = "chrome_control_page_tests.rs"]
 mod control_page_tests;
+#[path="chrome_execution_proof.rs"]
+mod execution_proof;
 
 fn json_request(
     config: &ProviderConfig,
@@ -293,7 +295,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
         ));
     }
     let client = wire::client(45)?;
-    let available = clients(config, &client)?;
+    let mut available = clients(config, &client)?;
     let launch = format!("bridge-director-desktop-{}", request.request_id);
     let legacy_launch = format!("director-desktop-{}", request.request_id);
     // A normal prepare never guesses whether an existing page was submitted.
@@ -309,17 +311,26 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
     let binding=config.chrome_binding.as_ref().ok_or_else(||ProviderError::new("BROWSER_BINDING_REQUIRED","请在软件设置连接并绑定 Chrome 执行浏览器；旧任务只核对原页面，不重新发送。"))?;
     crate::chrome_setup::browser_binding(&crate::chrome_setup::binding_settings(&wire::base(config,true)?,Some(binding)))
         .map_err(|message|ProviderError::new("BROWSER_BINDING_REQUIRED",message))?;
-    let opener=crate::chrome_setup::profile_execution_client(&available,binding)
-        .map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?;
+    let mut opener=crate::chrome_setup::profile_execution_client(&available,binding)
+        .map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?.clone();
+    let live_execution_required=opener["transportHealth"]["kind"]=="connect_snapshot";
+    if live_execution_required && !execution_proof::owned_root(&opener,binding) {
+        available=execution_proof::bootstrap_control(config,&client,&opener,binding)?;
+        opener=crate::chrome_setup::profile_execution_client(&available,binding).map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?.clone();
+    }
     let opener_id = opener
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| ProviderError::new("BRIDGE_STATE", "浏览器身份无效。"))?;
     let mut intent=Value::Null;
+    if live_execution_required {
+        execution_proof::fresh_idle(config,&client,&opener,binding,request)?;
+        if recovery.is_some() {if let Some(observer)=observer {observer(&json!({"version":"chrome-prepare-execution-start/v1","requestId":request.request_id,"requestHash":hex_hash(json!(request).to_string().as_bytes()),"configSha256":hex_hash(json!(config).to_string().as_bytes())}))?;}}
+    }
     let tab=if let Some(recovery)=recovery {
         recover_blank_tab(config,&client,&available,binding,request,recovery,observer.ok_or_else(||ProviderError::new("CHROME_PREPARE_PROOF_REQUIRED","恢复缺少持久化证据回调"))?,&mut intent)?
     } else {
-    intent=prepare_intent(request,binding,opener,"new_prepare",Value::Null)?;
+    intent=prepare_intent(request,binding,&opener,"new_prepare",Value::Null)?;
     if let Some(observer)=observer {observer(&intent)?;}
     let opened = json_request(
         config,
@@ -336,7 +347,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
     if opened.get("ok").and_then(Value::as_bool) != Some(true)
         || tab.get("launchToken").and_then(Value::as_str) != Some(launch.as_str())
         || tab["browserProfileId"] != binding.profile_id || tab["browserIncognito"] != false
-        || !same_browser_runtime(tab,opener,binding) || tab["url"]!="https://chatgpt.com/"
+        || !same_browser_runtime(tab,&opener,binding) || tab["url"]!="https://chatgpt.com/"
         || tab["focused"]!=false || tab["visibilityState"]!="hidden"
         || !usable(tab)
     {

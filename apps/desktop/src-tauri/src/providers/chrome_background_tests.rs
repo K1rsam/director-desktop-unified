@@ -55,6 +55,44 @@ fn native_first_open_fixture()->(GenerationRequest,Value,Value,Vec<Value>) {
     (r,source,proof,replies)
 }
 #[test]
+fn chrome_connect_snapshot_requires_independent_live_proof_before_intent_or_open(){
+    let (r,mut source,_proof,replies)=native_first_open_fixture();source["transportHealth"]=json!({"kind":"connect_snapshot","tabQueue":{"running":true,"pending":1}});
+    let f=fixture(vec![replies[0].clone(),json!({"ok":true,"clients":[source]}),json!({"ok":true,"clients":[source]}),replies[5].clone()]);
+    let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+    let error=prepare_observed(&cfg,&r,&|_|panic!("missing live queue proof cannot persist intent")).unwrap_err();assert_eq!(error.code,"BRIDGE_BUSY");f.thread.join().unwrap();
+    assert_eq!(f.requests.lock().unwrap().len(),4);assert!(f.requests.lock().unwrap().iter().all(|(route,_)|route.starts_with("GET ")));std::env::remove_var(env);
+}
+#[test]
+fn chrome_fresh_exact_queue_read_permits_one_owned_prepare_after_readback_with_zero_generation(){
+    let (r,mut source,_,replies)=native_first_open_fixture();source["transportHealth"]=json!({"kind":"connect_snapshot","tabQueue":{"running":true,"pending":1}});
+    let mut native=replies[5].clone();native["commandId"]=json!("live-cmd");native["inventoryCommandId"]=json!("live-cmd");native["rpcRequestId"]=json!("ext-live-rpc-1234");
+    native["inventory"]["sourceExecutionProof"]=json!({"version":"director-source-execution-idle/v1","sourceTabId":10,"inventoryCommandId":"live-cmd","rpcRequestId":"ext-live-rpc-1234","nativeSamples":2,"observedAt":chrono::Utc::now().timestamp_millis(),"lease":null,
+        "ownCommand":{"commandId":"live-cmd","commandType":"browser.tab.identify","scope":"standalone","mode":"result","operation":"control","status":"dispatched","requestId":""},"otherUnresolvedCommands":[],"otherPendingOutbox":[],"ownAcceptedMessageIds":[],"queue":{"version":"tab-operation-snapshot/v1","tabId":10,"running":{"sequence":1,"label":"content:bridge.tab.open","meta":{"type":"bridge.tab.open","requestId":"ext-live-rpc-1234"}},"queued":[]}});
+    let raw=native["inventory"].to_string();native["inventoryCanonicalJson"]=json!(raw);native["inventorySha256"]=json!(hex_hash(raw.as_bytes()));
+    let f=fixture(vec![replies[0].clone(),json!({"ok":true,"clients":[source]}),json!({"ok":true,"clients":[source]}),native,json!({"ok":true,"clients":[source]}),replies[7].clone(),empty_preflight()]);
+    let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+    let captured=std::sync::Mutex::new(vec![]);let p=prepare_observed(&cfg,&r,&|v|{assert_eq!(f.requests.lock().unwrap().len(),5);captured.lock().unwrap().push(v.clone());Ok(())}).unwrap();f.thread.join().unwrap();
+    assert_eq!(p.wire["sourceClientId"],"worker");assert_eq!(captured.lock().unwrap().len(),1);assert_eq!(f.requests.lock().unwrap().len(),7);assert_eq!(f.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /browser/tabs/open ")).count(),1);assert!(f.requests.lock().unwrap().iter().all(|(route,_)|!route.starts_with("POST /turns")));std::env::remove_var(env);
+}
+#[test]
+fn chrome_first_connection_bootstraps_one_fixed_background_control_without_touching_user_page(){
+    let (_,mut control,_,_)=native_first_open_fixture();let mut user=control.clone();user["id"]=json!("user");user["browserTabId"]=json!(20);user["launchToken"]=json!("");user["focused"]=json!(true);user["visibilityState"]=json!("visible");user["url"]=json!("https://chatgpt.com/c/user-conversation");
+    control["transportHealth"]=json!({"kind":"connect_snapshot"});let f=fixture(vec![json!({"ok":true,"clients":[user]}),json!({"ok":true,"client":control,"tabState":{"active":false,"autoDiscardable":false,"discarded":false}}),json!({"ok":true,"clients":[user,control]})]);
+    let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);let client=wire::client(5).unwrap();
+    let pages=execution_proof::bootstrap_control(&cfg,&client,&user,cfg.chrome_binding.as_ref().unwrap()).unwrap();f.thread.join().unwrap();assert_eq!(pages.iter().find(|p|p["id"]=="user").unwrap(),&user);
+    let requests=f.requests.lock().unwrap();assert_eq!(requests.len(),3);let body:Value=serde_json::from_str(&requests[1].1).unwrap();assert!(requests[1].0.starts_with("POST /browser/tabs/open "));assert_eq!(body["sourceClientId"],"user");assert_eq!(body["launchToken"],control["launchToken"]);assert_eq!(body["active"],false);assert_eq!(body["select"],false);assert_eq!(body["allowSystemFallback"],false);std::env::remove_var(env);
+}
+#[test]
+fn chrome_bootstrap_existing_canonical_uses_zero_create_and_unconfirmed_create_never_prepares_generation(){
+    let (_,control,_,_)=native_first_open_fixture();let mut user=control.clone();user["id"]=json!("user");user["launchToken"]=json!("");
+    let env=credential();let existing=fixture(vec![json!({"ok":true,"clients":[user,control]})]);let mut cfg=config(&existing.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);let client=wire::client(5).unwrap();
+    execution_proof::bootstrap_control(&cfg,&client,&user,cfg.chrome_binding.as_ref().unwrap()).unwrap();existing.thread.join().unwrap();assert_eq!(existing.requests.lock().unwrap().len(),1);
+    for detail in ["Controller creation remains unresolved; original reservation was preserved","Controller creation has unknown tab identity"] {
+        let failed=fixture(vec![json!({"ok":true,"clients":[user]}),json!({"__httpStatus":500,"detail":detail})]);let mut cfg=config(&failed.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+        assert_eq!(execution_proof::bootstrap_control(&cfg,&client,&user,cfg.chrome_binding.as_ref().unwrap()).unwrap_err().code,"BRIDGE_BUSY");failed.thread.join().unwrap();assert_eq!(failed.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST ")).count(),1);assert!(failed.requests.lock().unwrap().iter().all(|(route,_)|!route.starts_with("POST /turns")));
+    }std::env::remove_var(env);
+}
+#[test]
 fn chrome_prepare_native_absent_legacy_first_open_freezes_intent_before_one_open_and_never_reopens_after_timeout() {
     for timeout in [false,true] {
         let (r,source,proof,mut replies)=native_first_open_fixture();if timeout {replies[7]=json!({"__httpStatus":500,"detail":"Browser handshake timed out"});replies.truncate(8);}

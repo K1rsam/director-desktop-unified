@@ -301,13 +301,15 @@ fn prepare_generation(
                 }
             }
             Err(e) => {
+                if recovering && e.code!="BRIDGE_BUSY" {chrome_prepare_recovery::execution_started(store,key,cfg,"non_queue_prepare_outcome")?;}
                 if cfg.kind=="chrome" {
                     store.event(key,"chrome_prepare_error",&json!({"error":e,"generationCalled":false,"sameRequestId":j["snapshot"]["requestId"],"priorError":j["error"]}))?;
                 }
                 if unsubmitted(&store.job(key)?) {
                     if cfg.kind == "chrome" && e.code == "BRIDGE_BUSY" && !e.submission_unknown && !e.auth_required {
-                        // This error originates before tab creation or submission. Wait durably,
-                        // without consuming recovery attempts or retrying unknown side effects.
+                        // Pure pre-execution busy waits have no execution clock.
+                        // After an execution marker/intent, busy never refunds
+                        // attempts or enlarges the original recovery budget.
                         if recovering {chrome_prepare_recovery::busy_wait(store,key)?;}
                         let original_intent:bool=store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='chrome_prepare_intent')",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
                         store.claim_job_fields(key, "preparing", if recovering || original_intent {"recovery_paused"} else {"queued"}, &json!({"error":e.message,"nextAttemptAt":chrono::Utc::now().timestamp()+5}))?;

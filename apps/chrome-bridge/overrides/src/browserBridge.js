@@ -349,6 +349,25 @@ export class BrowserBridge {
     const sourceTabs=Array.isArray(result.inventory.tabs)?result.inventory.tabs.filter(tab=>tab.id===runtime.sourceTabId):[];
     if(sourceTabs.length!==1 || sourceTabs[0].incognito!==false)return held('inventory_receipt_source_tab_unproved');
     const sourceTab=sourceTabs[0];
+    const execution=result.inventory.sourceExecutionProof,own=execution?.ownCommand,queue=execution?.queue;
+    const ownIds=execution?.ownAcceptedMessageIds;
+    if(!execution || execution.version!=='director-source-execution-idle/v1'
+      || execution.sourceTabId!==runtime.sourceTabId || execution.nativeSamples!==2
+      || !Number.isSafeInteger(execution.observedAt) || Date.now()-execution.observedAt<0 || Date.now()-execution.observedAt>5000
+      || typeof result.inventoryCommandId!=='string' || !result.inventoryCommandId || result.inventoryCommandId!==result.commandId
+      || execution.inventoryCommandId!==result.inventoryCommandId || execution.rpcRequestId!==result.rpcRequestId
+      || typeof result.rpcRequestId!=='string' || !/^ext-[a-z0-9-]{8,127}$/i.test(result.rpcRequestId)
+      || execution.lease!==null || !Array.isArray(execution.otherUnresolvedCommands) || execution.otherUnresolvedCommands.length
+      || !Array.isArray(execution.otherPendingOutbox) || execution.otherPendingOutbox.length
+      || own?.commandId!==result.commandId || own.commandType!=='browser.tab.identify' || own.scope!=='standalone'
+      || own.mode!=='result' || own.operation!=='control' || own.status!=='dispatched' || own.requestId!==''
+      || !Array.isArray(ownIds) || ownIds.some(id=>typeof id!=='string'||!id)
+      || queue?.version!=='tab-operation-snapshot/v1' || queue.tabId!==runtime.sourceTabId
+      || !Number.isSafeInteger(queue.running?.sequence) || queue.running.sequence<=0
+      || queue.running.label!=='content:bridge.tab.open' || queue.running.meta?.type!=='bridge.tab.open'
+      || queue.running.meta.requestId!==result.rpcRequestId || !Array.isArray(queue.queued)
+      || queue.queued.some(item=>!item || !item.label?.startsWith('server:transport.ack:')
+        || typeof item.meta?.ackMessageId!=='string' || !ownIds.includes(item.meta.ackMessageId)))return held('inventory_receipt_source_execution_unproved');
     if(sourceTab.active!==false){
       const proof=result.inventory.sourceBackgroundProof;
       if(sourceTab.active!==true || !proof || proof.version!=='director-source-background-proof/v1'

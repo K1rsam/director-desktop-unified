@@ -7,6 +7,18 @@ fn page(id: &str, profile: &str, epoch: &str) -> Value {
         "browserProfileId":profile,"browserIncognito":false,"backgroundEpoch":epoch,"extensionBundleId":"bundle","serverInstanceId":"server"})
 }
 fn binding() -> BrowserBinding {BrowserBinding{profile_id:PROFILE.into(),endpoint:"http://127.0.0.1:53179".into(),bundle_id:"bundle".into()}}
+#[test] fn chrome_hello_snapshot_is_history_but_release_and_untyped_queue_still_hold(){
+    let mut client=json!({"transportHealth":{"tabQueue":{"running":true,"pending":1}}});assert!(client_command_busy(&client));
+    client["transportHealth"]["kind"]=json!("connect_snapshot");assert!(!client_command_busy(&client));
+    client["releasePending"]=json!(true);assert!(client_command_busy(&client));
+}
+#[test] fn chrome_bound_controller_wins_over_selected_user_page_and_cannot_be_bypassed_when_busy(){
+    let mut user=page("user",PROFILE,"epoch");user["selected"]=json!(true);
+    let mut control=page("control",PROFILE,"epoch");control["launchToken"]=json!(format!("bridge-director-control-{PROFILE}"));control["focused"]=json!(false);control["visibilityState"]=json!("hidden");
+    assert_eq!(profile_execution_client(&[user.clone(),control.clone()],&binding()).unwrap()["id"],"control");
+    for field in ["releasePending","focused","activeRequest"] {let mut bad=control.clone();bad[field]=if field=="activeRequest" {json!({"requestId":"other"})}else{json!(true)};assert!(profile_execution_client(&[user.clone(),bad],&binding()).is_err(),"{field}");}
+    assert!(profile_execution_client(&[user,control.clone(),control],&binding()).is_err());
+}
 #[test] fn chrome_binding_tracks_profile_across_new_tabs_and_worker_epochs_without_switching_profiles() {
     let mut other=page("other",OTHER,"other-epoch");other["selected"]=json!(true);
     for epoch in ["before-restart","after-restart"] {

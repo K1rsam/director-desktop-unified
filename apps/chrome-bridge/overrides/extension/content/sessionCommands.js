@@ -177,6 +177,7 @@ async function handleBrowserTabIdentify(payload) {
   try {
     if(payload.mode==='owned_launch_inventory_v1') {
       const result=await extensionRequest('bridge.tab.open',{lookupOnly:true,lookupRequestId:payload.lookupRequestId,
+        inventoryCommandId:payload.commandId,
         launchToken:payload.launchToken,expectedRuntime:payload.expectedRuntime,
         sourceDocument:{visibilityState:typeof document==='object'?document.visibilityState:'unknown',
           focused:typeof document==='object'&&typeof document.hasFocus==='function'?document.hasFocus():null,sampledAt:Date.now()}},10000);

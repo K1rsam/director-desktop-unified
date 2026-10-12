@@ -18,7 +18,15 @@ fn envelope(store:&Store,key:&str,cfg:&ProviderConfig,intent:&Value)->Result<Val
 pub(super) fn observer<'a>(store:&'a Store,key:&'a str,cfg:&'a ProviderConfig)->impl Fn(&Value)->ProviderResult<()>+'a {
     move |intent| {
         let work=||->Result<()> {
+            if intent["version"]=="chrome-prepare-execution-start/v1" {
+                let job=store.job(key)?;let request=generation_request(&job["snapshot"])?;
+                if intent["requestId"]!=request.request_id || intent["requestHash"]!=hash(&json!(request)) || intent["configSha256"]!=hash(&json!(cfg)) {return Err(HELD.into());}
+                return execution_started(store,key,cfg,"fresh_native_idle");
+            }
+            // Older provider fixtures/contracts still start execution before
+            // persisting an actual intent; never interpret it as queue waiting.
             let value=envelope(store,key,cfg,intent)?;
+            execution_started(store,key,cfg,"before_prepare_intent")?;
             let c=store.conn()?;
             let old:Option<String>=c.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_intent' ORDER BY id LIMIT 1",[key],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
             if let Some(old)=old {if old!=value.to_string(){return Err(HELD.into());}return Ok(());}
@@ -81,12 +89,54 @@ fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
     let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
     let Some(raw)=raw else {return Ok(None);};
     let budget:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
-    if budget["snapshotSha256"]!=hash(snapshot) || budget["version"]!="chrome-prepare-recovery-budget/v1"
+    if budget["snapshotSha256"]!=hash(snapshot) || !["chrome-prepare-recovery-budget/v1","chrome-prepare-recovery-budget/v2"].contains(&s(&budget,"version"))
         || budget["startedAt"].as_i64().is_none() || budget["attempts"].as_u64().is_none() {return Err(HELD.into());}
+    if budget["version"]=="chrome-prepare-recovery-budget/v2" {
+        if budget.get("executionStartedAt").is_none() || !budget["executionStartedAt"].is_null() && budget["executionStartedAt"].as_i64().is_none()
+            || budget["executionStartedAt"].is_null() && budget["attempts"]!=0 {return Err(HELD.into());}
+        let raw:Option<String>=store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' ORDER BY id DESC LIMIT 1",[key],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if let Some(raw)=raw {let event:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
+            if event["version"]!="chrome-prepare-execution-clock/v1" || event["jobId"]!=key || event["snapshotSha256"]!=hash(snapshot)
+                || event["requestId"]!=snapshot["requestId"] || event["configSha256"]!=hash(&snapshot["providerConfig"])
+                || event["executionStartedAt"]!=budget["executionStartedAt"] || event["attempt"]!=budget["attempts"] {return Err(HELD.into());}
+        } else if !budget["executionStartedAt"].is_null() || budget["attempts"]!=0 {return Err(HELD.into());}
+        return Ok(Some(budget));
+    }
+    // Narrow interpretation of complete legacy recovery cycles. Original
+    // prepare errors before this recovery chain are not reclassified.
+    if budget["attempts"]==0 {
+        if let Some(history)=legacy_queue_only_history(store,key)? {
+            let mut upgraded=budget.clone();upgraded["version"]=json!("chrome-prepare-recovery-budget/v2");upgraded["executionStartedAt"]=Value::Null;
+            upgraded["legacyQueueOnlyMigration"]=json!({"version":"chrome-queue-budget-migration/v1","originalBudget":budget,"eventHistorySha256":hash(&history),"noPrepareIntent":true,"noExecution":true});
+            return Ok(Some(upgraded));
+        }
+    }
     Ok(Some(budget))
 }
+fn legacy_queue_only_history(store:&Store,key:&str)->Result<Option<Value>> {
+    let c=store.conn()?;let mut q=c.prepare("SELECT type,data FROM events WHERE job_id=?1 ORDER BY id").map_err(|e|e.to_string())?;
+    let rows=q.query_map([key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    if rows.iter().any(|(kind,_)|kind=="chrome_prepare_intent" || kind=="chrome_prepare_execution_started") {return Ok(None);}
+    let Some(first)=rows.iter().position(|(kind,_)|kind=="chrome_prepare_recovery_attempt") else{return Ok(None);};
+    let request_id=store.job(key)?["snapshot"]["requestId"].clone();let mut stage=0;let mut cycles=0;
+    for (kind,raw) in &rows[first..] {
+        let v:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
+        match (stage,kind.as_str()) {
+            (0,"chrome_prepare_recovery_attempt") if v["attempt"]==1 && v["sameRequestId"]==true && v["newTabRetryAllowed"]==false=>stage=1,
+            (1,"chrome_prepare_recovery_started") if v["requestId"]==request_id && v["firstSubmitAllowed"]==false=>stage=2,
+            (2,"state_claim") if v["state"]=="preparing" && ["failed","preparing","recovery_paused"].contains(&s(&v,"from"))=>stage=3,
+            (3,"chrome_prepare_error") if v["error"]["code"]=="BRIDGE_BUSY" && v["generationCalled"]==false && v["error"]["submissionUnknown"]==false && v["error"]["authRequired"]==false && v["sameRequestId"]==request_id=>stage=4,
+            (4,"state_claim") if v["from"]=="preparing" && v["state"]=="recovery_paused"=>{stage=0;cycles+=1;},
+            (0,"browser_queue_wait") if v["code"]=="BRIDGE_BUSY" && v["generationCalled"]==false=>{},
+            _=>return Ok(None),
+        }
+    }
+    Ok((stage==0 && cycles>0).then(||json!(rows)))
+}
 fn budget_exhausted(budget:&Value)->bool {
-    let elapsed=chrono::Utc::now().timestamp()-budget["startedAt"].as_i64().unwrap();
+    if budget["version"]=="chrome-prepare-recovery-budget/v2" && budget["executionStartedAt"].is_null(){return false;}
+    let clock=if budget["version"]=="chrome-prepare-recovery-budget/v2" {&budget["executionStartedAt"]}else{&budget["startedAt"]};
+    let elapsed=chrono::Utc::now().timestamp()-clock.as_i64().unwrap();
     elapsed<0 || elapsed>180 || budget["attempts"].as_u64().unwrap()>=3
 }
 pub(crate) fn retire_exhausted_chrome_prepare(store:&Store,job:&Value,cfg:&ProviderConfig)->Result<bool> {
@@ -107,21 +157,37 @@ pub(super) fn begin(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Va
     let Some(proof)=proof(store,key,cfg)? else {return Ok(None);};
     let metadata=format!("chrome_prepare_recovery:{key}");
     let original=store.job(key)?;
-    let mut budget=saved_budget(store,key,&original["snapshot"])? .unwrap_or_else(||json!({"version":"chrome-prepare-recovery-budget/v1","snapshotSha256":hash(&original["snapshot"]),"startedAt":chrono::Utc::now().timestamp(),"attempts":0}));
+    let budget=saved_budget(store,key,&original["snapshot"])? .unwrap_or_else(||json!({"version":"chrome-prepare-recovery-budget/v2","snapshotSha256":hash(&original["snapshot"]),"startedAt":chrono::Utc::now().timestamp(),"executionStartedAt":null,"attempts":0}));
     if budget_exhausted(&budget) {
         return Err("CHROME_PREPARE_RECOVERY_EXHAUSTED: 原页准备恢复已到有界上限，保留原任务，不开新页".into());
     }
-    budget["attempts"]=json!(budget["attempts"].as_u64().unwrap()+1);
-    store.conn()?.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![metadata,budget.to_string()]).map_err(|e|e.to_string())?;
-    store.event(key,"chrome_prepare_recovery_attempt",&json!({"attempt":budget["attempts"],"sameRequestId":true,"newTabRetryAllowed":false,"legacyFirstOpenRequiresNativeAbsence":true}))?;
+    let mut c=store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    let old:Option<String>=tx.query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if let Some(raw)=&old {let actual:Value=serde_json::from_str(raw).map_err(|_|HELD)?;let expected=if actual["version"]=="chrome-prepare-recovery-budget/v1" {budget.get("legacyQueueOnlyMigration").map(|v|&v["originalBudget"]).unwrap_or(&budget)}else{&budget};if actual!=*expected{return Err(HELD.into());}}
+    if budget.get("legacyQueueOnlyMigration").is_some() && old.as_ref().is_some_and(|raw|serde_json::from_str::<Value>(raw).ok().is_some_and(|v|v["version"]=="chrome-prepare-recovery-budget/v1")) {
+        tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_queue_budget_migrated',?2,?3)",rusqlite::params![key,budget["legacyQueueOnlyMigration"].to_string(),now()]).map_err(|e|e.to_string())?;
+    }
+    tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![metadata,budget.to_string()]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;
     Ok(Some(proof))
 }
+pub(super) fn execution_started(store:&Store,key:&str,cfg:&ProviderConfig,reason:&str)->Result<()> {
+    let original=store.job(key)?;let Some(mut budget)=saved_budget(store,key,&original["snapshot"])? else{return Ok(());};
+    if original["snapshot"]["providerConfig"]!=json!(cfg){return Err(HELD.into());}
+    let old=budget.to_string();
+    // One marker per actual recovery cycle. Intent persistence may repeat it.
+    let c=store.conn()?;let seen:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' AND id>(SELECT COALESCE(MAX(id),0) FROM events WHERE job_id=?1 AND type='chrome_prepare_recovery_started'))",[key],|r|r.get(0)).map_err(|e|e.to_string())?;drop(c);
+    if seen{return Ok(());}
+    if budget_exhausted(&budget){return Err("CHROME_PREPARE_RECOVERY_EXHAUSTED".into());}
+    if budget["version"]=="chrome-prepare-recovery-budget/v2" && budget["executionStartedAt"].is_null(){budget["executionStartedAt"]=json!(chrono::Utc::now().timestamp());}
+    budget["attempts"]=json!(budget["attempts"].as_u64().ok_or(HELD)?+1);
+    let mut c=store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    if tx.execute("UPDATE metadata SET value=?1 WHERE key=?2 AND value=?3",rusqlite::params![budget.to_string(),format!("chrome_prepare_recovery:{key}"),old]).map_err(|e|e.to_string())?!=1{return Err(HELD.into());}
+    tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_execution_started',?2,?3)",rusqlite::params![key,json!({"version":"chrome-prepare-execution-clock/v1","jobId":key,"snapshotSha256":hash(&original["snapshot"]),"configSha256":hash(&json!(cfg)),"requestId":original["snapshot"]["requestId"],"attempt":budget["attempts"],"executionStartedAt":budget["executionStartedAt"],"reason":reason,"generationCalled":false}).to_string(),now()]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;Ok(())
+}
 pub(super) fn busy_wait(store:&Store,key:&str)->Result<()> {
-    let metadata=format!("chrome_prepare_recovery:{key}");
-    let old:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
-    if let Some(old)=old {let mut budget:Value=serde_json::from_str(&old).map_err(|_|HELD)?;budget["attempts"]=json!(budget["attempts"].as_u64().ok_or(HELD)?.saturating_sub(1));
-        store.conn()?.execute("UPDATE metadata SET value=?1 WHERE key=?2 AND value=?3",rusqlite::params![budget.to_string(),metadata,old]).map_err(|e|e.to_string())?;}
-    Ok(())
+    let job=store.job(key)?;let budget=saved_budget(store,key,&job["snapshot"])? .ok_or(HELD)?;
+    store.event(key,"chrome_prepare_queue_wait_accounted",&json!({"version":"chrome-prepare-queue-wait/v1","generationCalled":false,"budget":budget,"budgetRefunded":false}))
 }
 pub(crate) fn resume_chrome_prepare(store:&Store,key:&str,cfg:&ProviderConfig,account:&str,channels:&dyn Channels)->Result<()> {
     // Preparation only: the enclosing scheduler must separately recheck its
@@ -184,15 +250,19 @@ mod tests {
         }
     }
     #[test]
-    fn chrome_prepare_recovery_busy_is_waiting_not_failure_and_has_fixed_expiry_and_budget() {
+    fn chrome_prepare_recovery_busy_observation_does_not_consume_execution_clock_or_reset_history() {
         let (_temp,store,key,cfg)=fixture();let fake=Fake{proofs:Mutex::new(vec![]),calls:AtomicUsize::new(0),busy:true};
         for _ in 0..4 {resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap();assert_eq!(store.job(&key).unwrap()["status"],"recovery_paused");}
         let metadata=format!("chrome_prepare_recovery:{key}");let raw:String=store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|r|r.get(0)).unwrap();let mut budget:Value=serde_json::from_str(&raw).unwrap();assert_eq!(budget["attempts"],0);
         budget["startedAt"]=json!(chrono::Utc::now().timestamp()-181);store.conn().unwrap().execute("UPDATE metadata SET value=?1 WHERE key=?2",rusqlite::params![budget.to_string(),metadata]).unwrap();
-        let calls=fake.calls.load(Ordering::SeqCst);assert!(resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap_err().contains("EXHAUSTED"));assert_eq!(fake.calls.load(Ordering::SeqCst),calls);
-        for (started,attempts) in [(chrono::Utc::now().timestamp()+60,0),(chrono::Utc::now().timestamp(),3)] {
-            budget["startedAt"]=json!(started);budget["attempts"]=json!(attempts);
+        assert!(budget["executionStartedAt"].is_null());resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap();
+        let original_started=budget["startedAt"].clone();execution_started(&store,&key,&cfg,"synthetic_execution").unwrap();
+        let raw:String=store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|r|r.get(0)).unwrap();budget=serde_json::from_str(&raw).unwrap();assert_eq!(budget["startedAt"],original_started);assert_eq!(budget["attempts"],1);
+        let calls=fake.calls.load(Ordering::SeqCst);
+        for (started,attempts) in [(chrono::Utc::now().timestamp()-181,1),(chrono::Utc::now().timestamp()+60,1),(chrono::Utc::now().timestamp(),3)] {
+            budget["executionStartedAt"]=json!(started);budget["attempts"]=json!(attempts);
             store.conn().unwrap().execute("UPDATE metadata SET value=?1 WHERE key=?2",rusqlite::params![budget.to_string(),format!("chrome_prepare_recovery:{key}")]).unwrap();
+            store.conn().unwrap().execute("UPDATE events SET data=json_set(data,'$.executionStartedAt',?1,'$.attempt',?2) WHERE job_id=?3 AND type='chrome_prepare_execution_started'",rusqlite::params![started,attempts,key]).unwrap();
             assert!(resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap_err().contains("EXHAUSTED"));assert_eq!(fake.calls.load(Ordering::SeqCst),calls);
         }
     }
@@ -204,5 +274,38 @@ mod tests {
         let mut changed=intent.clone();changed["runtime"]["backgroundEpoch"]=json!("other");assert!(observer(&reopened,&key,&cfg)(&changed).is_err());
         let fake=Fake{proofs:Mutex::new(vec![]),calls:AtomicUsize::new(0),busy:false};resume_chrome_prepare(&reopened,&key,&cfg,"original-account",&fake).unwrap();
         assert_eq!(fake.proofs.lock().unwrap()[0]["intent"],intent);assert_eq!(reopened.job(&key).unwrap()["snapshot"],original["snapshot"]);assert_eq!(fake.calls.load(Ordering::SeqCst),1);
+    }
+    fn legacy_busy_budget(store:&Store,key:&str)->Value {
+        store.event(key,"chrome_prepare_recovery_attempt",&json!({"attempt":1,"sameRequestId":true,"newTabRetryAllowed":false})).unwrap();
+        store.event(key,"chrome_prepare_recovery_started",&json!({"requestId":"original-request","firstSubmitAllowed":false})).unwrap();
+        store.claim_job(key,"failed","preparing").unwrap();
+        store.event(key,"chrome_prepare_error",&json!({"error":{"code":"BRIDGE_BUSY","submissionUnknown":false,"authRequired":false},"generationCalled":false,"sameRequestId":"original-request"})).unwrap();
+        store.claim_job(key,"preparing","recovery_paused").unwrap();
+        store.event(key,"browser_queue_wait",&json!({"code":"BRIDGE_BUSY","generationCalled":false})).unwrap();
+        let budget=json!({"version":"chrome-prepare-recovery-budget/v1","snapshotSha256":hash(&store.job(key).unwrap()["snapshot"]),"startedAt":chrono::Utc::now().timestamp()-600,"attempts":0});
+        store.conn().unwrap().execute("INSERT INTO metadata(key,value) VALUES(?1,?2)",rusqlite::params![format!("chrome_prepare_recovery:{key}"),budget.to_string()]).unwrap();budget
+    }
+    #[test] fn legacy_complete_zero_execution_wait_migrates_original_clock_once_and_only_execution_consumes_budget(){
+        let (_t,store,key,cfg)=fixture();let original=legacy_busy_budget(&store,&key);let snapshot=store.job(&key).unwrap()["snapshot"].clone();
+        assert!(chrome_prepare_recovery_eligible(&store,&store.job(&key).unwrap(),&cfg).unwrap());assert!(!retire_exhausted_chrome_prepare(&store,&store.job(&key).unwrap(),&cfg).unwrap());
+        begin(&store,&key,&cfg).unwrap();begin(&store,&key,&cfg).unwrap();
+        let b=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(b["startedAt"],original["startedAt"]);assert_eq!(b["attempts"],0);assert!(b["executionStartedAt"].is_null());assert_eq!(b["legacyQueueOnlyMigration"]["originalBudget"],original);
+        let count:i64=store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type='chrome_prepare_queue_budget_migrated'",[&key],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        let fake=Fake{proofs:Mutex::new(vec![]),calls:AtomicUsize::new(0),busy:false};resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap();
+        let b=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(b["attempts"],1);assert!(b["executionStartedAt"].as_i64().is_some());assert_eq!(b["startedAt"],original["startedAt"]);assert_eq!(store.job(&key).unwrap()["snapshot"],snapshot);
+    }
+    #[test] fn legacy_wait_migration_rejects_intent_attempt_nonbusy_unknown_request_or_incomplete_cycles(){
+        for case in ["intent","attempt","nonbusy","unknown","request","missing"] {
+            let (_t,store,key,_cfg)=fixture();let mut old=legacy_busy_budget(&store,&key);let c=store.conn().unwrap();
+            match case {"intent"=>{c.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_intent','{}',?2)",rusqlite::params![key,now()]).unwrap();},"attempt"=>{old["attempts"]=json!(1);c.execute("UPDATE metadata SET value=?1 WHERE key=?2",rusqlite::params![old.to_string(),format!("chrome_prepare_recovery:{key}")]).unwrap();},"nonbusy"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.code','EMPTY_PREFLIGHT') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},"unknown"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.submissionUnknown',json('true')) WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},"request"=>{c.execute("UPDATE events SET data=json_set(data,'$.sameRequestId','other') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},_=>{c.execute("DELETE FROM events WHERE job_id=?1 AND type='chrome_prepare_recovery_started'",[&key]).unwrap();}}drop(c);
+            let b=saved_budget(&store,&key,&store.job(&key).unwrap()["snapshot"]).unwrap().unwrap();assert_eq!(b["version"],"chrome-prepare-recovery-budget/v1","{case}");assert!(budget_exhausted(&b),"{case}");
+        }
+    }
+    #[test] fn execution_start_marker_refuses_config_request_or_hash_drift_without_metadata_write(){
+        for case in ["config","request","hash"] {
+            let (_t,store,key,cfg)=fixture();begin(&store,&key,&cfg).unwrap();let before=saved_budget(&store,&key,&store.job(&key).unwrap()["snapshot"]).unwrap();
+            let request=generation_request(&store.job(&key).unwrap()["snapshot"]).unwrap();let mut marker=json!({"version":"chrome-prepare-execution-start/v1","requestId":request.request_id,"requestHash":hash(&json!(request)),"configSha256":hash(&json!(cfg))});
+            marker[match case {"config"=>"configSha256","request"=>"requestId",_=>"requestHash"}]=json!("changed");assert!(observer(&store,&key,&cfg)(&marker).is_err());assert_eq!(saved_budget(&store,&key,&store.job(&key).unwrap()["snapshot"]).unwrap(),before);
+        }
     }
 }

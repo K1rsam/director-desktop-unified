@@ -38,9 +38,12 @@ pub(crate) fn client_command_busy(client:&Value) -> bool {
         || value.as_array().is_some_and(|a|!a.is_empty()) || value.as_object().is_some_and(|o|!o.is_empty())
         || value.as_str().is_some_and(|s|!s.is_empty() && !["idle","none","0"].contains(&s));
     client["releasePending"]==true || client["releaseState"]=="pending"
-        || busy(&client["transportHealth"]["tabQueue"]["running"])
-        || busy(&client["transportHealth"]["tabQueue"]["pending"])
-        || busy(&client["transportHealth"]["tabQueue"]["activeCommand"])
+        // A hello collected inside its own queue is connection history only.
+        // New prepare still requires the separate native, fresh execution proof.
+        || client["transportHealth"]["kind"]!="connect_snapshot" && (
+            busy(&client["transportHealth"]["tabQueue"]["running"])
+            || busy(&client["transportHealth"]["tabQueue"]["pending"])
+            || busy(&client["transportHealth"]["tabQueue"]["activeCommand"]))
 }
 fn profile_clients(clients: &[Value]) -> Vec<&Value> {
     clients.iter().filter(|c| c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true
@@ -58,6 +61,15 @@ fn profile_collision(clients: &[Value], profile: &str) -> bool {
 pub(crate) fn profile_execution_client<'a>(clients: &'a [Value], binding: &BrowserBinding) -> Result<&'a Value> {
     if profile_collision(clients,&binding.profile_id) {return Err("Chrome 浏览器身份出现多个运行实例，已停止新提交；请核对复制的浏览器配置。".into());}
     let filtered: Vec<Value>=profile_clients(clients).into_iter().filter(|c|c["browserProfileId"]==binding.profile_id && c["extensionBundleId"]==binding.bundle_id).cloned().collect();
+    let controller=format!("bridge-director-control-{}",binding.profile_id);
+    let controls:Vec<_>=filtered.iter().filter(|c|c["launchToken"]==controller).collect();
+    if !controls.is_empty() {
+        if controls.len()!=1 || controls[0]["url"]!="https://chatgpt.com/" || !controls[0]["activeRequest"].is_null()
+            || controls[0]["focused"]!=false || controls[0]["visibilityState"]!="hidden" || client_command_busy(controls[0]) {
+            return Err("Chrome 专属控制页未就绪或身份不唯一，保留原浏览器等待，不改用用户页面。".into());
+        }
+        return clients.iter().find(|c|c["id"]==controls[0]["id"]).ok_or("Chrome 专属控制页身份未确认。".into());
+    }
     let chosen=execution_client(&filtered).ok_or("已绑定的 Chrome 浏览器未连接或正在忙碌，请重新连接原浏览器；未改用其他浏览器。")?;
     clients.iter().find(|c|c["id"]==chosen["id"]).ok_or("Chrome 执行页面身份未确认。".into())
 }

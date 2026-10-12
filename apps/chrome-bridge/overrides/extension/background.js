@@ -240,6 +240,23 @@ const {
       backgroundEpoch,serverInstanceId:runtime.transport.serverEpoch,sourceClientId:state.clientId,sourceTabId:state.tabId,
       extensionVersion:backgroundManifestVersion,contentEpoch:state.contentEpoch};
   },
+  readExecutionInventory: async (port, bindings = {}) => {
+    const state = connections.get(port);
+    if (!state || state.closed || !state.protocolReady) throw new Error('Source execution transport is not ready');
+    const runtime = await backgroundState.read(state.tabId);
+    const id = String(bindings.inventoryCommandId || '');
+    const own = runtime.commands?.[id];
+    const commandFact = command => Object.fromEntries(['commandId','commandType','scope','mode','operation','status','requestId']
+      .map(key => [key, command?.[key] ?? null]));
+    const outbox = (runtime.outbox || []).map(entry => ({messageId:String(entry.messageId || ''),
+      messageType:String(entry.messageType || ''),commandId:String(entry.commandId || entry.body?.commandId || '')}));
+    return {sourceTabId:state.tabId,lease:runtime.lease ? {...runtime.lease} : null,ownCommand:commandFact(own),
+      otherUnresolvedCommands:Object.entries(runtime.commands || {}).filter(([key,command]) => key !== id
+        && !['succeeded','rejected'].includes(command.status)).map(([,command])=>commandFact(command)),
+      ownAcceptedMessageIds:outbox.filter(entry=>entry.commandId===id && entry.messageType==='command.accepted').map(entry=>entry.messageId).sort(),
+      otherPendingOutbox:outbox.filter(entry=>entry.commandId!==id || entry.messageType!=='command.accepted'),
+      queue:tabOperations.snapshot(state.tabId)};
+  },
 });
 
 function connectWebSocket(port, config) {
@@ -315,6 +332,7 @@ async function openConnection(state) {
           acknowledgedSequence: runtime.transport.ackCursor,
         },
         health: {
+          kind: 'connect_snapshot', observedAt: Date.now(),
           outbox: { size: runtime.outbox.length, ...runtime.metrics },
           tabQueue: tabOperations.metrics(state.tabId),
         },
@@ -359,7 +377,9 @@ async function openConnection(state) {
           launchRecordMatches: launch?.launchToken === hello.body.launchToken,
         });
       }
-    }, serverEnvelopeQueueOptions(envelope)).catch((error) => {
+    }, (() => { const options = serverEnvelopeQueueOptions(envelope);
+      return {...options,meta:{...(options.meta || {}),ackMessageId:String(envelope.body?.ackMessageId || '')}};
+    })()).catch((error) => {
       post(state.port, { type: 'extension.error', message: error.message || String(error) });
     });
   });
