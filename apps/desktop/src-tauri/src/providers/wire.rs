@@ -108,10 +108,12 @@ pub(super) fn read_json(mut response: Response, submitting: bool) -> ProviderRes
                 "渠道返回服务异常，受理结果未知；不会自动重发。",
             ));
         }
-        return Err(ProviderError::new(
-            &format!("HTTP_{}", status.as_u16()),
+        let mut error=ProviderError::new(
+            safe_code(&body).as_deref().unwrap_or(&format!("HTTP_{}", status.as_u16())),
             safe_message(&body).unwrap_or_else(|| "渠道请求被拒绝。".into()),
-        ));
+        );
+        error.context=Some(json!({"httpStatus":status.as_u16()}));
+        return Err(error);
     }
     Ok(sanitize(body))
 }
@@ -123,12 +125,18 @@ pub(super) fn safe_message(body: &Value) -> Option<String> {
             v.as_str()
                 .or_else(|| v.get("message").and_then(Value::as_str))
         })
-        .or_else(|| body.get("message").and_then(Value::as_str))?;
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .or_else(|| body.get("detail").and_then(Value::as_str))?;
     // Do not expose URLs, authorization strings or arbitrary upstream object dumps.
-    if text.contains("http") || text.to_ascii_lowercase().contains("bearer") || text.len() > 800 {
+    if text.to_ascii_lowercase().contains("http") || text.len() > 800
+        || ["bearer","authorization","cookie","api_key","apikey","access_token","refresh_token","password","secret","token="].iter().any(|word|text.to_ascii_lowercase().contains(word)) {
         return None;
     }
     Some(text.to_string())
+}
+pub(super) fn safe_code(body:&Value)->Option<String> {
+    let code=body["code"].as_str().or_else(||body["error"]["code"].as_str())?;
+    (!code.is_empty() && code.len()<=80 && code.bytes().all(|b|b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'_')).then(||code.into())
 }
 
 pub(super) fn sanitize(value: Value) -> Value {

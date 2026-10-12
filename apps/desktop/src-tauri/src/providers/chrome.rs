@@ -1,5 +1,6 @@
 use super::*;
 use reqwest::blocking::Client;
+use crate::store::s;
 
 #[cfg(test)]
 #[path = "chrome_background_tests.rs"]
@@ -29,7 +30,18 @@ fn json_request(
             ProviderError::new("BRIDGE_OFFLINE", "Chrome 桥接离线；已提交任务不会重发。")
         }
     })?;
-    wire::read_json(response, submitting)
+    wire::read_json(response, submitting).map_err(|mut error| {
+        let phase=match route {"/browser/tabs/open"=>"tab_open","/browser/recover-latest"=>"empty_preflight","/files/from-path"=>"reference_upload",_=>"bridge_read"};
+        let original=error.code.clone();
+        if !submitting && (["STANDALONE_COMMAND_BUSY","COMMAND_BUSY","CLIENT_BUSY","BRIDGE_BUSY"].contains(&error.code.as_str())
+            || error.message.to_ascii_lowercase().contains("unreleased standalone")
+            || error.message.to_ascii_lowercase().contains("standalone command") && error.message.to_ascii_lowercase().contains("busy")) {
+            error.code="BRIDGE_BUSY".into();
+        }
+        let http=error.context.as_ref().and_then(|context|context.get("httpStatus")).cloned().unwrap_or(Value::Null);
+        error.context=Some(json!({"phase":phase,"transportCode":original,"httpStatus":http}));
+        error
+    })
 }
 fn clients(config: &ProviderConfig, client: &Client) -> ProviderResult<Vec<Value>> {
     let body = json_request(config, client, "/browser/clients", None, false)?;
@@ -49,6 +61,8 @@ fn usable(value: &Value) -> bool {
         && value.get("compatible").and_then(Value::as_bool) != Some(false)
         && value.get("quarantined").and_then(Value::as_bool) != Some(true)
         && value.get("activeRequest").is_none_or(Value::is_null)
+        && value["releasePending"] != true && value["releaseState"] != "pending"
+        && !crate::chrome_setup::client_command_busy(value)
 }
 
 fn control_launch(binding:&crate::chrome_setup::BrowserBinding)->String {
@@ -236,6 +250,15 @@ pub(super) fn prepare(
     config: &ProviderConfig,
     request: &GenerationRequest,
 ) -> ProviderResult<PreparedRequest> {
+    prepare_inner(config,request,None,None)
+}
+pub(super) fn prepare_observed(config:&ProviderConfig,request:&GenerationRequest,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
+    prepare_inner(config,request,Some(observer),None)
+}
+pub(super) fn recover_prepare(config:&ProviderConfig,request:&GenerationRequest,proof:&Value,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
+    prepare_inner(config,request,Some(observer),Some(proof))
+}
+fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Option<&PrepareObserver<'_>>,recovery:Option<&Value>) -> ProviderResult<PreparedRequest> {
     if !request.options.as_object().is_some_and(|m| {
         m.iter()
             .all(|(key, value)| key == "count" && value.as_u64() == Some(1))
@@ -273,8 +296,8 @@ pub(super) fn prepare(
     let available = clients(config, &client)?;
     let launch = format!("bridge-director-desktop-{}", request.request_id);
     let legacy_launch = format!("director-desktop-{}", request.request_id);
-    // Existing owned tabs represent an earlier prepare or submit. Only read-only reconciliation is safe.
-    if available
+    // A normal prepare never guesses whether an existing page was submitted.
+    if recovery.is_none() && available
         .iter()
         .any(|c| matches!(c.get("launchToken").and_then(Value::as_str), Some(t) if t==launch || t==legacy_launch))
     {
@@ -292,22 +315,29 @@ pub(super) fn prepare(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| ProviderError::new("BRIDGE_STATE", "浏览器身份无效。"))?;
+    let mut intent=Value::Null;
+    let tab=if let Some(recovery)=recovery {
+        recover_blank_tab(config,&client,&available,binding,request,recovery,observer.ok_or_else(||ProviderError::new("CHROME_PREPARE_PROOF_REQUIRED","恢复缺少持久化证据回调"))?,&mut intent)?
+    } else {
+    intent=prepare_intent(request,binding,opener,"new_prepare",Value::Null)?;
+    if let Some(observer)=observer {observer(&intent)?;}
     let opened = json_request(
         config,
         &client,
         "/browser/tabs/open",
         Some(
-            &json!({"url":"https://chatgpt.com/","sourceClientId":opener_id,"active":false,"select":false,"launchToken":launch,"timeoutMs":12000,"allowSystemFallback":false}),
+            &json!({"url":"https://chatgpt.com/","sourceClientId":opener_id,"active":false,"select":false,"launchToken":launch,"timeoutMs":30000,"allowSystemFallback":false}),
         ),
         false,
-    )?;
+    ).map_err(|mut error|{if error.code!="BRIDGE_BUSY" && !error.auth_required {let transport=error.code.clone();error.code="CHROME_PREPARE_OPEN_UNCONFIRMED".into();let mut context=error.context.take().unwrap_or_else(||json!({}));context["phase"]=json!("tab_open");context["transportCode"]=json!(transport);context["sameRequestRecoveryOnly"]=json!(true);error.context=Some(context);}error})?;
     let tab = opened
         .get("client")
         .ok_or_else(|| ProviderError::new("TAB_OPEN_UNKNOWN", "标签页创建回执未确认。"))?;
     if opened.get("ok").and_then(Value::as_bool) != Some(true)
         || tab.get("launchToken").and_then(Value::as_str) != Some(launch.as_str())
         || tab["browserProfileId"] != binding.profile_id || tab["browserIncognito"] != false
-        || tab["extensionBundleId"] != binding.bundle_id || tab["backgroundEpoch"] != opener["backgroundEpoch"]
+        || !same_browser_runtime(tab,opener,binding) || tab["url"]!="https://chatgpt.com/"
+        || tab["focused"]!=false || tab["visibilityState"]!="hidden"
         || !usable(tab)
     {
         return Err(ProviderError::new(
@@ -315,6 +345,8 @@ pub(super) fn prepare(
             "任务标签页创建身份未确认。",
         ));
     }
+    tab.clone()
+    };
     let source_id = tab
         .get("id")
         .and_then(Value::as_str)
@@ -341,6 +373,13 @@ pub(super) fn prepare(
             "EMPTY_PREFLIGHT",
             "Chrome 新会话未通过原生空白检查，请更新桥接扩展。",
         ));
+    }
+    if recovery.is_some() {
+        let verified=clients(config,&client)?;
+        let owners:Vec<_>=verified.iter().filter(|page|page["launchToken"]==launch).collect();
+        if owners.len()!=1 || !same_idle_owned_source(owners[0],&tab,binding) || !compatible_profile_clients(&verified,&tab,binding) {
+            return Err(ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原空白页身份在核验期间变化，未准备或发送"));
+        }
     }
     let mut attachments = Vec::new();
     let mut receipts = Vec::new();
@@ -409,10 +448,125 @@ pub(super) fn prepare(
         request: frozen,
         capability_version: caps.version,
         upload_receipts: receipts,
-        wire: json!({"id":request.request_id,"message":message,"attachments":attachments,"newSession":false,"sourceClientId":source_id,"browserBinding":binding,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
+        wire: json!({"id":request.request_id,"message":message,"attachments":attachments,"newSession":false,"sourceClientId":source_id,"browserBinding":binding,"prepareRuntime":intent,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
         estimated_cost: None,
         prepared_at: now(),
     })
+}
+
+fn prepare_intent(request:&GenerationRequest,binding:&crate::chrome_setup::BrowserBinding,source:&Value,mode:&str,audit:Value) -> ProviderResult<Value> {
+    if !same_browser_runtime(source,source,binding) || s(source,"id").is_empty() {
+        return Err(ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","首次准备缺少完整浏览器运行身份"));
+    }
+    let request_hash=hex_hash(json!(request).to_string().as_bytes());
+    Ok(json!({"version":"chrome-prepare-intent/v1","mode":mode,"requestId":request.request_id,"requestHash":request_hash,
+        "launchToken":format!("bridge-director-desktop-{}",request.request_id),"browserBinding":binding,"sourceClientId":source["id"],
+        "runtime":{"browserProfileId":source["browserProfileId"],"extensionBundleId":source["extensionBundleId"],"backgroundEpoch":source["backgroundEpoch"],"serverInstanceId":source["serverInstanceId"],"transport":"extension","browserIncognito":false},
+        "createdAt":now(),"legacyNoSubmitAudit":audit}))
+}
+fn recover_blank_tab(config:&ProviderConfig,client:&Client,available:&[Value],binding:&crate::chrome_setup::BrowserBinding,request:&GenerationRequest,recovery:&Value,observer:&PrepareObserver<'_>,intent:&mut Value) -> ProviderResult<Value> {
+    let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原图片准备证据不足；保留原任务，不新开页或发送");
+    let launch=format!("bridge-director-desktop-{}",request.request_id);
+    let hash=hex_hash(json!(request).to_string().as_bytes());
+    if recovery["version"]!="chrome-prepare-recovery/v1" || recovery["requestHash"]!=hash || recovery["noLocalSubmit"]!=true {return Err(held());}
+    let owners:Vec<_>=available.iter().filter(|page|page["launchToken"]==launch).collect();
+    if owners.is_empty() {
+        if !recovery["intent"].is_null() {return Err(ProviderError::new("CHROME_PREPARE_WAIT_ORIGINAL","原开页还未形成唯一可用页；只等待同关联码，不再次开页"));}
+        return legacy_first_open(config,client,available,binding,request,recovery,observer,intent);
+    }
+    if owners.len()!=1 {return Err(held());}
+    let page=owners[0];
+    if page["url"]!="https://chatgpt.com/" || page["focused"]!=false || page["visibilityState"]!="hidden" || !explicit_idle(page)
+        || !same_browser_runtime(page,page,binding) || !compatible_profile_clients(available,page,binding) {return Err(held());}
+    let frozen=&recovery["intent"];
+    if !frozen.is_null() {
+        if frozen["version"]!="chrome-prepare-intent/v1" || frozen["requestId"]!=request.request_id || frozen["requestHash"]!=hash
+            || frozen["launchToken"]!=launch || frozen["browserBinding"]!=json!(binding)
+            || !same_browser_runtime(page,&frozen["runtime"],binding) {return Err(held());}
+        *intent=frozen.clone();
+    } else if recovery["legacyNoSubmitAudit"]["version"]!="chrome-legacy-no-submit/v1"
+        || recovery["legacyNoSubmitAudit"]["snapshotSha256"].as_str().is_none_or(|v|v.len()!=64)
+        || recovery["legacyNoSubmitAudit"]["stateChainProven"]!=true {return Err(held());}
+    // A 404 alone is insufficient. Require the exact known endpoint's not-found
+    // response, authoritative canonical absence, local zero-submit history and
+    // the original launch page's independent native empty preflight below.
+    prove_bridge_prepare_absence(config,client,request)?;
+    if frozen.is_null() {
+        let mut audit=recovery["legacyNoSubmitAudit"].clone();
+        audit["bridgeNoTurn"]=json!(true);audit["bridgeCanonicalAbsent"]=json!(true);
+        // This is explicitly the FIRST completed prepare runtime, not an
+        // invented assertion that an old epoch existed or remained unchanged.
+        *intent=prepare_intent(request,binding,page,"legacy_first_prepare",audit)?;
+        observer(intent)?;
+    }
+    Ok(page.clone())
+}
+fn prove_bridge_prepare_absence(config:&ProviderConfig,client:&Client,request:&GenerationRequest)->ProviderResult<()> {
+    let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原请求存在执行记录或无可信未提交证明，未开页或发送");
+    match json_request(config,client,&format!("/turns/{}",request.request_id),None,false) {
+        Err(error) if error.context.as_ref().and_then(|c|c.get("httpStatus"))==Some(&json!(404))
+            && error.message==format!("Turn not found: {}",request.request_id)=>{},
+        _=>return Err(held()),
+    }
+    let canonical=json_request(config,client,&format!("/diagnostics/request-state?requestId={}",request.request_id),None,false)?;
+    let tracked=&canonical["requests"];
+    if canonical["ok"]!=true || canonical["authoritative"]!=true || !tracked.is_object()
+        || tracked.get("state")!=Some(&Value::Null)
+        || !tracked["history"].as_array().is_some_and(Vec::is_empty)
+        || !tracked["deadlines"].as_array().is_some_and(Vec::is_empty) {return Err(held());}
+    Ok(())
+}
+fn legacy_first_open(config:&ProviderConfig,client:&Client,available:&[Value],binding:&crate::chrome_setup::BrowserBinding,request:&GenerationRequest,recovery:&Value,observer:&PrepareObserver<'_>,intent:&mut Value)->ProviderResult<Value> {
+    let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原页是否存在未由原生inventory证实，保留原任务，不开页或发送");
+    let valid_uuid=|v:&str|uuid::Uuid::parse_str(v).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==v);
+    if !valid_uuid(&request.request_id) || recovery["legacyNoSubmitAudit"]["version"]!="chrome-legacy-no-submit/v1"
+        || recovery["legacyNoSubmitAudit"]["snapshotSha256"].as_str().is_none_or(|v|v.len()!=64)
+        || recovery["legacyNoSubmitAudit"]["stateChainProven"]!=true {return Err(held());}
+    let owned_idle=|page:&&Value|page["url"]=="https://chatgpt.com/" && page["focused"]==false && page["visibilityState"]=="hidden"
+        && same_browser_runtime(page,page,binding) && explicit_idle(page)
+        && (page["launchToken"]==control_launch(binding) || s(page,"launchToken").strip_prefix("bridge-director-desktop-").is_some_and(&valid_uuid));
+    let controllers:Vec<_>=available.iter().filter(owned_idle).collect();
+    let source=controllers.iter().find(|page|page["launchToken"]==control_launch(binding)).copied().or_else(||controllers.first().copied()).ok_or_else(held)?;
+    if !compatible_profile_clients(available,source,binding) || available.iter().filter(|c|c["browserProfileId"]==binding.profile_id).any(|c|!explicit_idle(c)) {return Err(held());}
+    prove_bridge_prepare_absence(config,client,request)?;
+    let mut url=reqwest::Url::parse(&format!("http://localhost/browser/owned-launch/{}",request.request_id)).map_err(|_|held())?;
+    url.query_pairs_mut().append_pair("sourceClientId",s(source,"id")).append_pair("profileId",&binding.profile_id).append_pair("bundleId",&binding.bundle_id)
+        .append_pair("backgroundEpoch",s(source,"backgroundEpoch")).append_pair("serverInstanceId",s(source,"serverInstanceId"));
+    let native=json_request(config,client,&format!("{}?{}",url.path(),url.query().unwrap_or("")),None,false)?;
+    let runtime=&native["runtime"];let inventory=&native["inventory"];
+    let raw=native["inventoryCanonicalJson"].as_str().ok_or_else(held)?;
+    let parsed:Value=serde_json::from_str(raw).map_err(|_|held())?;
+    let age=chrono::Utc::now().timestamp_millis()-native["observedAt"].as_i64().ok_or_else(held)?;
+    let source_tabs:Vec<_>=inventory["tabs"].as_array().ok_or_else(held)?.iter().filter(|t|t["id"]==runtime["sourceTabId"]).collect();
+    if native["ok"]!=true || native["version"]!="director-owned-launch-inventory/v1" || native["status"]!="confirmed_absent" || native["complete"]!=true
+        || native["requestId"]!=request.request_id || native["launchToken"]!=format!("bridge-director-desktop-{}",request.request_id)
+        || native["absenceScope"]!="current_browser_inventory_only" || native["componentVersion"]!="6.4.0"
+        || runtime["extensionVersion"]!="2.4.5" || runtime["profileId"]!=binding.profile_id || runtime["bundleId"]!=binding.bundle_id
+        || runtime["backgroundEpoch"]!=source["backgroundEpoch"] || runtime["serverInstanceId"]!=source["serverInstanceId"]
+        || runtime["sourceClientId"]!=source["id"] || native["sourceClientId"]!=source["id"] || runtime["sourceTabId"]!=source["browserTabId"]
+        || !runtime["sourceTabId"].as_u64().is_some_and(|id|id>0) || runtime["contentEpoch"]!=source["contentEpoch"] || s(runtime,"contentEpoch").is_empty()
+        || inventory["sourceTabId"]!=runtime["sourceTabId"] || !inventory["launchRecords"].is_array() || parsed!=*inventory
+        || native["inventorySha256"]!=hex_hash(raw.as_bytes()) || native["inventoryGeneration"].as_str().is_none_or(|id|!valid_uuid(id))
+        || !(0..=30_000).contains(&age) || source_tabs.len()!=1 || source_tabs[0]["active"]!=false || source_tabs[0]["incognito"]!=false
+        || source_tabs[0]["discarded"]!=false {return Err(held());}
+    let verified=clients(config,client)?;
+    let sources:Vec<_>=verified.iter().filter(|p|p["id"]==source["id"]).collect();
+    if sources.len()!=1 || !same_idle_owned_source(sources[0],source,binding) || sources[0]["browserTabId"]!=source["browserTabId"]
+        || sources[0]["contentEpoch"]!=source["contentEpoch"] || !compatible_profile_clients(&verified,source,binding)
+        || verified.iter().filter(|p|p["browserProfileId"]==binding.profile_id).any(|p|!explicit_idle(p))
+        || verified.iter().any(|p|p["launchToken"]==native["launchToken"]) {return Err(held());}
+    let mut audit=recovery["legacyNoSubmitAudit"].clone();audit["bridgeNoTurn"]=json!(true);audit["bridgeCanonicalAbsent"]=json!(true);
+    // Current native absence permits the first versioned open adoption only.
+    // It is never presented as proof of an unavailable historical runtime nonce.
+    audit["nativeCurrentAbsence"]=native;
+    *intent=prepare_intent(request,binding,source,"legacy_first_open",audit)?;observer(intent)?;
+    let opened=json_request(config,client,"/browser/tabs/open",Some(&json!({"url":"https://chatgpt.com/","sourceClientId":source["id"],"active":false,"select":false,
+        "launchToken":format!("bridge-director-desktop-{}",request.request_id),"timeoutMs":30000,"allowSystemFallback":false})),false)
+        .map_err(|mut error|{if error.code!="BRIDGE_BUSY" && !error.auth_required {error.code="CHROME_PREPARE_OPEN_UNCONFIRMED".into();}error})?;
+    let tab=&opened["client"];
+    if opened["ok"]!=true || tab["launchToken"]!=intent["launchToken"] || tab["url"]!="https://chatgpt.com/" || tab["focused"]!=false || tab["visibilityState"]!="hidden"
+        || !same_browser_runtime(tab,source,binding) || !explicit_idle(tab) {return Err(held());}
+    Ok(tab.clone())
 }
 
 pub(super) fn submit(
@@ -433,10 +587,19 @@ pub(super) fn submit(
             return Err(ProviderError::new("BROWSER_BINDING_CHANGED","任务原浏览器绑定已变化，未发送请求；请核对原工作页。"));
         }
     }
+    if let Some(frozen)=prepared.wire.get("prepareRuntime") {
+        let binding=config.chrome_binding.as_ref().ok_or_else(||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原准备浏览器绑定缺失，未发送"))?;
+        if frozen["version"]!="chrome-prepare-intent/v1" || frozen["requestId"]!=prepared.request.request_id
+            || frozen["requestHash"]!=hex_hash(json!(prepared.request).to_string().as_bytes())
+            || frozen["browserBinding"]!=json!(binding) || !same_browser_runtime(&source,&frozen["runtime"],binding) {
+            return Err(ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","浏览器运行身份在准备后变化，保留原请求，未发送"));
+        }
+    }
     let mut body = prepared.wire.clone();
     body.as_object_mut()
         .ok_or_else(|| ProviderError::new("PREPARED_INVALID", "浏览器准备快照无效。"))?
         .remove("emptyPreflight");
+    body.as_object_mut().unwrap().remove("prepareRuntime");
     if shutting_down() {
         return Err(ProviderError::new(
             "CLIENT_CLOSING",

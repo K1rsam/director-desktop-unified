@@ -18,7 +18,7 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let saved = requests.clone();
     let thread = thread::spawn(move || {
-        for reply in replies {
+        for mut reply in replies {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -51,12 +51,14 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
             let line = headers.lines().next().unwrap().to_string();
             let body = String::from_utf8_lossy(&bytes[header_end..header_end + length]).to_string();
             saved.lock().unwrap().push((line, body));
+            let status=reply.get("__httpStatus").and_then(Value::as_u64).unwrap_or(200);
+            if let Some(object)=reply.as_object_mut() {object.remove("__httpStatus");}
             let body = if reply == json!("invalid-json") {
                 b"not json".to_vec()
             } else {
                 serde_json::to_vec(&reply).unwrap()
             };
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+            write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
             stream.write_all(&body).unwrap();
             stream.flush().unwrap();
         }
@@ -96,6 +98,21 @@ fn request() -> GenerationRequest {
         references: vec![],
         options: json!({}),
     }
+}
+
+#[test]
+fn chrome_wire_detail_and_safe_code_survive_500_without_exposing_credentials_or_objects() {
+    for (body,expected) in [(json!({"detail":"Client has unreleased standalone command","code":"STANDALONE_COMMAND_BUSY"}),Some("Client has unreleased standalone command")),
+        (json!({"detail":"Bearer synthetic-private-token"}),None),(json!({"detail":"error https://fixture.invalid/?token=hidden"}),None),
+        (json!({"detail":{"token":"hidden"}}),None),(json!({"detail":"authorization=hidden"}),None)] {
+        assert_eq!(wire::safe_message(&body).as_deref(),expected);
+    }
+    assert_eq!(wire::safe_code(&json!({"code":"STANDALONE_COMMAND_BUSY"})).as_deref(),Some("STANDALONE_COMMAND_BUSY"));
+    assert!(wire::safe_code(&json!({"code":"Bearer private"})).is_none());
+    let f=fixture(vec![json!({"__httpStatus":500,"detail":"Browser handshake timed out","code":"TAB_HANDSHAKE_TIMEOUT"})]);
+    let response=wire::client(5).unwrap().get(f.endpoint.clone()).send().unwrap();
+    let error=wire::read_json(response,false).unwrap_err();f.thread.join().unwrap();
+    assert_eq!(error.code,"TAB_HANDSHAKE_TIMEOUT");assert_eq!(error.message,"Browser handshake timed out");assert_eq!(error.context.unwrap()["httpStatus"],500);
 }
 
 #[test]

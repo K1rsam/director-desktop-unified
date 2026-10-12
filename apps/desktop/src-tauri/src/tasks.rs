@@ -15,11 +15,18 @@ mod chrome_queue_tests;
 #[cfg(test)]
 #[path = "tasks_chrome_cleanup_tests.rs"]
 pub(crate) mod chrome_cleanup_tests;
+#[path="tasks_chrome_prepare_recovery.rs"]
+mod chrome_prepare_recovery;
+pub(crate) use chrome_prepare_recovery::{chrome_prepare_recovery_eligible,resume_chrome_prepare};
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
     fn prepare(&self, c: &ProviderConfig, r: &GenerationRequest)
         -> ProviderResult<PreparedRequest>;
+    fn prepare_observed(&self,c:&ProviderConfig,r:&GenerationRequest,_observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {self.prepare(c,r)}
+    fn recover_prepare(&self,_c:&ProviderConfig,_r:&GenerationRequest,_proof:&Value,_observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {
+        Err(ProviderError::new("CHROME_PREPARE_RECOVERY_UNSUPPORTED","渠道未实现同 ID 原页准备恢复，保留原任务"))
+    }
     fn submit(&self, c: &ProviderConfig, r: &PreparedRequest) -> ProviderResult<SubmitReceipt>;
     fn query(&self, c: &ProviderConfig, id: &str) -> ProviderResult<QueryResult>;
     fn query_for_kind(
@@ -53,6 +60,8 @@ pub trait Channels: Send + Sync {
 }
 pub struct RealChannels;
 impl Channels for RealChannels {
+    fn prepare_observed(&self,c:&ProviderConfig,r:&GenerationRequest,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::prepare_observed(c,r,observer)}
+    fn recover_prepare(&self,c:&ProviderConfig,r:&GenerationRequest,proof:&Value,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::recover_chrome_prepare(c,r,proof,observer)}
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities> {
         providers::capabilities(c)
     }
@@ -200,7 +209,8 @@ fn prepare_generation(
         return Ok(None);
     }
     let state = s(&j, "status").to_owned();
-    if !["queued", "ready"].contains(&state.as_str()) {
+    let recovering=cfg.kind=="chrome" && chrome_prepare_recovery::chrome_prepare_recovery_eligible(store,&j,cfg)?;
+    if !["queued", "ready"].contains(&state.as_str()) && !recovering {
         return Ok(None);
     }
     if s(&j, "accountId") != account {
@@ -229,7 +239,7 @@ fn prepare_generation(
         store.claim_job_fields(key, &state, "stale", &json!({"error":e}))?;
         return Ok(None);
     }
-    if state == "queued" {
+    if state == "queued" || recovering {
         let request = match generation_request(&j["snapshot"]) {
             Ok(r) => r,
             Err(e) => {
@@ -237,10 +247,16 @@ fn prepare_generation(
                 return Ok(None);
             }
         };
-        if !store.claim_job(key, "queued", "preparing")? {
+        let recovery=if recovering {chrome_prepare_recovery::begin(store,key,cfg)?}else{None};
+        if recovering {store.event(key,"chrome_prepare_recovery_started",&json!({"previousState":state,"previousError":j["error"],"requestId":j["snapshot"]["requestId"],"firstSubmitAllowed":false}))?;}
+        if !store.claim_job(key, &state, "preparing")? {
             return Ok(None);
         }
-        match channels.prepare(cfg, &request) {
+        let observe=chrome_prepare_recovery::observer(store,key,cfg);
+        let prepared=if let Some(recovery)=&recovery {channels.recover_prepare(cfg,&request,recovery,&observe)}
+            else if cfg.kind=="chrome" {channels.prepare_observed(cfg,&request,&observe)}
+            else {channels.prepare(cfg,&request)};
+        match prepared {
             Ok(p) => {
                 // Uploads are a separate durable receipt class, never mistaken for generation IDs.
                 let saved: Result<bool> = (|| {
@@ -285,14 +301,23 @@ fn prepare_generation(
                 }
             }
             Err(e) => {
+                if cfg.kind=="chrome" {
+                    store.event(key,"chrome_prepare_error",&json!({"error":e,"generationCalled":false,"sameRequestId":j["snapshot"]["requestId"],"priorError":j["error"]}))?;
+                }
                 if unsubmitted(&store.job(key)?) {
                     if cfg.kind == "chrome" && e.code == "BRIDGE_BUSY" && !e.submission_unknown && !e.auth_required {
                         // This error originates before tab creation or submission. Wait durably,
                         // without consuming recovery attempts or retrying unknown side effects.
-                        store.claim_job_fields(key, "preparing", "queued", &json!({"error":e.message,"nextAttemptAt":chrono::Utc::now().timestamp()+5}))?;
+                        if recovering {chrome_prepare_recovery::busy_wait(store,key)?;}
+                        let original_intent:bool=store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='chrome_prepare_intent')",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
+                        store.claim_job_fields(key, "preparing", if recovering || original_intent {"recovery_paused"} else {"queued"}, &json!({"error":e.message,"nextAttemptAt":chrono::Utc::now().timestamp()+5}))?;
                         if j["error"] != e.message {
                             store.event(key, "browser_queue_wait", &json!({"code":e.code,"generationCalled":false}))?;
                         }
+                        return Ok(None);
+                    }
+                    if cfg.kind=="chrome" && (recovering || ["CHROME_PREPARE_OPEN_UNCONFIRMED","TAB_OPEN_UNKNOWN","EMPTY_PREFLIGHT","EXISTING_TAB_REQUIRES_RECONCILIATION"].contains(&e.code.as_str())) && !e.submission_unknown && !e.auth_required {
+                        store.claim_job_fields(key,"preparing","recovery_paused",&json!({"error":e.message,"nextAttemptAt":chrono::Utc::now().timestamp()+15}))?;
                         return Ok(None);
                     }
                     store.claim_job_fields(

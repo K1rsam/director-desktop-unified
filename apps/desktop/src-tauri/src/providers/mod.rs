@@ -210,6 +210,8 @@ pub struct ProviderError {
     pub submission_unknown: bool,
     pub auth_required: bool,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
 }
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -224,6 +226,7 @@ impl ProviderError {
             submission_unknown: false,
             auth_required: false,
             message: message.into(),
+            context: None,
         }
     }
     pub fn uncertain(message: impl Into<String>) -> Self {
@@ -239,6 +242,16 @@ impl ProviderError {
         e.auth_required = true;
         e
     }
+}
+pub type PrepareObserver<'a> = dyn Fn(&Value) -> ProviderResult<()> + 'a;
+pub fn prepare_observed(config:&ProviderConfig,request:&GenerationRequest,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
+    if config.kind=="chrome" {validate_request(request)?;chrome::prepare_observed(config,request,observer)}
+    else {prepare(config,request)}
+}
+pub fn recover_chrome_prepare(config:&ProviderConfig,request:&GenerationRequest,proof:&Value,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
+    if config.kind!="chrome" || request.kind!="image" {return Err(ProviderError::new("CHROME_PREPARE_SCOPE","仅允许恢复原 Chrome 图片准备"));}
+    validate_request(request)?;
+    chrome::recover_prepare(config,request,proof,observer)
 }
 
 pub fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {

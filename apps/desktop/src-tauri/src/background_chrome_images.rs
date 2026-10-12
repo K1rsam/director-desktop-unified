@@ -2,9 +2,11 @@
 //! Standard desktop and this runner hold the same OS file lease at their entrypoints.
 use super::*;
 use serde::{Deserialize, Serialize};
+use rusqlite::OptionalExtension;
 
 const CONTRACT: &str = "background-chrome-images/v1";
 const HELD: &str = "BACKGROUND_CHROME_HELD: 请求或原任务身份不一致；保留任务，不重发";
+const CLEANUP_FINISH_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// OS ownership, not a PID marker. Crash/exit releases the lock automatically.
 pub struct HomeExecutionLease { _file: fs::File }
@@ -233,11 +235,118 @@ fn persist_report(r:&Request,journal:&Journal,store:&Store,status:&str,operation
             "status":job["status"],"providerTaskId":job["providerTaskId"],"nextAttemptAt":job["nextAttemptAt"],
             "mediaIds":job["resultMediaIds"],"adoptedMediaId":adopted}));
     }
+    let images_complete=journal.phase=="queued" && !jobs.is_empty() && jobs.iter().all(|job|job["status"]=="downloaded");
+    let cleanup=cleanup_summary(store,journal)?;
     atomic_json(&r.report_path,&json!({"schemaVersion":CONTRACT,"requestId":r.request_id,"requestSha256":r.hash()?,
         "projectId":r.project_id,"sourceSha256":r.source_sha256,"pid":std::process::id(),"status":status,
         "queuePhase":journal.phase,"operationJobId":operation,"updatedAt":now(),"jobs":jobs,
-        "errorCode":match status {"held"=>Some("BACKGROUND_CHROME_HELD"),"stopped"=>Some("BACKGROUND_CHROME_STOPPED"),"timed_out"=>Some("BACKGROUND_CHROME_TIMEOUT"),_=>None},
+        "imagesComplete":images_complete,"cleanup":cleanup,
+        "cleanupFinishTimeoutSeconds":CLEANUP_FINISH_TIMEOUT.as_secs(),
+        "errorCode":match status {"held"=>Some("BACKGROUND_CHROME_HELD"),"stopped"=>Some("BACKGROUND_CHROME_STOPPED"),"timed_out"=>Some("BACKGROUND_CHROME_TIMEOUT"),"completed_cleanup_pending"=>Some("BACKGROUND_CHROME_CLEANUP_PENDING"),_=>None},
         "scope":{"text":false,"video":false,"otherProviders":false,"otherProjects":false}}))
+}
+
+/// Read only the exact journal IDs. No all-project legacy backfill or media calls.
+fn cleanup_summary(store:&Store,journal:&Journal) -> Result<Value> {
+    let mut rows=vec![];
+    let mut done=0;let mut retained=0;let mut pending=0;let mut not_ready=0;
+    for binding in &journal.jobs {
+        let key=s(binding,"jobId");
+        let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[format!("browser_tab_cleanup:{key}")],|row|row.get(0))
+            .optional().map_err(|e|e.to_string())?;
+        let value:Value=raw.as_deref().map(serde_json::from_str).transpose().map_err(|_|HELD)?.unwrap_or(Value::Null);
+        let status=match s(&value,"status") {"done"=>{done+=1;"done"},"retained"=>{retained+=1;"retained"},"pending"=>{pending+=1;"pending"},"" if value.is_null()=>{not_ready+=1;"not_ready"},_=>return Err(HELD.into())};
+        let reason=s(&value["outcome"],"reason");
+        let disposition=if status=="done" {"closed"} else if value["outcome"]["status"]=="retained" {"retained"} else {"unconfirmed"};
+        rows.push(json!({"jobId":key,"status":status,"pageDisposition":disposition,"reason":reason,
+            "outcomeStatus":value["outcome"]["status"],"nextAttemptAt":value["nextAttemptAt"],"attempts":value["attempts"]}));
+    }
+    Ok(json!({"done":done,"pending":pending,"retained":retained,"notReady":not_ready,"jobs":rows}))
+}
+
+fn selected_cleanup_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -> Result<bool> {
+    // Narrow backfill: the helper is passed only a proven selected downloaded ID.
+    for saved in &journal.jobs {
+        let job=store.job(s(saved,"jobId"))?;
+        r.job_bound(&job)?;
+        if job_identity(&job)!=*saved {return Err(HELD.into());}
+        if job["status"]=="downloaded" {tasks::queue_browser_tab_cleanup(store,s(saved,"jobId"))?;}
+    }
+    for row in cleanup_summary(store,journal)?["jobs"].as_array().into_iter().flatten() {
+        if row["status"]!="pending" || row["nextAttemptAt"].as_i64().unwrap_or(0)>chrono::Utc::now().timestamp() {continue;}
+        let key=s(row,"jobId");let job=store.job(key)?;
+        if job["status"]!="downloaded" {continue;}
+        let (config,_)=engine.generation_config(store,&job)?;
+        if config.kind!="chrome" {return Err(HELD.into());}
+        // Original helper proves owned page, completed media and idle state. It
+        // persists pending/retained/done; this runner never infers closure itself.
+        tasks::run_browser_tab_cleanup(store,key,&config,engine.channels.as_ref())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn recover_selected_dependency_blocks(r:&Request,store:&Store,journal:&Journal)->Result<bool> {
+    let assets=store.values("assets")?;
+    let mut changed=false;
+    // A legacy parent prepare failure is recoverable without replacing either ID.
+    // Only the exact historical dependency failure is eligible; unknown submits,
+    // edited source chains and unrelated blocked errors remain untouched.
+    for saved in &journal.jobs {
+        let job=store.job(s(saved,"jobId"))?;
+        if job["status"]!="blocked" || job["error"]!="指定来源图片任务未完成，请处理该来源后重新制作关联图片" {continue;}
+        r.job_bound(&job)?;
+        if job_identity(&job)!=*saved {return Err(HELD.into());}
+        if !job["prepared"].is_null() || !job["result"].is_null() || !s(&job,"providerTaskId").is_empty()
+            || !(job["receipt"].is_null() || job["receipt"]==json!({}) || job["receipt"]=="")
+            || job["snapshot"]["references"]!=json!([]) {continue;}
+        binding::validate_generation_snapshot(store,&job["snapshot"])?;
+        let asset=store.active_asset(s(&job,"entityId"))?;
+        if !job["snapshot"]["sourceChain"].is_array()
+            || json!(pipeline::asset_design_contract::source_chain(&assets,&asset)?)!=job["snapshot"]["sourceChain"] {return Err(HELD.into());}
+        let deps=job["snapshot"]["dependencyJobIds"].as_array().filter(|a|!a.is_empty()).ok_or(HELD)?;
+        let expected=image_dependency_ids(&assets,&asset)?;
+        let mut parent_entities=HashSet::new();let mut all_available=true;let mut restored_parent=false;
+        for dep in deps {
+            let id=dep.as_str().ok_or(HELD)?;
+            let parent_saved=journal.jobs.iter().find(|j|j["jobId"]==id).ok_or(HELD)?;
+            let parent=store.job(id)?;r.job_bound(&parent)?;
+            if job_identity(&parent)!=*parent_saved || !parent_entities.insert(s(&parent,"entityId").to_owned()) {return Err(HELD.into());}
+            let event=if parent["status"]=="waiting_dependency" {"chrome_dependency_recovery"} else {"chrome_prepare_recovery_started"};
+            let restored:bool=store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type=?2)",rusqlite::params![id,event],|row|row.get(0)).map_err(|e|e.to_string())?;
+            restored_parent|=restored && (parent["status"]=="waiting_dependency" || !parent["prepared"].is_null());
+            if !["waiting_dependency","queued","ready","submitted","processing","succeeded","downloaded","query_failed","download_failed"].contains(&s(&parent,"status")) {all_available=false;}
+        }
+        // The frozen dependencyJobIds may omit references already adopted when
+        // this job was queued. Every saved dependency still has to be a current
+        // declared reference; the journal binds the original complete ID list.
+        if parent_entities.iter().any(|id|!expected.contains(id)) {return Err(HELD.into());}
+        if !all_available || !restored_parent {continue;}
+        let mut c=store.conn()?;
+        let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let mut q=tx.prepare("SELECT type,data FROM events WHERE job_id=?1 ORDER BY id").map_err(|e|e.to_string())?;
+        let history=q.query_map([s(&job,"id")],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(|e|e.to_string())?
+            .collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        drop(q);
+        let mut blocked_proven=false;let mut submitted=false;
+        for (kind,raw) in &history {
+            let value:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
+            if kind=="state" && value["state"]=="blocked" && value["error"]==job["error"] {blocked_proven=true;}
+            submitted|=kind.contains("submit") || kind.contains("query") || kind.contains("download") || kind.contains("reconcile")
+                || ["ready","preparing","submitting","submitted","processing","submission_unknown","succeeded","downloading","downloaded"].iter().any(|state|value["state"]==*state || value["from"]==*state);
+        }
+        if !blocked_proven || submitted {continue;}
+        let count=tx.execute("UPDATE jobs SET state='waiting_dependency',next_attempt_at=0,updated_at=?1 WHERE id=?2 AND state='blocked' AND snapshot=?3 AND error=?4 AND prepared IS NULL AND result IS NULL AND (task_id IS NULL OR task_id='') AND (receipt IS NULL OR receipt IN ('','null','{}'))",
+            rusqlite::params![now(),s(&job,"id"),job["snapshot"].to_string(),s(&job,"error")]).map_err(|e|e.to_string())?;
+        if count==1 {
+            tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_dependency_recovery',?2,?3)",rusqlite::params![s(&job,"id"),
+                json!({"version":"chrome-dependency-recovery/v1","previousState":"blocked","previousError":job["error"],"snapshotSha256":pipeline::digest(&job["snapshot"].to_string()),"eventHistorySha256":pipeline::digest(&json!(history).to_string()),"dependencyJobIds":deps,"sameRequestId":true,"generationAllowed":false}).to_string(),now()]).map_err(|e|e.to_string())?;
+            changed=true;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+    }
+    if changed {store.dirty()?;}
+    Ok(changed)
 }
 
 fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -> Result<bool> {
@@ -250,6 +359,7 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
         if job_identity(&job)!=*identity {return Err(HELD.into());}
         if job["status"]=="waiting_dependency" && job["snapshot"]["references"]!=json!([]) {return Err(HELD.into());}
     }
+    let dependencies_restored=recover_selected_dependency_blocks(r,store,journal)?;
     engine.unblock_image_dependencies_selected(store,Some(&ids))?;
     let mut jobs=journal.jobs.iter().map(|j|store.job(s(j,"jobId"))).collect::<Result<Vec<_>>>()?;
     // Known originals precede new work; unknown tasks have no generation path.
@@ -266,10 +376,12 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
         }
         if job["nextAttemptAt"].as_i64().unwrap_or(0)>chrono::Utc::now().timestamp() {continue;}
         let known=!s(&job,"providerTaskId").is_empty();
-        let generate=!known && ["queued","ready"].contains(&state);
-        if !generate && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
-        if generate && !engine.chrome_image_queue_ready(store,key)? {continue;}
         let (config,account)=engine.generation_config(store,&job)?;
+        let recover_prepare=!known && ["failed","recovery_paused","preparing"].contains(&state)
+            && tasks::chrome_prepare_recovery_eligible(store,&job,&config)?;
+        let generate=!known && ["queued","ready"].contains(&state);
+        if !generate && !recover_prepare && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
+        if generate && !engine.chrome_image_queue_ready(store,key)? {continue;}
         if config.kind!="chrome" {return Err(HELD.into());}
         // Includes source/asset versions and exact adopted parent media hashes.
         binding::validate_generation_snapshot(store,&job["snapshot"])?;
@@ -278,25 +390,21 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
             Ok(account)=>account,
             Err(error)=>{Engine::account_preflight_failed(store,key,&error)?;return Ok(true);}
         };
-        if generate {tasks::run_generation(store,key,&config,&account,engine.channels.as_ref())?;}
+        if recover_prepare {tasks::resume_chrome_prepare(store,key,&config,&account,engine.channels.as_ref())?;}
+        else if generate {tasks::run_generation(store,key,&config,&account,engine.channels.as_ref())?;}
         else if ["succeeded","download_failed"].contains(&state) {
             tasks::download_saved_result(store,key,&config,&account,engine.channels.as_ref())?;
         } else {tasks::resume_job(store,key,&config,&account,engine.channels.as_ref(),true)?;}
         return Ok(true);
     }
-    // Cleanup is restricted to the same exact completed jobs; original unknown pages remain.
-    for key in tasks::due_browser_tab_cleanups(store)?.iter().filter(|key|ids.contains(key.as_str())) {
-        let job=store.job(key)?;
-        r.job_bound(&job)?;
-        let (config,_)=engine.generation_config(store,&job)?;
-        if config.kind!="chrome" {return Err(HELD.into());}
-        tasks::run_browser_tab_cleanup(store,key,&config,engine.channels.as_ref())?;
-        return Ok(true);
-    }
-    Ok(false)
+    // New generation/recovery operations above retain priority over cleanup.
+    Ok(selected_cleanup_step(engine,r,store,journal)? || dependencies_restored)
 }
 
 fn run_owned(engine:Arc<Engine>,r:&Request) -> Result<i32> {
+    run_owned_with_cleanup_budget(engine,r,CLEANUP_FINISH_TIMEOUT)
+}
+fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Duration) -> Result<i32> {
     r.validate()?;
     let store=engine.store(&r.project_id)?;
     if r.stop_path.try_exists().map_err(|e|e.to_string())? {
@@ -305,9 +413,13 @@ fn run_owned(engine:Arc<Engine>,r:&Request) -> Result<i32> {
     }
     let journal=prepare_queue(&engine,r,&store)?;
     let start=Instant::now();
+    let mut cleanup_started:Option<Instant>=None;
+    let mut completion_media_verified=false;
     loop {
         let status=if r.stop_path.try_exists().map_err(|e|e.to_string())? {Some(("stopped",3))}
-            else if start.elapsed()>=Duration::from_secs(r.max_runtime_seconds) {Some(("timed_out",3))}
+            else if start.elapsed()>=Duration::from_secs(r.max_runtime_seconds) {
+                Some(if cleanup_started.is_some() {("completed_cleanup_pending",0)} else {("timed_out",3)})
+            }
             else {None};
         if let Some((status,code))=status {persist_report(r,&journal,&store,status,None)?;return Ok(code);}
         let progressed=match selected_step(&engine,r,&store,&journal) {
@@ -317,17 +429,31 @@ fn run_owned(engine:Arc<Engine>,r:&Request) -> Result<i32> {
         let jobs=journal.jobs.iter().map(|j|store.job(s(j,"jobId"))).collect::<Result<Vec<_>>>()?;
         let complete=journal.phase=="queued" && !jobs.is_empty() && jobs.iter().all(|j|j["status"]=="downloaded");
         if complete {
-            for job in &jobs {
+            if !completion_media_verified {for job in &jobs {
                 let media=job["resultMediaIds"].as_array().filter(|ids|!ids.is_empty()).ok_or(HELD)?;
                 for mid in media {store.verify_media(&store.get("media",mid.as_str().ok_or(HELD)?)?)?;}
                 if store.adopted(s(job,"entityId"),s(&job["snapshot"],"variantId"))?.as_deref()!=media[0].as_str() {return Err(HELD.into());}
+            } completion_media_verified=true;}
+            let cleanup=cleanup_summary(&store,&journal)?;
+            if cleanup["pending"].as_u64().unwrap_or(0)==0 && cleanup["notReady"].as_u64().unwrap_or(0)==0 {
+                let status=if cleanup["retained"].as_u64().unwrap_or(0)>0 {"completed_with_retained_pages"} else {"completed"};
+                persist_report(r,&journal,&store,status,None)?;return Ok(0);
             }
-            persist_report(r,&journal,&store,"completed",None)?;return Ok(0);
+            let began=cleanup_started.get_or_insert_with(Instant::now);
+            if began.elapsed()>=cleanup_budget {
+                persist_report(r,&journal,&store,"completed_cleanup_pending",None)?;return Ok(0);
+            }
+            persist_report(r,&journal,&store,"finishing_cleanup",None)?;
+            if !progressed {std::thread::sleep(Duration::from_millis(r.poll_interval_ms));}
+            continue;
         }
-        let runnable=jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
+        let recoverable=jobs.iter().filter(|j|["failed","recovery_paused","preparing"].contains(&s(j,"status")))
+            .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::chrome_prepare_recovery_eligible(&store,j,&cfg)))
+            .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
+        let runnable=recoverable || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
         let unknown=jobs.iter().any(|j|["submission_unknown","auth_required","recovery_paused"].contains(&s(j,"status")));
         let known_pending=jobs.iter().any(|j|!s(j,"providerTaskId").is_empty() && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
-        if !progressed && (!runnable || unknown && !known_pending) {
+        if !progressed && (!runnable || unknown && !known_pending && !recoverable) {
             persist_report(r,&journal,&store,"held",None)?;return Ok(2);
         }
         persist_report(r,&journal,&store,"running",None)?;

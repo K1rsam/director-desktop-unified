@@ -33,6 +33,15 @@ pub fn binding_settings(base: &str, binding: Option<&BrowserBinding>) -> Value {
 fn valid_profile_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==value)
 }
+pub(crate) fn client_command_busy(client:&Value) -> bool {
+    let busy=|value:&Value|value.as_bool()==Some(true) || value.as_u64().is_some_and(|n|n>0)
+        || value.as_array().is_some_and(|a|!a.is_empty()) || value.as_object().is_some_and(|o|!o.is_empty())
+        || value.as_str().is_some_and(|s|!s.is_empty() && !["idle","none","0"].contains(&s));
+    client["releasePending"]==true || client["releaseState"]=="pending"
+        || busy(&client["transportHealth"]["tabQueue"]["running"])
+        || busy(&client["transportHealth"]["tabQueue"]["pending"])
+        || busy(&client["transportHealth"]["tabQueue"]["activeCommand"])
+}
 fn profile_clients(clients: &[Value]) -> Vec<&Value> {
     clients.iter().filter(|c| c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true
         && c["transport"]=="extension" && c["browserIncognito"]==false
@@ -212,7 +221,7 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let opener=selected_binding.and_then(|b|profile_execution_client(clients,b).ok());
     let busy = health["pendingRequests"].as_u64().unwrap_or(0)>0
         || health["pendingCommands"].as_u64().unwrap_or(0)>0
-        || clients.iter().any(|c|!c["activeRequest"].is_null());
+        || clients.iter().any(|c|!c["activeRequest"].is_null() || client_command_busy(c));
     // Upstream health.ok describes its generic selected-client fallback. An
     // explicitly bound opener is usable when only that fallback is ambiguous.
     let connected = health["ok"] == true || health["needsSelection"] == true && opener.is_some();
@@ -229,6 +238,8 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let mut value=report(state,message,component().is_some(),true);
     value["clients"]=json!(clients.len()); value["usableClients"]=json!(usable.len());
     value["pendingRequests"] = health["pendingRequests"].clone();
+    value["pendingCommands"] = health["pendingCommands"].clone();
+    value["pendingStandaloneClients"]=json!(clients.iter().filter(|c|client_command_busy(c)).count());
     value["browserProfiles"]=json!(browser_profiles);value["unidentifiedClients"]=json!(unidentified);
     value["boundProfileId"]=settings["chromeProfileId"].clone();
     Ok(value)
