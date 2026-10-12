@@ -576,6 +576,7 @@ pub async fn run_asset_design(
     reasoning: &str,
 ) -> Result<Value, String> {
     inline_delta_enabled(input)?;
+    let incremental_comparisons = super::asset_design_contract::incremental_comparisons(input)?;
     let assets = input
         .get("assets")
         .and_then(Value::as_array)
@@ -750,6 +751,35 @@ pub async fn run_asset_design(
         .map(|item| text(item, "assetId").to_string())
         .collect();
     pending.retain(|id, _| !failed.contains(id));
+    // Freeze a deterministic topological character lane, independent of which
+    // unrelated non-character future happens to finish first. Other kinds still
+    // use all available slots. Existing dependency errors retain their handling.
+    let mut comparison_order = Vec::new();
+    if incremental_comparisons {
+        let mut remaining: BTreeMap<String, HashSet<String>> = pending.iter().map(|(id, _)| {
+            let mut dependencies = HashSet::new();
+            if let Some(Some(parent)) = parents.get(id) {
+                if let Ok(parent) = inline_reference_target(parent, &by_id, &parents) {
+                    if pending.contains_key(&parent) { dependencies.insert(parent); }
+                }
+            }
+            for prop in prop_dependencies.get(id).into_iter().flatten() {
+                if let Some(prop) = prop["assetId"].as_str().filter(|p| pending.contains_key(*p)) {
+                    dependencies.insert(prop.to_owned());
+                }
+            }
+            (id.clone(), dependencies)
+        }).collect();
+        while !remaining.is_empty() {
+            let Some(next) = remaining.iter().find(|(_, dependencies)| dependencies.is_empty()).map(|(id,_)|id.clone()) else {
+                comparison_order.extend(remaining.keys().filter(|id| super::asset_design_contract::is_character(pending[*id])).cloned());
+                break;
+            };
+            remaining.remove(&next);
+            for dependencies in remaining.values_mut() { dependencies.remove(&next); }
+            if super::asset_design_contract::is_character(pending[&next]) { comparison_order.push(next); }
+        }
+    }
     let mut designs: Vec<Value> = Vec::new();
     let mut available_designs: BTreeMap<String, Value> = BTreeMap::new();
     for asset in assets
@@ -799,6 +829,9 @@ pub async fn run_asset_design(
                 continue;
             }
             let asset = pending[&id];
+            if incremental_comparisons && super::asset_design_contract::is_character(asset)
+                && comparison_order.iter().find(|candidate| pending.contains_key(*candidate)) != Some(&id)
+            { continue; }
             let variant = text(asset, "variantId");
             let parent = parents.get(&id).and_then(|p| p.as_deref());
             if automatic
@@ -982,7 +1015,24 @@ pub async fn run_asset_design(
             let mode = if parent.is_some() { "DERIVED" } else { "BASE" };
             let production_direction = super::asset_design_contract::production_direction(input);
             let design_receipt = super::asset_design_contract::design_receipt(&design_basis, asset)?;
-            let comparison_designs = input["comparisonDesignsByAssetId"].get(&id).and_then(Value::as_array).cloned().unwrap_or_else(||super::asset_design_contract::comparison_designs(input, asset));
+            let frozen_request = incremental_comparisons.then(||input[super::asset_design_contract::FROZEN_COMPARISON_REQUESTS].get(&id)).flatten();
+            let comparison_designs = if let Some(saved) = frozen_request {
+                saved["input"]["comparisonDesigns"].as_array().cloned().ok_or("已派发人物设计缺少冻结对照")?
+            } else if incremental_comparisons {
+                // Future selected characters must not leak into an earlier
+                // request when a resumed image workflow already published them.
+                let mut comparison_basis = design_basis.clone();
+                if let Some(rows) = comparison_basis["assets"].as_array_mut() {
+                    for row in rows {
+                        if pending.contains_key(text(row,"id")) || failed.contains(text(row,"id")) {
+                            row["prompt"] = json!("");
+                        }
+                    }
+                }
+                super::asset_design_contract::comparison_designs(&comparison_basis, asset)
+            } else {
+                input["comparisonDesignsByAssetId"].get(&id).and_then(Value::as_array).cloned().unwrap_or_else(||super::asset_design_contract::comparison_designs(input, asset))
+            };
             let allowed_references: Vec<String> = parent.into_iter().map(str::to_string).collect();
             let output_schema = obj(
                 json!({"schemaVersion":choices(&["asset-design/v1"]),"assetId":{"type":"string","enum":[id]},"variantId":{"type":"string","enum":[variant]},"prompt":string(),"freeDesignScope":string(),"sourceRefs":refs(&evidence.iter().map(|r|r.id.clone()).collect::<Vec<_>>()),"referenceVariantIds":refs(&allowed_references)}),
@@ -1000,10 +1050,16 @@ pub async fn run_asset_design(
             design_input["projectVisualStyle"] = json!(super::asset_design_contract::project_visual_style(&input["settings"]));
             design_input["imagePresentation"] = super::asset_design_contract::image_presentation(&input["settings"], asset);
             design_input["comparisonDesigns"] = json!(comparison_designs);
+            if incremental_comparisons {
+                design_input[super::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(super::asset_design_contract::COMPARISON_PROFILE);
+            }
             if !scope_context.is_empty() {
                 design_input["sourceScopeContext"] = json!({"version":"asset-scene-context/v1","instruction":"evidence包含SOURCE_SCOPE标记所定位场次的锁定原文，不再只提供场次标题。先在原文中确认当前主体及其物种/空间/物件身份；空facts仅表示尚无已登记外观约束，不表示原文没有该主体。仍按原C/D岗位区分原文依据与普通非剧情美术补足，补足写入freeDesignScope；不得把同场其它主体或后期状态移植给当前形象，也不得把整场原文标成该资产的外观事实。"});
             }
             let mut frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
+            if incremental_comparisons {
+                frozen_context[super::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(super::asset_design_contract::COMPARISON_PROFILE);
+            }
             if let Some(context) = production_context {
                 design_input["assetProductionContext"] = context.clone();
                 frozen_context["assetProductionContext"] = context;
@@ -1066,6 +1122,12 @@ pub async fn run_asset_design(
                     }
                     row["evidenceUses"] = json!(uses);
                 }
+            }
+            if let Some(saved) = frozen_request {
+                if super::asset_design_contract::comparison_domain_input(&saved["input"]) != design_input || saved["schema"] != output_schema
+                    || saved["model"] != model || saved["reasoning"] != reasoning
+                    || saved["ruleSnapshot"] != snapshot("asset-art-director", &[])?
+                { return Err("已派发人物设计的冻结领域请求已变化，保留原请求且不重发".into()); }
             }
             let fingerprint = digest(&serde_json::to_string(&design_input).unwrap());
             // Own the validation inputs so futures do not borrow temporary facts
@@ -1679,6 +1741,119 @@ mod tests {
     }
 
     struct Designer;
+    #[derive(Default)]
+    struct ComparisonDesigner {
+        requests: std::sync::Mutex<Vec<TextRequest>>,
+        accepted: std::sync::Mutex<HashSet<String>>,
+        cache: std::sync::Mutex<BTreeMap<String,Value>>,
+        fail_b: std::sync::atomic::AtomicBool,
+        character_active: std::sync::atomic::AtomicUsize,
+        character_peak: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        generated: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl TextExecutor for ComparisonDesigner {
+        async fn execute(&self, request: TextRequest) -> Result<Value,String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if request.stage == "assetVisualFacts" { return Ok(empty_visual(&request)); }
+            let id = text(&request.input["asset"],"id").to_owned();
+            let hash = digest(&serde_json::to_string(&request).unwrap());
+            self.requests.lock().unwrap().push(request.clone());
+            if let Some(value)=self.cache.lock().unwrap().get(&hash).cloned() { return Ok(value); }
+            for comparison in request.input["comparisonDesigns"].as_array().unwrap() {
+                assert!(self.accepted.lock().unwrap().contains(text(comparison,"assetId")),"comparison is not yet accepted");
+            }
+            let character = super::super::asset_design_contract::is_character(&request.input["asset"]);
+            if character { let active=self.character_active.fetch_add(1,SeqCst)+1; self.character_peak.fetch_max(active,SeqCst); }
+            let active=self.active.fetch_add(1,SeqCst)+1; self.peak.fetch_max(active,SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            self.active.fetch_sub(1,SeqCst);
+            if character { self.character_active.fetch_sub(1,SeqCst); }
+            if id=="b" && self.fail_b.load(SeqCst) { return Err("synthetic first attempt failure".into()); }
+            self.generated.fetch_add(1,SeqCst);
+            let refs=request.input["parentAsset"]["id"].as_str().map(|id|vec![id]).unwrap_or_default();
+            let value=json!({"schemaVersion":"asset-design/v1","assetId":id,"variantId":request.input["asset"]["variantId"],"prompt":format!("{id}独立脸部比例与衣装轮廓"),"freeDesignScope":"未限定外貌","sourceRefs":request.input["asset"]["sourceRefs"],"referenceVariantIds":refs});
+            self.cache.lock().unwrap().insert(hash,value.clone());
+            Ok(value)
+        }
+        async fn accept(&self,request:&TextRequest,_value:&Value)->Result<(),String> {
+            if request.stage=="assetDesign" { self.accepted.lock().unwrap().insert(text(&request.input["asset"],"id").into()); }
+            Ok(())
+        }
+    }
+    fn comparison_fixture() -> Value {
+        let source=prepare_source("第一集\n场景：门口\n△甲乙丙站在门口。\n").unwrap();
+        let row=source.rows[2].id.clone();
+        let mut assets:Vec<_>=["c","b","a"].iter().map(|id|design_asset(id,&row,None)).collect();
+        for n in 0..4 { let mut prop=design_asset(&format!("prop{n}"),&row,None);prop["kind"]=json!("PROP");assets.push(prop); }
+        let mut input=json!({"source":source,"assets":assets,"comparisonDesignsByAssetId":{"a":[],"b":[],"c":[]}});
+        input[super::super::asset_design_contract::COMPARISON_PROFILE_FIELD]=json!(super::super::asset_design_contract::COMPARISON_PROFILE);
+        input
+    }
+    #[tokio::test]
+    async fn incremental_comparison_new_characters_receive_accepted_predecessors_and_props_stay_parallel() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let input=comparison_fixture();let exec=ComparisonDesigner::default();
+        let result=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert!(result["blocked"].as_array().unwrap().is_empty());
+        assert_eq!(exec.generated.load(SeqCst),7);
+        assert_eq!(exec.character_peak.load(SeqCst),1);
+        assert_eq!(exec.peak.load(SeqCst),4);
+        let requests=exec.requests.lock().unwrap();
+        for (id,expected) in [("a",vec![]),("b",vec!["a"]),("c",vec!["a","b"])] {
+            let request=requests.iter().find(|r|r.input["asset"]["id"]==id).unwrap();
+            assert_eq!(request.input["comparisonDesigns"].as_array().unwrap().iter().map(|r|text(r,"assetId")).collect::<Vec<_>>(),expected);
+            assert!(request.input["referenceCatalog"].as_array().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn incremental_comparison_resume_preserves_dispatched_domain_hash_after_failed_predecessor_recovers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut input=comparison_fixture();let exec=ComparisonDesigner::default();exec.fail_b.store(true,SeqCst);
+        let first=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert_eq!(first["blocked"].as_array().unwrap().len(),1);
+        let original=exec.requests.lock().unwrap().clone();
+        let mut frozen=json!({});
+        for r in &original { frozen[text(&r.input["asset"],"id")]=serde_json::to_value(r).unwrap(); }
+        input[super::super::asset_design_contract::FROZEN_COMPARISON_REQUESTS]=frozen;
+        exec.fail_b.store(false,SeqCst);exec.requests.lock().unwrap().clear();
+        let second=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert!(second["blocked"].as_array().unwrap().is_empty());
+        assert_eq!(exec.generated.load(SeqCst),7,"accepted predecessors and later requests are cache replays");
+        for replay in exec.requests.lock().unwrap().iter() {
+            let old=original.iter().find(|r|r.input["asset"]["id"]==replay.input["asset"]["id"]).unwrap();
+            assert_eq!(serde_json::to_value(old).unwrap(),serde_json::to_value(replay).unwrap());
+        }
+        let dispatched=exec.requests.lock().unwrap().len();
+        input["settings"]["projectVisualStyle"]=json!("changed");
+        assert!(run_asset_design(&input,&exec,"offline","medium").await.unwrap_err().contains("冻结领域请求"));
+        assert_eq!(exec.requests.lock().unwrap().len(),dispatched,"domain drift cannot dispatch");
+    }
+    #[tokio::test]
+    async fn incremental_comparison_legacy_frozen_empty_map_and_parallelism_are_unchanged() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut input=comparison_fixture();input.as_object_mut().unwrap().remove(super::super::asset_design_contract::COMPARISON_PROFILE_FIELD);
+        let exec=ComparisonDesigner::default();run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert!(exec.character_peak.load(SeqCst)>1);
+        for request in exec.requests.lock().unwrap().iter() {
+            assert_eq!(request.input["comparisonDesigns"],json!([]));
+            assert!(request.input.get(super::super::asset_design_contract::COMPARISON_PROFILE_FIELD).is_none());
+        }
+    }
+    #[tokio::test]
+    async fn incremental_comparison_character_lane_respects_parent_topology_before_lexical_order() {
+        let mut input=comparison_fixture();
+        input["assets"][2]["sourceAssetId"]=json!("c");
+        input["assets"][2]["preparation"]["mode"]=json!("DERIVE");
+        let exec=ComparisonDesigner::default();
+        let result=run_asset_design(&input,&exec,"offline","medium").await.unwrap();
+        assert!(result["blocked"].as_array().unwrap().is_empty());
+        let requests=exec.requests.lock().unwrap();
+        let chars:Vec<_>=requests.iter().filter(|r|super::super::asset_design_contract::is_character(&r.input["asset"])).map(|r|text(&r.input["asset"],"id")).collect();
+        assert_eq!(chars,vec!["b","c","a"]);
+    }
     #[async_trait]
     impl TextExecutor for Designer {
         async fn execute(&self, request: TextRequest) -> Result<Value, String> {

@@ -3354,6 +3354,9 @@ impl Engine {
                 }
             }
             design_input["comparisonDesignsByAssetId"] = original_context["comparisonDesignsByAssetId"].clone();
+            if let Some(profile) = original_context.get(pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD) {
+                design_input[pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD] = profile.clone();
+            }
             // The current immutable fact receipts carry repair budgets. Direction and
             // comparisons remain those captured by the original workflow.
             design_input["foundation"]["directionConfirmed"] = original_context["foundation"]["directionConfirmed"].clone();
@@ -3370,6 +3373,7 @@ impl Engine {
             let mut comparisons = json!({});
             for asset in &all_assets { comparisons[s(asset,"id")] = json!(pipeline::asset_design_contract::comparison_designs(&design_input,asset)); }
             design_input["comparisonDesignsByAssetId"] = comparisons;
+            design_input[pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(pipeline::asset_design_contract::COMPARISON_PROFILE);
         }
         let needs_visual_check =
             pipeline::asset_visual_facts::cached_visual_check_required(&design_input)?;
@@ -3408,10 +3412,14 @@ impl Engine {
         let stage=s(&snapshot,"stage").to_string();
         let r=snapshot["request"].clone();
         let execution_settings=snapshot["settings"].clone();
-        let stage2_context=snapshot["stage2Context"].clone();
+        let mut stage2_context=snapshot["stage2Context"].clone();
         let version=snapshot["sourceVersion"].clone();
         let engine=self.clone();
         store.ensure_workflow_storage()?;
+        if pipeline::asset_design_contract::incremental_comparisons(&stage2_context)? {
+            stage2_context[pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS] =
+                pipeline::asset_design_contract::frozen_comparison_requests(&store,&job)?;
+        }
         Self::spawn_owned(lease,move||{
             let runtime=tokio::runtime::Runtime::new().map_err(|e|e.to_string())?;
             let result:Result<Value>=runtime.block_on(async{
@@ -3430,6 +3438,9 @@ impl Engine {
                         let policy=r["imageProductionPolicy"].as_str().filter(|p|["automatic","trialReview"].contains(p)).unwrap_or_else(||pipeline::image_production_policy(&settings));
                         let active_image_ids:Vec<_>=store.job_summaries()?.iter().filter(|j|s(j,"kind")=="image"&&is_active_generation(s(j,"status"))).map(|j|j["entityId"].clone()).collect();
                         let mut input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
+                        for key in [pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD,pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS] {
+                            if let Some(value)=stage2_context.get(key) { input[key]=value.clone(); }
+                        }
                         for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD] {
                             if let Some(value) = stage2_context.get(key) { input[key] = value.clone(); }
                         }

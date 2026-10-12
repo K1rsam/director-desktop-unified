@@ -4,6 +4,75 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
 
 pub const DESIGN_PROFILE: &str = "asset-design-context/v2";
+pub const COMPARISON_PROFILE_FIELD: &str = "stage2ComparisonProfile";
+pub const COMPARISON_PROFILE: &str = "asset-accepted-comparisons/v1";
+pub(crate) const FROZEN_COMPARISON_REQUESTS: &str = "frozenAssetComparisonRequests";
+
+pub(crate) fn incremental_comparisons(input: &Value) -> Result<bool, String> {
+    match input.get(COMPARISON_PROFILE_FIELD).filter(|v| !v.is_null()) {
+        None => Ok(false),
+        Some(value) if value == COMPARISON_PROFILE => Ok(true),
+        _ => Err("未知人物设计对照策略，保留原请求且不派发".into()),
+    }
+}
+
+/// Read only requests bound to this workflow (or its explicitly bound image
+/// resume ancestors). The executor remains authoritative for replay/acceptance.
+pub(crate) fn frozen_comparison_requests(store: &crate::store::Store, workflow: &str) -> Result<Value, String> {
+    let mut result = serde_json::Map::new();
+    let mut cursor = workflow.to_owned();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(cursor.clone()) { return Err("图片续跑来源循环".into()); }
+        let parent = store.job(&cursor)?;
+        if parent["kind"] != "workflow" || !incremental_comparisons(&parent["snapshot"]["stage2Context"])? {
+            return Err("人物对照恢复缺少原工作流策略".into());
+        }
+        let connection = store.conn()?;
+        let mut query = connection.prepare("SELECT w.node_key,w.request_hash,j.snapshot,j.kind FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.stage='assetDesign' ORDER BY w.rowid").map_err(|e|e.to_string())?;
+        let rows = query.query_map([&cursor], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?))).map_err(|e|e.to_string())?;
+        for row in rows {
+            let (node, hash, raw, kind) = row.map_err(|e|e.to_string())?;
+            let raw = raw.ok_or("人物对照恢复缺少绑定请求")?;
+            let saved: Value = serde_json::from_str(&raw).map_err(|e|e.to_string())?;
+            let asset = &saved["input"]["asset"];
+            let expected_node = format!("assetDesign:asset:{}",digest(&json!({"id":asset["id"],"variantId":asset["variantId"]}).to_string()));
+            if kind.as_deref() != Some("text") || raw != saved.to_string() || hash != digest(&raw) || node != expected_node
+                || saved["stage"] != "assetDesign" || saved["skill"] != "asset-art-director"
+                || saved["input"]["sourceSha256"] != parent["snapshot"]["stage2Context"]["source"]["sha256"]
+                || !incremental_comparisons(&saved["input"])? || !saved["input"]["comparisonDesigns"].is_array()
+                || s(asset,"id").is_empty()
+            { return Err("人物对照恢复的请求绑定或摘要不匹配".into()); }
+            let key = s(asset,"id").to_owned();
+            if let Some(previous) = result.get(&key) {
+                // Native execution identity may differ across an image resume;
+                // the immutable domain input/schema/rules must still agree.
+                if comparison_domain_input(&previous["input"]) != comparison_domain_input(&saved["input"]) {
+                    return Err("同一人物存在冲突的已派发设计请求".into());
+                }
+                for field in ["stage","skill","model","reasoning","schema","ruleSnapshot"] {
+                    if previous[field] != saved[field] { return Err("同一人物存在冲突的已派发设计请求".into()); }
+                }
+            } else { result.insert(key,saved); }
+        }
+        let origin = &parent["snapshot"]["request"]["imageResumeOrigin"];
+        let Some(previous) = origin["workflowId"].as_str() else { break; };
+        let original = store.job(previous)?;
+        if origin["snapshotSha256"] != digest(&original["snapshot"].to_string()) {
+            return Err("图片续跑来源快照变化，不能重建人物对照".into());
+        }
+        cursor = previous.to_owned();
+    }
+    Ok(Value::Object(result))
+}
+
+/// Transport retry proofs are revalidated/restored by TextExecutor immediately
+/// before dispatch. Compare the creative domain without rewriting saved bytes.
+pub(crate) fn comparison_domain_input(input: &Value) -> Value {
+    let mut input=input.clone();
+    if let Some(object)=input.as_object_mut() { object.remove("textTransportRetry"); }
+    input
+}
 pub(crate) use super::assets::{freeze_inline_delta_profile, INLINE_DELTA_PROFILE_FIELD};
 pub const IDENTITY_MATERIAL_PROFILE: &str = "asset-identity-production-material/v1";
 pub const IDENTITY_MATERIAL_PROFILE_FIELD: &str = "stage2IdentityMaterialProfile";
@@ -632,6 +701,32 @@ pub fn comparison_designs(input: &Value, asset: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_comparison_bound_request_recovery_is_read_only_and_rejects_drift() {
+        let temp=tempfile::tempdir().unwrap();
+        let store=crate::store::Store::open(temp.path().join("project")).unwrap();
+        store.ensure_workflow_storage().unwrap();
+        let mut context=json!({"source":{"sha256":"source-sha"}});
+        context[COMPARISON_PROFILE_FIELD]=json!(COMPARISON_PROFILE);
+        let parent=store.add_job("workflow","images.design","local","local",&json!({"stage":"images.design","stage2Context":context}),"running").unwrap();
+        let mut input=json!({"sourceSha256":"source-sha","asset":{"id":"a","variantId":"base"},"comparisonDesigns":[]});
+        input[COMPARISON_PROFILE_FIELD]=json!(COMPARISON_PROFILE);
+        let saved=json!({"stage":"assetDesign","skill":"asset-art-director","input":input,"model":"offline","reasoning":"medium","schema":{},"ruleSnapshot":{}});
+        let job=store.add_job("text","design","codex","offline",&saved,"received").unwrap();
+        let node=format!("assetDesign:asset:{}",digest(&json!({"id":"a","variantId":"base"}).to_string()));
+        store.checkpoint(&parent,&node,"assetDesign",&digest(&saved.to_string()),"received",Some(&job),None,None).unwrap();
+        let before=store.job(&job).unwrap();
+        assert_eq!(frozen_comparison_requests(&store,&parent).unwrap()["a"],saved);
+        assert_eq!(store.job(&job).unwrap(),before);
+        let origin=store.job(&parent).unwrap();
+        let resume=store.add_job("workflow","images.produce","local","local",&json!({"stage":"images.produce","stage2Context":context,"request":{"imageResumeOrigin":{"workflowId":parent,"snapshotSha256":digest(&origin["snapshot"].to_string())}}}),"queued").unwrap();
+        assert_eq!(frozen_comparison_requests(&store,&resume).unwrap()["a"],saved);
+        store.conn().unwrap().execute("UPDATE workflow_steps SET request_hash='changed' WHERE workflow_id=?1",[&parent]).unwrap();
+        assert!(frozen_comparison_requests(&store,&resume).unwrap_err().contains("摘要不匹配"));
+        assert_eq!(store.job(&job).unwrap(),before);
+        assert!(!incremental_comparisons(&json!({})).unwrap());
+        assert!(incremental_comparisons(&json!({COMPARISON_PROFILE_FIELD:"unknown"})).is_err());
+    }
     fn basis() -> Value {
         json!({"source":{"sha256":"locked"},"foundation":{"facts":[]},"settings":{"projectVisualStyle":"水墨国漫","ratio":"9:16"},"assets":[{"id":"a","identityId":"a","variantId":"base","kind":"CH","prompt":"成熟深肤色人物","promptOrigin":"MANUAL"}]})
     }
