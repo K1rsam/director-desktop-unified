@@ -1286,14 +1286,22 @@ impl Store {
         // Queued/ready with no receipt is waiting work, never a channel owner.
         // Completion means original bytes have reached the project, not merely
         // that the website reported succeeded. Legacy failed IDs also stay held.
-        connection.query_row(r#"
-            SELECT id FROM jobs WHERE kind='image' AND provider='chrome' AND id<>?1 AND (
+        let mut query=connection.prepare(r#"
+            SELECT id,state,task_id,snapshot,prepared,result FROM jobs WHERE kind='image' AND provider='chrome' AND id<>?1 AND (
                 state IN ('preparing','submitting','submitted','processing','succeeded',
                     'query_failed','download_failed','downloading','submission_unknown')
                 OR (state IN ('auth_required','failed','recovery_paused','queued','ready')
                     AND (COALESCE(task_id,'')<>'' OR COALESCE(receipt,'') NOT IN ('','null','{}')))
-            ) ORDER BY created_at,rowid LIMIT 1
-        "#, [except_job], |row| row.get(0)).optional().map_err(|e| e.to_string())
+            ) ORDER BY created_at,rowid
+        "#).map_err(|e|e.to_string())?;
+        let rows=query.query_map([except_job],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?))).map_err(|e|e.to_string())?;
+        for row in rows{
+            let (id,state,task,snapshot,prepared,result)=row.map_err(|e|e.to_string())?;
+            let parse=|v:Option<String>|v.and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+            let candidate=json!({"kind":"image","provider":"chrome","status":state,"providerTaskId":task,"snapshot":parse(Some(snapshot)),"prepared":parse(prepared),"result":parse(result)});
+            if !crate::chrome_terminal::settled_job(&candidate){return Ok(Some(id));}
+        }
+        Ok(None)
     }
 
     /// Waiting for another browser owner is not a state transition. Preserve FIFO

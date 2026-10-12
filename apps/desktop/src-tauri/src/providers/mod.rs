@@ -421,6 +421,11 @@ pub fn query_prepared(
         query(config, task_id)
     }
 }
+pub(crate) fn chrome_locator_valid(config:&ProviderConfig,p:&PreparedRequest,loc:&Value)->bool{chrome::conversation::locator_valid(config,p,loc)}
+pub fn query_saved(config:&ProviderConfig,p:&PreparedRequest,id:&str,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<QueryResult>{
+    valid_id(id)?;
+    if config.kind=="chrome"{chrome::query_with_saved(config,id,p,saved,observe)}else{query_prepared(config,p,id)}
+}
 pub fn reconcile_unknown(config: &ProviderConfig, request_id: &str) -> ProviderResult<QueryResult> {
     // Chrome uses a caller-controlled request ID, so GET is safe even after an uncertain POST.
     if config.kind == "chrome" {

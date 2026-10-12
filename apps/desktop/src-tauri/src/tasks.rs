@@ -21,6 +21,8 @@ pub(crate) use chrome_prepare_recovery::{chrome_prepare_recovery_eligible,resume
 #[path="tasks_chrome_prepared_refresh.rs"]
 mod chrome_prepared_refresh;
 pub(crate) use chrome_prepared_refresh::{prepared_runtime_refresh_eligible,refresh_prepared_runtime};
+#[path="tasks_chrome_conversation.rs"]
+mod chrome_conversation;
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
@@ -58,6 +60,7 @@ pub trait Channels: Send + Sync {
         url: &str,
         path: &Path,
     ) -> ProviderResult<DownloadReceipt>;
+    fn query_saved(&self,c:&ProviderConfig,p:&PreparedRequest,id:&str,_saved:&Value,_observe:&providers::PrepareObserver<'_>)->ProviderResult<QueryResult>{self.query_prepared(c,p,id)}
     fn reconcile(&self, c: &ProviderConfig, id: &str) -> ProviderResult<QueryResult>;
     /// Called only after local media import/link/adoption commits. Cleanup never submits.
     fn release_completed_tab(&self, _c: &ProviderConfig, _p: &PreparedRequest, _result: &QueryResult) -> ProviderResult<Value> {
@@ -66,6 +69,7 @@ pub trait Channels: Send + Sync {
 }
 pub struct RealChannels;
 impl Channels for RealChannels {
+    fn query_saved(&self,c:&ProviderConfig,p:&PreparedRequest,id:&str,saved:&Value,observe:&providers::PrepareObserver<'_>)->ProviderResult<QueryResult>{providers::query_saved(c,p,id,saved,observe)}
     fn refresh_unsubmitted_prepared(&self,c:&ProviderConfig,p:&PreparedRequest)->ProviderResult<PreparedRequest>{providers::refresh_chrome_unsubmitted_prepared(c,p)}
     fn prepare_observed(&self,c:&ProviderConfig,r:&GenerationRequest,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::prepare_observed(c,r,observer)}
     fn recover_prepare(&self,c:&ProviderConfig,r:&GenerationRequest,proof:&Value,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::recover_chrome_prepare(c,r,proof,observer)}
@@ -495,7 +499,10 @@ pub fn resume_job(
         return Err("同步图片任务没有云端查询ID；已有下载地址可重试，过期后需明确重新生成".into());
     }
     let queried = if let Some(p) = &prepared {
-        channels.query_prepared(cfg, p, task)
+        if cfg.kind=="chrome"{
+            let saved=chrome_conversation::saved(store,key)?;
+            channels.query_saved(cfg,p,task,&saved,&chrome_conversation::observer(store,key,p,cfg))
+        }else{channels.query_prepared(cfg, p, task)}
     } else {
         channels.query_for_kind(cfg, task, s(&j, "kind"))
     };

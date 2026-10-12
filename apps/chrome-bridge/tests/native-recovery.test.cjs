@@ -26,18 +26,19 @@ function record() {
 }
 
 async function fixture(options = {}) {
+  const fixturePrompt=options.markerless?'请生成一张原图。':prompt;
   let active = options.active || null;
   let launch = options.launch === undefined ? `director-desktop-${requestId}` : options.launch;
   const calls = [], observed = [], messages = [];
   const image = { isConnected: true, src: options.blob ? 'blob:https://chatgpt.com/synthetic' : '', currentSrc: '', naturalWidth: 0, naturalHeight: 0, closest: () => ({}), getAttribute: () => '' };
-  const user = { isConnected: true, innerText: options.domPrompt || prompt, querySelectorAll: () => [] };
+  const user = { isConnected: true, innerText: options.domPrompt || fixturePrompt, querySelectorAll: () => [] };
   if(options.presentationControls){
     user.innerText=prompt+'\n显示更多';user.matches=selector=>selector==='.bg-user-message';
     const body={isConnected:true,textContent:options.bodyPrompt||prompt,querySelector:()=>null};
     user.querySelectorAll=selector=>selector==='div.whitespace-pre-wrap'?(options.multiplePromptBodies?[body,{...body}]:[body]):[];
     if(options.changeBodyDuringDownload)options.onBody=()=>{body.textContent='changed source text';};
   }
-  const assistant = { isConnected: true, innerText: '', querySelectorAll: () => [image] };
+  const assistant = { isConnected: true, innerText: options.reply||'', querySelectorAll: () => options.noImage?[]:[image] };
   const turns = [user, ...(options.noAssistant ? [] : [assistant]), ...(options.extraUser ? [user] : []), ...(options.extraAssistant ? [assistant] : [])];
   let reads = 0;
   const context = vm.createContext({ URL, AbortController, TextEncoder, TextDecoder, Uint8Array, Response, crypto: webcrypto, setTimeout, clearTimeout,
@@ -48,8 +49,12 @@ async function fixture(options = {}) {
       assert.equal(init.method || 'GET', 'GET', 'recovery cannot submit prompts or create jobs');
       if (url.endsWith(`/backend-api/conversation/${conversationId}`)) {
         const value = record();
+        value.mapping['user-node'].message.content.parts=[fixturePrompt];
+        if(options.noImage)value.mapping['assistant-node'].message.content={content_type:'text',parts:[options.reply||'未能生成图片。']};
         if(options.noAssistant){value.current_node='user-node';delete value.mapping['assistant-node'];}
         reads++;
+        if(reads===2&&options.replyAfterRecheck){options.reply=options.replyAfterRecheck;assistant.innerText=options.reply;}
+        if(reads===2&&options.oversizedRecheck)return new Response(new Uint8Array(4*1024*1024+1));
         if (options.backendPrompt) value.mapping['user-node'].message.content.parts = [options.backendPrompt];
         if (options.status) value.mapping['assistant-node'].message.status = options.status;
         options.recordTransform?.(value);
@@ -73,15 +78,56 @@ async function fixture(options = {}) {
   const proof = context.ChatGptImageRecordProof;
   const snapshot = () => {
     observed.push({ turnKey: proof.key(assistant), source: proof.imageSource(image) });
-    const value={ answer: '', artifacts: proof.imageSource(image) && (!options.hidden || proof.imageReady(image)) ? [{ id: options.artifactIdsFollowTurnKey ? (proof.key(assistant)?'canonical-artifact':'observed-artifact') : 'original-artifact', kind: 'image', generatedImage: true, downloadable:true, mime:'image/png',size:png.length, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', userTurnKey:proof.key(user), messageId: proof.key(assistant), hasFinalMessage: true };
+    const value={ answer: options.noImage?(options.reply||'未能生成图片。'):'', artifacts: proof.imageSource(image) && (!options.hidden || proof.imageReady(image)) ? [{ id: options.artifactIdsFollowTurnKey ? (proof.key(assistant)?'canonical-artifact':'observed-artifact') : 'original-artifact', kind: 'image', generatedImage: true, downloadable:true, mime:'image/png',size:png.length, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', userTurnKey:proof.key(user), messageId: proof.key(assistant), hasFinalMessage: true };
     options.snapshotTransform?.(value,{nativeBound:!!proof.key(assistant),user,image});
     return value;
   };
-  const expected = { mode: 'image_record_v1', requestId, conversationId, promptSha256: await proof.digest(prompt), imageCount: 1, allowReleasedRequest: options.allowReleasedRequest !== false, allowReloadedOriginalTab: options.allowReloadedOriginalTab === true };
+  const expected = { mode: 'image_record_v1', requestId, conversationId, promptSha256: await proof.digest(fixturePrompt), imageCount: 1, allowReleasedRequest: options.allowReleasedRequest !== false, allowReloadedOriginalTab: options.allowReloadedOriginalTab === true };
+  if(options.readOnlyRecoveryLaunch)expected.readOnlyRecoveryLaunch=options.readOnlyRecoveryLaunch;
+  if(options.savedConversation)expected.savedConversation={version:'chrome-conversation-locator/v1',requestId,conversationId,promptSha256:expected.promptSha256,userMessageId:userId,...options.savedConversation};
   const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => 'content-epoch', readLatestAssistantSnapshot: snapshot, onBound: () => options.onBound?.({user,assistant,image}) };
   return { context, proof, expected, deps, snapshot, calls, observed, messages, user, assistant, image, get reads() { return reads; } };
 }
 
+test('verified final text without an image is a stable terminal receipt, never an image result',async()=>{
+  const f=await fixture({noImage:true,reply:'由于我这边发生了错误，我未能生成图片。'});
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'matched_no_image');assert.equal(p.backendImageCount,0);assert.equal(p.userMessageId,userId);assert.equal(p.assistantMessageId,assistantId);
+  assert.equal(p.recordSha256,p.recordRecheckSha256);assert.equal(f.reads,2);assert.equal(p.bindings.length,0);
+  assert.ok(f.calls.every(c=>c.init.method==='GET'));assert.ok(!f.calls.some(c=>c.url.includes('/files/download/')));
+});
+test('no-image settlement rejects a changed branch, streaming, text mismatch, extra turns, or diagnostic-only read',async()=>{
+  for(const options of [{changedBranch:true},{replyAfterRecheck:'late changed answer'},{snapshotTransform:s=>{s.streamingVisible=true}},{snapshotTransform:s=>{s.answer='different'}},{extraUser:true},{extraAssistant:true}]){
+    const f=await fixture({noImage:true,...options});const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.notEqual(p.status,'matched_no_image');
+  }
+  const f=await fixture({noImage:true});f.expected.mode='image_record_probe';assert.notEqual((await f.proof.read(f.expected,f.snapshot(),f.deps)).status,'matched_no_image');
+});
+test('saved exact conversation and native user identity recover a marker-free image after release',async()=>{
+  const f=await fixture({markerless:true,savedConversation:{},artifactIdsFollowTurnKey:true});const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'matched_complete');assert.equal(p.userMessageId,userId);assert.equal(f.reads,2);
+  for(const savedConversation of [{userMessageId:'other'},{requestId:'other'},{conversationId:'other'},{promptSha256:'a'.repeat(64)}]){
+    const bad=await fixture({markerless:true,savedConversation});assert.notEqual((await bad.proof.read(bad.expected,bad.snapshot(),bad.deps)).status,'matched_complete');
+  }
+  const missing=await fixture({markerless:true});assert.equal((await missing.proof.read(missing.expected,missing.snapshot(),missing.deps)).reason,'released_task_marker');
+});
+test('pending native user binding is retained while the image is still rendering',async()=>{
+  const f=await fixture({snapshotTransform:s=>{s.streamingVisible=true}});const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'matched_incomplete');assert.equal(p.userMessageId,userId);assert.equal(p.backendPromptVerified,true);assert.equal(f.reads,1);
+});
+test('saved marker-free conversation is readable in a separate recovery alias without replacing original request identity',async()=>{
+  const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+  const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias});
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.equal(p.status,'matched_complete');assert.equal(p.requestId,requestId);
+  assert.ok(f.calls.every(c=>c.init.method==='GET'));
+  for(const options of [{launch:alias,readOnlyRecoveryLaunch:'bridge-director-desktop-33333333-3333-4333-8333-333333333333'},
+    {launch:alias},{launch:'user-page',readOnlyRecoveryLaunch:'user-page'},{launch:alias,readOnlyRecoveryLaunch:alias,savedConversation:{requestId:'other'}}]){
+    const bad=await fixture({markerless:true,savedConversation:{},...options});assert.equal((await bad.proof.read(bad.expected,bad.snapshot(),bad.deps)).reason,'active_request_identity');assert.equal(bad.calls.length,0);
+  }
+});
+test('no-image second record read is bounded before parsing or settling',async()=>{
+  const f=await fixture({noImage:true,oversizedRecheck:true});const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'unavailable');assert.equal(p.reason,'record_limit');assert.equal(f.reads,2);
+});
 test('released task downloads its native original bytes only after exact branch recheck and binds canonical identities', async () => {
   for (const prefix of ['director-desktop-', 'bridge-director-desktop-']) {
     const f = await fixture({ launch: prefix + requestId });

@@ -138,18 +138,20 @@
     const fail = reason => result(expected,'mismatch',reason);
     if(!/^[a-f0-9]{64}$/.test(expected.promptSha256||'')||!Number.isInteger(expected.imageCount)||expected.imageCount<1||expected.imageCount>4)return fail('invalid_expectation');
     if(facts.userCount!==1||![0,1].includes(facts.assistantCount)||await digest(facts.userText)!==expected.promptSha256)return fail('dom_user_boundary');
-    if(snapshot.stopVisible||snapshot.streamingVisible||snapshot.hasError||snapshot.needsContinue||snapshot.needsConfirmation)return result(expected,'matched_incomplete','dom_generation_not_complete');
     const branch=branchOf(record,expected.conversationId);if(!branch)return result(expected,'unavailable','unsupported_branch');
     const users=branch.filter(n=>n.message?.author?.role==='user');if(users.length!==1)return fail('backend_user_boundary');
     const user=users[0].message,parts=user.content?.parts;if(typeof user.id!=='string'||!user.id)return fail('native_user_identity');
     if(!Array.isArray(parts))return result(expected,'unavailable','unsupported_user_content');
     const textParts=parts.filter(p=>typeof p==='string');if(!textParts.length||await digest(textParts.join('\n'))!==expected.promptSha256)return fail('backend_prompt');
+    const locator={userMessageId:user.id,backendPromptVerified:true};
+    if(expected.savedConversation?.userMessageId && expected.savedConversation.userMessageId!==user.id)return fail('saved_user_identity');
+    if(snapshot.stopVisible||snapshot.streamingVisible||snapshot.hasError||snapshot.needsContinue||snapshot.needsConfirmation)return result(expected,'matched_incomplete','dom_generation_not_complete',locator);
     // A fresh, submitted conversation can have its exact user turn before the
     // assistant node exists. It cannot yield image adoption or byte bindings.
-    if(facts.assistantCount===0)return result(expected,'matched_incomplete','assistant_not_created');
+    if(facts.assistantCount===0)return result(expected,'matched_incomplete','assistant_not_created',locator);
     const userIndex=branch.indexOf(users[0]);const outputs=branch.slice(0,userIndex);const assistant=outputs.find(n=>n.message?.author?.role==='assistant')?.message;
     const schemaFacts=outputs.map(n=>({role:n.message?.author?.role,contentType:n.message?.content?.content_type,status:n.message?.status,endTurn:n.message?.end_turn}));
-    if(!assistant?.id||assistant.status!=='finished_successfully'||assistant.end_turn!==true||(assistant.recipient&&assistant.recipient!=='all')||(assistant.channel&&assistant.channel!=='final'))return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts});
+    if(!assistant?.id||assistant.status!=='finished_successfully'||assistant.end_turn!==true||(assistant.recipient&&assistant.recipient!=='all')||(assistant.channel&&assistant.channel!=='final'))return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts,...locator});
     if(outputs[0]?.message?.id!==assistant.id)return result(expected,'matched_incomplete','backend_current_node_not_final',{schemaFacts});
     // Intermediate render attempts are history, not additional delivered images.
     // Select only the newest image-bearing output, then corroborate its exact
@@ -157,6 +159,12 @@
     // Never fall back to an older match or select a subset of a multi-image output.
     const imageOutputs=outputs.filter(n=>['assistant','tool'].includes(n.message?.author?.role)).map(n=>({node:n,pointers:imagePointers(n.message.content)})).filter(o=>o.pointers.size);
     const delivery=imageOutputs[0];const pointers=delivery?.pointers || new Set();
+    if(!delivery && outputs.length===1 && assistant.content?.content_type==='text'
+      && Array.isArray(assistant.content.parts) && assistant.content.parts.length>0 && assistant.content.parts.every(p=>typeof p==='string')
+      && typeof snapshot.answer==='string' && await digest(snapshot.answer)===await digest(assistant.content.parts.join('\n'))){
+      return result(expected,'no_image_candidate','final_text_without_image',{...locator,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:true,currentNode:record.current_node,backendImageCount:0,
+        assistantTextSha256:await digest(snapshot.answer),branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id||'',role:n.message?.author?.role||'',status:n.message?.status||'',endTurn:n.message?.end_turn}))});
+    }
     if(delivery && delivery.node.message.status!=='finished_successfully')return result(expected,'matched_incomplete','backend_image_not_complete',{schemaFacts});
     if(pointers.size!==expected.imageCount)return result(expected,'mismatch','backend_image_identity',{schemaFacts,backendImageCount:pointers.size});
     return {userMessageId:user.id,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:assistant.end_turn,pointers:[...pointers],schemaFacts,currentNode:record.current_node,deliveryNode:delivery?.node.nodeKey,deliveryMessageId:delivery?.node.message.id,branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id || '',role:n.message?.author?.role || '',status:n.message?.status || '',endTurn:n.message?.end_turn}))};
@@ -172,7 +180,15 @@
   function preflight(){const dom=globalThis.ChatGptTurnDom.createTurnDom();const empty=location.pathname==='/'&&dom.getTurnNodes().length===0;return {source:'browser-empty-preflight',version:1,proofVersion:2,status:empty?'matched_empty':'mismatch',reason:empty?'new_empty_chat':'chat_not_empty',checkedAt:Date.now()};}
   async function read(expected,snapshot,deps={}) {
     const unavailable=reason=>result(expected,'unavailable',reason);
+    async function boundedRecord(response){
+      const reader=response.body.getReader(),chunks=[];let size=0;
+      try {while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>4*1024*1024){await reader.cancel();return null;}chunks.push(value);}}finally{reader.releaseLock();}
+      const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}return bytes;
+    }
     const uuid=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+    const saved=expected.savedConversation;
+    const savedIdentity=saved?.version==='chrome-conversation-locator/v1'&&saved.requestId===expected.requestId&&saved.conversationId===expected.conversationId&&saved.promptSha256===expected.promptSha256;
+    const readOnlyLaunch=String(expected.readOnlyRecoveryLaunch||'');
     // A released task may only read its original single-user branch in its own launch tab.
     // No prompt submission, lease creation, or active-request replacement is permitted.
     // Desktop opts in only after matching the immutable prepared/turn sourceClientId.
@@ -180,7 +196,8 @@
     // task marker, original native branch and bytes checked below.
     const releasedMatches=()=>expected.allowReleasedRequest===true && !deps.getActiveRequest?.() && uuid.test(expected.requestId||'') && (
       ['director-desktop-','bridge-director-desktop-'].some(prefix=>deps.getBrowserLaunchToken?.()===prefix+expected.requestId) ||
-      expected.allowReloadedOriginalTab===true && (!deps.getBrowserLaunchToken?.() || String(deps.getBrowserLaunchToken?.()).startsWith('bridge-reload-')));
+      expected.allowReloadedOriginalTab===true && (!deps.getBrowserLaunchToken?.() || String(deps.getBrowserLaunchToken?.()).startsWith('bridge-reload-')) ||
+      savedIdentity && /^bridge-director-desktop-[a-f0-9-]{36}$/.test(readOnlyLaunch) && deps.getBrowserLaunchToken?.()===readOnlyLaunch);
     const requestMatches=()=>deps.getActiveRequest?.()?.requestId===expected.requestId || releasedMatches();
     if(expected.mode!=='image_record_probe'&&(!expected.requestId||!requestMatches()))return unavailable('active_request_identity');
     const page=new URL(location.href);if(page.origin!=='https://chatgpt.com'||page.pathname!==`/c/${expected.conversationId}`)return unavailable('page_conversation_changed');
@@ -193,23 +210,40 @@
       const facts={userCount:users.length,assistantCount:assistants.length,userText:userPromptText(users[0]),assistantText:normalize(assistants[0]?.innerText||assistants[0]?.textContent)};
       const pendingAssistant=facts.assistantCount===0 && deps.getActiveRequest?.()?.requestId===expected.requestId;
       if(facts.userCount!==1||!(facts.assistantCount===1||pendingAssistant)||await digest(facts.userText)!==expected.promptSha256)return result(expected,'mismatch','dom_user_boundary',{domFacts:{userCount:facts.userCount,assistantCount:facts.assistantCount,promptMatches:await digest(facts.userText)===expected.promptSha256}});
-      if(expected.mode!=='image_record_probe' && !deps.getActiveRequest?.() && !normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。'))return unavailable('released_task_marker');
+      const savedBound=saved?.version==='chrome-conversation-locator/v1' && saved.requestId===expected.requestId && saved.conversationId===expected.conversationId
+        && saved.promptSha256===expected.promptSha256 && typeof saved.userMessageId==='string' && saved.userMessageId.length>0;
+      if(expected.mode!=='image_record_probe' && !deps.getActiveRequest?.() && !savedBound && !normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。'))return unavailable('released_task_marker');
       const endpoint=`${page.origin}/backend-api/conversation/${encodeURIComponent(expected.conversationId)}`;let response=await fetch(endpoint,options);
       if([401,403,404].includes(response.status)){const session=await fetch(`${page.origin}/api/auth/session`,options);if(!session.ok)return unavailable('authentication_unavailable');const token=(await session.json())?.accessToken;if(typeof token!=='string'||!token)return unavailable('authentication_unavailable');authHeaders={Authorization:`Bearer ${token}`};response=await fetch(endpoint,{...options,headers:authHeaders});}
       if(!response.ok)return unavailable(`http_${response.status}`);
-      const reader=response.body.getReader(),chunks=[];let size=0;try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>4*1024*1024){await reader.cancel();return unavailable('record_limit');}chunks.push(value);}}finally{reader.releaseLock();}
-      const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}const record=JSON.parse(new TextDecoder().decode(bytes));
+      const bytes=await boundedRecord(response);if(!bytes)return unavailable('record_limit');const record=JSON.parse(new TextDecoder().decode(bytes));
       const byteDigest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(v=>v.toString(16).padStart(2,'0')).join('');
       const recordSha256=await byteDigest(bytes);
       if(location.href!==page.href)return unavailable('page_conversation_changed');
       const boundary=await nativeBoundary(record,expected,snapshot,facts);
+      if(boundary.status==='no_image_candidate'){
+        if(expected.mode!=='image_record_v1'||(snapshot.artifacts||[]).length||assistants[0].querySelectorAll('img').length)return unavailable('no_image_dom_ambiguous');
+        const reread=await fetch(endpoint,{...options,...(authHeaders?{headers:authHeaders}:{})});if(!reread.ok)return unavailable('record_recheck_http');
+        const again=await boundedRecord(reread);if(!again)return unavailable('record_limit');
+        const finalSnapshot=deps.readLatestAssistantSnapshot?.()||snapshot;
+        if((finalSnapshot.artifacts||[]).length||assistants[0].querySelectorAll('img').length)return unavailable('no_image_branch_changed');
+        const reBoundary=await nativeBoundary(JSON.parse(new TextDecoder().decode(again)),expected,finalSnapshot,facts);
+        if(JSON.stringify(reBoundary)!==JSON.stringify(boundary)||!sameIdentity()||location.href!==page.href
+          ||await digest(userPromptText(users[0]))!==expected.promptSha256||dom.getTurnNodes().some((n,i)=>n!==turns[i])||dom.getTurnNodes().length!==turns.length)return unavailable('no_image_branch_changed');
+        nativeKeys.set(users[0],{id:boundary.userMessageId,url:page.href,fingerprint:domFingerprint(users[0])});
+        nativeKeys.set(assistants[0],{id:boundary.assistantMessageId,url:page.href,fingerprint:domFingerprint(assistants[0])});deps.onBound?.();
+        return {...boundary,status:'matched_no_image',bindings:[],recordSha256,recordRecheckSha256:await byteDigest(again),checkedAt:Date.now()};
+      }
+      if(boundary.status)return {...boundary,recordSha256,checkedAt:Date.now()};
       if(!boundary.status){
         const generatedImages=[...assistants[0].querySelectorAll('img')].filter(img=>img.closest?.('[data-testid="generated-image-gallery"]'));
         if(boundary.pointers.length===1&&generatedImages.length===1&&expected.imageCount===1){
           const image=generatedImages[0],raw=rawImageSource(image),nativeId=boundary.pointers[0];
           const isBlob=/^blob:https:\/\/chatgpt\.com\//.test(raw);
           const nativeOnly=expected.mode!=='image_record_probe' && !raw && Number(image.naturalWidth || 0)===0 && Number(image.naturalHeight || 0)===0;
-          const strongIdentity=uuid.test(expected.requestId) && normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。') && initialIdentity.contentEpoch && initialIdentity.responseEpoch===0 && (initialIdentity.requestId===expected.requestId && initialIdentity.leaseId && initialIdentity.ownerServerInstanceId || releasedMatches());
+          const strongIdentity=uuid.test(expected.requestId) && initialIdentity.contentEpoch && initialIdentity.responseEpoch===0
+            && (initialIdentity.requestId===expected.requestId && initialIdentity.leaseId && initialIdentity.ownerServerInstanceId
+              || releasedMatches() && (savedBound || normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。')));
           const directNative=expected.mode!=='image_record_probe' && fileId(raw)===nativeId && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(expected.requestId);
           if(nativeOnly&&!strongIdentity)return unavailable('native_source_identity');
           if(directNative&&!strongIdentity)return unavailable('native_source_identity');

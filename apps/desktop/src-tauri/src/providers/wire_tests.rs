@@ -19,6 +19,7 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let saved = requests.clone();
     let thread = thread::spawn(move || {
+        let mut recovery_alias=String::new();
         for mut reply in replies {
             // A changed request sequence must fail the fixture instead of
             // blocking thread.join forever waiting for an unused response.
@@ -66,7 +67,14 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
             let headers = String::from_utf8_lossy(&bytes[..header_end]);
             let line = headers.lines().next().unwrap().to_string();
             let body = String::from_utf8_lossy(&bytes[header_end..header_end + length]).to_string();
+            if line.starts_with("POST /browser/tabs/open "){
+                recovery_alias=serde_json::from_str::<Value>(&body).ok().and_then(|v|v["launchToken"].as_str().map(String::from)).unwrap_or_default();
+            }
             saved.lock().unwrap().push((line, body));
+            if reply["__echoRecoveryAlias"]==true{
+                reply.as_object_mut().unwrap().remove("__echoRecoveryAlias");
+                reply=serde_json::from_str(&reply.to_string().replace("__RECOVERY_ALIAS__",&recovery_alias)).unwrap();
+            }
             let status=reply.get("__httpStatus").and_then(Value::as_u64).unwrap_or(200);
             if let Some(object)=reply.as_object_mut() {object.remove("__httpStatus");}
             let body = if reply == json!("invalid-json") {

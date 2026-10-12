@@ -15,7 +15,7 @@
     {
       "path": "extension/content/conversationReconciliation.js",
       "beforeSha256": "f82342b48c333aa8d86e6296716543d85b0abaffeb561b0db02518d55083a892",
-      "afterSha256": "ce2a8cfec520c0014f7c5513c0b3f3e9f014ae3e732786d0929e9560d0809a6f",
+      "afterSha256": "680600eb568ebdddb929f1853aa4df363933e79f06fe18cefa5f56e171549791",
       "previousAfterSha256": "09810908e5f758eee8e0bc1db965649c166a6d6c07545bba6ded7889191165be",
       "previousAfterSha256s": [
         "340994c84a7dcdc8ea3485f13950d9f267dab797a46ef1b7cf6799df704d6695",
@@ -24,7 +24,8 @@
         "955567495694f0e73960328d5d7e7f6b8a872779197fbfb0dcd206adb7f20344",
         "16545bf49529ff9673fbe6ed1a1f10e799202a9109ee3ac6c8dacdad8e3ea012",
         "1d1fb489446368e4eb983106efb1a01c06286d453df043dcc3dbd3947986751b",
-        "627c9333fb97c90ffb633ebc6e264fcf627b0de1aafbeb2d1a933cc6ea92149b"
+        "627c9333fb97c90ffb633ebc6e264fcf627b0de1aafbeb2d1a933cc6ea92149b",
+        "ce2a8cfec520c0014f7c5513c0b3f3e9f014ae3e732786d0929e9560d0809a6f"
       ]
     },
     {

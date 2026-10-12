@@ -1,6 +1,7 @@
 pub mod binding;
 pub mod app_settings;
 pub mod chrome_setup;
+mod chrome_terminal;
 pub mod engine;
 pub mod executable_paths;
 pub mod importer;

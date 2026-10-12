@@ -3706,7 +3706,7 @@ fn is_active_generation(state: &str) -> bool {
 }
 fn retains_image_generation(job: &Value) -> bool {
     is_active_generation(s(job, "status")) || s(job, "provider") == "chrome"
-        && s(job, "status") == "failed" && !s(job, "providerTaskId").is_empty()
+        && s(job, "status") == "failed" && !s(job, "providerTaskId").is_empty() && !crate::chrome_terminal::settled_job(job)
 }
 fn require_account(store: &Store, provider: &str) -> Result<()> {
     if ["dreamina", "bh", "chrome"].contains(&provider)

@@ -3,7 +3,7 @@ use super::*;
 use super::super::wire_tests::fixture;
 const ID:&str="a4d27dca-a0c4-4a43-b6be-75528f9fd27f";
 const PROFILE:&str="b84d4521-56ba-4f84-9948-090f82d639e7";
-fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Vec<Value>){
+pub(super) fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Vec<Value>){
     let env=format!("DIRECTOR_REFRESH_FIXTURE_{}",uuid::Uuid::new_v4().simple());std::env::set_var(&env,"synthetic-only");
     let endpoint=endpoint.trim_end_matches("/v1");
     let cfg:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","endpoint":endpoint,"bridgeTokenEnv":env,"chromeBinding":{"profileId":PROFILE,"bundleId":"a".repeat(32),"endpoint":endpoint}})).unwrap();

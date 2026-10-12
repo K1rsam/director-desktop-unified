@@ -11,8 +11,13 @@ mod control_page_tests;
 #[cfg(test)]
 #[path = "chrome_prepared_refresh_tests.rs"]
 mod prepared_refresh_tests;
+#[cfg(test)]
+#[path="chrome_conversation_tests.rs"]
+mod conversation_tests;
 #[path="chrome_execution_proof.rs"]
 mod execution_proof;
+#[path="chrome_conversation.rs"]
+pub(super) mod conversation;
 
 fn json_request(
     config: &ProviderConfig,
@@ -135,7 +140,16 @@ pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &Prepared
     }
     let original_conversation = proof["conversationId"].as_str().filter(|s| !s.is_empty())
         .ok_or_else(|| ProviderError::new("TAB_CLEANUP_IDENTITY", "原会话证明缺失，保留页面。"))?;
-    let source = prepared.wire["sourceClientId"].as_str().filter(|s| !s.is_empty())
+    let recovery=&result.raw["readOnlyRecovery"];
+    let recovered=!recovery.is_null();
+    if recovered && (!conversation::locator_valid(config,prepared,&recovery["locator"])
+        || recovery["locator"]["conversationId"]!=original_conversation
+        || recovery["locator"]["userMessageId"]!=proof["userMessageId"]
+        || !s(&recovery["client"],"launchToken").strip_prefix("bridge-director-desktop-").is_some_and(|v|uuid::Uuid::parse_str(v).is_ok())
+        || recovery["client"]["launchToken"]==format!("bridge-director-desktop-{task}")) {
+        return Err(ProviderError::new("TAB_CLEANUP_IDENTITY","恢复工作页的原会话证明不完整，保留页面。"));
+    }
+    let source = if recovered {recovery["client"]["id"].as_str()}else{prepared.wire["sourceClientId"].as_str()}.filter(|s| !s.is_empty())
         .ok_or_else(|| ProviderError::new("TAB_CLEANUP_IDENTITY", "原工作页身份缺失，保留页面。"))?;
     let client = wire::client(12)?;
     let available = clients(config, &client)?;
@@ -143,7 +157,7 @@ pub(super) fn release_completed_tab(config: &ProviderConfig, prepared: &Prepared
     if matches.is_empty() { return Ok(json!({"status":"already_closed"})); }
     if matches.len() != 1 { return Err(ProviderError::new("TAB_CLEANUP_IDENTITY", "工作页身份不唯一，保留页面。")); }
     let owned = matches[0];
-    let launch = format!("bridge-director-desktop-{task}");
+    let launch = if recovered {s(&recovery["client"],"launchToken").to_owned()}else{format!("bridge-director-desktop-{task}")};
     if owned["launchToken"] != launch {
         return Ok(json!({"status":"retained","reason":"ownership_changed"}));
     }
@@ -455,7 +469,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
             upstream_read_confirmed: false,
         });
     }
-    let message=format!("{}\n\n画面比例：{}。请生成 1 张原图。\n任务关联码：{}。仅用于关联本次生成，请勿将编号或文字画入图片。",request.prompt,request.ratio,request.request_id);
+    let message=format!("{}\n\n画面比例：{}。请生成 1 张原图。",request.prompt,request.ratio);
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut frozen = request.clone();
     frozen.references = sorted_references(request);
@@ -464,7 +478,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
         request: frozen,
         capability_version: caps.version,
         upload_receipts: receipts,
-        wire: json!({"id":request.request_id,"message":message,"attachments":attachments,"newSession":false,"sourceClientId":source_id,"browserBinding":binding,"prepareRuntime":intent,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
+        wire: json!({"id":request.request_id,"message":message,"correlationVersion":"conversation/v1","attachments":attachments,"newSession":false,"sourceClientId":source_id,"browserBinding":binding,"prepareRuntime":intent,"metadata":{"jobId":request.request_id,"promptSha256":hex_hash(normalized.as_bytes())},"emptyPreflight":proof}),
         estimated_cost: None,
         prepared_at: now(),
     })
@@ -703,6 +717,7 @@ pub(super) fn submit(
         .remove("emptyPreflight");
     body.as_object_mut().unwrap().remove("prepareRuntime");
     body.as_object_mut().unwrap().remove("preparedRuntimeRefresh");
+    body.as_object_mut().unwrap().remove("correlationVersion");
     if shutting_down() {
         return Err(ProviderError::new(
             "CLIENT_CLOSING",
@@ -848,8 +863,18 @@ pub(super) fn query_with_prepared(
     id: &str,
     prepared: Option<&PreparedRequest>,
 ) -> ProviderResult<QueryResult> {
+    query_inner(config,id,prepared,&json!({}),&|_|Ok(()))
+}
+pub(super) fn query_with_saved(config:&ProviderConfig,id:&str,p:&PreparedRequest,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<QueryResult>{
+    query_inner(config,id,Some(p),saved,observe)
+}
+fn query_inner(config:&ProviderConfig,id:&str,prepared:Option<&PreparedRequest>,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<QueryResult>{
     let client = wire::client(45)?;
-    let raw = json_request(config, &client, &format!("/turns/{id}"), None, false)?;
+    let raw = match json_request(config, &client, &format!("/turns/{id}"), None, false){
+        Ok(raw)=>raw,
+        Err(e) if e.context.as_ref().is_some_and(|c|c["httpStatus"]==404)&&prepared.is_some_and(|p|conversation::locator_valid(config,p,&saved["locator"]))=>json!({"ok":true,"turn":{"id":id,"status":"original_record_unavailable"},"originalTurn404":true}),
+        Err(e)=>return Err(e)
+    };
     let turn = &raw["turn"];
     if raw["ok"] != true || turn["id"] != id {
         return Err(ProviderError::new(
@@ -862,11 +887,23 @@ pub(super) fn query_with_prepared(
     // Read the original native branch even before the legacy bridge reports completed.
     let original_source = prepared.and_then(|p| p.wire["sourceClientId"].as_str())
         .or_else(|| turn["input"]["sourceClientId"].as_str());
-    let source = original_client_for(config, &client, id, true, original_source)?;
+    let original_client=original_client_for(config, &client, id, true, original_source);
+    let mut saved_state=saved.clone();
+    if saved_state["locator"].is_null(){if let (Some(p),Ok(source))=(prepared,&original_client){
+        if p.wire["correlationVersion"]!="conversation/v1"&&source["url"].as_str().is_some_and(|u|u.starts_with("https://chatgpt.com/c/")){
+            let locator=conversation::legacy_seed(config,p,source,observe)?;if !locator.is_null(){saved_state["locator"]=locator;}
+        }
+    }}
+    let saved=&saved_state;
+    let (source,restored)=match original_client{
+        Ok(source) if !(source["focused"]==true&&prepared.is_some_and(|p|p.wire["correlationVersion"]!="conversation/v1")&&prepared.is_some_and(|p|conversation::locator_valid(config,p,&saved["locator"])))=>(source,false),
+        Ok(_)=>(conversation::restore_source(config,&client,prepared.unwrap(),saved,observe)?,true),
+        Err(original_error)=>if let Some(p)=prepared.filter(|p|conversation::locator_valid(config,p,&saved["locator"])){(conversation::restore_source(config,&client,p,saved,observe)?,true)}else{return Err(original_error);}
+    };
     // Stable request ID + owned tab + native conversation permit exact source reconciliation.
-    if prepared
+    if !restored && (prepared
         .is_some_and(|p| p.request.request_id != id || p.wire["sourceClientId"] != source["id"])
-        || turn["input"]["sourceClientId"].as_str().is_some_and(|original| source["id"] != original)
+        || turn["input"]["sourceClientId"].as_str().is_some_and(|original| source["id"] != original))
     {
         return Err(ProviderError::new(
             "IMAGE_PROVENANCE",
@@ -877,6 +914,7 @@ pub(super) fn query_with_prepared(
         return Ok(pending);
     }
     let conversation = owned_conversation(&source)?;
+    if !saved["locator"].is_null()&&saved["locator"]["conversationId"]!=conversation{return Err(ProviderError::new("IMAGE_PROVENANCE","当前页面不是保存的原会话"));}
     if let Some(original) = turn["output"]["response"]["session"]["id"].as_str() {
         if original != conversation { return Err(ProviderError::new("IMAGE_PROVENANCE", "原任务与当前会话身份不一致。")); }
     }
@@ -909,11 +947,26 @@ pub(super) fn query_with_prepared(
         &client,
         "/browser/recover-latest",
         Some(
-            &json!({"sourceClientId":source["id"],"index":1,"timeoutMs":40000,"reconcileConversation":{"mode":"image_record_v1","requestId":id,"conversationId":conversation,"promptSha256":hash,"imageCount":1,"allowReleasedRequest":true,"allowReloadedOriginalTab":original_source.is_some_and(|original|source["id"]==original)}}),
+            &json!({"sourceClientId":source["id"],"index":1,"timeoutMs":40000,"reconcileConversation":{"mode":"image_record_v1","requestId":id,"conversationId":conversation,"promptSha256":hash,"imageCount":1,"allowReleasedRequest":true,"allowReloadedOriginalTab":original_source.is_some_and(|original|source["id"]==original),"savedConversation":saved["locator"],"readOnlyRecoveryLaunch":if restored{source["launchToken"].clone()}else{Value::Null}}}),
         ),
         false,
     )?;
     let proof = &recovered["result"]["reconciliation"];
+    let locator=if let Some(p)=prepared{conversation::pin(config,p,&source,proof,saved,observe)?}else{Value::Null};
+    if proof["status"]=="matched_no_image" {
+        let p=prepared.ok_or_else(||ProviderError::new("IMAGE_PROVENANCE","无图终态缺少原准备记录"))?;
+        if !crate::chrome_terminal::proof_valid(proof,&json!(p),id) || recovered["result"]["sourceClientId"]!=source["id"]
+            || recovered["result"]["session"]["id"]!=conversation || recovered["result"]["artifacts"].as_array().is_none_or(|a|!a.is_empty()) {
+            return Err(ProviderError::new("IMAGE_PROVENANCE","无图终态的原会话与分支证明不完整"));
+        }
+        let settled=if ["failed","cancelled","interrupted","completed_without_artifact"].contains(&status){turn.clone()}
+            else {json_request(config,&client,&format!("/turns/{id}/interrupt"),Some(&json!({"reason":"原生会话双读已证明本次仅返回最终文字、未生成图片；结束原任务等待，保留回执"})),false)?["turn"].clone()};
+        if settled["id"]!=id || !["failed","cancelled","interrupted","completed_without_artifact"].contains(&s(&settled,"status")) {
+            return Err(ProviderError::new("IMAGE_TERMINAL_SETTLEMENT_PENDING","网页已确认无图，等待原任务结算；未重新生成"));
+        }
+        return Ok(QueryResult{task_id:id.into(),status:"failed".into(),result_urls:vec![],error:Some("ChatGPT 本次未能生成图片，原会话与失败回执已保存；其他资产继续排队。".into()),actual_cost:None,
+            raw:json!({"turn":turn,"recoveredResponse":recovered["result"],"nativeProof":proof,"taskSettlement":{"id":id,"status":settled["status"]},"progress":{"phase":"generation_failed_no_image","message":"网页已结束，但没有生成图片。","checkedAt":now()}})});
+    }
     if proof["promptSha256"] != hash {
         return Err(ProviderError::new(
             "IMAGE_PROVENANCE",
@@ -935,7 +988,7 @@ pub(super) fn query_with_prepared(
         result_urls: urls,
         error: None,
         actual_cost: None,
-        raw: json!({"turn":turn,"recoveredResponse":recovered["result"],"nativeProof":proof,"progress":{"phase":"image_verified","message":"网页原图已核对，正在下载并保存到资产。","checkedAt":now()}}),
+        raw: json!({"turn":turn,"recoveredResponse":recovered["result"],"nativeProof":proof,"readOnlyRecovery":if restored{json!({"locator":locator,"client":source})}else{Value::Null},"progress":{"phase":"image_verified","message":"网页原图已核对，正在下载并保存到资产。","checkedAt":now()}}),
     })
 }
 
