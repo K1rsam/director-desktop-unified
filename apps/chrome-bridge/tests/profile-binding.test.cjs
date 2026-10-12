@@ -48,9 +48,9 @@ test('identity storage failure preserves source-bound transport but removes spoo
 });
 test('only owned Director work tabs disable auto discard; normal bridge/user pages stay unchanged and background',async()=>{
   const calls=[];
-  const context=load('extension/background/tabController.js',{chrome:{runtime:{},tabs:{create:(options,done)=>{calls.push(['create',options]);done({id:123})},update:(id,options,done)=>{calls.push(['update',id,options]);done({id})}}}});
+  const context=load('extension/background/tabController.js',{chrome:{runtime:{},tabs:{get:async()=>({id:1,windowId:10,incognito:false,url:'https://chatgpt.com/'}),create:(options,done)=>{calls.push(['create',options]);done({id:123,windowId:10})},update:(id,options,done)=>{calls.push(['update',id,options]);done({id})}}}});
   const port={sender:{tab:{id:1}}};
-  const controller=context.createTabController({connections:new Map([[port,{serverUrl:'http://127.0.0.1:53179'}]]),safeBridgeServerUrl:x=>x,rememberLaunchedTab:async()=>{},readLaunchedTab:async()=>null,forgetLaunchedTab:async()=>{},isStableLaunchToken:()=>true});
+  const controller=context.createTabController({connections:new Map([[port,{serverUrl:'http://127.0.0.1:53179'}]]),safeBridgeServerUrl:x=>x,rememberLaunchedTab:async()=>{},readLaunchedTab:async()=>({launchToken:'bridge-director-control-'+PROFILE,serverUrl:'http://127.0.0.1:53179'}),forgetLaunchedTab:async()=>{},isStableLaunchToken:()=>true});
   await controller.openBridgeTab(port,{active:false,launchToken:'bridge-director-desktop-'+PROFILE});
   assert.equal(calls[0][1].active,false);assert.equal(calls[1][2].active,false);assert.equal(calls[1][2].autoDiscardable,false);
   for (const launchToken of ['bridge-other-task','bridge-director-desktop-fake','bridge-director-desktop-'+PROFILE+'-suffix']) {

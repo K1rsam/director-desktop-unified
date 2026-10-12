@@ -20,7 +20,7 @@ import {
 } from './background/extensionReloadCoordinator.js';
 import { createTabController } from './background/tabController.js';
 import { checkBridgeAuth } from './background/authPreflight.js';
-import { createConnectionWatchdog, recoverOwnedController } from './background/connectionWatchdog.js';
+import { createConnectionWatchdog, recoverOwnedController, confirmOwnedControllerReady } from './background/connectionWatchdog.js';
 import { tabScopedClientId } from './shared/tabClientIdentity.js';
 import './shared/buildIdentity.js';
 const connections = new Map();
@@ -367,7 +367,8 @@ async function openConnection(state) {
         state.pendingHelloReceipt = null;
         const launch = await readLaunchedTab(state.tabId);
         const runtime = await backgroundState.read(state.tabId);
-        await confirmSourceReady({ accepted: true, helloMessageId: hello.messageId,
+        const readyProof={ accepted: true, helloMessageId: hello.messageId,
+          ackMessageId:envelope.body.ackMessageId,acceptedSequence:Number(envelope.body.acceptedSequence),
           tabId: state.tabId, launchToken: String(hello.body.launchToken || ''),
           profileId: String(hello.body.browserProfileId || ''), browserIncognito: hello.body.browserIncognito,
           serverUrl: state.serverUrl, serverInstanceId: String(envelope.source.backgroundEpoch || ''),
@@ -375,7 +376,10 @@ async function openConnection(state) {
           bundleId: String(hello.body.extensionBundleId || ''), extensionVersion: String(hello.body.extensionVersion || ''),
           backgroundEpoch, contentEpoch: state.contentEpoch,
           launchRecordMatches: launch?.launchToken === hello.body.launchToken,
-        });
+        };
+        state.directorReadyProof=readyProof;
+        await confirmSourceReady(readyProof);
+        await confirmOwnedControllerReady({proof:readyProof});
       }
     }, (() => { const options = serverEnvelopeQueueOptions(envelope);
       return {...options,meta:{...(options.meta || {}),ackMessageId:String(envelope.body?.ackMessageId || '')}};

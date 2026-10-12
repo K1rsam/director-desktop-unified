@@ -69,7 +69,7 @@
     {
       "path": "extension/background/tabController.js",
       "beforeSha256": "e15ac5bb213847882e3e960dc77fdd268d646d208a6bd0dfe722b484d2e45b98",
-      "afterSha256": "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf",
+      "afterSha256": "c5e4582364b1a4b166a1b352a0adb40872403f37042370170699beb97fa4e684",
       "previousAfterSha256s": [
         "b6b4c753e8320d4aeb51ccba086813969cdffcb1ff359dee6722f401c83a6ebb",
         "db568da46fddeccd02c7e61f6db69349ca22270fc9333b6b21c349db4555ec6f",
@@ -79,7 +79,8 @@
         "674461b82cf582acd782dcb3bed53399bd8c43eed50811ed34718e09b01a0807",
         "0877128584e8d1d69327469a190772f3755c12e242c2b638b0d3c4282811136d",
         "d1c896b460a193066160699347a0aa1e21421ec35d9241270958a59198ae9ac8",
-        "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6"
+        "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6",
+        "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf"
       ]
     },
     {
@@ -135,11 +136,12 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed",
+      "afterSha256": "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
-        "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095"
+        "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
+        "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed"
       ]
     },
     {
@@ -150,10 +152,12 @@
     {
       "path": "extension/background/connectionWatchdog.js",
       "beforeSha256": "2809b469459963b4971c1c19c27e4cc2aa8c7ffdbc6c11b79537a0d34aef71ee",
-      "afterSha256": "0aaa0d41285afd630ba671c12eb9d4cb5f78993650038d7384d0bfed88235666",
+      "afterSha256": "9a066654da0da6cb4adf5fce38dc2caa052c2b50663ddbf70608c0da37574bc5",
       "previousAfterSha256s": [
         "ae2aaf99dd322d5263f3c767122603547e9d36e71aca52df39755206d8b63849",
-        "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0"
+        "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0",
+        "0aaa0d41285afd630ba671c12eb9d4cb5f78993650038d7384d0bfed88235666",
+        "57cc3e013f97e96a4bf11b5c2a09ce222c26b452c378146e26e34659e2a3906e"
       ]
     }
   ]

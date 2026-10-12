@@ -384,13 +384,25 @@ export function createTabController({
       controllerQueue = pending.catch(() => {});
       return await pending;
     }
-    const tab = await createTab({ url: 'about:blank', active });
+    const directorOwned = /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(launchToken);
+    let sourceWindowId;
+    if(directorOwned){
+      // Chrome otherwise chooses the last focused window, which can belong to
+      // the user. Keep every work page in its already-owned controller window.
+      const sourceId=port?.sender?.tab?.id,record=await readLaunchedTab(sourceId);
+      const source=await chrome.tabs.get(sourceId);
+      if(active||!source||source.id!==sourceId||!Number.isSafeInteger(source.windowId)||source.windowId<=0
+        ||source.incognito!==false||!controllerRootUrl(source.url)||record?.serverUrl!==bridgeServerUrl
+        ||!(CONTROLLER_LAUNCH_RE.test(record?.launchToken||'')||/^bridge-director-desktop-[a-f0-9-]{36}$/i.test(record?.launchToken||'')))throw Error('Owned background source window is unproved');
+      sourceWindowId=source.windowId;
+    }
+    const tab = await createTab({ url: 'about:blank', active, ...(directorOwned?{windowId:sourceWindowId}:{}) });
     if (!Number.isInteger(tab?.id)) throw new Error('Chrome did not return a tab id for the new ChatGPT tab');
     try {
       // Persist ownership before navigation so a fast content connection cannot
       // announce without its one-time launch identity.
       await rememberLaunchedTab(tab.id, { launchToken, requestedUrl, createdAt: Date.now(), serverUrl: bridgeServerUrl });
-      const directorOwned = /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(launchToken);
+      if(directorOwned&&tab.windowId!==sourceWindowId)throw Error('Chrome returned a different owned work window');
       await updateTab(tab.id, { url: requestedUrl, active, ...(directorOwned ? { autoDiscardable: false } : {}) });
     } catch (error) {
       await forgetLaunchedTab(tab.id);
