@@ -29,16 +29,17 @@ export function createExtensionReloadCoordinator({
   reloadRuntime = () => chrome.runtime.reload(),
   scheduleRecoveryWake = null,
   clearRecoveryWake = null,
+  readRuntimeIdentity = null,
   ackTimeoutMs = 7_000,
 } = {}) {
   let pendingRecovery = null;
 
-  async function armRecoveryWake(operationId) {
+  async function armRecoveryWake(operationId, delayMs = 750) {
     const alarmName = extensionReloadAlarmName(operationId);
     if (!alarmName) return { armed: false, reason: 'missing_operation_id' };
-    if (typeof scheduleRecoveryWake === 'function') return await scheduleRecoveryWake(alarmName);
+    if (typeof scheduleRecoveryWake === 'function') return await scheduleRecoveryWake(alarmName, delayMs);
     if (!chrome.alarms?.create) return { armed: false, reason: 'alarms_unavailable', alarmName };
-    const when = Date.now() + 750;
+    const when = Date.now() + delayMs;
     await chrome.alarms.create(alarmName, { when });
     if (chrome.alarms.get) {
       const alarm = await chrome.alarms.get(alarmName);
@@ -98,6 +99,8 @@ export function createExtensionReloadCoordinator({
     if (!url) return false;
     try {
       await navigateTab(tabId, url);
+      // Hash/same-URL updates do not recreate the invalidated content context.
+      await reloadTab(tabId);
       return true;
     } catch {
       return false;
@@ -206,8 +209,28 @@ export function createExtensionReloadCoordinator({
       throw error;
     }
     const stored = await storage.get(PENDING_EXTENSION_RELOAD_KEY);
-    const pending = stored?.[PENDING_EXTENSION_RELOAD_KEY];
+    let pending = stored?.[PENDING_EXTENSION_RELOAD_KEY];
+    if (!pending && typeof readRuntimeIdentity === 'function') pending = await recoverLegacyUnverifiedOperation();
     if (!pending || !Array.isArray(pending.tabIds)) return { recovered: false, reason: 'missing' };
+    // Crash recovery for the success-before-anchor-removal window. Only the
+    // same operation's already persisted exact connection proof can close it.
+    const durableResult = pending.legacyOperation
+      ? (await storage.get(`chatgptBridge:reloadConnectionProof:${pending.operationId}`))?.[`chatgptBridge:reloadConnectionProof:${pending.operationId}`]
+      : (await maintenanceOperations.read?.())?.active;
+    const settled = pending.legacyOperation ? durableResult : (durableResult?.operationId === pending.operationId
+      && durableResult.status === 'succeeded' ? durableResult.result : null);
+    const durableProof = settled?.connectionProof;
+    const originalLaunch = pendingLaunchRecord(pending, pending.sourceTabId);
+    if (settled?.connectionVerified === true && settled.operationId === pending.operationId
+      && durableProof?.accepted === true && durableProof.helloMessageId && durableProof.tabId === pending.sourceTabId
+      && durableProof.launchToken === originalLaunch?.launchToken && durableProof.profileId === pending.expectedRuntime?.profileId
+      && durableProof.bundleId === pending.expectedRuntime?.bundleId && durableProof.extensionVersion === pending.expectedVersion
+      && durableProof.serverUrl === pending.temporaryServerUrl && durableProof.serverInstanceId
+      && durableProof.serverInstanceId === durableProof.transportServerInstanceId) {
+      await storage.remove(PENDING_EXTENSION_RELOAD_KEY);
+      await disarmRecoveryWake(pending.recoveryAlarmName || extensionReloadAlarmName(pending.operationId));
+      return { recovered: true, connectionVerified: true, reason: 'durable_source_ready', result: settled };
+    }
     console.info('[chatgpt-bridge] Restoring extension reload', {
       operationId: String(pending.operationId || ''),
       commandId: String(pending.commandId || ''),
@@ -216,38 +239,110 @@ export function createExtensionReloadCoordinator({
     });
     const requestedAt = Number(pending.requestedAt || 0);
     if (!requestedAt || Date.now() - requestedAt > PENDING_EXTENSION_RELOAD_TTL_MS) {
-      await storage.remove(PENDING_EXTENSION_RELOAD_KEY);
       await disarmRecoveryWake(pending.recoveryAlarmName);
-      if (pending.operationId) await maintenanceOperations.fail(pending.operationId, {
-        code: 'MAINTENANCE_EXPIRED',
-        message: 'Extension reload maintenance expired before recovery',
-      });
-      return { recovered: false, reason: 'expired' };
+      await storage.set({ [PENDING_EXTENSION_RELOAD_KEY]: { ...pending, recoveryStatus: 'held', recoveryReason: 'source_ready_timeout' } });
+      return { recovered: false, pending: true, reason: 'source_ready_timeout' };
     }
     const sourceTabId = Number.isInteger(pending.sourceTabId) ? pending.sourceTabId : null;
     const serverUrl = safeBridgeServerUrl(pending.temporaryServerUrl);
+    if (pending.recoveryStatus === 'held') return { recovered: false, pending: true, reason: pending.recoveryReason };
+    if (pending.recoveryStatus === 'awaiting_source_ready') {
+      await armRecoveryWake(pending.operationId, 5_000);
+      return { recovered: false, pending: true, reason: 'awaiting_source_ready' };
+    }
     await restorePendingLaunchRecords(pending);
     await markReloadedControllers(pending);
+    // Persist before issuing any navigation: a worker restart must not repeat it.
+    await storage.set({ [PENDING_EXTENSION_RELOAD_KEY]: { ...pending, recoveryStatus: 'awaiting_source_ready', recoveryStartedAt: Date.now() } });
     for (const tabId of pending.tabIds) {
       const targetUrl = String(pending.targetUrls?.[String(tabId)] || '');
       if (targetUrl) {
-        try { await navigateTab(tabId, targetUrl); continue; } catch {}
+        try { await navigateTab(tabId, targetUrl); await reloadTab(tabId); continue; } catch {
+          await storage.set({ [PENDING_EXTENSION_RELOAD_KEY]: { ...pending, recoveryStatus: 'held', recoveryReason: 'original_navigation_unknown' } });
+          return { recovered: false, pending: true, reason: 'original_navigation_unknown' };
+        }
       }
       const launchRecord = pendingLaunchRecord(pending, tabId);
       if (tabId === sourceTabId && await reloadTabWithTemporaryConnection(tabId, serverUrl, launchRecord?.launchToken || '')) continue;
       if (chrome.tabs?.reload) await reloadTab(tabId);
     }
+    await armRecoveryWake(pending.operationId, 5_000);
+    return { recovered: false, pending: true, reason: 'awaiting_source_ready', tabCount: pending.tabIds.length, sourceTabId };
+  }
+
+  async function confirmSourceReady(proof = {}) {
+    // Called only for the exact hello envelope accepted by the bridge, never
+    // for socket.open, navigation completion, or locally queued protocolReady.
+    const storage = chrome.storage.local;
+    const stored = await storage.get(PENDING_EXTENSION_RELOAD_KEY);
+    const pending = stored?.[PENDING_EXTENSION_RELOAD_KEY];
+    if (!pending || (pending.recoveryStatus !== 'awaiting_source_ready'
+      && !(pending.recoveryStatus === 'held' && pending.recoveryReason === 'source_ready_timeout'))) return { verified: false, reason: 'not_waiting' };
+    const expected = pending.expectedRuntime;
+    const launch = pendingLaunchRecord(pending, pending.sourceTabId);
+    if (!expected || !launch || proof.accepted !== true || !proof.helloMessageId
+      || proof.tabId !== pending.sourceTabId || proof.launchToken !== launch.launchToken
+      || proof.profileId !== expected.profileId || !proof.serverInstanceId
+      || proof.serverInstanceId !== proof.transportServerInstanceId
+      || proof.serverUrl !== pending.temporaryServerUrl
+      || proof.bundleId !== expected.bundleId || proof.extensionVersion !== pending.expectedVersion
+      || proof.launchRecordMatches !== true || !proof.contentEpoch || !proof.backgroundEpoch
+      || (!pending.legacyOperation && proof.backgroundEpoch === expected.backgroundEpoch)
+      || proof.browserIncognito !== false) return { verified: false, reason: 'source_identity_mismatch' };
+    const result = { recovered: true, connectionVerified: true, tabCount: pending.tabIds.length,
+      sourceTabId: pending.sourceTabId, connectionProof: { ...proof }, previousRuntime: expected, operationId: pending.operationId };
+    // Settle the durable operation before removing its recovery anchor.
+    if (pending.legacyOperation) {
+      // The old premature success is immutable history. Attach verified proof
+      // separately rather than rewriting a terminal operation.
+      await storage.set({ [`chatgptBridge:reloadConnectionProof:${pending.operationId}`]: result });
+    } else await maintenanceOperations.succeed(pending.operationId, result);
     await storage.remove(PENDING_EXTENSION_RELOAD_KEY);
-    await disarmRecoveryWake(pending.recoveryAlarmName);
-    const result = { recovered: true, tabCount: pending.tabIds.length, sourceTabId };
-    if (pending.operationId) await maintenanceOperations.succeed(pending.operationId, result);
-    console.info('[chatgpt-bridge] Extension reload recovery completed', {
-      operationId: String(pending.operationId || ''),
-      commandId: String(pending.commandId || ''),
-      tabCount: pending.tabIds.length,
-      sourceTabId,
-    });
-    return result;
+    await disarmRecoveryWake(pending.recoveryAlarmName || extensionReloadAlarmName(pending.operationId));
+    return { verified: true, result };
+  }
+
+  async function recoverLegacyUnverifiedOperation() {
+    const operation = (await maintenanceOperations.read?.())?.active;
+    if (!operation || operation.kind !== 'extension.reload' || operation.status !== 'succeeded'
+      || operation.result?.recovered !== true || operation.result.connectionVerified === true
+      || !operation.operationId || !Number(operation.updatedAt) || Number(operation.updatedAt) > Date.now()
+      || Date.now() - Number(operation.updatedAt || 0) > 24 * 60 * 60_000) return null;
+    const sourceTabId = operation.result.sourceTabId;
+    const ids = operation.preconditions?.tabIds;
+    if (!Number.isInteger(sourceTabId) || !Array.isArray(ids) || !ids.includes(sourceTabId)
+      || operation.result.tabCount !== ids.length) return null;
+    const storage = chrome.storage.local;
+    const proofKey = `chatgptBridge:reloadConnectionProof:${operation.operationId}`;
+    if ((await storage.get(proofKey))?.[proofKey]) return null;
+    const records = await snapshotOwnedLaunchRecords();
+    const launch = records[String(sourceTabId)];
+    if (!launch || !ownedDesktopLaunch(String(launch.launchToken || ''))) return null;
+    const tab = await chrome.tabs.get(sourceTabId).catch(() => null);
+    let root = false;
+    try { const url = new URL(tab?.url || ''); root = url.origin === 'https://chatgpt.com' && url.pathname === '/' && !url.search; } catch {}
+    if (!root || tab.incognito !== false || tab.active !== false) return null;
+    const runtime = await backgroundState.read(sourceTabId);
+    if (runtime.lease || Object.values(runtime.commands || {}).some(c => !['succeeded', 'rejected'].includes(c.status))) return null;
+    const identity = await readRuntimeIdentity(sourceTabId);
+    const profileOk = CONTROLLER_SESSION_UUID_RE.test(String(identity?.profileId || ''));
+    const serverUrl = safeBridgeServerUrl(launch.serverUrl);
+    // Idle runtime compaction/extension reload may remove the old transport
+    // nonce. Do not invent it: retain the missing historical value and require
+    // a nonempty real server nonce in the eventual exact hello ACK instead.
+    if (!profileOk || !identity.bundleId || !identity.extensionVersion || !identity.backgroundEpoch || !serverUrl
+      || (operation.preconditions.expectedVersion && operation.preconditions.expectedVersion !== identity.extensionVersion)) return null;
+    const targetUrl = temporaryReloadUrl(tab.url, serverUrl, launch.launchToken);
+    if (!targetUrl) return null;
+    const pending = { legacyOperation: true, operationId: operation.operationId, commandId: '',
+      tabIds: [sourceTabId], sourceTabId, expectedVersion: identity.extensionVersion,
+      expectedRuntime: identity, temporaryServerUrl: serverUrl, launchRecords: records,
+      targetUrls: { [sourceTabId]: targetUrl }, requestedAt: Date.now(),
+      originalOperationUpdatedAt: operation.updatedAt, recoveryAlarmName: extensionReloadAlarmName(operation.operationId) };
+    // This anchor is written once before touching only the original idle root.
+    // A timeout retains it and cannot trigger another legacy adoption.
+    await storage.set({ [PENDING_EXTENSION_RELOAD_KEY]: pending });
+    return pending;
   }
 
   function recoverPendingExtensionReload() {
@@ -372,6 +467,13 @@ export function createExtensionReloadCoordinator({
     // the source page is refreshed. Preserve ownership without expanding tabs.
     const launchRecords = await snapshotOwnedLaunchRecords();
     const idleControllers = await snapshotIdleControllers(launchRecords);
+    const expectedRuntime = typeof readRuntimeIdentity === 'function' ? await readRuntimeIdentity(sourceTabId) : null;
+    if (typeof readRuntimeIdentity === 'function' && (!CONTROLLER_SESSION_UUID_RE.test(String(expectedRuntime?.profileId || ''))
+      || !expectedRuntime.bundleId || !expectedRuntime.extensionVersion || !expectedRuntime.backgroundEpoch || !expectedRuntime.serverInstanceId)) {
+      const error = new Error('Extension maintenance requires verified original runtime identity');
+      error.code = 'MAINTENANCE_RUNTIME_IDENTITY_REQUIRED';
+      throw error;
+    }
     const planned = await maintenanceOperations.plan('extension.reload', {
       preconditions: { expectedVersion: String(expectedVersion || ''), tabIds: tabs.map((tab) => tab.id).filter(Number.isInteger) },
     });
@@ -391,7 +493,7 @@ export function createExtensionReloadCoordinator({
     }
     const pending = {
       tabIds: tabs.map((tab) => tab.id).filter(Number.isInteger),
-      expectedVersion: String(expectedVersion || ''),
+      expectedVersion: String(expectedVersion || expectedRuntime?.extensionVersion || ''),
       sourceTabId: Number.isInteger(sourceTabId) ? sourceTabId : null,
       temporaryServerUrl: safeBridgeServerUrl(temporaryServerUrl),
       launchRecords,
@@ -401,6 +503,7 @@ export function createExtensionReloadCoordinator({
       requestedAt: Date.now(),
       operationId,
       commandId: terminalCommandId,
+      expectedRuntime,
     };
     if (Number.isInteger(pending.sourceTabId)
       && launchTokenPattern.test(String(sourceLaunchToken || ''))
@@ -443,5 +546,5 @@ export function createExtensionReloadCoordinator({
     };
   }
 
-  return Object.freeze({ recoverPendingExtensionReload, scheduleExtensionReload });
+  return Object.freeze({ recoverPendingExtensionReload, scheduleExtensionReload, confirmSourceReady });
 }

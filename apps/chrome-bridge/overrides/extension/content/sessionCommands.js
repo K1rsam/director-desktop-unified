@@ -175,6 +175,12 @@ function showTabIdentifyIndicator(options = {}) {
 
 async function handleBrowserTabIdentify(payload) {
   try {
+    if(payload.mode==='owned_launch_inventory_v1') {
+      const result=await extensionRequest('bridge.tab.open',{lookupOnly:true,lookupRequestId:payload.requestId,
+        launchToken:payload.launchToken,expectedRuntime:payload.expectedRuntime},10000);
+      send({type:'browser.tab.identified',commandId:payload.commandId,...result});
+      return;
+    }
     const result = showTabIdentifyIndicator(payload);
     send({ type: 'browser.tab.identified', commandId: payload.commandId, ...result });
   } catch (err) {

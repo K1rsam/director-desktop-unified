@@ -2,6 +2,7 @@ import { ArtifactRegistry, publishArtifactSettlement } from './bridge/artifacts/
 import { withAttachmentIntegrity } from './bridge/attachmentTransport.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { config } from './config.js';
+import { BRIDGE_VERSION } from './extensionCompatibility.js';
 import { makeRequestId } from './protocol.js';
 import { safeBridgeServerUrl } from './browserLaunch.js';
 import { openExternalBrowserUrl } from './bridge/externalBrowser.js';
@@ -305,6 +306,38 @@ export class BrowserBridge {
 
   requestStateDiagnostics(requestId = '') {
     return this.#lifecycle.diagnostics(requestId);
+  }
+
+  async ownedLaunchInventory(requestId, expected) {
+    const held=reason=>({version:'director-owned-launch-inventory/v1',status:'unknown',reason,requestId,complete:false});
+    if(!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(requestId||''))return held('invalid_request_identity');
+    const before=this.health(),source=before.clients.find(client=>client.id===expected.sourceClientId);
+    const matches=client=>client && client.ready===true && client.compatible!==false && client.browserIncognito===false
+      && client.activeRequest===null && !client.quarantined && client.focused===false && client.visibilityState==='hidden'
+      && client.url==='https://chatgpt.com/' && (client.launchToken===`bridge-director-control-${expected.profileId}`
+        || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(client.launchToken||''))
+      && client.browserProfileId===expected.profileId && client.extensionBundleId===expected.bundleId
+      && client.backgroundEpoch===expected.backgroundEpoch && client.serverInstanceId===expected.serverInstanceId
+      && expected.serverInstanceId===this.#serverInstanceId;
+    if(!matches(source) || before.pendingRequests || before.pendingCommands || before.clients.some(client=>client.activeRequest))return held('source_or_runtime_not_idle');
+    const runtime={...expected,sourceTabId:source.browserTabId};
+    let result;
+    try{result=await this.#sendCommand('browser.tab.identify',{mode:'owned_launch_inventory_v1',requestId,
+      launchToken:`bridge-director-desktop-${requestId}`,expectedRuntime:runtime},{sourceClientId:source.id,timeoutMs:15000});}
+    catch{return held('inventory_command_unavailable');}
+    if(result?.status==='unknown')return held(result.reason||'inventory_unknown');
+    const after=this.health();
+    if(!matches(after.clients.find(client=>client.id===source.id)) || after.pendingRequests || after.clients.some(client=>client.activeRequest))return held('runtime_changed_after_inventory');
+    let decodedInventory;
+    try{decodedInventory=JSON.parse(result.inventoryCanonicalJson);}catch{return held('inventory_receipt_mismatch');}
+    if(result?.version!=='director-owned-launch-inventory/v1' || !['matched','confirmed_absent'].includes(result.status)
+      || result.complete!==true || result.requestId!==requestId || result.launchToken!==`bridge-director-desktop-${requestId}`
+      || !['profileId','bundleId','backgroundEpoch','serverInstanceId','sourceClientId','sourceTabId'].every(key=>result.runtime?.[key]===runtime[key])
+      || !/^[a-f0-9-]{36}$/i.test(result.inventoryGeneration||'') || !Number.isSafeInteger(result.observedAt)
+      || Math.abs(Date.now()-result.observedAt)>30000 || !result.inventory
+      || JSON.stringify(decodedInventory)!==JSON.stringify(result.inventory)
+      || createHash('sha256').update(result.inventoryCanonicalJson).digest('hex')!==result.inventorySha256)return held('inventory_receipt_mismatch');
+    return {...result,componentVersion:BRIDGE_VERSION,sourceClientId:source.id};
   }
 
   async requestForcedSnapshot(requestId, options = {}) {

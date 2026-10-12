@@ -62,6 +62,11 @@ export function createProtocolOutbox({ backgroundEpoch, backgroundState, post, s
 
   async function sendProtocolMessage(state, messageType, body, options = {}) {
     const envelope = await materialize(state, messageType, body, options);
+    if (messageType === 'transport.hello') {
+      // Retain the exact materialized identity until the server accepts this
+      // hello. A local send or protocolReady flag is not a remote receipt.
+      state.pendingHelloReceipt = envelope;
+    }
     const critical = options.critical === true || isCriticalMessageType(messageType);
     if (critical && options.persisted !== true) {
       const stored = await backgroundState.transition(state.tabId, {

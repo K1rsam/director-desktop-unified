@@ -739,6 +739,14 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     } catch (err) { next(err); }
   });
 
+  router.get('/browser/owned-launch/:requestId', async (req, res, next) => {
+    try {
+      if(!bridge.isLocalRequest(req))throw new HttpError(403,'Owned inventory is only available from localhost');
+      const expected=Object.fromEntries(['sourceClientId','profileId','bundleId','backgroundEpoch','serverInstanceId'].map(key=>[key,String(req.query?.[key]||'')]));
+      res.json({ok:true,...await bridge.ownedLaunchInventory(String(req.params.requestId||''),expected)});
+    }catch(err){next(err);}
+  });
+
   router.post('/browser/tabs/close', async (req, res, next) => {
     try {
       const sourceClientId = String(req.body?.sourceClientId || req.body?.clientId || '').trim();
@@ -986,7 +994,10 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
   router.use((err, _req, res, _next) => {
     const statusCode = Number.isInteger(err.statusCode) ? err.statusCode : 500;
     if (statusCode >= 500) logError('Request failed:', err);
-    res.status(statusCode).json({ detail: err.message || 'Internal Server Error', ...(err.code ? { code: err.code } : {}) });
+    res.status(statusCode).json({ detail: err.message || 'Internal Server Error', ...(err.code ? { code: err.code } : {}),
+      ...(err.code==='EXTENSION_RELOAD_RECONNECT_PENDING' && err.reloadAccepted===true ? {
+        reloadAccepted:true,originalOutcomePreserved:true,recovery:{used:false,reason:'original_owned_reconnect_pending'},
+      } : {}) });
   });
 
   return router;

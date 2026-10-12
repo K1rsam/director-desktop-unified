@@ -43,12 +43,12 @@ test('source-only recovery restores every owned identity but refreshes only its 
   for(const key of Object.keys(f.records))delete f.records[key];
   for(const key of Object.keys(f.session))delete f.session[key];
   const result=await f.coordinator.recoverPendingExtensionReload();
-  assert.equal(result.recovered,true);assert.equal(result.tabCount,1);
+  assert.equal(result.recovered,false);assert.equal(result.pending,true);assert.equal(result.tabCount,1);
   assert.deepEqual(f.remembered.map(r=>r.id),[1,2]);
   assert.equal(f.records[2].launchToken,token(2));
   assert.equal(f.session['chatgptBridgeLaunchedTab:2'].launchToken,token(2));
-  assert.deepEqual(f.navigated.map(t=>t.id),[1]);assert.deepEqual(f.reloaded,[]);
-  assert.equal(f.queries.length,0);assert.ok(!Object.hasOwn(f.local,'bridgePendingExtensionReload'));
+  assert.deepEqual(f.navigated.map(t=>t.id),[1]);assert.deepEqual(f.reloaded,[1]);
+  assert.equal(f.queries.length,0);assert.equal(f.local.bridgePendingExtensionReload.recoveryStatus,'awaiting_source_ready');
 });
 
 test('session snapshot and recovery reject user tokens, fake prefixes and invalid tab keys',async()=>{

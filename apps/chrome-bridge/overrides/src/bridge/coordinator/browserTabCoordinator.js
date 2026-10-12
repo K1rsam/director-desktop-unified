@@ -195,7 +195,7 @@ export class BrowserTabCoordinator {
     const timeoutMs = Math.max(2_000, Number(options.timeoutMs) || 20_000);
     const requestedAt = Date.now();
     const reloadServerUrl = options.serverUrl || this.runtimeOptions.publicBaseUrl;
-    const maintenanceBootstrapUrl = options.allowMaintenancePageBootstrap === true && !before.activeRequest?.requestId
+    const maintenanceBootstrapUrl = options.allowMaintenancePageBootstrap === true && options.ownedTabsOnly !== true && !before.activeRequest?.requestId
       ? extensionMaintenanceReloadUrl(before, {
           expectedVersion,
           reloadTabs: options.reloadTabs !== false,
@@ -306,6 +306,20 @@ export class BrowserTabCoordinator {
       new Promise((resolve) => setTimeout(() => resolve(null), graceMs)),
     ]);
     if (originalReconnect) return { accepted, reconnected: originalReconnect };
+
+    // Accepted runtime reload is an existing side effect, even when no content
+    // client reconnects. Owned-only/background recovery must retain that outcome
+    // rather than spawn an OS browser or replace its original work page.
+    if(options.ownedTabsOnly===true || options.allowMaintenancePageBootstrap!==true) {
+      cancelWait();
+      reconnectPromise.catch(()=>{});
+      const error=new Error('Extension reload was accepted, but its original owned page has not reconnected; no system browser was opened');
+      error.code='EXTENSION_RELOAD_RECONNECT_PENDING';
+      error.reloadAccepted=true;
+      error.accepted=accepted;
+      error.recovery={used:false,reason:'original_owned_reconnect_pending'};
+      throw error;
+    }
 
     // A successful command result only proves that the old service worker
     // scheduled its own restart. It does not prove that Chrome injected the
