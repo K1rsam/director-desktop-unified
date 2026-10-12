@@ -35,3 +35,5 @@
 新上传文件名按 requestId 和参考图序号唯一命名；图片原 SHA、mediaId、顺序和上传回执独立保留，精确图片校验不放宽。旧冻结 prepared 不修改。新增停住上传的结算只接受原 request、原 source、原附件列表、已停止的 attachments.upload effect 和原生空页；在原任务取消前后各读取一次原生空页。任何已发送、未知作用或出现用户轮次的情况仍保护，不允许重复提交。
 
 扩展恢复核验同时修正：附件期待列表可读取原 effect 的 preconditions；缺少期待列表或与原列表冲突时不再误报“没有附件需要上传”。最终该补丁 Windows Rust Chrome专项148项通过，扩展132项通过；真实上传恢复仍按后续回执分别验收。
+
+原上传等待随后被 bridge deadline 终止；canonical lifecycle=failed、submission=accepted，原 attachments.upload 不确定记录和 sentAt=0 的 scoped snapshot 保留。结算兼容这个已经失败的状态，但强制 submission=accepted，并继续双读原生空页。该窄补充的 Chrome terminal 5项、上传结算HTTP专项1项通过；不将已提交、缺证据或其他失败视为未发送。
