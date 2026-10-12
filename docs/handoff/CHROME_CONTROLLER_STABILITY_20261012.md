@@ -50,6 +50,12 @@ Windows 原生 Rust `background_chrome_` 35 passed、0 failed，覆盖恢复成�
 
 队列修复的最终Windows原生Chrome组合119 passed / 0 failed，receipt success=true、exitCode=0、timedOut=false、进程树已空，证据 `native-prepared-refresh-owner-tests-04/`。此前125项JS未受此纯Rust调度修改影响。
 
+该修复已原生发布为同名当前客户端，SHA `dad1eb32a19e6813641e016ea9cedbcffdf5c423e596b13b5664032903d498f5`；唯一备用 `fcef5b75…`，候选已清理。原批次在同一继续调用中由21推进至27张，7份旧准备均已恢复其中6份生成入库；父图成功后两份依赖任务自动恢复，未修改原请求文件或已完成结果，视频仍为0。
+
+第28张的最新原生回读确认了真实上游失败：同一会话只有一个 finished_successfully / endTurn=true 的 assistant text，backendImageCount=0，答复为“由于我这边发生了错误，我未能生成图片。”没有完成图片，不能标成下载通过。现有桥把这一明确无图答复误显示为持续等待/回收，最终6次查询后recovery_paused；第29张独立任务因原owner仍未结算保持等待。原批次尚未全部完成。原回读保存在 `stalled-lobster-original-recovery-01.json`，只读恢复modelSubmissions=0；未用新任务绕过原记录。下一修复应独立实现稳定原生分支的无图终态证明、原lease结算、清晰错误投影与保留历史的有界重试，而不是放宽图像来源校验。
+
+本轮补充视觉审核第15–27张：关键人物及直接父子形象总体可用，王东鞋帮略高于设计作为小偏差记录，变异老鼠绝对尺寸缺可信参照，未将其记为尺寸通过。私人逐图审核保存在 `.local/validation/chrome-batch-20261012/visual-review-*.json`，不能用入库数量代替全部视觉或十集分镜验收。
+
 ## 会话链接恢复的设计判断
 
 用户建议持久保存 `https://chatgpt.com/c/<conversationId>`，原工作页丢失时后台重开原会话进行只读恢复。采用这一方向，保留本地任务ID作为发送前与队列身份；会话URL是定位信息，完整提示词哈希、消息分支与原图文件身份是采用依据。现有实现已校验会话ID，但仍依赖原工作页且部分恢复要求正文任务标记，本补丁没有宣称链接重开或去标记已经完成。
