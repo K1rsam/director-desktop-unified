@@ -188,6 +188,44 @@ fn background_chrome_foreign_provider_existing_hold_and_job_drift_cannot_be_adop
 }
 impl Fixture {fn queue_safe(&self)->Result<Journal>{prepare_queue(&self.engine,&self.request,&self.store)}}
 
+fn exhausted_original_prepare(f:&Fixture,key:&str) {
+    f.store.claim_job(key,"queued","preparing").unwrap();f.store.claim_job_fields(key,"preparing","failed",&json!({"error":"original failed prepare"})).unwrap();
+    f.store.update_job(key,"recovery_paused",&json!({})).unwrap();
+    f.store.conn().unwrap().execute("INSERT INTO metadata(key,value) VALUES(?1,?2)",rusqlite::params![format!("chrome_prepare_recovery:{key}"),
+        json!({"version":"chrome-prepare-recovery-budget/v1","snapshotSha256":pipeline::digest(&f.store.job(key).unwrap()["snapshot"].to_string()),"startedAt":chrono::Utc::now().timestamp()-181,"attempts":1}).to_string()]).unwrap();
+}
+#[test]
+fn background_chrome_expired_prepare_is_sealed_once_while_healthy_independent_branch_finishes() {
+    let f=Fixture::new(&[("exhausted",None),("healthy",None)]);let j=f.queue();let bad=j.jobs.iter().find(|job|job["assetId"]=="exhausted").unwrap();let key=s(bad,"jobId");
+    exhausted_original_prepare(&f,key);let original=f.store.job(key).unwrap();
+    let (cfg,_)=f.engine.generation_config(&f.store,&original).unwrap();assert!(!tasks::chrome_prepare_recovery_eligible(&f.store,&original,&cfg).unwrap());
+    assert!(f.step(&j));assert_eq!(f.store.job(key).unwrap()["status"],"failed");assert_eq!(f.fake.recoveries.load(Ordering::SeqCst),0);
+    for _ in 0..4 {f.step(&j);}
+    assert_eq!(f.count(),1);assert_eq!(f.store.jobs().unwrap().len(),2);let healthy=j.jobs.iter().find(|job|job["assetId"]=="healthy").unwrap();assert_eq!(f.store.job(s(healthy,"jobId")).unwrap()["status"],"downloaded");
+    let after=f.store.job(key).unwrap();for field in ["snapshot","error","prepared","receipt","result","providerTaskId","accountId"] {assert_eq!(after[field],original[field],"{field}");}
+    let seals:i64=f.store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type='chrome_prepare_recovery_exhausted'",[key],|row|row.get(0)).unwrap();assert_eq!(seals,1);
+    assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.count(),1,"reopen cannot reset budget or resubmit");
+}
+#[test]
+fn background_chrome_only_expired_prepare_stops_without_recoverable_empty_loop_or_budget_reset() {
+    let f=Fixture::new(&[("exhausted",None)]);let j=f.queue();let key=s(&j.jobs[0],"jobId");exhausted_original_prepare(&f,key);
+    assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.count(),0);assert_eq!(f.fake.recoveries.load(Ordering::SeqCst),0);
+    let (cfg,_)=f.engine.generation_config(&f.store,&f.store.job(key).unwrap()).unwrap();assert!(!tasks::chrome_prepare_recovery_eligible(&f.store,&f.store.job(key).unwrap(),&cfg).unwrap());
+    assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.count(),0);
+}
+#[test]
+fn background_chrome_expired_prepare_never_releases_unknown_global_gate_or_swallows_budget_binding_drift() {
+    let f=Fixture::new(&[("exhausted",None),("healthy",None)]);let j=f.queue();let bad=j.jobs.iter().find(|job|job["assetId"]=="exhausted").unwrap();let key=s(bad,"jobId");exhausted_original_prepare(&f,key);
+    let unknown=f.store.add_job("image","untouched","chrome","offline",&json!({}),"submission_unknown").unwrap();let original_unknown=f.store.job(&unknown).unwrap();
+    assert!(f.step(&j));assert_eq!(f.count(),0);
+    // A foreign unknown retains the existing cross-project wait and bounded
+    // runner timeout; budget isolation must not turn that gate into a submit.
+    assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),3);assert_eq!(f.store.job(&unknown).unwrap(),original_unknown);
+    let drift=Fixture::new(&[("exhausted",None)]);let j=drift.queue();let key=s(&j.jobs[0],"jobId");exhausted_original_prepare(&drift,key);
+    drift.store.conn().unwrap().execute("UPDATE metadata SET value=json_set(value,'$.snapshotSha256',?1) WHERE key=?2",rusqlite::params!["0".repeat(64),format!("chrome_prepare_recovery:{key}")]).unwrap();
+    let before=drift.store.jobs().unwrap();assert!(selected_step(&drift.engine,&drift.request,&drift.store,&j).unwrap_err().contains("HELD"));assert_eq!(drift.store.jobs().unwrap(),before);assert_eq!(drift.count(),0);
+}
+
 #[test]
 fn background_chrome_legacy_prepare_recovery_is_ready_only_then_original_gate_before_first_submit() {
     let f=Fixture::new(&[("root",None)]);let j=f.queue();let key=s(&j.jobs[0],"jobId");let original=f.store.job(key).unwrap();

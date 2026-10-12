@@ -17,7 +17,7 @@ mod chrome_queue_tests;
 pub(crate) mod chrome_cleanup_tests;
 #[path="tasks_chrome_prepare_recovery.rs"]
 mod chrome_prepare_recovery;
-pub(crate) use chrome_prepare_recovery::{chrome_prepare_recovery_eligible,resume_chrome_prepare};
+pub(crate) use chrome_prepare_recovery::{chrome_prepare_recovery_eligible,resume_chrome_prepare,retire_exhausted_chrome_prepare};
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
@@ -209,7 +209,7 @@ fn prepare_generation(
         return Ok(None);
     }
     let state = s(&j, "status").to_owned();
-    let recovering=cfg.kind=="chrome" && chrome_prepare_recovery::chrome_prepare_recovery_eligible(store,&j,cfg)?;
+    let recovering=cfg.kind=="chrome" && chrome_prepare_recovery::has_proof(store,&j,cfg)?;
     if !["queued", "ready"].contains(&state.as_str()) && !recovering {
         return Ok(None);
     }

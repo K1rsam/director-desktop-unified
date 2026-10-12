@@ -352,12 +352,20 @@ fn recover_selected_dependency_blocks(r:&Request,store:&Store,journal:&Journal)-
 fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -> Result<bool> {
     r.validate_source_assets(store)?;
     let ids:HashSet<_>=journal.jobs.iter().map(|j|s(j,"jobId").to_owned()).collect();
+    let mut prepare_budgets_retired=false;
     // Check the entire selected set before a dependency resolver can write.
     for identity in &journal.jobs {
         let job=store.job(s(identity,"jobId"))?;
         r.job_bound(&job)?;
         if job_identity(&job)!=*identity {return Err(HELD.into());}
         if job["status"]=="waiting_dependency" && job["snapshot"]["references"]!=json!([]) {return Err(HELD.into());}
+    }
+    for identity in &journal.jobs {
+        let job=store.job(s(identity,"jobId"))?;
+        if ["failed","recovery_paused","preparing"].contains(&s(&job,"status")) {
+            let (cfg,_)=engine.generation_config(store,&job)?;
+            prepare_budgets_retired|=tasks::retire_exhausted_chrome_prepare(store,&job,&cfg)?;
+        }
     }
     let dependencies_restored=recover_selected_dependency_blocks(r,store,journal)?;
     engine.unblock_image_dependencies_selected(store,Some(&ids))?;
@@ -398,7 +406,7 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
         return Ok(true);
     }
     // New generation/recovery operations above retain priority over cleanup.
-    Ok(selected_cleanup_step(engine,r,store,journal)? || dependencies_restored)
+    Ok(selected_cleanup_step(engine,r,store,journal)? || dependencies_restored || prepare_budgets_retired)
 }
 
 fn run_owned(engine:Arc<Engine>,r:&Request) -> Result<i32> {

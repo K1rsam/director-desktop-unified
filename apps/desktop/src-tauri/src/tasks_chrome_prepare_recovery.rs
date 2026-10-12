@@ -45,6 +45,7 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let mut begin=false;let mut failed=false;let mut intent=None;
     for (kind,raw) in &events {
         let value:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
+        if kind=="chrome_prepare_recovery_exhausted" {return Ok(None);}
         if kind.contains("submit") || kind.contains("query") || kind.contains("download") || kind.contains("reconcile")
             || ["ready","submitting","submitted","processing","submission_unknown","succeeded","downloading","downloaded"].iter()
                 .any(|state|value["state"]==*state || value["from"]==*state) {return Ok(None);}
@@ -70,17 +71,44 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
             "configSha256":hash(&json!(cfg)),"eventHistorySha256":hash(&json!(events)),"stateChainProven":true,"preparedNeverCompleted":true}})))
 }
 pub(crate) fn chrome_prepare_recovery_eligible(store:&Store,job:&Value,cfg:&ProviderConfig)->Result<bool> {
+    if proof(store,s(job,"id"),cfg)?.is_none() {return Ok(false);}
+    Ok(!saved_budget(store,s(job,"id"),&job["snapshot"])? .as_ref().is_some_and(budget_exhausted))
+}
+pub(super) fn has_proof(store:&Store,job:&Value,cfg:&ProviderConfig)->Result<bool> {
     Ok(proof(store,s(job,"id"),cfg)?.is_some())
+}
+fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
+    let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+    let Some(raw)=raw else {return Ok(None);};
+    let budget:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
+    if budget["snapshotSha256"]!=hash(snapshot) || budget["version"]!="chrome-prepare-recovery-budget/v1"
+        || budget["startedAt"].as_i64().is_none() || budget["attempts"].as_u64().is_none() {return Err(HELD.into());}
+    Ok(Some(budget))
+}
+fn budget_exhausted(budget:&Value)->bool {
+    let elapsed=chrono::Utc::now().timestamp()-budget["startedAt"].as_i64().unwrap();
+    elapsed<0 || elapsed>180 || budget["attempts"].as_u64().unwrap()>=3
+}
+pub(crate) fn retire_exhausted_chrome_prepare(store:&Store,job:&Value,cfg:&ProviderConfig)->Result<bool> {
+    // Never classify a binding/history conflict as a budget terminal. All
+    // original zero-submit proofs must still validate before this narrow seal.
+    if proof(store,s(job,"id"),cfg)?.is_none() {return Ok(false);}
+    let Some(budget)=saved_budget(store,s(job,"id"),&job["snapshot"])? else {return Ok(false);};
+    if !budget_exhausted(&budget) {return Ok(false);}
+    let mut c=store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    let count=tx.execute("UPDATE jobs SET state='failed',next_attempt_at=0,updated_at=?1 WHERE id=?2 AND state=?3 AND snapshot=?4 AND prepared IS NULL AND result IS NULL AND (task_id IS NULL OR task_id='') AND (receipt IS NULL OR receipt IN ('','null','{}'))",
+        rusqlite::params![now(),s(job,"id"),s(job,"status"),job["snapshot"].to_string()]).map_err(|e|e.to_string())?;
+    if count==1 {tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_recovery_exhausted',?2,?3)",rusqlite::params![s(job,"id"),
+        json!({"version":"chrome-prepare-budget-terminal/v1","code":"CHROME_PREPARE_RECOVERY_EXHAUSTED","snapshotSha256":hash(&job["snapshot"]),"requestId":job["snapshot"]["requestId"],
+            "previousState":job["status"],"previousError":job["error"],"budget":budget,"generationCalled":false,"budgetResetAllowed":false,"independentJobsMayContinue":true}).to_string(),now()]).map_err(|e|e.to_string())?;}
+    tx.commit().map_err(|e|e.to_string())?;if count==1 {store.dirty()?;}Ok(count==1)
 }
 pub(super) fn begin(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let Some(proof)=proof(store,key,cfg)? else {return Ok(None);};
     let metadata=format!("chrome_prepare_recovery:{key}");
-    let old:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
     let original=store.job(key)?;
-    let mut budget:Value=old.as_deref().map(serde_json::from_str).transpose().map_err(|_|HELD)?.unwrap_or_else(||json!({"version":"chrome-prepare-recovery-budget/v1","snapshotSha256":hash(&original["snapshot"]),"startedAt":chrono::Utc::now().timestamp(),"attempts":0}));
-    if budget["snapshotSha256"]!=hash(&store.job(key)?["snapshot"]) || budget["version"]!="chrome-prepare-recovery-budget/v1" {return Err(HELD.into());}
-    let elapsed=chrono::Utc::now().timestamp()-budget["startedAt"].as_i64().ok_or(HELD)?;
-    if elapsed<0 || elapsed>180 || budget["attempts"].as_u64().ok_or(HELD)?>=3 {
+    let mut budget=saved_budget(store,key,&original["snapshot"])? .unwrap_or_else(||json!({"version":"chrome-prepare-recovery-budget/v1","snapshotSha256":hash(&original["snapshot"]),"startedAt":chrono::Utc::now().timestamp(),"attempts":0}));
+    if budget_exhausted(&budget) {
         return Err("CHROME_PREPARE_RECOVERY_EXHAUSTED: 原页准备恢复已到有界上限，保留原任务，不开新页".into());
     }
     budget["attempts"]=json!(budget["attempts"].as_u64().unwrap()+1);

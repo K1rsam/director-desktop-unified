@@ -33,6 +33,14 @@
 
 ## 续接顺序
 
+### 本轮准备预算隔离补丁
+
+准备恢复达到原 3 次／180 秒预算时，原执行器直接传播错误，导致整个批次停止；另一个有完整未提交证明但预算已过期的任务仍被算作 runnable，会造成无效等待。现改为完整核对原零提交证据、冻结 snapshot 与预算后，原子封存这一项；原 ID、snapshot、错误及预算均保留，独立健康分支继续。封存事件明确 `generationCalled=false`、`budgetResetAllowed=false`；未知提交、身份漂移和证据矛盾仍保持原门禁，不能当成预算耗尽消化。
+
+Windows debug 定向 32 项后台及 14 项共享任务回归通过。随后重新编译 release 核心并以 Cargo JSON 固定唯一测试产物、清单 1211 项及 SHA256 `fe63eea24d9e7871a9892304fec1fab0dd1af04b5634865d00b39a93f90f3b60`。原生 job runner 实际执行 `--test-threads=4`：1167 通过、0 失败、44 忽略，144.52 秒；receipt 确认 unpackaged、共享写探针和进程树已空。没有运行真实模型或 ignored 测试。
+
+2026-10-12 05:06:48 UTC 对原项目稳定 SQLite/WAL 副本进行只读核验：仍为 5 downloaded、8 failed、2 blocked、13 queued、1 waiting_dependency；`chrome_prepare_recovery` 预算元数据为空。因此现有八项准备失败尚未消耗此恢复预算，不应仅根据旧 GUI 的 prepare_error 事件数量判断预算耗尽。原文精确一致、视频任务 0；没有重新创建批次。
+
 1. 通过可用的后台浏览器控制连接唤醒原工作页／实际重载扩展，核对真实 profile、bundle、原 source launch 和 hello ACK。当前 CUA Chrome 只读清单也返回连接失败，不能用磁盘 overlay 当成已唤醒；用户前台页面及 Chrome 配置不改。
 2. 验证新 worker 与 owned-launch inventory 实际运行。只有这些前置条件满足，才移除本次 controller 停止标记并以原请求文件启动同批后台入口；不创建新的29项批次。
 3. 恢复7项未提交准备失败和2项原依赖 blocked，续跑其余 waiting/queued。已有5图不重发。完成全29原图入库后逐图审核，核对人物视图、身份和父图承接以及最后工作页清理。
