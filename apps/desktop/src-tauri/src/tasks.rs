@@ -18,6 +18,9 @@ pub(crate) mod chrome_cleanup_tests;
 #[path="tasks_chrome_prepare_recovery.rs"]
 mod chrome_prepare_recovery;
 pub(crate) use chrome_prepare_recovery::{chrome_prepare_recovery_eligible,resume_chrome_prepare,retire_exhausted_chrome_prepare};
+#[path="tasks_chrome_prepared_refresh.rs"]
+mod chrome_prepared_refresh;
+pub(crate) use chrome_prepared_refresh::{prepared_runtime_refresh_eligible,refresh_prepared_runtime};
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
@@ -26,6 +29,9 @@ pub trait Channels: Send + Sync {
     fn prepare_observed(&self,c:&ProviderConfig,r:&GenerationRequest,_observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {self.prepare(c,r)}
     fn recover_prepare(&self,_c:&ProviderConfig,_r:&GenerationRequest,_proof:&Value,_observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {
         Err(ProviderError::new("CHROME_PREPARE_RECOVERY_UNSUPPORTED","渠道未实现同 ID 原页准备恢复，保留原任务"))
+    }
+    fn refresh_unsubmitted_prepared(&self,_c:&ProviderConfig,_p:&PreparedRequest)->ProviderResult<PreparedRequest>{
+        Err(ProviderError::new("CHROME_PREPARE_REFRESH_UNSUPPORTED","渠道未实现原页未提交证明更新，保留原准备"))
     }
     fn submit(&self, c: &ProviderConfig, r: &PreparedRequest) -> ProviderResult<SubmitReceipt>;
     fn query(&self, c: &ProviderConfig, id: &str) -> ProviderResult<QueryResult>;
@@ -60,6 +66,7 @@ pub trait Channels: Send + Sync {
 }
 pub struct RealChannels;
 impl Channels for RealChannels {
+    fn refresh_unsubmitted_prepared(&self,c:&ProviderConfig,p:&PreparedRequest)->ProviderResult<PreparedRequest>{providers::refresh_chrome_unsubmitted_prepared(c,p)}
     fn prepare_observed(&self,c:&ProviderConfig,r:&GenerationRequest,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::prepare_observed(c,r,observer)}
     fn recover_prepare(&self,c:&ProviderConfig,r:&GenerationRequest,proof:&Value,observer:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {providers::recover_chrome_prepare(c,r,proof,observer)}
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities> {

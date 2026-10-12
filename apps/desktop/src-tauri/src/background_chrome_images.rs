@@ -392,11 +392,16 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         let recover_prepare=!known && ["failed","recovery_paused","preparing"].contains(&state)
             && tasks::chrome_prepare_recovery_eligible(store,&job,&config)?;
         let generate=!known && ["queued","ready"].contains(&state);
+        let refresh_marker=format!("prepared:{key}");
+        let refresh_prepared=!known&&!paused_queries.contains(&refresh_marker)&&tasks::prepared_runtime_refresh_eligible(store,&job,&config)?;
         // An explicit batch continuation may read each exhausted KNOWN original
         // once. It never resets retry budgets or calls prepare/submit; a failed
         // recovery remains held for the rest of this invocation.
         let recover_paused_query=known && state=="recovery_paused" && !paused_queries.contains(key);
-        if !generate && !recover_prepare && !recover_paused_query && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
+        if !generate && !recover_prepare && !refresh_prepared && !recover_paused_query && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
+        // Refresh only reads the original page and updates its transport proof.
+        // The generation queue accepts queued/ready jobs, so a failed original
+        // must first be restored; its eventual first submit still passes that gate.
         if generate && !engine.chrome_image_queue_ready(store,key)? {continue;}
         if config.kind!="chrome" {return Err(HELD.into());}
         // Includes source/asset versions and exact adopted parent media hashes.
@@ -409,6 +414,14 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         if recover_paused_query {
             paused_queries.insert(key.to_owned());
             store.event(key,"chrome_paused_original_query_requested",&json!({"providerTaskId":job["providerTaskId"],"requestId":job["snapshot"]["requestId"],"queryAttemptsPreserved":job["queryAttempts"],"prepareCalled":false,"submitCalled":false,"boundedPerBatchContinuation":true}))?;
+        }
+        if refresh_prepared {
+            paused_queries.insert(refresh_marker.clone());
+            let refreshed=tasks::refresh_prepared_runtime(store,key,&config,&account,engine.channels.as_ref())?;
+            if !refreshed&&store.job(key)?["nextAttemptAt"].as_i64().is_some_and(|at|at>chrono::Utc::now().timestamp()){
+                paused_queries.remove(&refresh_marker);return Ok(true);
+            }
+            return Ok(refreshed);
         }
         if recover_prepare {tasks::resume_chrome_prepare(store,key,&config,&account,engine.channels.as_ref())?;}
         else if generate {tasks::run_generation(store,key,&config,&account,engine.channels.as_ref())?;}
@@ -471,7 +484,10 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
         let recoverable=jobs.iter().filter(|j|["failed","recovery_paused","preparing"].contains(&s(j,"status")))
             .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::chrome_prepare_recovery_eligible(&store,j,&cfg)))
             .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
-        let runnable=recoverable || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
+        let refreshable=jobs.iter().filter(|j|!paused_queries.contains(&format!("prepared:{}",s(j,"id"))))
+            .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::prepared_runtime_refresh_eligible(&store,j,&cfg)))
+            .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
+        let runnable=recoverable || refreshable || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
         let unknown=jobs.iter().any(|j|["submission_unknown","auth_required","recovery_paused"].contains(&s(j,"status")));
         let known_pending=jobs.iter().any(|j|!s(j,"providerTaskId").is_empty() && (["submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status"))
             || j["status"]=="recovery_paused" && !paused_queries.contains(s(j,"id"))));

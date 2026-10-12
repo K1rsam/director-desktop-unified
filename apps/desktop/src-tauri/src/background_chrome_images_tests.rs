@@ -16,11 +16,25 @@ struct Fake {
     pending:AtomicBool,
     prepare_busy:AtomicBool,
     query_error:AtomicBool,
+    refreshes:AtomicUsize,
+    refresh_error:AtomicBool,
+    refresh_payload_drift:AtomicBool,
+    refresh_busy:AtomicBool,
     cleanup_outcomes:Mutex<VecDeque<Value>>,
     cleanup_default:Mutex<Option<Value>>,
     releases:AtomicUsize,
 }
 impl Channels for Fake {
+    fn refresh_unsubmitted_prepared(&self,c:&ProviderConfig,p:&PreparedRequest)->ProviderResult<PreparedRequest>{
+        assert_eq!(c.kind,"chrome");self.refreshes.fetch_add(1,Ordering::SeqCst);
+        if self.refresh_busy.load(Ordering::SeqCst){return Err(ProviderError::new("BRIDGE_BUSY","synthetic queue waits"));}
+        if self.refresh_error.load(Ordering::SeqCst){return Err(ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","synthetic no authoritative absence"));}
+        let mut out=p.clone();out.wire["prepareRuntime"]["runtime"]["backgroundEpoch"]=json!("new-synthetic-runtime");out.prepared_at=now();
+        let proof=json!({"version":"chrome-prepared-runtime-refresh/v1","requestId":p.request.request_id,"sourceClientId":p.wire["sourceClientId"],"originalPreparedSha256":pipeline::digest(&json!(p).to_string()),"originalPrepareRuntime":p.wire["prepareRuntime"],"newRuntime":out.wire["prepareRuntime"]["runtime"]});
+        let mut history=p.wire["preparedRuntimeRefresh"].as_array().cloned().unwrap_or_default();history.push(proof);out.wire["preparedRuntimeRefresh"]=json!(history);
+        if self.refresh_payload_drift.load(Ordering::SeqCst){out.wire["message"]=json!("changed source prompt");}
+        Ok(out)
+    }
     fn capabilities(&self,c:&ProviderConfig)->ProviderResult<Capabilities> {
         assert_eq!(c.kind,"chrome");
         Ok(serde_json::from_value(json!({"provider":"chrome","version":"offline/v1","source":"synthetic","checkedAt":now(),
@@ -148,6 +162,68 @@ fn background_chrome_failed_paused_original_query_is_bounded_and_keeps_retry_bud
     assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
     assert_eq!(f.store.job(key).unwrap()["status"],"recovery_paused");assert!(f.store.job(key).unwrap()["queryAttempts"].as_u64().unwrap()>=5);
     assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);assert_eq!(f.count(),1);
+}
+
+fn failed_runtime_prepared(f:&Fixture,j:&Journal)->String{
+    let key=s(&j.jobs[0],"jobId").to_owned();let job=f.store.job(&key).unwrap();let (cfg,account)=f.engine.generation_config(&f.store,&job).unwrap();
+    assert_eq!(s(&job,"accountId"),account);assert!(f.store.claim_job(&key,"queued","preparing").unwrap());
+    let p=f.fake.prepare(&cfg,&tasks::generation_request(&job["snapshot"]).unwrap()).unwrap();
+    assert!(f.store.claim_job_fields(&key,"preparing","ready",&json!({"prepared":p})).unwrap());
+    let mut prepared=f.store.job(&key).unwrap()["prepared"].clone();prepared["wire"]["prepareRuntime"]=json!({"version":"chrome-prepare-intent/v1","runtime":{"backgroundEpoch":"old","browserProfileId":"original-profile"}});
+    f.store.update_job(&key,"ready",&json!({"prepared":prepared})).unwrap();assert!(f.store.claim_job(&key,"ready","submitting").unwrap());
+    f.store.update_job(&key,"failed",&json!({"error":"浏览器运行身份在准备后变化，保留原请求，未发送"})).unwrap();key
+}
+#[test]
+fn background_chrome_epoch_refresh_preserves_original_request_prepared_history_and_budget_then_first_submits_once(){
+    let f=Fixture::new(&[("first",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);let original=f.store.job(&key).unwrap();
+    let budget=json!({"attempts":1,"executionStartedAt":123});f.store.conn().unwrap().execute("INSERT INTO metadata VALUES(?1,?2)",rusqlite::params![format!("chrome_prepare_recovery:{key}"),budget.to_string()]).unwrap();
+    let mut attempted=HashSet::new();assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    let refreshed=f.store.job(&key).unwrap();assert_eq!(refreshed["status"],"ready");assert_eq!(refreshed["snapshot"],original["snapshot"]);assert_eq!(f.count(),0);assert_eq!(f.fake.prepares.load(Ordering::SeqCst),1);
+    let saved:String=f.store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|r|r.get(0)).unwrap();assert_eq!(saved,budget.to_string());
+    let archive:String=f.store.conn().unwrap().query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepared_runtime_refreshed'",[&key],|r|r.get(0)).unwrap();assert_eq!(serde_json::from_str::<Value>(&archive).unwrap()["originalPrepared"],original["prepared"]);
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.count(),1);assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),1);
+}
+#[test]
+fn background_chrome_prepared_refresh_never_bypasses_another_unknown_submission(){
+    let f=Fixture::new(&[("first",None),("unknown",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);
+    let unknown=s(&j.jobs[1],"jobId");f.store.update_job(unknown,"submission_unknown",&json!({})).unwrap();
+    let mut attempted=HashSet::new();
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    assert_eq!(f.store.job(&key).unwrap()["status"],"ready");assert_eq!(f.count(),0);
+    assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    assert_eq!(f.count(),0);assert_eq!(f.store.job(unknown).unwrap()["status"],"submission_unknown");
+}
+#[test]
+fn background_chrome_epoch_refresh_rejects_unknown_history_remote_receipts_or_changed_payload(){
+    for case in ["unknown","receipt","history","payload","remote-held"]{
+        let f=Fixture::new(&[("first",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);
+        match case{
+            "unknown"=>{f.store.event(&key,"state",&json!({"state":"submission_unknown"})).unwrap();},
+            "receipt"=>{f.store.update_job(&key,"failed",&json!({"receipt":{"original":"unknown"}})).unwrap();},
+            "history"=>{f.store.conn().unwrap().execute("DELETE FROM events WHERE job_id=?1 AND type='state_claim' AND json_extract(data,'$.from')='preparing'",[&key]).unwrap();},
+            "payload"=>{f.fake.refresh_payload_drift.store(true,Ordering::SeqCst);},
+            _=>{f.fake.refresh_error.store(true,Ordering::SeqCst);}
+        }
+        let before=f.store.job(&key).unwrap();let mut attempted=HashSet::new();let _=selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted);
+        assert_eq!(f.store.job(&key).unwrap(),before,"{case}");assert_eq!(f.count(),0);
+        let count=f.fake.refreshes.load(Ordering::SeqCst);let _=selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted);assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),count);
+    }
+}
+#[test]
+fn background_chrome_repeated_epoch_refresh_requires_each_original_prepost_rejection_and_preserves_history(){
+    let f=Fixture::new(&[("first",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);
+    for _ in 0..2{
+        let mut attempted=HashSet::new();assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+        assert!(f.store.claim_job(&key,"ready","submitting").unwrap());f.store.update_job(&key,"failed",&json!({"error":"浏览器运行身份在准备后变化，保留原请求，未发送"})).unwrap();
+    }
+    assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),2);assert_eq!(f.count(),0);assert_eq!(f.store.job(&key).unwrap()["prepared"]["wire"]["preparedRuntimeRefresh"].as_array().unwrap().len(),2);
+}
+#[test]
+fn background_chrome_epoch_refresh_busy_wait_is_deferred_and_does_not_seal_the_original(){
+    let f=Fixture::new(&[("first",None)]);let j=f.queue();let key=failed_runtime_prepared(&f,&j);let original=f.store.job(&key).unwrap();f.fake.refresh_busy.store(true,Ordering::SeqCst);
+    let mut attempted=HashSet::new();assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    let waiting=f.store.job(&key).unwrap();assert!(waiting["nextAttemptAt"].as_i64().unwrap()>chrono::Utc::now().timestamp());assert_eq!(waiting["prepared"],original["prepared"]);assert_eq!(waiting["snapshot"],original["snapshot"]);assert_eq!(f.count(),0);
+    assert!(!attempted.contains(&format!("prepared:{key}")));assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.fake.refreshes.load(Ordering::SeqCst),1);
 }
 #[test]
 fn background_chrome_due_waiter_cannot_starve_untouched_jobs_with_zero_generation(){

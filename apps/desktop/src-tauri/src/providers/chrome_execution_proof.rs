@@ -50,6 +50,9 @@ fn execution_valid(native:&Value,source:&Value)->bool {
             && item["meta"]["ackMessageId"].as_str().is_some_and(|id|!id.is_empty()) && acks.is_some_and(|a|a.contains(&item["meta"]["ackMessageId"]))))
 }
 pub(super) fn fresh_idle(config:&ProviderConfig,client:&Client,source:&Value,binding:&crate::chrome_setup::BrowserBinding,request:&GenerationRequest)->ProviderResult<()> {
+    prove_idle(config,client,source,binding,request).map(|_|())
+}
+pub(super) fn prove_idle(config:&ProviderConfig,client:&Client,source:&Value,binding:&crate::chrome_setup::BrowserBinding,request:&GenerationRequest)->ProviderResult<Value> {
     let held=||ProviderError::new("BRIDGE_BUSY","浏览器实时执行队列尚未证实空闲，原任务保持等待；未开页或发送。");
     let mut url=reqwest::Url::parse(&format!("http://localhost/browser/owned-launch/{}",request.request_id)).map_err(|_|held())?;
     url.query_pairs_mut().append_pair("sourceClientId",s(source,"id")).append_pair("profileId",&binding.profile_id).append_pair("bundleId",&binding.bundle_id)
@@ -70,9 +73,10 @@ pub(super) fn fresh_idle(config:&ProviderConfig,client:&Client,source:&Value,bin
         || decoded!=*inv || native["inventorySha256"]!=hex_hash(raw.as_bytes()) || inv["sourceTabId"]!=source["browserTabId"]
         || tabs.len()!=1 || tabs[0]["incognito"]!=false || tabs[0]["discarded"]!=false || !inventory_source_background_proven(inv,runtime,source,tabs[0]) || !execution_valid(&native,source) {return Err(held());}
     let after=clients(config,client)?;let matches:Vec<_>=after.iter().filter(|c|c["id"]==source["id"]).collect();
-    if matches.len()!=1 || !same_idle_owned_source(matches[0],source,binding) || matches[0]["browserTabId"]!=source["browserTabId"] || matches[0]["contentEpoch"]!=source["contentEpoch"] || !compatible_profile_clients(&after,source,binding)
+    if matches.len()!=1 || after.iter().filter(|c|c["launchToken"]==source["launchToken"]).count()!=1
+        || !same_idle_owned_source(matches[0],source,binding) || matches[0]["browserTabId"]!=source["browserTabId"] || matches[0]["contentEpoch"]!=source["contentEpoch"] || !compatible_profile_clients(&after,source,binding)
         || after.iter().filter(|c|c["browserProfileId"]==binding.profile_id).any(|c|!explicit_idle(c)) {return Err(held());}
-    Ok(())
+    Ok(native)
 }
 #[cfg(test)]
 mod tests {

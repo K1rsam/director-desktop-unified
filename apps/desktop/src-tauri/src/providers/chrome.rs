@@ -8,6 +8,9 @@ mod background_tests;
 #[cfg(test)]
 #[path = "chrome_control_page_tests.rs"]
 mod control_page_tests;
+#[cfg(test)]
+#[path = "chrome_prepared_refresh_tests.rs"]
+mod prepared_refresh_tests;
 #[path="chrome_execution_proof.rs"]
 mod execution_proof;
 
@@ -515,6 +518,9 @@ fn recover_blank_tab(config:&ProviderConfig,client:&Client,available:&[Value],bi
     Ok(page.clone())
 }
 fn prove_bridge_prepare_absence(config:&ProviderConfig,client:&Client,request:&GenerationRequest)->ProviderResult<()> {
+    bridge_prepare_absence_proof(config,client,request).map(|_|())
+}
+fn bridge_prepare_absence_proof(config:&ProviderConfig,client:&Client,request:&GenerationRequest)->ProviderResult<Value> {
     let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原请求存在执行记录或无可信未提交证明，未开页或发送");
     match json_request(config,client,&format!("/turns/{}",request.request_id),None,false) {
         Err(error) if error.context.as_ref().and_then(|c|c.get("httpStatus"))==Some(&json!(404))
@@ -527,7 +533,74 @@ fn prove_bridge_prepare_absence(config:&ProviderConfig,client:&Client,request:&G
         || tracked.get("state")!=Some(&Value::Null)
         || !tracked["history"].as_array().is_some_and(Vec::is_empty)
         || !tracked["deadlines"].as_array().is_some_and(Vec::is_empty) {return Err(held());}
-    Ok(())
+    Ok(json!({"requestId":request.request_id,"turnStatus":404,"turnDetail":format!("Turn not found: {}",request.request_id),"canonical":canonical,"observedAt":now()}))
+}
+
+/// Refresh only an already frozen, provably unsubmitted request on its SAME
+/// owned empty page. Caller must additionally prove its local no-submit chain
+/// and persist this result before submit; this adapter cannot inspect job state.
+/// Never opens a page, uploads a reference, or sends a generation request.
+pub(super) fn refresh_unsubmitted_prepared(config:&ProviderConfig,prepared:&PreparedRequest)->ProviderResult<PreparedRequest> {
+    let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原准备请求的未提交与原空白页身份未完整核对，保留原快照，未发送");
+    let request=&prepared.request;
+    let binding=config.chrome_binding.as_ref().ok_or_else(held)?;
+    let frozen=&prepared.wire["prepareRuntime"];
+    let launch=format!("bridge-director-desktop-{}",request.request_id);
+    let hash=hex_hash(json!(request).to_string().as_bytes());
+    let source_id=s(&prepared.wire,"sourceClientId");
+    if config.kind!="chrome" || prepared.provider!="chrome" || request.kind!="image" || request.model!="chatgpt-image"
+        || !uuid::Uuid::parse_str(&request.request_id).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==request.request_id)
+        || source_id.is_empty() || prepared.wire["id"]!=request.request_id || prepared.wire["newSession"]!=false
+        || frozen["version"]!="chrome-prepare-intent/v1" || frozen["requestId"]!=request.request_id || frozen["requestHash"]!=hash
+        // new_prepare/legacy_first_open freeze the opener, not the resulting
+        // work page. Preserve that original opener identity; never retarget it.
+        || frozen["launchToken"]!=launch || s(frozen,"sourceClientId").is_empty() || frozen["browserBinding"]!=json!(binding)
+        || !["new_prepare","legacy_first_open","legacy_first_prepare"].contains(&s(frozen,"mode"))
+        || frozen["mode"]=="legacy_first_prepare" && frozen["sourceClientId"]!=source_id
+        || prepared.wire["browserBinding"]!=json!(binding) || !same_browser_runtime(&frozen["runtime"],&frozen["runtime"],binding)
+        || !prepared.wire["attachments"].is_array() || !prepared.wire["message"].is_string() {return Err(held());}
+    crate::chrome_setup::browser_binding(&crate::chrome_setup::binding_settings(&wire::base(config,true)?,Some(binding))).map_err(|_|held())?;
+    let client=wire::client(15)?;
+    let check_page=|available:&[Value],expected:Option<&Value>|->ProviderResult<Value>{
+        let owners:Vec<_>=available.iter().filter(|p|p["launchToken"]==launch).collect();
+        let sources:Vec<_>=available.iter().filter(|p|p["id"]==source_id).collect();
+        if owners.len()!=1 || sources.len()!=1 || owners[0]!=sources[0] {return Err(held());}
+        let page=owners[0];
+        if page["url"]!="https://chatgpt.com/" || page["focused"]!=false || page["visibilityState"]!="hidden" || !explicit_idle(page)
+            || !same_browser_runtime(page,page,binding) || !compatible_profile_clients(available,page,binding)
+            || !page["browserTabId"].as_u64().is_some_and(|id|id>0) || s(page,"contentEpoch").is_empty()
+            || available.iter().filter(|p|p["browserProfileId"]==binding.profile_id).any(|p|!explicit_idle(p))
+            || expected.is_some_and(|old|!same_idle_owned_source(page,old,binding) || page["browserTabId"]!=old["browserTabId"] || page["contentEpoch"]!=old["contentEpoch"]) {return Err(held());}
+        Ok(page.clone())
+    };
+    let source=check_page(&clients(config,&client)?,None)?;
+    let before=bridge_prepare_absence_proof(config,&client,request)?;
+    let empty=json_request(config,&client,"/browser/recover-latest",Some(&json!({"sourceClientId":source_id,"index":1,"timeoutMs":10000,"reconcileConversation":{"mode":"image_preflight"}})),false)?;
+    let result=&empty["result"];let proof=&result["reconciliation"];
+    if empty["ok"]!=true || result["sourceClientId"]!=source_id || result["url"]!="https://chatgpt.com/"
+        || proof["source"]!="browser-empty-preflight" || proof["status"]!="matched_empty" || proof["version"]!=1 || proof["proofVersion"]!=2 {return Err(held());}
+    check_page(&clients(config,&client)?,Some(&source))?;
+    let after=bridge_prepare_absence_proof(config,&client,request)?;
+    let native=execution_proof::prove_idle(config,&client,&source,binding,request)?;
+    let native_age=native["inventory"]["sourceExecutionProof"]["observedAt"].as_i64().map(|at|chrono::Utc::now().timestamp_millis()-at);
+    if native["status"]!="matched" || native["match"]["tabId"]!=source["browserTabId"]
+        || native["match"]["url"]!="https://chatgpt.com/" || native["match"]["launchToken"]!=launch || native["match"]["connected"]!=true
+        || !native_age.is_some_and(|age|(0..=5000).contains(&age)) {return Err(held());}
+    let mut refreshed=prepared.clone();
+    let at=now();
+    for key in ["backgroundEpoch","serverInstanceId","contentEpoch"] {refreshed.wire["prepareRuntime"]["runtime"][key]=source[key].clone();}
+    // Keep the original request, message, files and receipts byte-for-byte in
+    // their serialized representation; the independent audit key is local only.
+    let mut history=prepared.wire.get("preparedRuntimeRefresh").cloned().unwrap_or_else(||json!([]));
+    let entries=history.as_array_mut().ok_or_else(held)?;
+    entries.push(json!({"version":"chrome-prepared-runtime-refresh/v1","requestId":request.request_id,"requestHash":hash,
+        "sourceClientId":source_id,"launchToken":launch,"browserBinding":binding,"refreshedAt":at,
+        "originalPreparedAt":prepared.prepared_at,"originalPrepareRuntime":frozen,"originalRuntimeSha256":hex_hash(frozen["runtime"].to_string().as_bytes()),"originalPrepareRuntimeSha256":hex_hash(frozen.to_string().as_bytes()),
+        "originalPreparedSha256":hex_hash(json!(prepared).to_string().as_bytes()),"bridgeAbsenceBefore":before,"bridgeAbsenceAfter":after,
+        "emptyPreflight":empty,"nativeExecutionProof":native,"newRuntime":refreshed.wire["prepareRuntime"]["runtime"]}));
+    refreshed.wire["preparedRuntimeRefresh"]=history;
+    refreshed.prepared_at=at;
+    Ok(refreshed)
 }
 fn inventory_source_background_proven(inventory:&Value,runtime:&Value,source:&Value,tab:&Value)->bool {
     if tab["active"]==false {return true;}
@@ -629,6 +702,7 @@ pub(super) fn submit(
         .ok_or_else(|| ProviderError::new("PREPARED_INVALID", "浏览器准备快照无效。"))?
         .remove("emptyPreflight");
     body.as_object_mut().unwrap().remove("prepareRuntime");
+    body.as_object_mut().unwrap().remove("preparedRuntimeRefresh");
     if shutting_down() {
         return Err(ProviderError::new(
             "CLIENT_CLOSING",

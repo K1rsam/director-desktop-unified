@@ -253,6 +253,11 @@ pub fn recover_chrome_prepare(config:&ProviderConfig,request:&GenerationRequest,
     validate_request(request)?;
     chrome::recover_prepare(config,request,proof,observer)
 }
+pub fn refresh_chrome_unsubmitted_prepared(config:&ProviderConfig,prepared:&PreparedRequest)->ProviderResult<PreparedRequest>{
+    if config.kind!="chrome"||prepared.provider!="chrome"||prepared.request.kind!="image"{return Err(ProviderError::new("CHROME_PREPARE_SCOPE","仅允许核验原 Chrome 未提交图片准备"));}
+    validate_request(&prepared.request)?;
+    chrome::refresh_unsubmitted_prepared(config,prepared)
+}
 
 pub fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
     match config.kind.as_str() {
