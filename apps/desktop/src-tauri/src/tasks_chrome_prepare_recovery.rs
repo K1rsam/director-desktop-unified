@@ -53,7 +53,8 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let mut begin=false;let mut failed=false;let mut intent=None;
     for (kind,raw) in &events {
         let value:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
-        if kind=="chrome_prepare_recovery_exhausted" {return Ok(None);}
+        if kind=="chrome_prepare_recovery_exhausted" && !saved_budget(store,key,&job["snapshot"])?
+            .is_some_and(|b|b.get("connectionWaitCorrection").is_some() && !budget_exhausted(&b)) {return Ok(None);}
         if kind.contains("submit") || kind.contains("query") || kind.contains("download") || kind.contains("reconcile")
             || ["ready","submitting","submitted","processing","submission_unknown","succeeded","downloading","downloaded"].iter()
                 .any(|state|value["state"]==*state || value["from"]==*state) {return Ok(None);}
@@ -94,12 +95,25 @@ fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
     if budget["version"]=="chrome-prepare-recovery-budget/v2" {
         if budget.get("executionStartedAt").is_none() || !budget["executionStartedAt"].is_null() && budget["executionStartedAt"].as_i64().is_none()
             || budget["executionStartedAt"].is_null() && budget["attempts"]!=0 {return Err(HELD.into());}
-        let raw:Option<String>=store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' ORDER BY id DESC LIMIT 1",[key],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let cutoff=if let Some(correction)=budget.get("connectionWaitCorrection") {
+            let cutoff=correction["throughEventId"].as_i64().ok_or(HELD)?;
+            let original=&correction["originalBudget"];
+            if original["startedAt"]!=budget["startedAt"] || original["snapshotSha256"]!=budget["snapshotSha256"]
+                || connection_wait_correction(store,key,original,Some(cutoff))?.as_ref()!=Some(correction) {return Err(HELD.into());}
+            cutoff
+        }else{0};
+        let raw:Option<String>=store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' AND id>?2 ORDER BY id DESC LIMIT 1",rusqlite::params![key,cutoff],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(raw)=raw {let event:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
             if event["version"]!="chrome-prepare-execution-clock/v1" || event["jobId"]!=key || event["snapshotSha256"]!=hash(snapshot)
                 || event["requestId"]!=snapshot["requestId"] || event["configSha256"]!=hash(&snapshot["providerConfig"])
                 || event["executionStartedAt"]!=budget["executionStartedAt"] || event["attempt"]!=budget["attempts"] {return Err(HELD.into());}
         } else if !budget["executionStartedAt"].is_null() || budget["attempts"]!=0 {return Err(HELD.into());}
+        if cutoff==0 && budget["attempts"].as_u64().is_some_and(|n|n>0) {
+            if let Some(correction)=connection_wait_correction(store,key,&budget,None)? {
+                let mut corrected=budget.clone();corrected["attempts"]=json!(0);corrected["executionStartedAt"]=Value::Null;
+                corrected["connectionWaitCorrection"]=correction;return Ok(Some(corrected));
+            }
+        }
         return Ok(Some(budget));
     }
     // Narrow interpretation of complete legacy recovery cycles. Original
@@ -112,6 +126,39 @@ fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
         }
     }
     Ok(Some(budget))
+}
+// Correct only this proven historical classification bug. Keep the original
+// budget and all events; any actual intent, fresh proof or remote work forbids it.
+fn connection_wait_correction(store:&Store,key:&str,budget:&Value,through:Option<i64>)->Result<Option<Value>> {
+    let job=store.job(key)?;
+    if budget["version"]!="chrome-prepare-recovery-budget/v2" || budget.get("connectionWaitCorrection").is_some()
+        || budget["attempts"].as_u64().is_none_or(|n|n==0) || !unsubmitted(&job) || !job["prepared"].is_null()
+        || !empty(&job["receipt"]) || !job["result"].is_null() {return Ok(None);}
+    let c=store.conn()?;let mut q=c.prepare("SELECT id,type,data FROM events WHERE job_id=?1 AND id<=?2 ORDER BY id").map_err(|e|e.to_string())?;
+    let rows=q.query_map(rusqlite::params![key,through.unwrap_or(i64::MAX)],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
+        .collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let mut attempts=0u64;let mut pending=false;
+    for (_,kind,raw) in &rows {
+        let v:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
+        if kind=="chrome_prepare_intent" || kind.contains("submit") || kind.contains("query") || kind.contains("download") || kind.contains("reconcile")
+            || ["ready","submitting","submitted","processing","submission_unknown","succeeded","downloading","downloaded"].iter().any(|s|v["state"]==*s || v["from"]==*s) {return Ok(None);}
+        if pending && kind!="chrome_prepare_error" {return Ok(None);}
+        if kind=="chrome_prepare_execution_started" {
+            if v["reason"]!="non_queue_prepare_outcome" || v["version"]!="chrome-prepare-execution-clock/v1" || v["generationCalled"]!=false
+                || v["jobId"]!=key || v["requestId"]!=job["snapshot"]["requestId"] || v["snapshotSha256"]!=hash(&job["snapshot"])
+                || v["configSha256"]!=hash(&job["snapshot"]["providerConfig"]) || v["executionStartedAt"]!=budget["executionStartedAt"]
+                || v["attempt"]!=attempts+1 {return Ok(None);}
+            attempts+=1;pending=true;
+        } else if kind=="chrome_prepare_error" && attempts>0 {
+            if !pending || v["error"]["code"]!="BRIDGE_BROWSER_NOT_READY" || v["generationCalled"]!=false
+                || v["error"]["submissionUnknown"]!=false || v["error"]["authRequired"]!=false || v["sameRequestId"]!=job["snapshot"]["requestId"] {return Ok(None);}
+            pending=false;
+        }
+    }
+    if pending || attempts!=budget["attempts"].as_u64().unwrap() {return Ok(None);}
+    let Some((last,_,_))=rows.last() else{return Ok(None);};
+    if through.is_some_and(|id|id!=*last){return Ok(None);}
+    Ok(Some(json!({"version":"chrome-connection-wait-correction/v1","originalBudget":budget,"throughEventId":last,"eventHistorySha256":hash(&json!(rows)),"noPrepareIntent":true,"noActualExecution":true})))
 }
 fn legacy_queue_only_history(store:&Store,key:&str)->Result<Option<Value>> {
     let c=store.conn()?;let mut q=c.prepare("SELECT type,data FROM events WHERE job_id=?1 ORDER BY id").map_err(|e|e.to_string())?;
@@ -163,9 +210,14 @@ pub(super) fn begin(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Va
     }
     let mut c=store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
     let old:Option<String>=tx.query_row("SELECT value FROM metadata WHERE key=?1",[&metadata],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-    if let Some(raw)=&old {let actual:Value=serde_json::from_str(raw).map_err(|_|HELD)?;let expected=if actual["version"]=="chrome-prepare-recovery-budget/v1" {budget.get("legacyQueueOnlyMigration").map(|v|&v["originalBudget"]).unwrap_or(&budget)}else{&budget};if actual!=*expected{return Err(HELD.into());}}
+    if let Some(raw)=&old {let actual:Value=serde_json::from_str(raw).map_err(|_|HELD)?;let expected=if actual["version"]=="chrome-prepare-recovery-budget/v1" {budget.get("legacyQueueOnlyMigration").map(|v|&v["originalBudget"]).unwrap_or(&budget)}else if actual.get("connectionWaitCorrection").is_none() {budget.get("connectionWaitCorrection").map(|v|&v["originalBudget"]).unwrap_or(&budget)}else{&budget};if actual!=*expected{return Err(HELD.into());}}
     if budget.get("legacyQueueOnlyMigration").is_some() && old.as_ref().is_some_and(|raw|serde_json::from_str::<Value>(raw).ok().is_some_and(|v|v["version"]=="chrome-prepare-recovery-budget/v1")) {
         tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_queue_budget_migrated',?2,?3)",rusqlite::params![key,budget["legacyQueueOnlyMigration"].to_string(),now()]).map_err(|e|e.to_string())?;
+    }
+    if let Some(correction)=budget.get("connectionWaitCorrection") {
+        if old.as_ref().is_some_and(|raw|serde_json::from_str::<Value>(raw).ok().is_some_and(|v|v.get("connectionWaitCorrection").is_none())) {
+            tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_connection_wait_corrected',?2,?3)",rusqlite::params![key,correction.to_string(),now()]).map_err(|e|e.to_string())?;
+        }
     }
     tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![metadata,budget.to_string()]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;
     Ok(Some(proof))
@@ -299,6 +351,37 @@ mod tests {
             let (_t,store,key,_cfg)=fixture();let mut old=legacy_busy_budget(&store,&key);let c=store.conn().unwrap();
             match case {"intent"=>{c.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_intent','{}',?2)",rusqlite::params![key,now()]).unwrap();},"attempt"=>{old["attempts"]=json!(1);c.execute("UPDATE metadata SET value=?1 WHERE key=?2",rusqlite::params![old.to_string(),format!("chrome_prepare_recovery:{key}")]).unwrap();},"nonbusy"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.code','EMPTY_PREFLIGHT') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},"unknown"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.submissionUnknown',json('true')) WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},"request"=>{c.execute("UPDATE events SET data=json_set(data,'$.sameRequestId','other') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},_=>{c.execute("DELETE FROM events WHERE job_id=?1 AND type='chrome_prepare_recovery_started'",[&key]).unwrap();}}drop(c);
             let b=saved_budget(&store,&key,&store.job(&key).unwrap()["snapshot"]).unwrap().unwrap();assert_eq!(b["version"],"chrome-prepare-recovery-budget/v1","{case}");assert!(budget_exhausted(&b),"{case}");
+        }
+    }
+    fn disconnected_history(store:&Store,key:&str,cfg:&ProviderConfig)->Value {
+        begin(store,key,cfg).unwrap();
+        store.event(key,"chrome_prepare_recovery_started",&json!({"requestId":"original-request","firstSubmitAllowed":false})).unwrap();
+        store.claim_job(key,"failed","preparing").unwrap();execution_started(store,key,cfg,"non_queue_prepare_outcome").unwrap();
+        store.event(key,"chrome_prepare_error",&json!({"error":{"code":"BRIDGE_BROWSER_NOT_READY","submissionUnknown":false,"authRequired":false},"generationCalled":false,"sameRequestId":"original-request"})).unwrap();
+        store.claim_job(key,"preparing","recovery_paused").unwrap();
+        let raw:String=store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|r|r.get(0)).unwrap();serde_json::from_str(&raw).unwrap()
+    }
+    #[test] fn chrome_disconnected_wait_correction_retains_original_and_cannot_reset_real_execution(){
+        let (_t,store,key,cfg)=fixture();let original=disconnected_history(&store,&key,&cfg);let snapshot=store.job(&key).unwrap()["snapshot"].clone();
+        store.event(&key,"chrome_prepare_recovery_exhausted",&json!({"version":"chrome-prepare-budget-terminal/v1","generationCalled":false,"budget":original})).unwrap();
+        assert!(has_proof(&store,&store.job(&key).unwrap(),&cfg).unwrap(),"proven mistaken exhaustion is recoverable using the original job");
+        let corrected=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(corrected["connectionWaitCorrection"]["originalBudget"],original);assert_eq!(corrected["attempts"],0);
+        let raw:String=store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|r|r.get(0)).unwrap();assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(),original,"inspection has zero writes");
+        begin(&store,&key,&cfg).unwrap();begin(&store,&key,&cfg).unwrap();
+        let count:i64=store.conn().unwrap().query_row("SELECT COUNT(*) FROM events WHERE job_id=?1 AND type='chrome_prepare_connection_wait_corrected'",[&key],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        store.event(&key,"chrome_prepare_recovery_started",&json!({"requestId":"original-request","firstSubmitAllowed":false})).unwrap();execution_started(&store,&key,&cfg,"fresh_native_idle").unwrap();
+        let current=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(current["attempts"],1);assert_eq!(current["startedAt"],original["startedAt"]);assert_eq!(store.job(&key).unwrap()["snapshot"],snapshot);
+    }
+    #[test] fn chrome_disconnected_correction_refuses_fresh_intent_unknown_nonconnection_and_incomplete_history(){
+        for case in ["fresh","intent","unknown","nonconnection","missing","request"] {
+            let (_t,store,key,cfg)=fixture();let original=disconnected_history(&store,&key,&cfg);let c=store.conn().unwrap();
+            match case {"fresh"=>{c.execute("UPDATE events SET data=json_set(data,'$.reason','fresh_native_idle') WHERE job_id=?1 AND type='chrome_prepare_execution_started'",[&key]).unwrap();},
+                "intent"=>{store.event(&key,"chrome_prepare_intent",&json!({})).unwrap();},
+                "unknown"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.submissionUnknown',json('true')) WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},
+                "nonconnection"=>{c.execute("UPDATE events SET data=json_set(data,'$.error.code','EMPTY_PREFLIGHT') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},
+                "missing"=>{c.execute("DELETE FROM events WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();},
+                _=>{c.execute("UPDATE events SET data=json_set(data,'$.sameRequestId','other') WHERE job_id=?1 AND type='chrome_prepare_error'",[&key]).unwrap();}}drop(c);
+            assert_eq!(saved_budget(&store,&key,&store.job(&key).unwrap()["snapshot"]).unwrap().unwrap(),original,"{case}");
         }
     }
     #[test] fn execution_start_marker_refuses_config_request_or_hash_drift_without_metadata_write(){

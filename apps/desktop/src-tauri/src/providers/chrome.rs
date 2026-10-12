@@ -178,8 +178,10 @@ pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabiliti
         &crate::chrome_setup::binding_settings(&wire::base(config,true)?,config.chrome_binding.as_ref()),
         &wire::credential(config,true)?,
     ).map_err(|message|ProviderError::new("BRIDGE_OFFLINE",message))?;
-    if health["status"] == "busy" {
-        return Err(ProviderError::new("BRIDGE_BUSY", "浏览器正在执行已有任务，图片保持排队等待。"));
+    if health["status"] == "busy" || health["status"] == "waiting_browser" {
+        return Err(ProviderError::new("BRIDGE_BUSY", if health["status"]=="waiting_browser" {
+            "等待已绑定的 Chrome 后台连接恢复，图片保持排队；未开始生成。"
+        } else {"浏览器正在执行已有任务，图片保持排队等待。"}));
     }
     if health["status"] != "ready" {
         return Err(ProviderError::new("BRIDGE_BROWSER_NOT_READY",health["message"].as_str().unwrap_or("Chrome 网页尚未就绪。")));

@@ -63,6 +63,14 @@ fn chrome_connect_snapshot_requires_independent_live_proof_before_intent_or_open
     assert_eq!(f.requests.lock().unwrap().len(),4);assert!(f.requests.lock().unwrap().iter().all(|(route,_)|route.starts_with("GET ")));std::env::remove_var(env);
 }
 #[test]
+fn chrome_bound_disconnected_browser_is_queue_wait_before_any_prepare_or_execution(){
+    let f=fixture(vec![json!({"ok":false,"needsSelection":false,"pendingRequests":0,"pendingCommands":0}),json!({"ok":true,"clients":[]})]);
+    let env=credential();let cfg=config(&f.endpoint,&env);
+    let error=prepare_observed(&cfg,&request(),&|_|panic!("disconnection cannot start execution")).unwrap_err();
+    assert_eq!(error.code,"BRIDGE_BUSY");assert!(!error.submission_unknown);f.thread.join().unwrap();
+    assert_eq!(f.requests.lock().unwrap().len(),2);assert!(f.requests.lock().unwrap().iter().all(|(route,_)|route.starts_with("GET ")));std::env::remove_var(env);
+}
+#[test]
 fn chrome_fresh_exact_queue_read_permits_one_owned_prepare_after_readback_with_zero_generation(){
     let (r,mut source,_,replies)=native_first_open_fixture();source["transportHealth"]=json!({"kind":"connect_snapshot","tabQueue":{"running":true,"pending":1}});
     let mut native=replies[5].clone();native["commandId"]=json!("live-cmd");native["inventoryCommandId"]=json!("live-cmd");native["rpcRequestId"]=json!("ext-live-rpc-1234");
