@@ -288,7 +288,15 @@ function connectWebSocket(port, config) {
     return openConnection(state);
   }).catch((err) => post(port, { type: 'extension.error', message: err.message || String(err) }));
 }
-async function openConnection(state) {
+function openConnection(state) {
+  if(state.connectionAttempt)return state.connectionAttempt;
+  if(state.closed||!connections.has(state.port)||state.ws?.readyState===WebSocket.CONNECTING||state.ws?.readyState===WebSocket.OPEN)return Promise.resolve();
+  const attempt=openConnectionOnce(state);
+  state.connectionAttempt=attempt.finally(()=>{if(state.connectionAttempt===joined)state.connectionAttempt=null;});
+  const joined=state.connectionAttempt;
+  return joined;
+}
+async function openConnectionOnce(state) {
   if (state.closed || !connections.has(state.port)) return;
   post(state.port, { type: 'extension.status', status: 'checking bridge token', detail: 'Validating BRIDGE_TOKEN before opening WebSocket' });
   const auth = await checkBridgeAuth(state);
@@ -312,7 +320,10 @@ async function openConnection(state) {
     return;
   }
   ws.addEventListener('open', () => {
+    if(state.ws!==ws||state.closed)return;
+    clearTimeout(state.reconnectTimer);state.reconnectTimer=null;
     void tabOperations.run(state.tabId, async () => {
+      if(state.ws!==ws||state.closed)return;
       const connected = await backgroundState.transition(state.tabId, {
         type: 'transport.connected', connectionEpoch: state.connectionEpoch, contentEpoch: state.contentEpoch,
       });
@@ -340,6 +351,7 @@ async function openConnection(state) {
     }, { label: 'transport.open', priority: TabOperationPriority.OWNER_INVALIDATION, critical: true }).catch((error) => post(state.port, { type: 'extension.error', message: error.message || String(error) }));
   });
   ws.addEventListener('message', (event) => {
+    if(state.ws!==ws||state.closed)return;
     let envelope = null;
     try { envelope = JSON.parse(String(event.data)); } catch {}
     if (!isProtocol5Envelope(envelope, { direction: 'server_to_extension', requireClientId: true })) {
@@ -388,23 +400,26 @@ async function openConnection(state) {
     });
   });
   ws.addEventListener('close', (event) => {
+    if(state.ws!==ws||state.closed)return;
     void tabOperations.run(state.tabId, () => backgroundState.transition(state.tabId, {
       type: 'transport.disconnected', contentEpoch: state.contentEpoch,
     }), { label: 'transport.close', priority: TabOperationPriority.OWNER_INVALIDATION, critical: true }).catch(() => {});
     if (state.closed) return;
     post(state.port, { type: 'extension.status', status: 'extension disconnected', detail: `WebSocket closed${event?.code ? ` (${event.code})` : ''}; reconnecting` });
-    scheduleReconnect(state);
+    scheduleReconnect(state,ws);
   });
   ws.addEventListener('error', () => {
+    if(state.ws!==ws||state.closed)return;
     post(state.port, { type: 'extension.status', status: 'extension websocket error', detail: 'WebSocket failed after token preflight; reconnecting' });
   });
 }
-function scheduleReconnect(state) {
+function scheduleReconnect(state,expectedSocket=state.ws) {
   clearTimeout(state.reconnectTimer);
   state.reconnectTimer = setTimeout(() => {
-    if (state.closed || !connections.has(state.port)) return;
-    try { state.ws?.close?.(); } catch {}
+    if (state.closed || !connections.has(state.port)||state.ws!==expectedSocket) return;
+    const previous=state.ws;
     state.ws = null;
+    try { previous?.close?.(); } catch {}
     void openConnection(state);
   }, 1500);
 }

@@ -136,12 +136,13 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2",
+      "afterSha256": "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
         "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
-        "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed"
+        "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed",
+        "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2"
       ]
     },
     {
@@ -159,6 +160,11 @@
         "0aaa0d41285afd630ba671c12eb9d4cb5f78993650038d7384d0bfed88235666",
         "57cc3e013f97e96a4bf11b5c2a09ce222c26b452c378146e26e34659e2a3906e"
       ]
+    },
+    {
+      "path": "extension/background/authPreflight.js",
+      "beforeSha256": "fb858bca7936b180e71c65ccc6921e6e989e0d35fb1c17326b881ab5eaebb5b5",
+      "afterSha256": "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452"
     }
   ]
 }
