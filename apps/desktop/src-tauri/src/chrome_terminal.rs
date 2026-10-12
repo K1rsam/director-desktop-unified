@@ -29,9 +29,9 @@ pub(crate) fn settled_job(job:&Value)->bool{
         &&["failed","cancelled","interrupted","completed_without_artifact"].contains(&s(&result["raw"]["taskSettlement"],"status"))
 }
 
-#[cfg(test)]mod tests{
+#[cfg(test)]pub(crate) mod tests{
  use super::*;use serde_json::json;
- fn fixture()->Value{
+ pub(crate) fn fixture()->Value{
   let task="12345678-1234-4234-8234-123456789abc";let hash=crate::pipeline::digest("synthetic image");
   json!({"provider":"chrome","kind":"image","status":"failed","providerTaskId":task,"snapshot":{"requestId":task},
    "prepared":{"provider":"chrome","request":{"requestId":task,"kind":"image","model":"chatgpt-image"},"wire":{"id":task,"message":"synthetic image","metadata":{"promptSha256":hash}}},

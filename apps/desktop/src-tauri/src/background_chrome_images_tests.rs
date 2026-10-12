@@ -145,6 +145,25 @@ fn background_chrome_unknown_holds_other_new_work_and_reopen_never_resubmits() {
 }
 
 #[test]
+fn background_chrome_proved_no_image_retry_uses_full_evidence_and_keeps_failure_lineage(){
+ for proven in [true,false]{
+  let f=Fixture::new(&[("first",None)]);let journal=f.queue();f.step(&journal);let key=s(&journal.jobs[0],"jobId");let original=f.store.job(key).unwrap();
+  let task=s(&original,"providerTaskId");let mut p=original["prepared"].clone();p["wire"]["id"]=json!(task);p["wire"]["message"]=p["request"]["prompt"].clone();
+  let hash=pipeline::digest(&s(&p["wire"],"message").split_whitespace().collect::<Vec<_>>().join(" "));p["wire"]["metadata"]["promptSha256"]=json!(hash);
+  let mut result=crate::chrome_terminal::tests::fixture()["result"].clone();result["taskId"]=json!(task);result["raw"]["taskSettlement"]["id"]=json!(task);result["raw"]["nativeProof"]["requestId"]=json!(task);result["raw"]["nativeProof"]["promptSha256"]=json!(hash);
+  if !proven{result["raw"]["nativeProof"]["status"]=json!("matched_incomplete");}
+  f.store.update_job(key,"failed",&json!({"prepared":p,"result":result,"error":"synthetic final text without image"})).unwrap();let frozen=f.store.job(key).unwrap();
+  assert_eq!(crate::chrome_terminal::settled_job(&frozen),proven);
+  assert_eq!(Store::chrome_image_blocker(&f.store.root,&f.request.project_id,"").unwrap().is_none(),proven);
+  let report=f.engine.queue_images(&f.store,&json!({"provider":"chrome","model":"chatgpt-image","assetIds":["first"]})).unwrap();
+  assert_eq!(f.store.job(key).unwrap(),frozen,"original failed attempt is immutable");
+  if proven{assert_eq!(report["queued"].as_array().unwrap().len(),1);assert!(report["reused"].as_array().unwrap().is_empty());let retry=f.store.job(s(&report["queued"][0],"jobId")).unwrap();assert_eq!(retry["snapshot"]["retryOfJobId"],key);assert_eq!(retry["snapshot"]["retryOfRequestId"],task);}
+  else{assert!(report["queued"].as_array().unwrap().is_empty());assert_eq!(report["reused"][0]["jobId"],key);}
+  assert_eq!(f.count(),1,"queuing a retry never submits it");
+ }
+}
+
+#[test]
 fn background_chrome_explicit_continuation_queries_known_paused_original_without_resubmission(){
     let f=Fixture::new(&[("first",None)]);let j=f.queue();assert!(f.step(&j));
     let key=s(&j.jobs[0],"jobId");let original=f.store.job(key).unwrap();

@@ -2804,7 +2804,14 @@ impl Engine {
         if review && !approved && selected_count > 3 {
             return Err("未确认画风时试稿最多选择3个资产".into());
         }
-        let jobs = store.job_summaries()?;
+        let mut jobs = store.job_summaries()?;
+        // UI summaries intentionally omit frozen payloads and native proofs.
+        // Only full original evidence may release a known failed Chrome attempt.
+        if provider=="chrome" {
+            for job in jobs.iter_mut().filter(|j|j["provider"]=="chrome"&&j["kind"]=="image"&&j["status"]=="failed"&&!s(j,"providerTaskId").is_empty()) {
+                *job=store.job(s(job,"id"))?;
+            }
+        }
         let mut errors = Vec::new();
         let mut blocked = Vec::new();
         let mut queued = Vec::new();
@@ -2912,6 +2919,10 @@ impl Engine {
                 if let Some(binding) = r.get("backgroundChromeBinding") {
                     if provider != "chrome" { return Err("后台图片入口仅允许 Chrome".into()); }
                     snapshot["backgroundChromeBinding"] = binding.clone();
+                }
+                if let Some(previous)=jobs.iter().find(|j|j["entityId"]==a["id"]&&crate::chrome_terminal::settled_job(j)) {
+                    snapshot["retryOfJobId"]=previous["id"].clone();
+                    snapshot["retryOfRequestId"]=previous["providerTaskId"].clone();
                 }
                 store.add_job("image", s(a, "id"), provider, &account, &snapshot, state)
             })();
