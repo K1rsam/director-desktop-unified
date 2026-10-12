@@ -20,7 +20,7 @@ import {
 } from './background/extensionReloadCoordinator.js';
 import { createTabController } from './background/tabController.js';
 import { checkBridgeAuth } from './background/authPreflight.js';
-import { createConnectionWatchdog } from './background/connectionWatchdog.js';
+import { createConnectionWatchdog, recoverOwnedController } from './background/connectionWatchdog.js';
 import { tabScopedClientId } from './shared/tabClientIdentity.js';
 import './shared/buildIdentity.js';
 const connections = new Map();
@@ -408,6 +408,10 @@ const connectionWatchdog = createConnectionWatchdog({
   alarms: chrome.alarms,
   connections,
   openConnection,
+  recoverController: async () => {
+    const result=await recoverOwnedController({connections});
+    console.info('[chatgpt-bridge] owned controller reconnect', result.status, result.reason || '', result.tabId || '');
+  },
 });
 
 const { recoverPendingExtensionReload, scheduleExtensionReload, confirmSourceReady } = createExtensionReloadCoordinator({

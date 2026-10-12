@@ -14,6 +14,7 @@ struct Fake {
     unknown:AtomicBool,
     fail_download:AtomicBool,
     pending:AtomicBool,
+    prepare_busy:AtomicBool,
     cleanup_outcomes:Mutex<VecDeque<Value>>,
     cleanup_default:Mutex<Option<Value>>,
     releases:AtomicUsize,
@@ -28,6 +29,7 @@ impl Channels for Fake {
     fn prepare(&self,c:&ProviderConfig,r:&GenerationRequest)->ProviderResult<PreparedRequest> {
         self.prepares.fetch_add(1,Ordering::SeqCst);
         assert_eq!(c.kind,"chrome");assert_eq!(r.kind,"image");
+        if self.prepare_busy.load(Ordering::SeqCst) {return Err(ProviderError::new("BRIDGE_BUSY","synthetic disconnected browser waits"));}
         Ok(PreparedRequest{provider:"chrome".into(),request:r.clone(),capability_version:"offline/v1".into(),
             upload_receipts:vec![],wire:json!({"sourceClientId":"owned-synthetic-tab","metadata":{"promptSha256":pipeline::digest(&r.prompt)}}),estimated_cost:None,prepared_at:now()})
     }
@@ -124,6 +126,16 @@ fn background_chrome_unknown_holds_other_new_work_and_reopen_never_resubmits() {
     f.fake.unknown.store(true,Ordering::SeqCst);assert!(f.step(&j));assert!(!f.step(&j));
     assert_eq!(f.count(),1);assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.count(),1);
     assert!(j.jobs.iter().any(|j|f.store.job(s(j,"jobId")).unwrap()["status"]=="submission_unknown"));
+}
+#[test]
+fn background_chrome_due_waiter_cannot_starve_untouched_jobs_with_zero_generation(){
+    let f=Fixture::new(&[("first",None),("second",None),("third",None)]);let j=f.queue();f.fake.prepare_busy.store(true,Ordering::SeqCst);
+    assert!(f.step(&j));let first=s(&j.jobs[0],"jobId");let due=chrono::Utc::now().timestamp()-1;
+    f.store.conn().unwrap().execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2",rusqlite::params![due,first]).unwrap();
+    assert!(selected_step(&f.engine,&f.request,&f.store,&j).unwrap());assert!(selected_step(&f.engine,&f.request,&f.store,&j).unwrap());
+    assert_eq!(f.store.job(first).unwrap()["nextAttemptAt"],due,"old waiter did not take both subsequent slots");
+    for saved in &j.jobs[1..] {assert!(f.store.job(s(saved,"jobId")).unwrap()["nextAttemptAt"].as_i64().unwrap()>due);}
+    assert_eq!(f.fake.prepares.load(Ordering::SeqCst),3);assert_eq!(f.count(),0);
 }
 
 #[test]

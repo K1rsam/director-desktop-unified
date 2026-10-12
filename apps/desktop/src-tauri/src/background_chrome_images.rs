@@ -371,7 +371,7 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
     engine.unblock_image_dependencies_selected(store,Some(&ids))?;
     let mut jobs=journal.jobs.iter().map(|j|store.job(s(j,"jobId"))).collect::<Result<Vec<_>>>()?;
     // Known originals precede new work; unknown tasks have no generation path.
-    jobs.sort_by_key(|j|u8::from(s(j,"providerTaskId").is_empty()));
+    jobs.sort_by_key(|j|(u8::from(s(j,"providerTaskId").is_empty()),j["nextAttemptAt"].as_i64().unwrap_or(0)));
     for job in jobs {
         r.job_bound(&job)?;
         let state=s(&job,"status");

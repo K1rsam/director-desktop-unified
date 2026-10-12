@@ -135,16 +135,25 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
+      "afterSha256": "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
-        "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463"
+        "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
+        "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095"
       ]
     },
     {
       "path": "extension/background/tabOperationQueue.js",
       "beforeSha256": "b4671c946509ddde596c7aa2c0973fd95380dfdac94393842875a4def1d84fb0",
       "afterSha256": "f4fe508a12877ab22e131cb610a7c77cb7d45b63e3a571521b58696c1e865659"
+    },
+    {
+      "path": "extension/background/connectionWatchdog.js",
+      "beforeSha256": "2809b469459963b4971c1c19c27e4cc2aa8c7ffdbc6c11b79537a0d34aef71ee",
+      "afterSha256": "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0",
+      "previousAfterSha256s": [
+        "ae2aaf99dd322d5263f3c767122603547e9d36e71aca52df39755206d8b63849"
+      ]
     }
   ]
 }
