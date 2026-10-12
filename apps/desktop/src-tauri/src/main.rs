@@ -367,6 +367,17 @@ fn main() {
         return;
     }
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--background-chrome-images") {
+        let valid = args.iter().skip(1).enumerate().all(|(offset,arg)| {
+            offset + 1 == index || offset + 1 == index + 1 || arg == "--unvirtualized-desktop"
+        });
+        let Some(path) = args.get(index + 1).map(std::path::PathBuf::from).filter(|path|path.is_absolute()) else {
+            std::process::exit(64);
+        };
+        if !valid { std::process::exit(64); }
+        let code = director_core::engine::background_chrome_images::run_file(&path).unwrap_or(2);
+        std::process::exit(code);
+    }
     let verification = args.iter().position(|a| a == "--verify-startup").map(|i| {
         let output = args.get(i + 1).map(std::path::PathBuf::from).unwrap_or_else(|| {
             eprintln!("--verify-startup requires an absolute report file path");
@@ -405,6 +416,10 @@ fn main() {
             if let Some(v) = &setup_verification { v.diagnostics.mark(DiagnosticStage::SetupEntered); }
             let home = match &setup_verification { Some(v) => v.home.clone(), None => app.path().app_data_dir()? };
             director_core::windows_runtime::verify_shared_directory(&home).map_err(std::io::Error::other)?;
+            // Lifetime OS lease also excludes the explicit image-only background runner.
+            // Held in Tauri state until every worker and final receipt has drained.
+            let execution_lease = director_core::engine::background_chrome_images::HomeExecutionLease::acquire(&home).map_err(std::io::Error::other)?;
+            app.manage(execution_lease);
             let saved_acceptance_grant = home.join("native-cli-acceptance.json").try_exists()?;
             // Diagnostic projects have no channel account configured. Disable live-account
             // lookup so automatic Stage 4 preflight fails locally without touching a user session.

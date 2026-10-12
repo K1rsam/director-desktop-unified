@@ -22,6 +22,8 @@ use std::{
 };
 #[path = "app_settings_engine.rs"]
 mod app_settings_engine;
+#[path = "background_chrome_images.rs"]
+pub mod background_chrome_images;
 
 // Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
 const IMAGE_SUBMIT_WORKERS: usize = 8;
@@ -369,6 +371,9 @@ impl Engine {
         Self::build(home, channels, false, false)
     }
     fn build(home: PathBuf, channels: Arc<dyn Channels>, live_accounts: bool, offline_only: bool) -> Result<Arc<Self>> {
+        Self::build_with_recovery(home, channels, live_accounts, offline_only, true)
+    }
+    fn build_with_recovery(home: PathBuf, channels: Arc<dyn Channels>, live_accounts: bool, offline_only: bool, recover_projects: bool) -> Result<Arc<Self>> {
         fs::create_dir_all(home.join("projects")).map_err(|e| e.to_string())?;
         let engine = Arc::new(Self {
             home,
@@ -388,7 +393,7 @@ impl Engine {
             readiness_resources: None,
             stop: AtomicBool::new(false),
         });
-        for p in engine.project_list()? {
+        if recover_projects { for p in engine.project_list()? {
             if project_archived(&p)
                 || !Path::new(s(&p, "rootPath"))
                     .join("project.sqlite")
@@ -399,7 +404,7 @@ impl Engine {
             let store = registered_store(&p)?;
             store.recover_interrupted()?;
             store.ensure_current_images()?;
-        }
+        } }
         Ok(engine)
     }
     pub fn registry(&self) -> Result<Value> {
@@ -1023,6 +1028,9 @@ impl Engine {
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }
     pub fn canvas_oauth_stopped(&self) -> bool { self.canvas_sessions.stopped() }
     pub fn dispatch(self: &Arc<Self>, request: Value) -> Result<Value> {
+        if request.get("backgroundChromeBinding").is_some() {
+            return Err("后台队列绑定只能由专用执行入口创建".into());
+        }
         let action = s(&request, "action");
         if action == "getExecutionPolicy" {
             let mut policy=match &self.native_acceptance {Some(a)=>crate::execution_policy::native_report(a),None if self.standard_native=>crate::execution_policy::standard_report(),None=>crate::execution_policy::report()};
@@ -1487,6 +1495,9 @@ impl Engine {
                 return Ok(workspace);
             }
             "images.run" => {
+                if request.get("backgroundChromeBinding").is_some() {
+                    return Err("后台队列绑定只能由专用执行入口创建".into());
+                }
                 let report = self.queue_images(&store, &request)?;
                 let mut workspace = self.workspace(&store, None)?;
                 workspace["imageQueueReport"] = report;
@@ -2157,11 +2168,15 @@ impl Engine {
         Ok(())
     }
     fn unblock_image_dependencies(&self, store: &Store) -> Result<()> {
+        self.unblock_image_dependencies_selected(store, None)
+    }
+    fn unblock_image_dependencies_selected(&self, store: &Store, selected: Option<&HashSet<String>>) -> Result<()> {
         let assets = store.values("assets")?;
         for summary in store
             .pending_jobs()?
             .iter()
             .filter(|j| s(j, "status") == "waiting_dependency")
+            .filter(|j| selected.is_none_or(|ids| ids.contains(s(j, "id")) && j["kind"] == "image" && j["provider"] == "chrome"))
         {
             let full_job = store.job(s(summary, "id"))?;
             let j = &full_job;
@@ -2892,7 +2907,11 @@ impl Engine {
                 let style = pipeline::asset_design_contract::project_visual_style(settings);
                 let presentation = pipeline::asset_design_contract::image_presentation(settings, a);
                 let prompt = pipeline::asset_design_contract::compile_image_prompt(s(a, "prompt"), style, &presentation);
-                let snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":settings.get("imageResolution").cloned().unwrap_or(json!("2K")),"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
+                let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":settings.get("imageResolution").cloned().unwrap_or(json!("2K")),"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
+                if let Some(binding) = r.get("backgroundChromeBinding") {
+                    if provider != "chrome" { return Err("后台图片入口仅允许 Chrome".into()); }
+                    snapshot["backgroundChromeBinding"] = binding.clone();
+                }
                 store.add_job("image", s(a, "id"), provider, &account, &snapshot, state)
             })();
             match result {
