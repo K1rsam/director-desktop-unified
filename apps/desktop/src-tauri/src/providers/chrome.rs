@@ -516,6 +516,22 @@ fn prove_bridge_prepare_absence(config:&ProviderConfig,client:&Client,request:&G
         || !tracked["deadlines"].as_array().is_some_and(Vec::is_empty) {return Err(held());}
     Ok(())
 }
+fn inventory_source_background_proven(inventory:&Value,runtime:&Value,source:&Value,tab:&Value)->bool {
+    if tab["active"]==false {return true;}
+    if tab["active"]!=true {return false;}
+    let proof=&inventory["sourceBackgroundProof"];
+    let Some(sampled_at)=proof["content"]["sampledAt"].as_i64() else {return false;};
+    let age=chrono::Utc::now().timestamp_millis()-sampled_at;
+    proof["version"]=="director-source-background-proof/v1" && proof["nativeSamples"]==2
+        && proof["sourceTabId"]==tab["id"] && tab["id"]==runtime["sourceTabId"]
+        && tab["windowId"].as_u64().is_some_and(|id|id>0) && proof["sourceWindowId"]==tab["windowId"]
+        && proof["native"]["tabActive"]==true && proof["native"]["windowFocused"]==false
+        && ["normal","minimized","maximized","fullscreen"].contains(&s(&proof["native"],"windowState"))
+        && proof["content"]["visibilityState"]=="hidden" && proof["content"]["focused"]==false
+        && source["visibilityState"]=="hidden" && source["focused"]==false
+        && proof["content"]["contentEpoch"]==runtime["contentEpoch"] && runtime["contentEpoch"]==source["contentEpoch"]
+        && !s(runtime,"contentEpoch").is_empty() && (0..=30_000).contains(&age)
+}
 fn legacy_first_open(config:&ProviderConfig,client:&Client,available:&[Value],binding:&crate::chrome_setup::BrowserBinding,request:&GenerationRequest,recovery:&Value,observer:&PrepareObserver<'_>,intent:&mut Value)->ProviderResult<Value> {
     let held=||ProviderError::new("CHROME_PREPARE_IDENTITY_HELD","原页是否存在未由原生inventory证实，保留原任务，不开页或发送");
     let valid_uuid=|v:&str|uuid::Uuid::parse_str(v).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==v);
@@ -547,7 +563,7 @@ fn legacy_first_open(config:&ProviderConfig,client:&Client,available:&[Value],bi
         || !runtime["sourceTabId"].as_u64().is_some_and(|id|id>0) || runtime["contentEpoch"]!=source["contentEpoch"] || s(runtime,"contentEpoch").is_empty()
         || inventory["sourceTabId"]!=runtime["sourceTabId"] || !inventory["launchRecords"].is_array() || parsed!=*inventory
         || native["inventorySha256"]!=hex_hash(raw.as_bytes()) || native["inventoryGeneration"].as_str().is_none_or(|id|!valid_uuid(id))
-        || !(0..=30_000).contains(&age) || source_tabs.len()!=1 || source_tabs[0]["active"]!=false || source_tabs[0]["incognito"]!=false
+        || !(0..=30_000).contains(&age) || source_tabs.len()!=1 || !inventory_source_background_proven(inventory,runtime,source,source_tabs[0]) || source_tabs[0]["incognito"]!=false
         || source_tabs[0]["discarded"]!=false {return Err(held());}
     let verified=clients(config,client)?;
     let sources:Vec<_>=verified.iter().filter(|p|p["id"]==source["id"]).collect();

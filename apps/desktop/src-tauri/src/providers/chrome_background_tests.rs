@@ -96,6 +96,54 @@ fn chrome_prepare_clients_absence_and_user_homepage_alone_never_authorize_first_
     assert!(recover_prepare(&cfg,&r,&proof,&|_|panic!("no first runtime adoption from clients absence")).is_err());f.thread.join().unwrap();
     assert!(f.requests.lock().unwrap().iter().all(|(route,_)|!route.contains("/owned-launch/") && !route.contains("/tabs/open") && !route.starts_with("POST /turns")));std::env::remove_var(env);
 }
+fn active_background_native(replies:&mut [Value],window_state:&str) {
+    replies[5]["inventory"]["tabs"][0]["active"]=json!(true);replies[5]["inventory"]["tabs"][0]["windowId"]=json!(20);
+    replies[5]["inventory"]["sourceBackgroundProof"]=json!({"version":"director-source-background-proof/v1","sourceTabId":10,"sourceWindowId":20,"nativeSamples":2,
+        "native":{"tabActive":true,"windowFocused":false,"windowState":window_state},
+        "content":{"visibilityState":"hidden","focused":false,"contentEpoch":"one-content","sampledAt":chrono::Utc::now().timestamp_millis()}});
+    let raw=replies[5]["inventory"].to_string();replies[5]["inventoryCanonicalJson"]=json!(raw);replies[5]["inventorySha256"]=json!(hex_hash(raw.as_bytes()));
+}
+#[test]
+fn chrome_prepare_native_active_source_requires_hashed_two_sample_background_window_and_current_content_proof() {
+    for state in ["normal","minimized","maximized","fullscreen"] {
+        let (r,_,proof,mut replies)=native_first_open_fixture();active_background_native(&mut replies,state);
+        let f=fixture(replies);let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+        let prepared=recover_prepare(&cfg,&r,&proof,&|intent|{assert_eq!(intent["legacyNoSubmitAudit"]["nativeCurrentAbsence"]["inventory"]["tabs"][0]["active"],true);Ok(())}).unwrap();
+        assert_eq!(prepared.wire["sourceClientId"],"worker");f.thread.join().unwrap();
+        let calls=f.requests.lock().unwrap();assert_eq!(calls.iter().filter(|(route,_)|route.starts_with("POST /browser/tabs/open ")).count(),1);
+        let open:Value=serde_json::from_str(&calls.iter().find(|(route,_)|route.starts_with("POST /browser/tabs/open ")).unwrap().1).unwrap();assert_eq!(open["active"],false);assert_eq!(open["select"],false);
+        assert!(calls.iter().all(|(route,_)|!route.starts_with("POST /turns")));std::env::remove_var(env);
+    }
+}
+#[test]
+fn chrome_prepare_native_active_source_foreground_unknown_stale_or_identity_drift_is_held_before_open() {
+    for case in ["missing","version","samples","tab","window","missing_window","native_active","window_focused","window_state","content_visible","content_focused","content_epoch","content_stale","content_future","hash","post_visible","post_focused"] {
+        let (r,_,proof,mut replies)=native_first_open_fixture();active_background_native(&mut replies,"normal");
+        match case {
+            "missing"=>{replies[5]["inventory"].as_object_mut().unwrap().remove("sourceBackgroundProof");},
+            "version"=>replies[5]["inventory"]["sourceBackgroundProof"]["version"]=json!("unknown"),
+            "samples"=>replies[5]["inventory"]["sourceBackgroundProof"]["nativeSamples"]=json!(1),
+            "tab"=>replies[5]["inventory"]["sourceBackgroundProof"]["sourceTabId"]=json!(99),
+            "window"=>replies[5]["inventory"]["sourceBackgroundProof"]["sourceWindowId"]=json!(99),
+            "missing_window"=>{replies[5]["inventory"]["tabs"][0].as_object_mut().unwrap().remove("windowId");},
+            "native_active"=>replies[5]["inventory"]["sourceBackgroundProof"]["native"]["tabActive"]=json!(false),
+            "window_focused"=>replies[5]["inventory"]["sourceBackgroundProof"]["native"]["windowFocused"]=json!(true),
+            "window_state"=>replies[5]["inventory"]["sourceBackgroundProof"]["native"]["windowState"]=json!("unknown"),
+            "content_visible"=>replies[5]["inventory"]["sourceBackgroundProof"]["content"]["visibilityState"]=json!("visible"),
+            "content_focused"=>replies[5]["inventory"]["sourceBackgroundProof"]["content"]["focused"]=json!(true),
+            "content_epoch"=>replies[5]["inventory"]["sourceBackgroundProof"]["content"]["contentEpoch"]=json!("changed"),
+            "content_stale"=>replies[5]["inventory"]["sourceBackgroundProof"]["content"]["sampledAt"]=json!(chrono::Utc::now().timestamp_millis()-31_000),
+            "content_future"=>replies[5]["inventory"]["sourceBackgroundProof"]["content"]["sampledAt"]=json!(chrono::Utc::now().timestamp_millis()+31_000),
+            "post_visible"=>replies[6]["clients"][0]["visibilityState"]=json!("visible"),
+            "post_focused"=>replies[6]["clients"][0]["focused"]=json!(true),
+            _=>{},
+        }
+        let raw=replies[5]["inventory"].to_string();replies[5]["inventoryCanonicalJson"]=json!(raw);replies[5]["inventorySha256"]=json!(if case=="hash"{"0".repeat(64)}else{hex_hash(raw.as_bytes())});
+        replies.truncate(if case.starts_with("post_"){7}else{6});let f=fixture(replies);let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+        assert!(recover_prepare(&cfg,&r,&proof,&|_|panic!("no first-open intent from unproved active source")).is_err(),"{case}");f.thread.join().unwrap();
+        assert!(f.requests.lock().unwrap().iter().all(|(route,_)|!route.contains("/tabs/open") && !route.starts_with("POST /turns")),"{case}");std::env::remove_var(env);
+    }
+}
 
 #[test]
 fn chrome_prepare_legacy_first_runtime_is_persisted_before_preflight_and_reuses_same_page_without_open_or_submit() {

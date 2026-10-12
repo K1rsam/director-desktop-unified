@@ -45,3 +45,9 @@ Windows debug 定向 32 项后台及 14 项共享任务回归通过。随后重�
 2. 验证新 worker 与 owned-launch inventory 实际运行。只有这些前置条件满足，才移除本次 controller 停止标记并以原请求文件启动同批后台入口；不创建新的29项批次。
 3. 恢复7项未提交准备失败和2项原依赖 blocked，续跑其余 waiting/queued。已有5图不重发。完成全29原图入库后逐图审核，核对人物视图、身份和父图承接以及最后工作页清理。
 4. 再接前十集 Stage3 与 Stage4 非视频验收，旧 B/C 未知文本任务继续保护。当前测试项目已完成 Stage1/Stage2文字设计，尚无采用单元；不能写成十集分镜或第四阶段已经通过。视频始终禁止。
+
+## 后台窗口的 Rust 首次开页校验
+
+桥接侧已用当前网页采样、双原生窗口枚举及完整 canonical JSON 哈希证明：正式 controller 的 `active=true` 源于最小化背景窗口，而非用户正在操作的前台页面。Rust 的 legacy first-open 原守卫仍硬要求 active=false，现同步接受严格的 `director-source-background-proof/v1`，如实保留 active=true。proof 必须绑定唯一源 tab/window、两次原生采样、未聚焦的合法窗口状态、hidden/未聚焦的当前 document、原 contentEpoch 及 0–30 秒时效；缺失、前台、漂移、错误 hash 均保持 held。active=false 的旧路径及原 request/runtime/absence/未知提交守卫不变。
+
+最终 Windows debug Chrome provider 31 项通过，覆盖四种背景窗口状态及 17 类拒绝。随后对最终 Rust 源码重新编译 release 核心，核对清单 1213 项、44 忽略，唯一 artifact SHA256 `33f619f7964629a9376f46cedf22709eb9e43bd42deacd8edd654dae0c5b94f0`。原生启动器实际执行完整核心 `--test-threads=4`：1169 通过、0 失败、44 忽略，144.82 秒；receipt 证实退出码 0、unpackaged、共享写探针及进程树已空。证据目录为 `.local/validation/chrome-batch-20261012/native-core-final-active-source-20261012T052254Z/`；真实批次的首次开页与完整出图验收仍需之后执行。
