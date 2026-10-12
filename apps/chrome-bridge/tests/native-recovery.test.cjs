@@ -66,10 +66,12 @@ async function fixture(options = {}) {
   const proof = context.ChatGptImageRecordProof;
   const snapshot = () => {
     observed.push({ turnKey: proof.key(assistant), source: proof.imageSource(image) });
-    return { answer: '', artifacts: proof.imageSource(image) && (!options.hidden || proof.imageReady(image)) ? [{ id: 'original-artifact', kind: 'image', generatedImage: true, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', messageId: proof.key(assistant), hasFinalMessage: true };
+    const value={ answer: '', artifacts: proof.imageSource(image) && (!options.hidden || proof.imageReady(image)) ? [{ id: options.artifactIdsFollowTurnKey ? (proof.key(assistant)?'canonical-artifact':'observed-artifact') : 'original-artifact', kind: 'image', generatedImage: true, downloadable:true, mime:'image/png',size:png.length, downloadUrl: proof.imageSource(image) }] : [], turnKey: proof.key(assistant) || 'dom-turn-ordinal', userTurnKey:proof.key(user), messageId: proof.key(assistant), hasFinalMessage: true };
+    options.snapshotTransform?.(value,{nativeBound:!!proof.key(assistant),user,image});
+    return value;
   };
   const expected = { mode: 'image_record_v1', requestId, conversationId, promptSha256: await proof.digest(prompt), imageCount: 1, allowReleasedRequest: options.allowReleasedRequest !== false, allowReloadedOriginalTab: options.allowReloadedOriginalTab === true };
-  const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => 'content-epoch', readLatestAssistantSnapshot: snapshot, onBound: () => {} };
+  const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => 'content-epoch', readLatestAssistantSnapshot: snapshot, onBound: () => options.onBound?.({user,assistant,image}) };
   return { context, proof, expected, deps, snapshot, calls, observed, messages, user, assistant, image, get reads() { return reads; } };
 }
 
@@ -214,7 +216,7 @@ test('diagnostic cached blob bytes cannot poison later background recovery or gr
 });
 
 test('response recovery rereads the proof-bound snapshot and returns original request and native turn identity', async () => {
-  const f = await fixture();
+  const f = await fixture({blob:true,artifactIdsFollowTurnKey:true});
   vm.runInContext(script('responseRecovery.js'), f.context);
   const observations = [];
   const recovery = f.context.ChatGptResponseRecovery.createResponseRecovery({
@@ -239,7 +241,69 @@ test('response recovery rereads the proof-bound snapshot and returns original re
   assert.equal(response.artifacts[0].requestId, requestId);
   assert.equal(response.artifacts[0].sourceTurnKey, assistantId);
   assert.equal(response.artifacts[0].downloadUrl, originalUrl);
+  assert.equal(response.artifacts[0].id,'canonical-artifact');
+  assert.equal(response.reconciliation.bindings[0].artifactId,response.artifacts[0].id);
+  assert.equal(response.reconciliation.bindings[0].originalObservedArtifactId,'observed-artifact');
   assert.equal(f.observed[0].turnKey, '');
   assert.ok(f.observed.some(snapshot => snapshot.turnKey === assistantId));
   assert.equal(observations.length, 1);
+});
+
+test('native key rebinding publishes one detached final snapshot and preserves its original observed artifact ID',async()=>{
+  const f=await fixture({blob:true,artifactIdsFollowTurnKey:true});let delivered;
+  const proof=await f.proof.read(f.expected,f.snapshot(),{...f.deps,onVerifiedSnapshot:value=>{delivered=value;}});
+  assert.equal(proof.status,'matched_complete');
+  assert.equal(proof.bindings[0].artifactId,'canonical-artifact');
+  assert.equal(proof.bindings[0].originalObservedArtifactId,'observed-artifact');
+  assert.equal(delivered.artifacts[0].id,proof.bindings[0].artifactId);
+  assert.equal(delivered.turnKey,assistantId);assert.equal(delivered.userTurnKey,userId);
+  assert.equal(proof.bindings[0].bytesSha256,hash(png));assert.equal(f.reads,2,'same record, no extra backend generation or lookup');
+  f.user.innerText='edited after transfer';
+  assert.equal(delivered.artifacts[0].id,'canonical-artifact','detached publication remains the verified snapshot');
+  assert.equal(f.proof.downloadBytes({sourceTurnKey:assistantId,requestId},originalUrl),null,'live byte binding is still revoked by edits');
+});
+
+test('final key rebinding rejects switched files, duplicate images and changed DOM without delivering a snapshot',async()=>{
+  for(const change of ['file','duplicate','prompt']){
+    const f=await fixture({blob:true,artifactIdsFollowTurnKey:true,
+      onBound:change==='prompt'?({user})=>{user.innerText='changed at native bind'}:undefined,
+      snapshotTransform:(value,{nativeBound})=>{if(!nativeBound||!value.artifacts.length)return;
+        if(change==='file')value.artifacts[0].downloadUrl=originalUrl.replace(imageId,'file-other');
+        if(change==='duplicate')value.artifacts.push({...value.artifacts[0],id:'another-artifact'});
+      }});
+    let delivered=false;
+    const proof=await f.proof.read(f.expected,f.snapshot(),{...f.deps,onVerifiedSnapshot:()=>{delivered=true;}});
+    assert.notEqual(proof.status,'matched_complete',change);assert.equal(delivered,false,change);
+  }
+});
+
+test('final coherent recovery reaches the unchanged strict native completion guard',async()=>{
+  const f=await fixture({blob:true,artifactIdsFollowTurnKey:true,launch:'bridge-director-desktop-'+requestId});let snapshot;
+  const proof=await f.proof.read(f.expected,f.snapshot(),{...f.deps,onVerifiedSnapshot:value=>{snapshot=value;}});
+  const source=fs.readFileSync(path.join(__dirname,'../overrides/src/browserBridge.js'),'utf8');
+  const body=source.slice(source.indexOf('export function nativeImageCompletionPayload'),source.indexOf('export class BrowserBridge')).replace('export function','function');
+  const guardContext=vm.createContext({createHash,URL});vm.runInContext(body+';this.complete=nativeImageCompletionPayload',guardContext);
+  const identity={requestId,leaseId:'original-lease',ownerServerInstanceId:'original-server',responseEpoch:0};
+  const client={id:'owned-source',ready:true,compatible:true,launchToken:'bridge-director-desktop-'+requestId,url:`https://chatgpt.com/c/${conversationId}`,activeRequest:identity};
+  const state={requestId,clientId:client.id,promptPayload:{requestId,message:prompt},runtime:{finished:false,cancellationRequested:false}};
+  const response={...snapshot,requestId,sourceClientId:client.id,url:client.url,session:{id:conversationId},reconciliation:proof,
+    artifacts:snapshot.artifacts.map(a=>({...a,requestId,sourceClientId:client.id,sourceTurnKey:assistantId}))};
+  const options={sourceClientId:client.id,reconcileConversation:f.expected};
+  assert.equal(guardContext.complete(state,identity,client,options,response).finishReason,'native_image_record_complete');
+  const wrong=JSON.parse(JSON.stringify(response));wrong.artifacts[0].id=proof.bindings[0].originalObservedArtifactId;
+  assert.equal(guardContext.complete(state,identity,client,options,wrong),null,'old artifact identity remains rejected');
+});
+
+test('request.snapshot also returns the same verified final artifact identity instead of its pre-bind observation',async()=>{
+  const f=await fixture({blob:true,artifactIdsFollowTurnKey:true});
+  vm.runInContext(script('responseRecovery.js'),f.context);
+  const recovery=f.context.ChatGptResponseRecovery.createResponseRecovery({...f.deps,
+    readAssistantSnapshotByTurnKey:()=>f.snapshot(),readRecentAssistantSnapshots:()=>[f.snapshot()],
+    getCurrentSession:()=>({id:conversationId}),normalizeText:String,isGenerating:()=>false,findStopButton:()=>null,
+    scheduleTabObservation:()=>{},diagnostic:()=>{},send:value=>f.messages.push(value)});
+  await recovery.handleResponseSnapshotRequest({commandId:'snapshot-original',requestId,turnKey:assistantId,reconcileConversation:f.expected});
+  assert.equal(f.messages[0].type,'request.snapshot');
+  assert.equal(f.messages[0].artifacts[0].id,'canonical-artifact');
+  assert.equal(f.messages[0].reconciliation.bindings[0].artifactId,f.messages[0].artifacts[0].id);
+  assert.equal(f.messages[0].reconciliation.bindings[0].originalObservedArtifactId,'observed-artifact');
 });

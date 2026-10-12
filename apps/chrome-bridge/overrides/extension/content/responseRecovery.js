@@ -22,9 +22,9 @@
       send,
     } = deps;
 
-    async function reconciliationFor(payload, snapshot) {
+    async function reconciliationFor(payload, snapshot, onVerifiedSnapshot) {
       if (['image_record_v1', 'image_record_probe'].includes(payload.reconcileConversation?.mode)) {
-        return await globalThis.ChatGptImageRecordProof.read(payload.reconcileConversation, snapshot, { signal: payload.signal, getActiveRequest, getBrowserLaunchToken: deps.getBrowserLaunchToken, getContentEpoch: deps.getContentEpoch, readLatestAssistantSnapshot, onBound: () => { if (getActiveRequest()) refreshRequestTurnAnchors(getActiveRequest()); deps.scheduleTabObservation('native-image-proof', 0); } });
+        return await globalThis.ChatGptImageRecordProof.read(payload.reconcileConversation, snapshot, { signal: payload.signal, getActiveRequest, getBrowserLaunchToken: deps.getBrowserLaunchToken, getContentEpoch: deps.getContentEpoch, readLatestAssistantSnapshot, onVerifiedSnapshot, onBound: () => { if (getActiveRequest()) refreshRequestTurnAnchors(getActiveRequest()); deps.scheduleTabObservation('native-image-proof', 0); } });
       }
       if (!payload.reconcileConversation || typeof payload.reconcileConversation !== 'object') return undefined;
       const expected = { ...payload.reconcileConversation,
@@ -92,9 +92,10 @@
           throw new Error('No active request in this tab and no assistantTurnKey was provided for a source-bound snapshot.');
         }
   
+        const reconciliation = await reconciliationFor(payload, snapshot, value => { snapshot=value; });
         const hasContent = Boolean(snapshot && (snapshot.answer || snapshot.thinking || snapshot.progress || snapshot.artifacts.length));
         if (!snapshot || !hasContent) {
-          send({ type: 'request.snapshot', commandId, requestId: expectedRequestId, active, generating, activeRequest: status, phase, artifacts: [], answer: '', thinking: '', progress: '', url: location.href, title: document.title, session: getCurrentSession(), reconciliation: await reconciliationFor(payload, snapshot) });
+          send({ type: 'request.snapshot', commandId, requestId: expectedRequestId, active, generating, activeRequest: status, phase, artifacts: [], answer: '', thinking: '', progress: '', url: location.href, title: document.title, session: getCurrentSession(), reconciliation });
           return;
         }
   
@@ -121,7 +122,7 @@
             },
             domPhase: snapshot.phase || '',
             messageId: snapshot.messageId || '',
-            reconciliation: await reconciliationFor(payload, snapshot),
+            reconciliation,
             modelSlug: snapshot.modelSlug || '',
             actionBarVisible: Boolean(snapshot.actionBarVisible),
             reasoningHistory: Array.isArray(snapshot.reasoningHistory) ? snapshot.reasoningHistory : [],
@@ -178,9 +179,11 @@
         const hasContent = Boolean(snapshot.answer || snapshot.artifacts.length);
         if (!hasContent && !['image_record_v1', 'image_record_probe'].includes(payload.reconcileConversation?.mode)) throw new Error(`No assistant response #${index} is visible in the current ChatGPT tab`);
         const session = getCurrentSession();
-        const reconciliation = await reconciliationFor(payload, snapshot);
+        let verifiedSnapshot;
+        const reconciliation = await reconciliationFor(payload, snapshot, value => { verifiedSnapshot=value; });
         if(reconciliation?.status==='matched_complete' && payload.reconcileConversation?.mode==='image_record_v1') {
-          snapshot=readLatestAssistantSnapshot(index);
+          if(!verifiedSnapshot)throw new Error('Verified native image snapshot was not delivered');
+          snapshot=verifiedSnapshot;
           // Exact native branch and original bytes have been checked before attaching identities.
           snapshot.artifacts=(snapshot.artifacts||[]).map(a=>({...a,requestId:reconciliation.requestId,sourceTurnKey:reconciliation.assistantMessageId}));
         }

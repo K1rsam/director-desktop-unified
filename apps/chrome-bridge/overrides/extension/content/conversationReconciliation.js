@@ -234,7 +234,8 @@
           const refreshed=deps.readLatestAssistantSnapshot?.(1);if(refreshed)snapshot.artifacts=refreshed.artifacts;
         }
       }
-      const proof=await evaluate(record,expected,snapshot,facts);if(expected.mode!=='image_record_probe'&&!requestMatches())return unavailable('active_request_identity');if(proof.status==='matched_complete'){
+      let verifiedSnapshot;
+      let proof=await evaluate(record,expected,snapshot,facts);if(expected.mode!=='image_record_probe'&&!requestMatches())return unavailable('active_request_identity');if(proof.status==='matched_complete'){
         const current=dom.getTurnNodes();if(current.length!==turns.length||current.some((n,i)=>n!==turns[i])||await digest(users[0].innerText||users[0].textContent)!==expected.promptSha256)return unavailable('dom_changed_during_proof');
         const currentSnapshot=deps.readLatestAssistantSnapshot?.(1);if(!currentSnapshot)return unavailable('snapshot_unavailable');
         const confirmed=await evaluate(record,expected,currentSnapshot,facts);if(confirmed.status!=='matched_complete'||JSON.stringify(confirmed.bindings)!==JSON.stringify(proof.bindings))return unavailable('image_changed_during_proof');
@@ -244,10 +245,33 @@
         nativeKeys.set(users[0],{id:proof.userMessageId,url:page.href,fingerprint:domFingerprint(users[0])});
         nativeKeys.set(assistants[0],{id:proof.assistantMessageId,url:page.href,fingerprint:domFingerprint(assistants[0])});
         deps.onBound?.();
+        // Artifact IDs include their turn key. Binding native keys can replace
+        // the former DOM key, so prove the final publication snapshot again
+        // against this same native record; never pair old IDs with a reread.
+        const finalSnapshot=deps.readLatestAssistantSnapshot?.(1);
+        if(!finalSnapshot)return unavailable('final_snapshot_unavailable');
+        const finalProof=await evaluate(record,expected,finalSnapshot,facts);
+        if(finalProof.status!=='matched_complete' || finalProof.assistantMessageId!==proof.assistantMessageId
+          || finalProof.userMessageId!==proof.userMessageId || finalProof.currentNode!==proof.currentNode
+          || finalProof.deliveryNode!==proof.deliveryNode || finalProof.deliveryMessageId!==proof.deliveryMessageId
+          || JSON.stringify(finalProof.branchIdentity)!==JSON.stringify(proof.branchIdentity)
+          || finalProof.bindings.length!==proof.bindings.length
+          || finalProof.bindings.some(binding=>!proof.bindings.some(original=>original.imageFileId===binding.imageFileId)))return unavailable('final_image_changed_during_proof');
+        if(!sameIdentity() || !requestMatches() || location.href!==page.href
+          || dom.getTurnNodes().length!==turns.length || dom.getTurnNodes().some((node,index)=>node!==turns[index])
+          || await digest(users[0].innerText||users[0].textContent)!==expected.promptSha256
+          || domFingerprint(users[0])!==nativeKeys.get(users[0]).fingerprint
+          || domFingerprint(assistants[0])!==nativeKeys.get(assistants[0]).fingerprint)return unavailable('final_dom_changed_during_proof');
+        proof={...finalProof,bindings:finalProof.bindings.map(binding=>({...binding,
+          originalObservedArtifactId:proof.bindings.find(original=>original.imageFileId===binding.imageFileId).artifactId}))};
+        // Transfer a detached snapshot only after all proof checks. The caller
+        // publishes it directly, without another DOM read changing its IDs.
+        verifiedSnapshot=JSON.parse(JSON.stringify(finalSnapshot));
       }
       const bindings=proof.bindings?.map(binding=>{const native=nativeDownloads.get(binding.imageFileId);return native && validImageBinding(native.image,native)?{...binding,bytesSha256:native.sha256,size:native.size,mime:native.mime,proofSource:native.proofSource,recordSha256:native.recordSha256,recordRecheckSha256:native.recordRecheckSha256}:binding;});
       const proofSource=bindings?.every(b=>b.proofSource==='native_record_download')?'native_record_download':bindings?.every(b=>b.proofSource==='dom_blob_bytes_equal')?'dom_blob_bytes_equal':bindings?.every(b=>b.proofSource==='dom_native_url_download')?'dom_native_url_download':'dom_native_url';
       const galleryImageFacts=expected.mode==='image_record_probe' ? [...assistants[0]?.querySelectorAll('img') || []].map(img=>({gallery:Boolean(img.closest?.('[data-testid="generated-image-gallery"]')),connected:img.isConnected,width:Number(img.naturalWidth||0),height:Number(img.naturalHeight||0),sourceKind:rawImageSource(img).startsWith('blob:')?'blob':fileId(rawImageSource(img))?'native':rawImageSource(img)?'other':'empty',fileId:fileId(rawImageSource(img))})) : undefined;
+      if(verifiedSnapshot)deps.onVerifiedSnapshot?.(verifiedSnapshot);
       return {...proof,...(bindings?{bindings}:{}),...(galleryImageFacts?{galleryImageFacts}:{}),proofSource,reason:proof.status==='matched_complete'&&proofSource==='native_record_download'?'exact_single_user_native_download':proof.status==='matched_complete'&&proofSource==='dom_blob_bytes_equal'?'exact_single_user_blob_bytes':proof.reason,checkedAt:Date.now()};
     }catch{return unavailable(controller.signal.aborted?'timeout_or_cancelled_'+readStage:'record_unavailable_'+readStage);}finally{clearTimeout(timer);deps.signal?.removeEventListener('abort',cancel);}
   }
