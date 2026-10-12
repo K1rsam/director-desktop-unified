@@ -150,9 +150,10 @@
     {
       "path": "extension/background/connectionWatchdog.js",
       "beforeSha256": "2809b469459963b4971c1c19c27e4cc2aa8c7ffdbc6c11b79537a0d34aef71ee",
-      "afterSha256": "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0",
+      "afterSha256": "0aaa0d41285afd630ba671c12eb9d4cb5f78993650038d7384d0bfed88235666",
       "previousAfterSha256s": [
-        "ae2aaf99dd322d5263f3c767122603547e9d36e71aca52df39755206d8b63849"
+        "ae2aaf99dd322d5263f3c767122603547e9d36e71aca52df39755206d8b63849",
+        "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0"
       ]
     }
   ]

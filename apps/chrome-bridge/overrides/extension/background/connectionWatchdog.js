@@ -3,6 +3,8 @@ const PROFILE_KEY='directorDesktop:browserProfileId:v1';
 const SESSION_KEY='directorDesktop:controllerBrowserSession:v1';
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const terminal=new Set(['succeeded','rejected','cancelled']);
+function canonical(v){if(Array.isArray(v))return v.map(canonical);if(v&&typeof v==='object')return Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])]));return v;}
+function same(a,b){return JSON.stringify(canonical(a))===JSON.stringify(canonical(b));}
 function socketAlive(state={}) {return state.ws?.readyState===WebSocket.CONNECTING || state.ws?.readyState===WebSocket.OPEN;}
 function root(url) {try{const u=new URL(url);return u.origin==='https://chatgpt.com'&&u.pathname==='/'&&!u.search&&!u.hash&&!u.username&&!u.password;}catch{return false;}}
 function idle(runtime) {
@@ -32,15 +34,27 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
       if(Object.entries(session).some(([k,v])=>k.startsWith('chatgptBridgeLaunchedTab:')&&v?.launchToken===launch))throw Error('bootstrap_owner_exists');
       if(Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).some(([,v])=>!idle(v)))throw Error('bootstrap_execution_unresolved');
       const sid=session[SESSION_KEY];if(sid!==undefined&&!UUID.test(sid||''))throw Error('bootstrap_session_damaged');
-      if(local[journalKey])throw Error('bootstrap_existing_reservation');
-      return {profile,key,journalKey,control,session,tabs:tabs.map(t=>({id:t.id,url:t.url,incognito:t.incognito})),sessionId:sid||null};
+      let orderingRepair=null;const prior=local[journalKey];
+      if(prior){
+        const order=['version','status','at','originalController','browserSession','foreground','generationCalled'];
+        const expected={version:'director-owned-controller-bootstrap/v1',status:'reserved',at:prior.at,originalController:control,browserSession:prior.browserSession,foreground:false,generationCalled:false};
+        // The pinned v1 implementation compared this exact insertion order to
+        // Chrome's sorted dictionary before its first native create call. Only
+        // that zero-create rejection is repairable; all other reservations hold.
+        if(!same(prior,expected)||!Number.isSafeInteger(prior.at)||!UUID.test(prior.browserSession||'')
+          ||sid!==undefined&&sid!==prior.browserSession||Object.keys(prior).length!==order.length
+          ||Object.keys(prior).join('|')===order.join('|'))throw Error('bootstrap_existing_reservation');
+        orderingRepair={version:'director-controller-zero-create-ordering-repair/v1',previousIntent:prior,
+          expectedKeyOrder:order,observedReadbackKeyOrder:Object.keys(prior),reason:'pinned_v1_readback_guard_rejected_before_create',previousContract:'director-owned-controller-bootstrap/v1'};
+      }
+      return {profile,key,journalKey,control,session,tabs:tabs.map(t=>({id:t.id,url:t.url,incognito:t.incognito})),sessionId:sid||null,orderingRepair};
     };
-    const first=await read(),second=await read();if(JSON.stringify(first)!==JSON.stringify(second))return held('bootstrap_native_drift');
+    const first=await read(),second=await read();if(!same(first,second))return held('bootstrap_native_drift');
     const sid=first.sessionId||crypto.randomUUID().toLowerCase();if(!UUID.test(sid))return held('bootstrap_session_identity');
-    const intent={version:'director-owned-controller-bootstrap/v1',status:'reserved',at:now(),originalController:first.control,browserSession:sid,foreground:false,generationCalled:false};
+    const intent={version:'director-owned-controller-bootstrap/v2',status:'reserved',at:now(),originalController:first.control,browserSession:sid,foreground:false,generationCalled:false,zeroCreateOrderingRepair:first.orderingRepair};
     await browser.storage.local.set({[first.journalKey]:intent});
-    if(JSON.stringify((await browser.storage.local.get(first.journalKey))[first.journalKey])!==JSON.stringify(intent))return held('bootstrap_intent_not_persisted');
-    const actual=(await browser.storage.local.get(first.key))[first.key];if(JSON.stringify(actual)!==JSON.stringify(first.control))return held('bootstrap_controller_changed');
+    if(!same((await browser.storage.local.get(first.journalKey))[first.journalKey],intent))return held('bootstrap_intent_not_persisted');
+    const actual=(await browser.storage.local.get(first.key))[first.key];if(!same(actual,first.control))return held('bootstrap_controller_changed');
     if(first.sessionId===null){await browser.storage.session.set({[SESSION_KEY]:sid});if((await browser.storage.session.get(SESSION_KEY))[SESSION_KEY]!==sid)return held('bootstrap_session_not_persisted');}
     const url=new URL('https://chatgpt.com/');url.hash=new URLSearchParams({'chatgpt-bridge-launch':first.control.launchToken,'chatgpt-bridge-server':first.control.serverUrl}).toString();
     let created;
@@ -51,7 +65,8 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
     const tabId=pages[0].id;
     await browser.tabs.update(tabId,{autoDiscardable:false});
     await browser.storage.session.set({['chatgptBridgeLaunchedTab:'+tabId]:{launchToken:first.control.launchToken,requestedUrl:'https://chatgpt.com/',serverUrl:first.control.serverUrl,createdAt:now()}});
-    const control={...first.control,tabId,browserSession:sid,status:'opened',retiredControllers:[...(first.control.retiredControllers||[]),{...first.control,retiredAt:now(),reason:'session_ownership_lost_old_page_untouched'}]};
+    const {retiredControllers:history,...retired}=first.control;
+    const control={...retired,tabId,browserSession:sid,status:'opened',retiredControllers:[...(history||[]),{...retired,retiredAt:now(),reason:'session_ownership_lost_old_page_untouched'}]};
     await browser.storage.local.set({[first.key]:control,[first.journalKey]:{...intent,status:'bootstrap_completed',controllerSha256:await digest(control),tabId,windowId:created.id,attempts:1}});
     return {status:'bootstrap_completed',tabId,windowId:created.id,foreground:false,generationCalled:false};
   }catch(error){return held(String(error.message||'bootstrap_read_failed'));}
@@ -96,14 +111,14 @@ export async function recoverOwnedController({browser=chrome,connections,now=Dat
     if(old && now()-old.at<120000)return held('reconnect_cooldown');
     if((old?.attempts||0)>=2)return held('reconnect_budget_exhausted');
     const second=await sample();if(second.connected)return {status:'connected'};
-    if(JSON.stringify(first)!==JSON.stringify(second))return held('native_state_changed');
+    if(!same(first,second))return held('native_state_changed');
     const intent={version:'director-owned-controller-reconnect/v1',controllerSha256:await digest(first.control),tabId:first.tab.id,
       browserSession:first.control.browserSession,launchToken:first.control.launchToken,status:'reserved',attempts:(old?.attempts||0)+1,at:now(),foreground:false,generationCalled:false};
     await browser.storage.local.set({[first.journalKey]:intent});
     const confirmed=(await browser.storage.local.get(first.journalKey))[first.journalKey];
-    if(JSON.stringify(confirmed)!==JSON.stringify(intent))return held('intent_not_persisted');
+    if(!same(confirmed,intent))return held('intent_not_persisted');
     const after=await sample();const expected={...first,journal:intent};
-    if(after.connected||JSON.stringify(after)!==JSON.stringify(expected))return held('pre_reload_state_changed');
+    if(after.connected||!same(after,expected))return held('pre_reload_state_changed');
     try{await browser.tabs.reload(first.tab.id);}
     catch{await browser.storage.local.set({[first.journalKey]:{...intent,status:'outcome_unknown'}});return held('reload_outcome_unknown');}
     await browser.storage.local.set({[first.journalKey]:{...intent,status:'reload_requested'}});
@@ -112,7 +127,7 @@ export async function recoverOwnedController({browser=chrome,connections,now=Dat
     if(reason==='controller_identity'||reason==='session_ownership')return bootstrapOwnedController({browser,connections,now});
     return held(reason);}
 }
-async function digest(value){const bytes=new TextEncoder().encode(JSON.stringify(value));return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');}
+async function digest(value){const bytes=new TextEncoder().encode(JSON.stringify(canonical(value)));return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 
 export function createConnectionWatchdog({alarms,connections,openConnection,periodInMinutes=1,recoverController}={}) {
   if(!connections||typeof openConnection!=='function')throw new TypeError('Connection watchdog requires connections and openConnection');

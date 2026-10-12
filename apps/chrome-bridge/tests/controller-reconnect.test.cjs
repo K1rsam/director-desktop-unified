@@ -70,3 +70,23 @@ test('unknown creation invalid old reservation owner drift or unresolved executi
  const lost=bootstrapFixture(f=>f.browser.windows.create=async()=>{throw Error('lost receipt');});assert.equal((await lost.run()).reason,'bootstrap_create_unknown');
  await lost.run();assert.equal(lost.local[lost.jkey].status,'outcome_unknown');assert.equal(lost.reloads(),0);
 });
+function chromeSortedStorage(f){
+ const sorted=v=>Array.isArray(v)?v.map(sorted):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,sorted(v[k])])):v;
+ for(const area of ['local','session']){const get=f.browser.storage[area].get;f.browser.storage[area].get=async keys=>sorted(await get(keys));}
+}
+test('Chrome dictionary key reordering preserves both reload intent and new-window reservation semantics',async()=>{
+ const f=fixture(chromeSortedStorage);assert.equal((await f.run()).status,'reload_requested');assert.equal(f.reloads(),1);
+ const fresh=bootstrapFixture(chromeSortedStorage);assert.equal((await fresh.run()).status,'bootstrap_completed');assert.equal(fresh.creates(),1);
+});
+test('pinned v1 sorted-readback rejection repairs zero-create reservation once and archives original',async()=>{
+ const f=bootstrapFixture(f=>{
+  f.local[f.jkey]={version:'director-owned-controller-bootstrap/v1',status:'reserved',at:900000,originalController:structuredClone(f.local[f.key]),browserSession:SESSION,foreground:false,generationCalled:false};chromeSortedStorage(f);
+ });const original=structuredClone(f.local[f.jkey]),out=await f.run();assert.equal(out.status,'bootstrap_completed');assert.equal(f.creates(),1);
+ assert.deepEqual(JSON.parse(JSON.stringify(f.local[f.jkey].zeroCreateOrderingRepair.previousIntent)),original);await f.run();assert.equal(f.creates(),1);
+});
+test('uncertain v2 or changed v1 reservation cannot be interpreted as the known ordering rejection',async()=>{
+ for(const change of [r=>r.version='director-owned-controller-bootstrap/v2',r=>r.status='outcome_unknown',r=>r.originalController.tabId=99,r=>r.foreground=true]){
+  const f=bootstrapFixture(f=>{const r={version:'director-owned-controller-bootstrap/v1',status:'reserved',at:900000,originalController:structuredClone(f.local[f.key]),browserSession:SESSION,foreground:false,generationCalled:false};change(r);f.local[f.jkey]=r;chromeSortedStorage(f);});
+  assert.equal((await f.run()).status,'held');assert.equal(f.creates(),0);
+ }
+});
