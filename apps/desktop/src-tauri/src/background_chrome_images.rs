@@ -349,7 +349,11 @@ fn recover_selected_dependency_blocks(r:&Request,store:&Store,journal:&Journal)-
     Ok(changed)
 }
 
+#[cfg(test)]
 fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -> Result<bool> {
+    selected_step_with_paused_queries(engine,r,store,journal,&mut HashSet::new())
+}
+fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal,paused_queries:&mut HashSet<String>) -> Result<bool> {
     r.validate_source_assets(store)?;
     let ids:HashSet<_>=journal.jobs.iter().map(|j|s(j,"jobId").to_owned()).collect();
     let mut prepare_budgets_retired=false;
@@ -388,7 +392,11 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
         let recover_prepare=!known && ["failed","recovery_paused","preparing"].contains(&state)
             && tasks::chrome_prepare_recovery_eligible(store,&job,&config)?;
         let generate=!known && ["queued","ready"].contains(&state);
-        if !generate && !recover_prepare && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
+        // An explicit batch continuation may read each exhausted KNOWN original
+        // once. It never resets retry budgets or calls prepare/submit; a failed
+        // recovery remains held for the rest of this invocation.
+        let recover_paused_query=known && state=="recovery_paused" && !paused_queries.contains(key);
+        if !generate && !recover_prepare && !recover_paused_query && !(known && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&state)) {continue;}
         if generate && !engine.chrome_image_queue_ready(store,key)? {continue;}
         if config.kind!="chrome" {return Err(HELD.into());}
         // Includes source/asset versions and exact adopted parent media hashes.
@@ -398,6 +406,10 @@ fn selected_step(engine:&Arc<Engine>,r:&Request,store:&Store,journal:&Journal) -
             Ok(account)=>account,
             Err(error)=>{Engine::account_preflight_failed(store,key,&error)?;return Ok(true);}
         };
+        if recover_paused_query {
+            paused_queries.insert(key.to_owned());
+            store.event(key,"chrome_paused_original_query_requested",&json!({"providerTaskId":job["providerTaskId"],"requestId":job["snapshot"]["requestId"],"queryAttemptsPreserved":job["queryAttempts"],"prepareCalled":false,"submitCalled":false,"boundedPerBatchContinuation":true}))?;
+        }
         if recover_prepare {tasks::resume_chrome_prepare(store,key,&config,&account,engine.channels.as_ref())?;}
         else if generate {tasks::run_generation(store,key,&config,&account,engine.channels.as_ref())?;}
         else if ["succeeded","download_failed"].contains(&state) {
@@ -423,6 +435,7 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
     let start=Instant::now();
     let mut cleanup_started:Option<Instant>=None;
     let mut completion_media_verified=false;
+    let mut paused_queries=HashSet::new();
     loop {
         let status=if r.stop_path.try_exists().map_err(|e|e.to_string())? {Some(("stopped",3))}
             else if start.elapsed()>=Duration::from_secs(r.max_runtime_seconds) {
@@ -430,7 +443,7 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
             }
             else {None};
         if let Some((status,code))=status {persist_report(r,&journal,&store,status,None)?;return Ok(code);}
-        let progressed=match selected_step(&engine,r,&store,&journal) {
+        let progressed=match selected_step_with_paused_queries(&engine,r,&store,&journal,&mut paused_queries) {
             Ok(value)=>value,
             Err(error)=>{persist_report(r,&journal,&store,"held",None)?;return Err(error);}
         };
@@ -460,7 +473,8 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
             .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
         let runnable=recoverable || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
         let unknown=jobs.iter().any(|j|["submission_unknown","auth_required","recovery_paused"].contains(&s(j,"status")));
-        let known_pending=jobs.iter().any(|j|!s(j,"providerTaskId").is_empty() && ["submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
+        let known_pending=jobs.iter().any(|j|!s(j,"providerTaskId").is_empty() && (["submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status"))
+            || j["status"]=="recovery_paused" && !paused_queries.contains(s(j,"id"))));
         if !progressed && (!runnable || unknown && !known_pending && !recoverable) {
             persist_report(r,&journal,&store,"held",None)?;return Ok(2);
         }

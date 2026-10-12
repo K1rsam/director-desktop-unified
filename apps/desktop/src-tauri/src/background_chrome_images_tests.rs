@@ -15,6 +15,7 @@ struct Fake {
     fail_download:AtomicBool,
     pending:AtomicBool,
     prepare_busy:AtomicBool,
+    query_error:AtomicBool,
     cleanup_outcomes:Mutex<VecDeque<Value>>,
     cleanup_default:Mutex<Option<Value>>,
     releases:AtomicUsize,
@@ -48,6 +49,7 @@ impl Channels for Fake {
     }
     fn query(&self,c:&ProviderConfig,id:&str)->ProviderResult<QueryResult> {
         assert_eq!(c.kind,"chrome");self.queries.fetch_add(1,Ordering::SeqCst);
+        if self.query_error.load(Ordering::SeqCst){return Err(ProviderError::new("IMAGE_PROVENANCE","synthetic original proof mismatch"));}
         if self.pending.load(Ordering::SeqCst) {return Ok(QueryResult{task_id:id.into(),status:"processing".into(),result_urls:vec![],error:None,actual_cost:None,raw:json!({"synthetic":true})});}
         let requests=self.submits.lock().unwrap();
         let request=requests.iter().find(|request|request.request_id==id).unwrap();
@@ -126,6 +128,26 @@ fn background_chrome_unknown_holds_other_new_work_and_reopen_never_resubmits() {
     f.fake.unknown.store(true,Ordering::SeqCst);assert!(f.step(&j));assert!(!f.step(&j));
     assert_eq!(f.count(),1);assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.count(),1);
     assert!(j.jobs.iter().any(|j|f.store.job(s(j,"jobId")).unwrap()["status"]=="submission_unknown"));
+}
+
+#[test]
+fn background_chrome_explicit_continuation_queries_known_paused_original_without_resubmission(){
+    let f=Fixture::new(&[("first",None)]);let j=f.queue();assert!(f.step(&j));
+    let key=s(&j.jobs[0],"jobId");let original=f.store.job(key).unwrap();
+    f.store.conn().unwrap().execute("UPDATE jobs SET state='recovery_paused',query_attempts=5,next_attempt_at=0 WHERE id=?1",[key]).unwrap();
+    let mut attempted=HashSet::new();assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    let recovered=f.store.job(key).unwrap();assert_eq!(recovered["status"],"downloaded");assert_eq!(recovered["providerTaskId"],original["providerTaskId"]);
+    assert_eq!(recovered["snapshot"],original["snapshot"]);assert_eq!(f.count(),1);assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);
+    assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+}
+#[test]
+fn background_chrome_failed_paused_original_query_is_bounded_and_keeps_retry_budget_and_new_work_held(){
+    let f=Fixture::new(&[("first",None),("second",None)]);let j=f.queue();assert!(f.step(&j));let key=s(&j.jobs[0],"jobId");
+    f.store.conn().unwrap().execute("UPDATE jobs SET state='recovery_paused',query_attempts=5,next_attempt_at=0 WHERE id=?1",[key]).unwrap();
+    f.fake.query_error.store(true,Ordering::SeqCst);let mut attempted=HashSet::new();
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
+    assert_eq!(f.store.job(key).unwrap()["status"],"recovery_paused");assert!(f.store.job(key).unwrap()["queryAttempts"].as_u64().unwrap()>=5);
+    assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);assert_eq!(f.count(),1);
 }
 #[test]
 fn background_chrome_due_waiter_cannot_starve_untouched_jobs_with_zero_generation(){

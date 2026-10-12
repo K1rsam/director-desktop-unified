@@ -29,3 +29,7 @@
 修复只读取 `.bg-user-message` 内唯一的 `div.whitespace-pre-wrap` 正文，排除控件标签；多正文、不明结构、正文改变仍不能通过。原完整提示词 SHA、原任务关联码、native branch、原图字节和二次原生记录回读全部保留，未放松来源校验。
 
 补丁在零活跃请求后后台加载；同一原任务真实恢复返回 `matched_complete / exact_single_user_blob_bytes`、1个 artifact，modelSubmissions=0。无需再生成。新增对应合成回归，全套124 passed、0 failed，另补充旧 socket 已排队回调在新连接建立后不得污染当前状态的回归。原图片批次继续，未宣称全部完成。
+
+恢复原图后还发现，客户端已将该任务的5次查询预算耗尽并记成 `recovery_paused`；旧 batch runner 只查询 processing/query_failed，跳过具有正式 providerTaskId 的暂停项，因全局未决保护再次 held。修复后每次显式继续原批次，可对每个正式已知暂停任务进行一次仅查询恢复。继续验证原账户、冻结准备快照、源文、资产和父图；不清查询预算、不 prepare/submit。失败后同次调用不会再尝试，也不会让后续新生成绕过未决保护。
+
+Windows 原生 Rust `background_chrome_` 35 passed、0 failed，覆盖恢复成功后原请求/任务ID/快照不变、查询失败只尝试一次、原预算保留和后续新提交继续被保护。完整核心没有在本补丁重跑。客户端发布及现场续跑以随后原生记录为准。
