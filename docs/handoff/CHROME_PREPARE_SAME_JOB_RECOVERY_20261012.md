@@ -27,4 +27,13 @@
 
 最终候选 EXE SHA256 `5b54c2734d0cbb9665edf7c261c6f7edbdefac30b76e6de416c84da665300d03`。实际运行该 EXE 的原批次 stop-before-queue 入口，29项原 job 的观察证据逐值不变，5图保留、原文精确一致、视频任务0；原请求与停止标记未改，运行报告的前一版留在私有证据目录。
 
+已用现有 `update-client.ps1 -PublishOnly` 发布同名 `apps/desktop/.local/client/director-desktop-next.exe`，核对 SHA256 与上文候选相同。唯一备用 `director-desktop-next-previous.exe` SHA256 为 `83f4aff0c2109a40025bcbb0b4614962f075a0b8e2fbb5a5ea2ed928c631db9f`；候选文件已由发布脚本核对后清理。实现提交为 `69fe4ae`，同一集成分支已推送到 `K1rsam/director-desktop-unified`。未启动 GUI。
+
 本轮准备恢复和清单源码尚未执行真实 first-open 验收，已入库5图不能代表全29项完成。现场原请求停止标记仍保留，浏览器扩展暂时0连接；须先完成原页连接恢复再启动原批次。当前阻塞和已部署的扩展修复见 `CHROME_RELOAD_SOURCE_READY_20261012.md`。私有请求、数据库、剧本、回包和媒体不提交仓库。
+
+## 续接顺序
+
+1. 通过可用的后台浏览器控制连接唤醒原工作页／实际重载扩展，核对真实 profile、bundle、原 source launch 和 hello ACK。当前 CUA Chrome 只读清单也返回连接失败，不能用磁盘 overlay 当成已唤醒；用户前台页面及 Chrome 配置不改。
+2. 验证新 worker 与 owned-launch inventory 实际运行。只有这些前置条件满足，才移除本次 controller 停止标记并以原请求文件启动同批后台入口；不创建新的29项批次。
+3. 恢复7项未提交准备失败和2项原依赖 blocked，续跑其余 waiting/queued。已有5图不重发。完成全29原图入库后逐图审核，核对人物视图、身份和父图承接以及最后工作页清理。
+4. 再接前十集 Stage3 与 Stage4 非视频验收，旧 B/C 未知文本任务继续保护。当前测试项目已完成 Stage1/Stage2文字设计，尚无采用单元；不能写成十集分镜或第四阶段已经通过。视频始终禁止。
