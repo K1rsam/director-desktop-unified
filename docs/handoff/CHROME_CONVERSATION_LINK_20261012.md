@@ -37,3 +37,9 @@
 扩展恢复核验同时修正：附件期待列表可读取原 effect 的 preconditions；缺少期待列表或与原列表冲突时不再误报“没有附件需要上传”。最终该补丁 Windows Rust Chrome专项148项通过，扩展132项通过；真实上传恢复仍按后续回执分别验收。
 
 原上传等待随后被 bridge deadline 终止；canonical lifecycle=failed、submission=accepted，原 attachments.upload 不确定记录和 sentAt=0 的 scoped snapshot 保留。结算兼容这个已经失败的状态，但强制 submission=accepted，并继续双读原生空页。该窄补充的 Chrome terminal 5项、上传结算HTTP专项1项通过；不将已提交、缺证据或其他失败视为未发送。
+
+### 已失败准备页的隔离恢复
+
+实测发现旧上传等待的 release cleanup 将准备页隔离。恢复仅对同 ID 已失败的原页开放只读未发送核验；核验完整后，先持久保存冻结 prepared 绑定的完整证明，再由空闲后台控制页处理这个本程序废弃页。保存证明后发生崩溃或页面丢失，可以恢复原失败，不能重新提交。没有完整未发送证明的隔离仍禁止绕过。owned close 增加当前 URL/非隐身核验，并从 HTTP 到原生后台完整传递。
+
+本补丁 `cargo test --lib chrome -- --test-threads=1`：151 passed，0 failed；扩展完整测试134 passed，0 failed。包含关闭前持久化顺序、保存证明重开、错误 prepared 拒绝、原任务/原请求保留及原 URL 改变拒绝。

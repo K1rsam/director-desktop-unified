@@ -74,7 +74,7 @@
     {
       "path": "extension/background/tabController.js",
       "beforeSha256": "e15ac5bb213847882e3e960dc77fdd268d646d208a6bd0dfe722b484d2e45b98",
-      "afterSha256": "c5e4582364b1a4b166a1b352a0adb40872403f37042370170699beb97fa4e684",
+      "afterSha256": "936a995ef9a4ff58310f4ff2b887c13e13f9080342d3188e1a6e5ecf53a06ad0",
       "previousAfterSha256s": [
         "b6b4c753e8320d4aeb51ccba086813969cdffcb1ff359dee6722f401c83a6ebb",
         "db568da46fddeccd02c7e61f6db69349ca22270fc9333b6b21c349db4555ec6f",
@@ -85,7 +85,8 @@
         "0877128584e8d1d69327469a190772f3755c12e242c2b638b0d3c4282811136d",
         "d1c896b460a193066160699347a0aa1e21421ec35d9241270958a59198ae9ac8",
         "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6",
-        "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf"
+        "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf",
+        "c5e4582364b1a4b166a1b352a0adb40872403f37042370170699beb97fa4e684"
       ]
     },
     {
@@ -120,9 +121,10 @@
     {
       "path": "src/routes.js",
       "beforeSha256": "4890d540e84c81b4ad8afc6363cca3a177fd6c71f2d4679c5905435b0ed5e0fe",
-      "afterSha256": "aeeb0d11c00ddab8f37537faeb904dce01e8507398043db9054852cbc1b97d94",
+      "afterSha256": "69901853a668d50bf0d88ff9639b83feb4b56d47a8b8615a461cbc10d10900d6",
       "previousAfterSha256s": [
-        "8d507a2b000d9c34b68e7e6320fd6e3073c013d11e17ae5d31cdd067c257708f"
+        "8d507a2b000d9c34b68e7e6320fd6e3073c013d11e17ae5d31cdd067c257708f",
+        "aeeb0d11c00ddab8f37537faeb904dce01e8507398043db9054852cbc1b97d94"
       ]
     },
     {
@@ -171,6 +173,11 @@
       "path": "extension/background/authPreflight.js",
       "beforeSha256": "fb858bca7936b180e71c65ccc6921e6e989e0d35fb1c17326b881ab5eaebb5b5",
       "afterSha256": "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452"
+    },
+    {
+      "path": "src/bridge/coordinator/browserClientCoordinator.js",
+      "beforeSha256": "b98e2bd2671054c0726c932dca00c7c05ac25fe63bb8a581f1e03a6b04632c76",
+      "afterSha256": "eed9ea6522c849d0fcf3dbeca47adf47e71de3e971055827ef7fa0069608f9b3"
     }
   ]
 }

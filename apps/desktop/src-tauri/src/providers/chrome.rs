@@ -872,6 +872,7 @@ pub(super) fn query_with_saved(config:&ProviderConfig,id:&str,p:&PreparedRequest
     query_inner(config,id,Some(p),saved,observe)
 }
 fn query_inner(config:&ProviderConfig,id:&str,prepared:Option<&PreparedRequest>,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<QueryResult>{
+    if let Some(p)=prepared.filter(|p|p.request.request_id==id){if let Some(result)=upload_settlement::saved_result(config,p,saved){return Ok(result);}}
     let client = wire::client(45)?;
     let raw = match json_request(config, &client, &format!("/turns/{id}"), None, false){
         Ok(raw)=>raw,
@@ -891,6 +892,7 @@ fn query_inner(config:&ProviderConfig,id:&str,prepared:Option<&PreparedRequest>,
     let original_source = prepared.and_then(|p| p.wire["sourceClientId"].as_str())
         .or_else(|| turn["input"]["sourceClientId"].as_str());
     let original_client=original_client_for(config, &client, id, true, original_source);
+    if original_client.is_err(){if let Some(p)=prepared.filter(|p|p.request.request_id==id){if let Some(result)=upload_settlement::quarantined_terminal(config,&client,turn,p,observe)?{return Ok(result);}}}
     let mut saved_state=saved.clone();
     if saved_state["locator"].is_null(){if let (Some(p),Ok(source))=(prepared,&original_client){
         if p.wire["correlationVersion"]!="conversation/v1"&&source["url"].as_str().is_some_and(|u|u.starts_with("https://chatgpt.com/c/")){

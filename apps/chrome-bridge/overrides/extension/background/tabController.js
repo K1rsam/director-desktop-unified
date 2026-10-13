@@ -435,6 +435,7 @@ export function createTabController({
     if (!launch || launch.launchToken !== expectedLaunchToken) {
       throw new Error('Refusing to close owned tab because its launch token does not match');
     }
+    if(options.expectedUrl){const tab=await chrome.tabs.get(tabId);if(tab.url!==options.expectedUrl||tab.incognito!==false)throw Error('Refusing to close owned tab because its current URL or profile changed');}
     setTimeout(() => { void removeTab(tabId).catch(() => {}); }, 150);
     return { tabId, closing: true, launchToken: launch.launchToken };
   }

@@ -5,11 +5,23 @@ function fixture(change=()=>{}){
  const chrome={runtime:{},tabs:{get:async()=>({...facts.source}),create:(options,done)=>{facts.calls.push(['create',options]);done({id:31,windowId:facts.returnedWindow});},
   update:(id,options,done)=>{facts.calls.push(['update',id,options]);done({id,windowId:10});},remove:(id,done)=>{facts.calls.push(['remove',id]);done();}}};
  const port={sender:{tab:{id:7,incognito:false}}},connections=new Map([[port,{serverUrl:facts.record.serverUrl}]]);
- const context=vm.createContext({chrome,URL,URLSearchParams,Date,console,setTimeout});
+ const context=vm.createContext({chrome,URL,URLSearchParams,Date,console,setTimeout:fn=>{fn();return 1;}});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/tabController.js'),'utf8').replace(/^export /gm,''),context);
  const api=context.createTabController({connections,safeBridgeServerUrl:u=>u,rememberLaunchedTab:async()=>{},readLaunchedTab:async()=>facts.record,forgetLaunchedTab:async()=>{},isStableLaunchToken:()=>true});
- return {...facts,open:options=>api.openBridgeTab(port,{active:false,launchToken:'bridge-director-desktop-'+REQUEST,bridgeServerUrl:'http://127.0.0.1:53179',...options})};
+ return {...facts,open:options=>api.openBridgeTab(port,{active:false,launchToken:'bridge-director-desktop-'+REQUEST,bridgeServerUrl:'http://127.0.0.1:53179',...options}),close:options=>api.closeOwnedBridgeTab(port,options)};
 }
+
+test('retired owned page close checks current exact URL and profile before removal',async()=>{
+ const options={tabId:7,expectedLaunchToken:'bridge-director-control-'+PROFILE,expectedUrl:'https://chatgpt.com/'};
+ const valid=fixture();assert.equal((await valid.close(options)).closing,true);assert.equal(valid.calls.at(-1)[0],'remove');
+ for(const change of [f=>f.source.url='https://chatgpt.com/c/user',f=>f.source.incognito=true,f=>f.record.launchToken='different']){const f=fixture(change);await assert.rejects(f.close(options));assert.equal(f.calls.length,0);}
+});
+test('server coordinator forwards exact expected URL to native owned close command',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../overrides/src/bridge/coordinator/browserClientCoordinator.js'),'utf8');
+ const body=source.match(/async closeOwnedBrowserTab\(options = \{\}\) \{([\s\S]*?)\n\}/)[1];const run=vm.runInNewContext('(async function(options){'+body+'})');const calls=[];
+ await run.call({sendCommand:async(...args)=>{calls.push(args);return {closing:true}}},{sourceClientId:'controller',tabId:7,expectedLaunchToken:'owned',expectedUrl:'https://chatgpt.com/'});
+ assert.equal(calls[0][0],'browser.tab.close-owned');assert.equal(calls[0][1].expectedUrl,'https://chatgpt.com/');assert.equal(calls[0][2].sourceClientId,'controller');
+});
 test('owned work page explicitly uses controller window instead of Chrome last-focused user window',async()=>{
  const f=fixture();await f.open();assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0])),['create',{url:'about:blank',active:false,windowId:10}]);
  assert.equal(f.calls.filter(c=>c[0]==='update')[0][2].active,false);

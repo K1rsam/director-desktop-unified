@@ -37,6 +37,13 @@ pub(super) fn saved(store:&Store,job:&str)->Result<Value>{
   for pointer in ["/requestId","/launchToken","/client/url","/client/launchToken"]{let mut bad=opened.clone();*bad.pointer_mut(pointer).unwrap()=json!("foreign");assert!(observe(&bad).is_err());assert_eq!(saved(&store,"job").unwrap()["recovery"],intent);}
   observe(&opened).unwrap();assert_eq!(saved(&store,"job").unwrap()["recovery"],opened);
  }
+ #[test]fn chrome_conversation_metadata_unsent_upload_proof_is_durable_immutable_and_bound_to_original_prepared(){
+  let(_tmp,store,_,cfg,_)=fixture();let base=crate::chrome_terminal::tests::upload_fixture();let mut value=base["prepared"].clone();value["wire"]["browserBinding"]=json!(cfg.chrome_binding.as_ref());
+  value["capabilityVersion"]=json!("fixture");value["uploadReceipts"]=json!([]);value["preparedAt"]=json!("original");for(key,val)in [("prompt",json!("synthetic image")),("ratio",json!("16:9")),("resolution",json!("native")),("references",json!([])),("options",json!({}))]{value["request"][key]=val;}
+  let p:PreparedRequest=serde_json::from_value(value).unwrap();let mut proof=base["result"]["raw"]["uploadNotSubmitted"].clone();proof["preparedSha256"]=json!(crate::pipeline::digest(&json!(p).to_string()));let observe=observer(&store,"job",&p,&cfg);
+  let event=json!({"type":"upload_not_submitted","proof":proof});observe(&event).unwrap();observe(&event).unwrap();let reopened=Store::open(store.root.clone()).unwrap();assert_eq!(saved(&reopened,"job").unwrap()["uploadNotSubmitted"],proof);
+  let mut wrong=event.clone();wrong["proof"]["preparedSha256"]=json!("changed");assert!(observe(&wrong).is_err());assert_eq!(saved(&store,"job").unwrap()["uploadNotSubmitted"],proof);
+ }
 }
 pub(super) fn observer<'a>(store:&'a Store,job:&'a str,p:&'a PreparedRequest,cfg:&'a ProviderConfig)->impl Fn(&Value)->ProviderResult<()>+'a{
  move |event|{
@@ -44,7 +51,12 @@ pub(super) fn observer<'a>(store:&'a Store,job:&'a str,p:&'a PreparedRequest,cfg
   let mut conn=store.conn().map_err(|_|fail())?;let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|fail())?;
   let raw:Option<String>=tx.query_row("SELECT value FROM metadata WHERE key=?1",[key(job)],|r|r.get(0)).optional().map_err(|_|fail())?;
   let mut state=raw.map(|v|serde_json::from_str::<Value>(&v)).transpose().map_err(|_|fail())?.unwrap_or(json!({}));
-  if event["type"]=="locator"{
+  if event["type"]=="upload_not_submitted"{
+   let proof=&event["proof"];
+   if cfg.kind!="chrome"||p.wire["browserBinding"]!=json!(cfg.chrome_binding.as_ref())||!crate::chrome_terminal::upload_not_submitted_valid(proof,&json!(p),&p.request.request_id)
+    ||!state["uploadNotSubmitted"].is_null()&&state["uploadNotSubmitted"]!=*proof{return Err(fail());}
+   if state["uploadNotSubmitted"]==*proof{return Ok(());}state["uploadNotSubmitted"]=proof.clone();
+  }else if event["type"]=="locator"{
    let loc=&event["locator"];
    let mut same=state["locator"].clone();if same["userMessageId"].is_null()&&!same.is_null(){same["userMessageId"]=loc["userMessageId"].clone();}
    if !providers::chrome_locator_valid(cfg,p,loc)||!state["locator"].is_null()&&same!=*loc{return Err(fail());}
