@@ -247,6 +247,27 @@ pub(super) async fn prepare_supervisor_handoff(
         resource_hashes: new_resources,
     }))
 }
+pub(super) async fn prepare_local_recovery_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    let old = receipt_identity(settings)?;
+    let resolved = resolve(settings).await?;
+    let new = identity(&resolved)?;
+    if !local_recovery_identity_bound(&old, &new) { return Err("SDK_LOCAL_RECOVERY_IDENTITY_CHANGED".into()); }
+    let resource_hashes = handoff_resource_hashes(Path::new(s(&new, "resourceDirectory")))?;
+    verify_local_recovery_bytes(&old, &new, &resource_hashes)?;
+    Ok(SupervisorHandoff { identity: new, resource_hashes })
+}
+pub(super) fn verify_local_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    serde_json::from_value::<SdkIdentity>(new.clone()).map_err(|e|e.to_string())?.validate()?;
+    if !local_recovery_identity_bound(old, new)
+        || handoff_resource_hashes(Path::new(s(new,"resourceDirectory")))? != *hashes { return Err("SDK_LOCAL_RECOVERY_IDENTITY_CHANGED".into()); }
+    for (field, sha) in [("nodeExecutable","nodeSha256"),("runtimeExecutable","runtimeSha256"),("supervisorExecutable","supervisorSha256")] {
+        if crate::store::hash_file(Path::new(s(new,field)))?.0 != s(new,sha) { return Err("SDK_LOCAL_RECOVERY_BYTES_CHANGED".into()); }
+    }
+    let root = Path::new(s(new,"resourceDirectory"));
+    let bridge = digest(&format!("{}{}{}", std::fs::read_to_string(root.join("src/main.mjs")).map_err(|e|e.to_string())?,std::fs::read_to_string(root.join("src/bridge.mjs")).map_err(|e|e.to_string())?,std::fs::read_to_string(root.join("src/native-runtime.mjs")).map_err(|e|e.to_string())?));
+    if bridge != compiled_native_bridge_sha() || hashes["node_modules/@openai/codex-sdk/dist/index.js"] != SDK_IMPLEMENTATION_SHA { return Err("SDK_LOCAL_RECOVERY_PACKAGE_CHANGED".into()); }
+    Ok(())
+}
 pub(super) async fn add_readiness(settings: &Value, result: &mut Value) {
     let inspected = crate::text_cli::readiness_status(settings).await;
     let cli = crate::readiness::codex_report(&inspected, settings);
@@ -331,7 +352,7 @@ fn valid_reasoning(reasoning: &str) -> bool {
     .contains(&reasoning)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimePlan {
     version: String,
@@ -432,17 +453,37 @@ pub fn run_runtime_wrapper() -> Result<bool> {
     let Some(file) = std::env::var_os("DIRECTOR_SDK_RUNTIME_PLAN") else {
         return Ok(false);
     };
+    let code = run_runtime_wrapper_plan(
+        Path::new(&file),
+        &std::env::var("DIRECTOR_SDK_RUNTIME_PLAN_SHA256").unwrap_or_default(),
+        &std::env::args().skip(1).collect::<Vec<_>>(),
+        std::io::stdin(),
+        run_supervised,
+    )?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(true)
+}
+// Tests use this same production validation path and replace only the final
+// process launch with a counter. No test switch can enter a production plan.
+fn run_runtime_wrapper_plan(
+    file: &Path,
+    expected_plan_sha256: &str,
+    args: &[String],
+    input: impl Read,
+    launch: impl FnOnce(&RuntimePlan, &Path, Vec<u8>, &Path) -> Result<i32>,
+) -> Result<i32> {
     if !cfg!(windows) || crate::windows_runtime::is_packaged()? {
         return Err("SDK_WRAPPER_NATIVE_CONTEXT_REQUIRED".into());
     }
-    let file = PathBuf::from(file);
     if !file.is_absolute() {
         return Err("SDK_WRAPPER_PLAN_PATH".into());
     }
     crate::windows_runtime::verify_shared_directory(file.parent().ok_or("SDK_WRAPPER_PLAN_PATH")?)?;
     let bytes = frozen_file(&file, FRAME_LIMIT as u64)?;
     if digest(std::str::from_utf8(&bytes).map_err(|_| "SDK_WRAPPER_PLAN_UTF8")?)
-        != std::env::var("DIRECTOR_SDK_RUNTIME_PLAN_SHA256").unwrap_or_default()
+        != expected_plan_sha256
     {
         return Err("SDK_WRAPPER_PLAN_HASH".into());
     }
@@ -471,7 +512,7 @@ pub fn run_runtime_wrapper() -> Result<bool> {
     }
     let root = canonical(file.parent().unwrap())?;
     if file.file_name().and_then(|s| s.to_str()) != Some("runtime-plan.json")
-        || root.file_name().and_then(|s| s.to_str()) != Some("native-runtime")
+        || ![Some("native-runtime"), Some("native-runtime-wrapper-repair")].contains(&root.file_name().and_then(|s| s.to_str()))
         || root
             .parent()
             .and_then(Path::file_name)
@@ -491,10 +532,10 @@ pub fn run_runtime_wrapper() -> Result<bool> {
         4_194_304,
     )?)
     .map_err(|_| "SDK_WRAPPER_RECEIPT_INVALID")?;
-    if record["state"] != "dispatching"
+    if record.get("wrapperPreparationRepair").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some("native-runtime-wrapper-repair"))
+        || record["state"] != "dispatching"
         || record["attempt"]["attemptId"] != plan.attempt_id
-        || record["attempt"]["runtimeIdentity"]
-            != serde_json::to_value(&plan.identity).map_err(|e| e.to_string())?
+        || !wrapper_runtime_identity_bound(&record, &plan, root.parent().unwrap())?
         || record["attempt"]["request"]["model"] != plan.model
         || record["attempt"]["request"]["reasoning"] != plan.reasoning
         || record["attempt"]["semanticRequestHash"] != plan.semantic_request_hash
@@ -523,10 +564,9 @@ pub fn run_runtime_wrapper() -> Result<bool> {
     {
         return Err("SDK_WRAPPER_EXECUTABLE_IDENTITY".into());
     }
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let schema = validate_argv(&args, &plan)?;
+    let schema = validate_argv(args, &plan)?;
     let mut prompt = Vec::new();
-    std::io::stdin()
+    input
         .take(FRAME_LIMIT as u64 + 1)
         .read_to_end(&mut prompt)
         .map_err(|e| e.to_string())?;
@@ -536,11 +576,55 @@ pub fn run_runtime_wrapper() -> Result<bool> {
     {
         return Err("SDK_WRAPPER_PROMPT_IDENTITY".into());
     }
-    let code = run_supervised(&plan, &schema, prompt, &root)?;
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(true)
+    launch(&plan, &schema, prompt, &root)
+}
+fn wrapper_runtime_identity_bound(record: &Value, plan: &RuntimePlan, attempt_root: &Path) -> Result<bool> {
+    let effective = serde_json::to_value(&plan.identity).map_err(|e| e.to_string())?;
+    let Some(recovery) = record.get("preDispatchRecovery") else {
+        return Ok(record["attempt"]["runtimeIdentity"] == effective);
+    };
+    let recovery_identity = if record.get("wrapperPreparationRepair").is_some() {
+        if !wrapper_repair_record_bound(attempt_root, record, &effective)? {return Ok(false);}
+        recovery["effectiveIdentity"].clone()
+    } else { effective };
+    let proof = &recovery["proof"];
+    if recovery.as_object().is_none_or(|o| o.len() != 2)
+        || recovery["effectiveIdentity"] != recovery_identity
+        || !local_recovery_identity_bound(&record["attempt"]["runtimeIdentity"], &recovery_identity)
+        || proof["version"] != "sdk-local-preparation-recovery/v1"
+        || proof["attemptId"] != plan.attempt_id
+        || proof["attemptEnvelopeHash"] != record["attempt"]["attemptEnvelopeHash"]
+        || proof["effectiveIdentitySha256"] != digest(&recovery_identity.to_string())
+        || proof["sdkEvents"] != 0 || proof["processTreeStopProven"] != true
+        || !valid_sha(s(proof, "evidenceSha256"))
+    { return Ok(false); }
+    let mut attempt: FrozenAttempt = serde_json::from_value(record["attempt"].clone()).map_err(|_| "SDK_WRAPPER_RECOVERY_ATTEMPT")?;
+    attempt.begin_dispatch(Backend::CodexSdk)?;
+    let project = attempt_root.parent().and_then(Path::parent).ok_or("SDK_WRAPPER_ATTEMPT_DIRECTORY")?;
+    // Validate the actual sealed current record, its unchanged frozen request
+    // and journal before recognizing an execution-only identity handoff.
+    historical_receipt(project, &attempt)?;
+    let intent: Value = serde_json::from_slice(&frozen_file(&attempt_root.join("local-preparation-recovery.json"), FRAME_LIMIT as u64)?)
+        .map_err(|_| "SDK_WRAPPER_RECOVERY_INTENT")?;
+    let archive = frozen_file(&attempt_root.join("local-preparation-original.json"), 4_194_304)?;
+    let archive = std::str::from_utf8(&archive).map_err(|_| "SDK_WRAPPER_RECOVERY_ARCHIVE")?;
+    let original: Value = serde_json::from_str(archive).map_err(|_| "SDK_WRAPPER_RECOVERY_ARCHIVE")?;
+    let seal = s(&original, "receiptEnvelopeSha256");
+    let suffix = format!(",\"receiptEnvelopeSha256\":\"{seal}\"}}");
+    let sealed = archive.strip_suffix(&suffix).is_some_and(|body| digest(&format!("{body}}}")) == seal);
+    Ok(intent == *proof && sealed && proof["originalReceiptSeal"] == seal
+        && original.get("preDispatchRecovery").is_none()
+        && original["state"] == "submission_unknown"
+        && original["error"] == json!({"code":"SDK_STREAM_ERROR","message":"SDK_NATIVE_IDENTITY: attempt directory"})
+        && original["lastSequence"] == 0 && original["threadId"].is_null()
+        && original["turnId"].is_null() && original["rawResult"].is_null()
+        && original["usage"].is_null() && original["rawResultSha256"].is_null()
+        && original["journalSha256"] == digest("")
+        && record["error"].is_null()
+        && ["protocolVersion", "attempt", "frozenAttemptSha256", "requestSnapshotSha256",
+            "compiledPrompt", "compiledSchema", "compiledPromptSha256", "compiledSchemaSha256",
+            "journalSha256", "lastSequence", "threadId", "turnId", "rawResult", "rawResultSha256", "usage", "domainAccepted"]
+            .iter().all(|key| original[key] == record[key]))
 }
 fn run_supervised(plan: &RuntimePlan, schema: &Path, prompt: Vec<u8>, root: &Path) -> Result<i32> {
     let mut command =
@@ -929,9 +1013,13 @@ impl ProcessJob {
 }
 
 #[cfg(test)]
+#[path = "sdk_native_wrapper_tests.rs"]
+mod wrapper_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    fn plan(root: &Path) -> RuntimePlan {
+    pub(super) fn plan(root: &Path) -> RuntimePlan {
         std::fs::create_dir(root.join("work")).unwrap();
         std::fs::create_dir(root.join("tmp")).unwrap();
         let mut identity: SdkIdentity = serde_json::from_value(
@@ -975,7 +1063,7 @@ mod tests {
             temp_directory: root.join("tmp"),
         }
     }
-    fn args(plan: &RuntimePlan) -> Vec<String> {
+    pub(super) fn args(plan: &RuntimePlan) -> Vec<String> {
         [
             "exec".into(),
             "--experimental-json".into(),

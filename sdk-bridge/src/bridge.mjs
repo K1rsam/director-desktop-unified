@@ -5,6 +5,9 @@ import path from 'node:path';
 
 export const PROTOCOL_VERSION = 'director-sdk-bridge/v1';
 export const SDK_VERSION = '0.160.1';
+export const LEGACY_PATH_BRIDGE_SHA = 'fc252738882b4fcdca3a52aeed2c50e1613b290ff3297e7f5cfd12f6b108b08a';
+export const WRAPPER_FAILED_BRIDGE_SHA = '47de63a6a0cc0a7a1255d593fb428b2a6daac80ddd21dd5d953e16f92347fabb';
+export const WRAPPER_FAILED_SUPERVISOR_SHA = '48a5b6a608163207297f56240c1f871755d9dd51516ecfad7188543e4a37e146';
 export const LIMITS = Object.freeze({ frameBytes: 1_048_576, eventBytes: 1_048_576, journalBytes: 16_777_216, receiptBytes: 4_194_304, events: 2048, attempts: 128, executionMs: 1_800_000, cancelMs: 500, outputQueueBytes: 2_097_152 });
 const REASONING = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent']);
 const UNRESOLVED = new Set(['dispatching', 'running', 'cancel_requested', 'submission_unknown']);
@@ -65,6 +68,7 @@ export class OfficialSdkBridge {
     this.nativeRuntime = nativeRuntime;
     this.limits = { ...LIMITS, ...limits };
     this.records = new Map();
+    this.loadedReceiptBytes = new Map();
     this.active = null;
     this.closed = false;
     this.initialized = false;
@@ -105,7 +109,9 @@ export class OfficialSdkBridge {
         let record;
         try {
           requireThat((await fs.stat(file)).size <= this.limits.receiptBytes, 'RECEIPT_LIMIT', 'Persisted receipt exceeds bound');
-          record = JSON.parse(await fs.readFile(file, 'utf8'));
+          const bytes = await fs.readFile(file, 'utf8');
+          record = JSON.parse(bytes);
+          if (record.state === 'dispatching' && record.preDispatchRecovery?.effectiveIdentity?.supervisorSha256 === WRAPPER_FAILED_SUPERVISOR_SHA) this.loadedReceiptBytes.set(entry.name, bytes);
         } catch (error) {
           if (error.code === 'ENOENT') throw new BridgeError('INCOMPLETE_RECEIPT', 'Partial attempt directory requires inspection; no new dispatch');
           throw error;
@@ -176,6 +182,8 @@ export class OfficialSdkBridge {
     switch (message.method) {
       case 'hello': case 'inspect': result = this.inspect(); break;
       case 'execute': result = await this.execute(message); break;
+      case 'recover-local-preparation': result = await this.recoverLocalPreparation(message); break;
+      case 'repair-wrapper-preparation': result = await this.repairWrapperPreparation(message); break;
       case 'observe': result = this.observe(message.attemptId); break;
       case 'cancel': result = await this.cancel(message.attemptId); break;
       case 'shutdown': await this.disconnect('SHUTDOWN'); result = { shutdown: true, processTreeStopProven: false }; break;
@@ -213,7 +221,97 @@ export class OfficialSdkBridge {
     const record = { protocolVersion: PROTOCOL_VERSION, attempt: frozen, compiledPrompt, compiledSchema, compiledPromptSha256, compiledSchemaSha256, requestSnapshotSha256: sha256(JSON.stringify(frozen.request)), frozenAttemptSha256: sha256(JSON.stringify(frozen)), journalSha256: sha256(''), rawResultSha256: null, state: 'dispatching', threadId: null, turnId: null, lastSequence: 0, rawResult: null, usage: null, error: null, domainAccepted: false };
     await atomicJson(path.join(dir, 'receipt.json'), record);
     this.records.set(attempt.attemptId, record);
-    const active = { record, requestId: message.requestId, controller: new AbortController(), canceled: false, seen: new Set(), bytes: 0, count: 0, threadStarted: false, turnStarted: false, completed: false, finalItem: null, task: null, abortable: false, finished: false, journalHash: createHash('sha256') };
+    return this.dispatchRecord(record, message.requestId, schema);
+  }
+  async recoverLocalPreparation(message) {
+    const record = this.records.get(message.attemptId), proof = message.params?.proof;
+    requireThat(this.nativeRuntime && !this.fixture && !this.active && record
+      && ![...this.records.values()].some(r => r !== record && UNRESOLVED.has(r.state)), 'LOCAL_RECOVERY_HELD', 'Only the original idle native attempt may recover');
+    requireThat(record.state === 'submission_unknown' && !record.preDispatchRecovery
+      && record.error?.code === 'SDK_STREAM_ERROR' && record.error?.message === 'SDK_NATIVE_IDENTITY: attempt directory'
+      && record.attempt.runtimeIdentity?.bridgeSha256 === LEGACY_PATH_BRIDGE_SHA
+      && record.lastSequence === 0 && record.threadId === null && record.turnId === null
+      && record.rawResult === null && record.rawResultSha256 === null && record.usage === null
+      && record.journalSha256 === sha256(''), 'LOCAL_RECOVERY_HELD', 'Not the sealed legacy preparation failure');
+    requireThat(proof?.version === 'sdk-local-preparation-recovery/v1'
+      && proof.attemptId === record.attempt.attemptId
+      && proof.attemptEnvelopeHash === record.attempt.attemptEnvelopeHash
+      && proof.originalReceiptSeal === sha256(JSON.stringify(receiptPayload(record)))
+      && proof.sdkEvents === 0 && proof.processTreeStopProven === true
+      && proof.effectiveIdentitySha256 === sha256(JSON.stringify(this.nativeRuntime.identity))
+      && /^[a-f0-9]{64}$/.test(proof.evidenceSha256 ?? ''), 'LOCAL_RECOVERY_HELD', 'Native recovery proof does not match frozen receipt');
+    const expected = { ...record.attempt.runtimeIdentity };
+    for (const key of ['bridgeSha256', 'supervisorExecutable', 'supervisorSha256', 'resourceDirectory']) expected[key] = this.nativeRuntime.identity[key];
+    requireThat(JSON.stringify(expected) === JSON.stringify(this.nativeRuntime.identity), 'LOCAL_RECOVERY_HELD', 'Recovery cannot change SDK, Node, runtime, account or permissions');
+    const dir = path.join(this.root, message.attemptId), file = path.join(dir, 'receipt.json');
+    const stat = await fs.lstat(dir);
+    requireThat(stat.isDirectory() && !stat.isSymbolicLink(), 'LOCAL_RECOVERY_HELD', 'Linked attempt cannot recover');
+    const names = await fs.readdir(dir);
+    requireThat(names.length === 1 && names[0] === 'receipt.json', 'LOCAL_RECOVERY_HELD', 'Runtime, journal or prior recovery exists');
+    const bytes = await fs.readFile(file, 'utf8');
+    requireThat(JSON.parse(bytes).receiptEnvelopeSha256 === proof.originalReceiptSeal
+      && sha256(JSON.stringify(receiptPayload(JSON.parse(bytes)))) === proof.originalReceiptSeal, 'LOCAL_RECOVERY_HELD', 'Receipt changed');
+    // Exclusive intent is consumed before runtime creation. Any crash from this
+    // point keeps ownership unknown; it never authorizes a second invocation.
+    const original = await fs.open(path.join(dir, 'local-preparation-original.json'), 'wx', 0o600);
+    try { await original.writeFile(bytes); await original.sync(); } finally { await original.close(); }
+    const intent = await fs.open(path.join(dir, 'local-preparation-recovery.json'), 'wx', 0o600);
+    try { await intent.writeFile(JSON.stringify(proof)); await intent.sync(); } finally { await intent.close(); }
+    record.preDispatchRecovery = { proof, effectiveIdentity: this.nativeRuntime.identity };
+    record.state = 'dispatching'; record.error = null;
+    await atomicJson(file, record);
+    return this.dispatchRecord(record, message.requestId, JSON.parse(record.compiledSchema));
+  }
+  async repairWrapperPreparation(message) {
+    const record = this.records.get(message.attemptId), proof = message.params?.proof;
+    const prior = record?.preDispatchRecovery, bytes = this.loadedReceiptBytes.get(message.attemptId);
+    requireThat(this.nativeRuntime && !this.fixture && !this.active && record && bytes
+      && ![...this.records.values()].some(r => r !== record && UNRESOLVED.has(r.state)), 'WRAPPER_REPAIR_HELD', 'Only the original stopped native attempt may repair');
+    const failed = JSON.parse(bytes), previousIdentity = prior?.effectiveIdentity;
+    requireThat(record.state === 'submission_unknown' && !record.wrapperPreparationRepair
+      && failed.state === 'dispatching' && failed.error === null
+      && previousIdentity?.bridgeSha256 === WRAPPER_FAILED_BRIDGE_SHA && previousIdentity.supervisorSha256 === WRAPPER_FAILED_SUPERVISOR_SHA
+      && record.attempt.runtimeIdentity?.bridgeSha256 === LEGACY_PATH_BRIDGE_SHA
+      && record.lastSequence === 0 && record.threadId === null && record.turnId === null && record.rawResult === null
+      && record.rawResultSha256 === null && record.usage === null && record.journalSha256 === sha256(''), 'WRAPPER_REPAIR_HELD', 'Not the pinned pre-runtime wrapper rejection');
+    requireThat(proof?.version === 'sdk-wrapper-preparation-repair/v1' && proof.attemptId === message.attemptId
+      && proof.attemptEnvelopeHash === record.attempt.attemptEnvelopeHash && proof.failedReceiptSha256 === sha256(bytes)
+      && proof.priorRecoveryProofSha256 === sha256(JSON.stringify(prior.proof))
+      && proof.effectiveIdentitySha256 === sha256(JSON.stringify(this.nativeRuntime.identity))
+      && proof.sdkEvents === 0 && proof.processTreeStopProven === true && proof.beforeOfficialRuntimeSpawn === true
+      && /^[a-f0-9]{64}$/.test(proof.evidenceSha256 ?? ''), 'WRAPPER_REPAIR_HELD', 'Repair proof is not bound');
+    const expected = { ...previousIdentity };
+    for (const key of ['bridgeSha256', 'supervisorExecutable', 'supervisorSha256', 'resourceDirectory']) expected[key] = this.nativeRuntime.identity[key];
+    requireThat(JSON.stringify(expected) === JSON.stringify(this.nativeRuntime.identity), 'WRAPPER_REPAIR_HELD', 'Repair cannot change account, SDK, Node, runtime or permissions');
+    const dir = path.join(this.root, message.attemptId), entries = (await fs.readdir(dir)).sort();
+    requireThat(JSON.stringify(entries) === JSON.stringify(['local-preparation-original.json', 'local-preparation-recovery.json', 'native-runtime', 'receipt.json']), 'WRAPPER_REPAIR_HELD', 'Prior repair or foreign files exist');
+    const items = [], root = path.join(dir, 'native-runtime');
+    const walk = async (base, relative = '') => {
+      const stat = await fs.lstat(base); requireThat(stat.isDirectory() && !stat.isSymbolicLink(), 'WRAPPER_REPAIR_HELD', 'Linked runtime');
+      for (const name of await fs.readdir(base)) {
+        const file = path.join(base, name), key = relative ? `${relative}/${name}` : name, st = await fs.lstat(file);
+        requireThat(!st.isSymbolicLink(), 'WRAPPER_REPAIR_HELD', 'Linked runtime entry');
+        if (st.isDirectory()) await walk(file, key);
+        else { requireThat(st.isFile() && st.size <= this.limits.receiptBytes && items.length < 8, 'WRAPPER_REPAIR_HELD', 'Runtime inventory limit'); const body = await fs.readFile(file); items.push([key, body.length, sha256(body)]); }
+      }
+    };
+    await walk(root); items.sort((a,b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    requireThat(sha256(JSON.stringify(items)) === proof.runtimeInventorySha256, 'WRAPPER_REPAIR_HELD', 'Original runtime files changed');
+    const plan = JSON.parse(await fs.readFile(path.join(root,'runtime-plan.json'),'utf8'));
+    requireThat(JSON.stringify(plan.identity) === JSON.stringify(previousIdentity) && plan.attemptId === message.attemptId
+      && JSON.stringify(previousIdentity) !== JSON.stringify(record.attempt.runtimeIdentity), 'WRAPPER_REPAIR_HELD', 'Pinned wrapper rejection predicate changed');
+    // A separate intent preserves the consumed v1 intent and all prior files.
+    for (const [name, body] of [['wrapper-preparation-original.json', bytes], ['wrapper-preparation-repair.json', JSON.stringify(proof)]]) {
+      const handle = await fs.open(path.join(dir,name),'wx',0o600); try { await handle.writeFile(body); await handle.sync(); } finally { await handle.close(); }
+    }
+    record.wrapperPreparationRepair = { proof, effectiveIdentity: this.nativeRuntime.identity };
+    record.state = 'dispatching'; record.error = null;
+    await atomicJson(path.join(dir,'receipt.json'),record);
+    return this.dispatchRecord(record,message.requestId,JSON.parse(record.compiledSchema));
+  }
+  dispatchRecord(record, requestId, schema) {
+    const dir = path.join(this.root, record.attempt.attemptId);
+    const active = { record, requestId, controller: new AbortController(), canceled: false, seen: new Set(), bytes: 0, count: 0, threadStarted: false, turnStarted: false, completed: false, finalItem: null, task: null, abortable: false, finished: false, journalHash: createHash('sha256') };
     this.active = active;
     active.task = this.run(active, schema).catch(async error => {
       record.state = 'submission_unknown';

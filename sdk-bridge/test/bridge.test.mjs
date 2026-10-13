@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { OfficialSdkBridge, PROTOCOL_VERSION, sha256 } from '../src/bridge.mjs';
+import { OfficialSdkBridge, PROTOCOL_VERSION, sha256, LEGACY_PATH_BRIDGE_SHA, WRAPPER_FAILED_BRIDGE_SHA, WRAPPER_FAILED_SUPERVISOR_SHA } from '../src/bridge.mjs';
 import { offlineFixture } from './fixture-runtime.mjs';
 
 const main = fileURLToPath(new URL('../src/main.mjs', import.meta.url));
@@ -33,6 +33,124 @@ async function completed(bridge, message = executeCommand()) {
   const task = bridge.active?.task;
   if (task) await task;
   return { dispatched, receipt: bridge.observe(message.attemptId) };
+}
+
+async function localPreparationFixture(t, fault = null) {
+  const identity = { version: 'official-sdk-identity/v2', bridgeSha256: LEGACY_PATH_BRIDGE_SHA, accountFingerprint: 'synthetic-account', runtimePackageVersion: 'synthetic-runtime', supervisorExecutable: 'synthetic-old', supervisorSha256: 'a'.repeat(64), resourceDirectory: 'synthetic-old-resources' };
+  const initial = await fixture(t, null, { nativeRuntime: { identity, async create() { throw new Error('SDK_NATIVE_IDENTITY: attempt directory'); } } });
+  const message = executeCommand(); message.params.attempt.runtimeIdentity = identity;
+  await completed(initial.bridge, message); await initial.bridge.disconnect();
+  const file = path.join(initial.dir, 'attempt_1', 'receipt.json');
+  const before = await fs.readFile(file, 'utf8');
+  let record = JSON.parse(before);
+  if (fault === 'network') record.error.message = 'tls handshake eof';
+  if (fault === 'thread') record.threadId = 'existing-provider-thread';
+  if (fault === 'journal') await fs.writeFile(path.join(initial.dir, 'attempt_1/events.ndjson'), '');
+  if (fault === 'runtime') await fs.mkdir(path.join(initial.dir, 'attempt_1/native-runtime'));
+  if (fault === 'reserved') await fs.writeFile(path.join(initial.dir, 'attempt_1/local-preparation-recovery.json'), '{}');
+  if (fault === 'network' || fault === 'thread') { const { receiptEnvelopeSha256, ...payload } = record; record = { ...payload, receiptEnvelopeSha256: sha256(JSON.stringify(payload)) }; await fs.writeFile(file, JSON.stringify(record)); }
+  const current = { ...identity, bridgeSha256: 'b'.repeat(64), supervisorExecutable: 'synthetic-new', resourceDirectory: 'synthetic-new-resources' };
+  if (fault === 'account') current.accountFingerprint = 'different-account';
+  let invocations = 0;
+  const runtime = { identity: current, async create(directory) {
+    invocations++;
+    if (fault === 'recover-fails') throw new Error('synthetic preparation still failed');
+    const result = await offlineFixture('happy').create(directory);
+    const temporaryDirectory = path.join(directory, 'schema'); await fs.mkdir(temporaryDirectory);
+    return { ...result, temporaryDirectory };
+  } };
+  const bridge = new OfficialSdkBridge({ stateDirectory: initial.dir, nativeRuntime: runtime });
+  await bridge.initialize(); t.after(() => bridge.disconnect());
+  record = JSON.parse(await fs.readFile(file, 'utf8'));
+  const proof = { version: 'sdk-local-preparation-recovery/v1', attemptId: 'attempt_1', attemptEnvelopeHash: record.attempt.attemptEnvelopeHash,
+    originalReceiptSeal: record.receiptEnvelopeSha256, sdkEvents: 0, processTreeStopProven: true,
+    effectiveIdentitySha256: sha256(JSON.stringify(current)), evidenceSha256: 'c'.repeat(64) };
+  if (fault === 'stop-proof') proof.processTreeStopProven = false;
+  if (fault === 'seal') proof.originalReceiptSeal = 'f'.repeat(64);
+  return { ...initial, bridge, runtime, proof, before, invocations: () => invocations, message };
+}
+
+test('sealed local preparation failure resumes original attempt exactly once with original receipt and frozen request retained', async t => {
+  const f = await localPreparationFixture(t);
+  await assert.rejects(f.bridge.handle(f.message), { code: 'WORKER_OCCUPIED' });
+  const { receipt } = await completed(f.bridge, command('recover-local-preparation', 'attempt_1', { proof: f.proof }));
+  assert.equal(receipt.state, 'transport_completed'); assert.equal(f.invocations(), 1);
+  assert.equal(await fs.readFile(path.join(f.dir, 'attempt_1/local-preparation-original.json'), 'utf8'), f.before);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.dir, 'attempt_1/receipt.json'), 'utf8')).attempt, JSON.parse(f.before).attempt);
+  await assert.rejects(f.bridge.handle(command('recover-local-preparation', 'attempt_1', { proof: f.proof })), { code: 'LOCAL_RECOVERY_HELD' });
+  assert.equal(f.invocations(), 1);
+});
+
+async function wrapperPreparationFixture(t, fault = null) {
+  const prior = await localPreparationFixture(t); await prior.bridge.disconnect();
+  const dir = path.join(prior.dir,'attempt_1'), file = path.join(dir,'receipt.json');
+  const previous = { ...prior.runtime.identity, bridgeSha256: WRAPPER_FAILED_BRIDGE_SHA, supervisorSha256: WRAPPER_FAILED_SUPERVISOR_SHA };
+  const current = { ...previous, bridgeSha256: 'd'.repeat(64), supervisorSha256: 'e'.repeat(64), supervisorExecutable: 'fixed-synthetic-supervisor' };
+  let record = JSON.parse(prior.before); delete record.receiptEnvelopeSha256;
+  const oldProof = { ...prior.proof, effectiveIdentitySha256:sha256(JSON.stringify(previous)) };
+  record.preDispatchRecovery={proof:oldProof,effectiveIdentity:previous};record.state='dispatching';record.error=null;
+  await fs.writeFile(path.join(dir,'local-preparation-original.json'),prior.before);
+  await fs.writeFile(path.join(dir,'local-preparation-recovery.json'),JSON.stringify(oldProof));
+  const native=path.join(dir,'native-runtime');await fs.mkdir(native);
+  const plan=JSON.stringify({identity:previous,attemptId:'attempt_1'});await fs.writeFile(path.join(native,'runtime-plan.json'),plan);
+  const inventory=[['runtime-plan.json',Buffer.byteLength(plan),sha256(plan)]];
+  if(fault==='old-supervisor')record.preDispatchRecovery.effectiveIdentity={...previous,supervisorSha256:'f'.repeat(64)};
+  if(fault==='events')record.lastSequence=1;
+  const failed=JSON.stringify({...record,receiptEnvelopeSha256:sha256(JSON.stringify(record))});await fs.writeFile(file,failed);
+  const proof={version:'sdk-wrapper-preparation-repair/v1',attemptId:'attempt_1',attemptEnvelopeHash:record.attempt.attemptEnvelopeHash,
+    priorRecoveryProofSha256:sha256(JSON.stringify(oldProof)),failedReceiptSha256:sha256(failed),runtimeInventorySha256:sha256(JSON.stringify(inventory)),
+    effectiveIdentitySha256:sha256(JSON.stringify(current)),evidenceSha256:'a'.repeat(64),sdkEvents:0,processTreeStopProven:true,beforeOfficialRuntimeSpawn:true};
+  if(fault==='proof')proof.beforeOfficialRuntimeSpawn=false;
+  if(fault==='account')current.accountFingerprint='different-account';
+  if(fault==='inventory')await fs.writeFile(path.join(native,'runtime-plan.json'),'{}');
+  if(fault==='intent')await fs.writeFile(path.join(dir,'wrapper-preparation-repair.json'),'{}');
+  let invocations=0;
+  const runtime={identity:current,async create(directory){invocations++;if(fault==='fails')throw Error('synthetic repair failed');
+    const result=await offlineFixture('happy').create(directory);const temporaryDirectory=path.join(directory,'native-runtime-wrapper-repair');await fs.mkdir(temporaryDirectory);return {...result,temporaryDirectory};}};
+  const bridge=new OfficialSdkBridge({stateDirectory:prior.dir,nativeRuntime:runtime});await bridge.initialize();t.after(()=>bridge.disconnect());
+  return {dir:prior.dir,attemptDir:dir,bridge,runtime,proof,failed,oldIntent:JSON.stringify(oldProof),oldPlan:plan,invocations:()=>invocations};
+}
+for(const fault of [null,'fails'])test(`wrapper preparation repair ${fault??'completion'} preserves lineage and restart never invokes twice`,async t=>{
+  const f=await wrapperPreparationFixture(t,fault);
+  const {receipt}=await completed(f.bridge,command('repair-wrapper-preparation','attempt_1',{proof:f.proof}));
+  assert.equal(receipt.state,fault?'submission_unknown':'transport_completed');assert.equal(f.invocations(),1);
+  assert.equal(await fs.readFile(path.join(f.attemptDir,'wrapper-preparation-original.json'),'utf8'),f.failed);
+  assert.equal(await fs.readFile(path.join(f.attemptDir,'local-preparation-recovery.json'),'utf8'),f.oldIntent);
+  assert.equal(await fs.readFile(path.join(f.attemptDir,'native-runtime/runtime-plan.json'),'utf8'),f.oldPlan);
+  await assert.rejects(f.bridge.handle(command('repair-wrapper-preparation','attempt_1',{proof:f.proof})),{code:'WRAPPER_REPAIR_HELD'});
+  await f.bridge.disconnect();const reopened=new OfficialSdkBridge({stateDirectory:f.dir,nativeRuntime:f.runtime});await reopened.initialize();
+  try{assert.equal(reopened.observe('attempt_1').state,receipt.state);await assert.rejects(reopened.handle(command('repair-wrapper-preparation','attempt_1',{proof:f.proof})),{code:'WRAPPER_REPAIR_HELD'});assert.equal(f.invocations(),1);}finally{await reopened.disconnect();}
+});
+for(const fault of ['old-supervisor','events','proof','account','inventory','intent'])test(`wrapper preparation repair rejects ${fault} without invoking runtime`,async t=>{
+  const f=await wrapperPreparationFixture(t,fault);await assert.rejects(f.bridge.handle(command('repair-wrapper-preparation','attempt_1',{proof:f.proof})),{code:'WRAPPER_REPAIR_HELD'});assert.equal(f.invocations(),0);
+});
+for (const fault of ['network', 'thread', 'journal', 'runtime', 'reserved', 'account', 'stop-proof', 'seal']) {
+  test(`local preparation recovery rejects ${fault} and makes zero SDK invocations`, async t => {
+    const f = await localPreparationFixture(t, fault);
+    await assert.rejects(f.bridge.handle(command('recover-local-preparation', 'attempt_1', { proof: f.proof })), { code: 'LOCAL_RECOVERY_HELD' });
+    assert.equal(f.invocations(), 0);
+  });
+}
+test('a consumed local recovery intent stays unknown after another failure and cannot dispatch again', async t => {
+  const f = await localPreparationFixture(t, 'recover-fails');
+  const { receipt } = await completed(f.bridge, command('recover-local-preparation', 'attempt_1', { proof: f.proof }));
+  assert.equal(receipt.state, 'submission_unknown'); assert.equal(f.invocations(), 1);
+  await assert.rejects(f.bridge.handle(command('recover-local-preparation', 'attempt_1', { proof: f.proof })), { code: 'LOCAL_RECOVERY_HELD' });
+  assert.equal(f.invocations(), 1);
+});
+for (const scenario of [null, 'recover-fails']) {
+  test(`restart observes consumed local recovery ${scenario ?? 'completion'} with zero new invocation`, async t => {
+    const f=await localPreparationFixture(t,scenario);
+    const { receipt }=await completed(f.bridge,command('recover-local-preparation','attempt_1',{proof:f.proof}));
+    await f.bridge.disconnect();
+    const reopened=new OfficialSdkBridge({stateDirectory:f.dir,nativeRuntime:f.runtime});await reopened.initialize();
+    try {
+      assert.equal((await reopened.handle(command('observe','attempt_1'))).result.state,receipt.state);
+      await assert.rejects(reopened.handle(command('recover-local-preparation','attempt_1',{proof:f.proof})),{code:'LOCAL_RECOVERY_HELD'});
+      assert.equal(f.invocations(),1);
+      assert.equal(await fs.readFile(path.join(f.dir,'attempt_1/local-preparation-original.json'),'utf8'),f.before);
+    } finally {await reopened.disconnect();}
+  });
 }
 
 test('hello/inspect/execute default stays disabled and starts zero runtime processes', async t => {

@@ -29,6 +29,20 @@ mod native;
 #[path = "text_sdk_passive.rs"]
 mod passive;
 pub(crate) use passive::historical_receipt;
+#[path = "text_sdk_local_recovery.rs"]
+mod local_recovery;
+pub(crate) use local_recovery::{local_preparation_evidence, local_recovery_identity_bound, recovered_receipt_bound, LOCAL_PATH_BRIDGE_SHA};
+#[path = "text_sdk_wrapper_repair.rs"]
+mod wrapper_repair;
+pub(crate) use wrapper_repair::{wrapper_preparation_evidence, repaired_receipt_bound, wrapper_repair_record_bound, WRAPPER_FAILED_BRIDGE_SHA, WRAPPER_FAILED_SUPERVISOR_SHA};
+#[cfg(test)]
+pub(crate) use wrapper_repair::test_append_wrapper_repair;
+pub(crate) async fn prepare_local_recovery_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    native::prepare_local_recovery_handoff(settings).await
+}
+pub(crate) fn verify_local_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    native::verify_local_recovery_bytes(old, new, hashes)
+}
 pub use native::{enable_native_execution, native_execution_enabled, run_runtime_wrapper};
 const FRAME_LIMIT: usize = 1_048_576;
 const EVENT_LIMIT: usize = 2048;
@@ -706,30 +720,13 @@ impl OfficialSdkTransport {
         })
     }
 }
-#[async_trait::async_trait]
-impl TextTransport for OfficialSdkTransport {
-    async fn inspect(&self) -> Result<Value> {
-        let mut worker = self.worker.lock().await;
-        self.connect(&mut worker).await?;
-        let value = worker
-            .as_mut()
-            .unwrap()
-            .rpc("inspect", None, Value::Null)
-            .await?;
-        if value["sdk"]["package"] != "@openai/codex-sdk"
-            || value["sdk"]["version"] != SDK_VERSION
-            || value["protocolVersion"] != PROTOCOL
-            || value["bridgeVersion"] != "0.1.0"
-            || value["liveCallsAllowed"] != self.config.fixture.is_none()
-            || value["capabilities"]["processTreeStopProven"] != false
-        {
-            return Err("SDK_INSPECT_IDENTITY".into());
-        }
-        Ok(value)
+impl OfficialSdkTransport {
+    pub(crate) async fn recover_local_preparation(&self, attempt: &FrozenAttempt, proof: &Value) -> Result<Observation> {
+        self.execute_method(attempt, Some(proof)).await
     }
-    async fn execute(&self, attempt: &FrozenAttempt) -> Result<Observation> {
+    async fn execute_method(&self, attempt: &FrozenAttempt, recovery: Option<&Value>) -> Result<Observation> {
         attempt.validate_identity()?;
-        if attempt.backend != Backend::CodexSdk || attempt.runtime_identity != self.config.identity
+        if attempt.backend != Backend::CodexSdk || if recovery.is_some() { !local_recovery_identity_bound(&attempt.runtime_identity, &self.config.identity) } else { attempt.runtime_identity != self.config.identity }
         {
             return Err("SDK_ATTEMPT_IDENTITY".into());
         }
@@ -744,9 +741,13 @@ impl TextTransport for OfficialSdkTransport {
         let mut worker = self.worker.lock().await;
         self.connect(&mut worker).await?;
         let worker = worker.as_mut().unwrap();
-        let id=worker.send("execute",Some(&attempt.attempt_id),json!({"attempt":attempt,
-            "compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,
-            "compiledPromptSha256":digest(&compiled.prompt),"compiledSchemaSha256":digest(&compiled.schema)})).await?;
+        let (method, params) = if let Some(proof) = recovery {
+            (if proof["version"] == "sdk-wrapper-preparation-repair/v1" {"repair-wrapper-preparation"} else {"recover-local-preparation"}, json!({"proof":proof}))
+        } else {
+            ("execute", json!({"attempt":attempt,"compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,
+                "compiledPromptSha256":digest(&compiled.prompt),"compiledSchemaSha256":digest(&compiled.schema)}))
+        };
+        let id=worker.send(method,Some(&attempt.attempt_id),params).await?;
         let deadline = tokio::time::Instant::now() + self.config.deadline;
         let mut last_sdk = 0;
         let mut ack = false;
@@ -814,6 +815,31 @@ impl TextTransport for OfficialSdkTransport {
                 Ok(self.unknown(attempt))
             }
         }
+    }
+}
+#[async_trait::async_trait]
+impl TextTransport for OfficialSdkTransport {
+    async fn inspect(&self) -> Result<Value> {
+        let mut worker = self.worker.lock().await;
+        self.connect(&mut worker).await?;
+        let value = worker
+            .as_mut()
+            .unwrap()
+            .rpc("inspect", None, Value::Null)
+            .await?;
+        if value["sdk"]["package"] != "@openai/codex-sdk"
+            || value["sdk"]["version"] != SDK_VERSION
+            || value["protocolVersion"] != PROTOCOL
+            || value["bridgeVersion"] != "0.1.0"
+            || value["liveCallsAllowed"] != self.config.fixture.is_none()
+            || value["capabilities"]["processTreeStopProven"] != false
+        {
+            return Err("SDK_INSPECT_IDENTITY".into());
+        }
+        Ok(value)
+    }
+    async fn execute(&self, attempt: &FrozenAttempt) -> Result<Observation> {
+        self.execute_method(attempt, None).await
     }
     async fn reconcile(&self, attempt: &FrozenAttempt) -> Result<Observation> {
         attempt.validate_identity()?;

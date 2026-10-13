@@ -5,19 +5,34 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const check = (ok, message) => { if (!ok) throw new Error(`SDK_NATIVE_IDENTITY: ${message}`); };
+const hasParent = value => value.split(process.platform === 'win32' ? /[\\/]/ : /\//).includes('..');
 export function nativeRuntime(config, stateDirectory) {
-  check(path.isAbsolute(stateDirectory) && config?.version === 'sdk-native-config/v1', 'explicit native configuration required');
+  check(path.isAbsolute(stateDirectory) && !hasParent(stateDirectory) && config?.version === 'sdk-native-config/v1', 'explicit native configuration required');
+  // Rust can pass C:/... while path.join/dirname return C:\\... on Windows.
+  // Compare normalized absolute filesystem paths, never their input spelling.
+  // Do not use realpath to silently follow a caller-supplied linked directory.
+  const stateRoot = path.resolve(stateDirectory);
   const identity = config.identity;
   check(identity?.version === 'official-sdk-identity/v2' && identity.provider === 'codex_sdk'
     && identity.permissionProfile === 'sdk-text-only-native/v1', 'unsupported identity or permission profile');
   for (const key of ['runtimeExecutable', 'supervisorExecutable', 'credentialHome', 'codexHome']) check(path.isAbsolute(identity[key] ?? ''), key);
   check(Object.keys(config).sort().join(',') === 'identity,version', 'unexpected configuration fields');
   return Object.freeze({ identity, async create(directory, record) {
-    check(path.dirname(directory) === stateDirectory && /^[A-Za-z0-9_-]{1,128}$/.test(path.basename(directory)), 'attempt directory');
-    check(JSON.stringify(record.attempt.runtimeIdentity) === JSON.stringify(identity), 'frozen SDK identity changed');
+    check(path.isAbsolute(directory) && !hasParent(directory), 'attempt directory');
+    directory = path.resolve(directory);
+    check(path.dirname(directory) === stateRoot && /^[A-Za-z0-9_-]{1,128}$/.test(path.basename(directory)), 'attempt directory');
+    const [stateStat, attemptStat] = await Promise.all([fs.lstat(stateRoot), fs.lstat(directory)]);
+    check(stateStat.isDirectory() && !stateStat.isSymbolicLink()
+      && attemptStat.isDirectory() && !attemptStat.isSymbolicLink(), 'attempt directory must not be linked');
+    const [realState, realAttempt] = await Promise.all([fs.realpath(stateRoot), fs.realpath(directory)]);
+    check(path.dirname(realAttempt) === realState, 'attempt directory escaped worker root');
+    // The bridge's one-use recovery protocol preserves the original frozen
+    // request while recording a separately verified execution-only handoff.
+    check(JSON.stringify(record.wrapperPreparationRepair?.effectiveIdentity ?? record.preDispatchRecovery?.effectiveIdentity ?? record.attempt.runtimeIdentity) === JSON.stringify(identity), 'frozen SDK identity changed');
+    check(path.basename(directory) === record.attempt.attemptId, 'attempt directory identity changed');
     check(hash(await fs.readFile(identity.supervisorExecutable)) === identity.supervisorSha256, 'supervisor changed');
     check(hash(await fs.readFile(identity.runtimeExecutable)) === identity.runtimeSha256, 'official runtime changed');
-    const root = path.join(directory, 'native-runtime');
+    const root = path.join(directory, record.wrapperPreparationRepair ? 'native-runtime-wrapper-repair' : 'native-runtime');
     await fs.mkdir(root, { mode: 0o700 });
     const work = path.join(root, 'work'), temp = path.join(root, 'tmp');
     await fs.mkdir(work); await fs.mkdir(temp);

@@ -4,6 +4,7 @@ use super::*;
 use crate::text_transport::FrozenAttempt;
 
 const POLICY: &str = "sdk-new-node-supervisor-handoff/v1";
+const LOCAL_RECOVERY_POLICY: &str = "sdk-new-node-local-recovery-handoff/v1";
 const FIELD: &str = "sdkSupervisorHandoff";
 const HELD: &str =
     "SDK_SUPERVISOR_HANDOFF_HELD: 新节点交接证据不足或原节点已存在；保留原请求、回包和预算，不重发";
@@ -39,7 +40,7 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
-    proof["policy"] == POLICY
+    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY)
         && proof["sha256"] == hash(&unsigned)
         && proof["workflowId"] == run
         && proof["nodeKey"] == key
@@ -54,10 +55,9 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
         && settings["textProvider"] == "codex_sdk"
         && settings["textModel"] == request.model
         && settings["reasoning"] == request.reasoning
-        && crate::text_sdk::supervisor_handoff_receipt_identity_bound(
-            &proof["originalIdentity"],
-            &snapshot["executorIdentity"],
-        )
+        && if proof["policy"] == LOCAL_RECOVERY_POLICY {
+            crate::text_sdk::local_recovery_identity_bound(&proof["originalIdentity"], &snapshot["executorIdentity"])
+        } else { crate::text_sdk::supervisor_handoff_receipt_identity_bound(&proof["originalIdentity"], &snapshot["executorIdentity"]) }
         && proof["resourceHashes"].as_object().is_some_and(|h| {
             h.len() == 9
                 && h.values().all(|v| {
@@ -329,7 +329,10 @@ impl SavedTextExecutor {
             &step_key(request),
             original,
         )?;
-        let Some(verified) = crate::text_sdk::prepare_supervisor_handoff(&self.settings).await?
+        let local_recovery = original["executorIdentity"]["bridgeSha256"] == crate::text_sdk::LOCAL_PATH_BRIDGE_SHA;
+        let Some(verified) = (if local_recovery {
+            Some(crate::text_sdk::prepare_local_recovery_handoff(&self.settings).await?)
+        } else { crate::text_sdk::prepare_supervisor_handoff(&self.settings).await? })
         else {
             return Ok(original.clone());
         };
@@ -351,6 +354,8 @@ impl SavedTextExecutor {
         // accepted zero-call F2 replay. No receipt is inferred from a status label.
         self.sdk_handoff_job_bound(&previous_job, &previous_job["snapshot"])?;
         self.sdk_raw(&previous_job, &previous_job["snapshot"])?;
+        if local_recovery && self.sdk_local_recovery_bound(&previous_job)?.is_none()
+            && previous_job["snapshot"][FIELD]["policy"] != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
         let original_parent: String = c
             .query_row(
                 "SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow'",
@@ -361,7 +366,7 @@ impl SavedTextExecutor {
         let mut snapshot = original.clone();
         snapshot["executorIdentity"] = verified.identity;
         snapshot[FIELD] = seal(
-            json!({"policy":POLICY,"workflowId":run,"nodeKey":step_key(request),"stage":request.stage,
+            json!({"policy":if local_recovery {LOCAL_RECOVERY_POLICY}else{POLICY},"workflowId":run,"nodeKey":step_key(request),"stage":request.stage,
             "domainRequestSha256":hash(&domain(original)?),"parentSnapshotSha256":crate::pipeline::digest(&original_parent),
             "originalSettingsSha256":hash(&self.settings),"originalIdentity":original["executorIdentity"],
             "effectiveIdentitySha256":hash(&snapshot["executorIdentity"]),"resourceHashes":verified.resource_hashes,
@@ -401,12 +406,16 @@ impl Store {
         if !parent_bound(&tx, proof, original_settings)? || !predecessor_bound(self, &tx, proof)? {
             return Err(HELD.into());
         }
+        if proof["policy"] == LOCAL_RECOVERY_POLICY {
+            let prior = executor.sdk_job(s(&proof["predecessor"],"jobId"))?;
+            executor.sdk_raw(&prior,&prior["snapshot"])?;
+            if executor.sdk_local_recovery_bound(&prior)?.is_none()
+                && prior["snapshot"][FIELD]["policy"] != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
+        }
         no_node_or_attempt(self, &tx, run, &key, snapshot)?;
-        crate::text_sdk::verify_supervisor_handoff_bytes(
-            &proof["originalIdentity"],
-            &snapshot["executorIdentity"],
-            &proof["resourceHashes"],
-        )?;
+        if proof["policy"] == LOCAL_RECOVERY_POLICY {
+            crate::text_sdk::verify_local_recovery_bytes(&proof["originalIdentity"], &snapshot["executorIdentity"], &proof["resourceHashes"])?;
+        } else { crate::text_sdk::verify_supervisor_handoff_bytes(&proof["originalIdentity"], &snapshot["executorIdentity"], &proof["resourceHashes"])?; }
         let job = id();
         let request_hash = hash(snapshot);
         let prepared = json!({"sdkSupervisorHandoff":proof,"sdkDispatchStarted":false,"sdkRequestHash":request_hash,"sdkOriginWorkflowId":run});
@@ -608,6 +617,129 @@ mod tests {
                 &json!({"requestHash":hash(snapshot),"value":raw}),
             )
             .unwrap();
+    }
+    fn recovered_chain_fixture() -> (tempfile::TempDir, SavedTextExecutor, TextRequest, Value, String) {
+        let (temp,mut executor,request,template)=fixture();
+        let effective=template["executorIdentity"].clone();
+        executor.settings["textSdkIdentity"]["bridgeSha256"]=json!(crate::text_sdk::LOCAL_PATH_BRIDGE_SHA);
+        let run=executor.workflow_id.clone().unwrap();
+        let mut parent=executor.store.job(&run).unwrap()["snapshot"].clone();parent["input"]["settings"]=executor.settings.clone();
+        executor.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?2 WHERE id=?1",params![run,parent.to_string()]).unwrap();
+        let prior_id=s(&template[FIELD]["predecessor"],"jobId").to_owned();
+        let prior_job=executor.sdk_job(&prior_id).unwrap();let mut prior_snapshot=prior_job["snapshot"].clone();
+        prior_snapshot["executorIdentity"]=executor.settings["textSdkIdentity"].clone();
+        let prior_request:TextRequest=serde_json::from_value(prior_snapshot.clone()).unwrap();
+        executor.store.conn().unwrap().execute("UPDATE jobs SET snapshot=?2 WHERE id=?1",params![prior_id,prior_snapshot.to_string()]).unwrap();
+        complete(&executor,&prior_request,&prior_snapshot,&prior_id,false);
+        let attempt=FrozenAttempt::load(&executor.store.root.join("text-runs").join(&prior_id).join("sdk-attempt.json")).unwrap();
+        let compiled=compile_codex_input(&prior_request).unwrap();
+        let mut frozen=attempt.clone();frozen.state=AttemptState::Prepared;frozen.dispatch_started=false;frozen.raw_result=None;frozen.last_sequence=0;
+        let frozen=json!(frozen);
+        let record=json!({"protocolVersion":crate::text_sdk::PROTOCOL,"attempt":frozen,"frozenAttemptSha256":hash(&frozen),"requestSnapshotSha256":hash(&frozen["request"]),
+            "compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,"compiledPromptSha256":crate::pipeline::digest(&compiled.prompt),"compiledSchemaSha256":crate::pipeline::digest(&compiled.schema),
+            "journalSha256":crate::pipeline::digest(""),"lastSequence":0,"threadId":null,"turnId":null,"rawResult":null,"rawResultSha256":null,"usage":null,"domainAccepted":false,
+            "state":"submission_unknown","error":{"code":"SDK_STREAM_ERROR","message":"SDK_NATIVE_IDENTITY: attempt directory"}});
+        let seal=|value:&Value|{let text=value.to_string();format!("{},\"receiptEnvelopeSha256\":\"{}\"}}",&text[..text.len()-1],hash(value))};
+        let original_bytes=seal(&record);
+        let evidence=json!({"originalReceiptSeal":hash(&record),"originalReceiptSha256":crate::pipeline::digest(&original_bytes)});
+        let proof=json!({"version":"sdk-local-preparation-recovery/v1","attemptId":prior_id,"attemptEnvelopeHash":attempt.attempt_envelope_hash,
+            "evidenceSha256":hash(&evidence),"originalReceiptSeal":evidence["originalReceiptSeal"],"effectiveIdentitySha256":hash(&effective),"sdkEvents":0,"processTreeStopProven":true});
+        let saved=json!({"proof":proof,"evidence":evidence,"effectiveIdentity":effective,"resourceHashes":template[FIELD]["resourceHashes"],"originalSettingsSha256":hash(&executor.settings)});
+        let dir=executor.store.root.join("sdk-worker").join(&prior_id);std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("local-preparation-original.json"),original_bytes).unwrap();
+        std::fs::write(dir.join("local-preparation-recovery.json"),proof.to_string()).unwrap();
+        let mut after=record;after["state"]=json!("transport_completed");after["error"]=Value::Null;after["rawResult"]=attempt.raw_result.clone().unwrap();after["rawResultSha256"]=json!(hash(&after["rawResult"]));
+        after["preDispatchRecovery"]=json!({"proof":proof,"effectiveIdentity":effective});
+        std::fs::write(dir.join("receipt.json"),seal(&after)).unwrap();
+        let mut prepared=executor.sdk_job(&prior_id).unwrap()["prepared"].clone();prepared["sdkLocalPreparationRecovery"]=saved.clone();
+        executor.store.conn().unwrap().execute("UPDATE jobs SET prepared=?2 WHERE id=?1",params![prior_id,prepared.to_string()]).unwrap();
+        executor.store.event(&prior_id,"sdk_local_preparation_recovery_reserved",&saved).unwrap();
+        let original=executor.request_snapshot(&request).unwrap();let c=executor.store.conn().unwrap();
+        let prior=predecessor(&executor.store,&c,&run,&step_key(&prior_request)).unwrap().unwrap();
+        let mut snapshot=original.clone();snapshot["executorIdentity"]=effective;
+        snapshot[FIELD]=super::seal(json!({"policy":LOCAL_RECOVERY_POLICY,"workflowId":run,"nodeKey":step_key(&request),"stage":request.stage,"domainRequestSha256":hash(&domain(&original).unwrap()),
+            "parentSnapshotSha256":hash(&parent),"originalSettingsSha256":hash(&executor.settings),"originalIdentity":executor.settings["textSdkIdentity"],"effectiveIdentitySha256":hash(&snapshot["executorIdentity"]),
+            "resourceHashes":template[FIELD]["resourceHashes"],"predecessor":prior,"modelCalls":0,"accountModelChecked":true}));
+        (temp,executor,request,snapshot,prior_id)
+    }
+    #[test]
+    fn sdk_local_recovery_completed_original_allows_only_absent_next_workflow_node() {
+        let (_temp,executor,request,snapshot,prior)=recovered_chain_fixture();
+        let original=executor.sdk_job(&prior).unwrap();let saved=std::fs::read(executor.store.root.join("text-runs").join(&prior).join("sdk-attempt.json")).unwrap();
+        assert!(executor.sdk_raw(&original,&original["snapshot"]).is_ok());
+        let next=executor.store.add_sdk_handoff_node_atomic(&request,&snapshot,&executor.settings).unwrap();
+        assert_eq!(executor.sdk_job(&prior).unwrap(),original);
+        assert_eq!(std::fs::read(executor.store.root.join("text-runs").join(&prior).join("sdk-attempt.json")).unwrap(),saved);
+        assert_eq!(executor.store.job(&next).unwrap()["prepared"]["sdkDispatchStarted"],false);
+        assert!(executor.store.add_sdk_handoff_node_atomic(&request,&snapshot,&executor.settings).is_err());
+    }
+    #[test]
+    fn sdk_wrapper_repair_unknown_to_receive_raw_next_node_and_reopen_preserves_original_chain() {
+        use crate::text_transport::{Observation,ObservationKind};
+        let (_temp,executor,request,mut next_snapshot,prior)=recovered_chain_fixture();
+        let job=executor.sdk_job(&prior).unwrap();let snapshot=job["snapshot"].clone();
+        let prior_request:TextRequest=serde_json::from_value(snapshot.clone()).unwrap();
+        let dir=executor.store.root.join("sdk-worker").join(&prior);let file=dir.join("receipt.json");
+        let mut record:Value=serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();record.as_object_mut().unwrap().remove("receiptEnvelopeSha256");
+        let raw=record["rawResult"].clone();
+        let effective=next_snapshot["executorIdentity"].clone();let mut failed_identity=effective.clone();
+        failed_identity["bridgeSha256"]=json!(crate::text_sdk::WRAPPER_FAILED_BRIDGE_SHA);failed_identity["supervisorSha256"]=json!(crate::text_sdk::WRAPPER_FAILED_SUPERVISOR_SHA);
+        assert_ne!(failed_identity["bridgeSha256"],effective["bridgeSha256"]);
+        let mut prepared=job["prepared"].clone();
+        prepared["sdkLocalPreparationRecovery"]["effectiveIdentity"]=failed_identity.clone();
+        prepared["sdkLocalPreparationRecovery"]["proof"]["effectiveIdentitySha256"]=json!(hash(&failed_identity));
+        let v1=prepared["sdkLocalPreparationRecovery"].clone();
+        executor.store.conn().unwrap().execute("UPDATE events SET data=?2 WHERE job_id=?1 AND type='sdk_local_preparation_recovery_reserved'",params![prior,v1.to_string()]).unwrap();
+        std::fs::write(dir.join("local-preparation-recovery.json"),v1["proof"].to_string()).unwrap();
+        record["preDispatchRecovery"]=json!({"proof":v1["proof"],"effectiveIdentity":failed_identity});
+        record["state"]=json!("dispatching");record["rawResult"]=Value::Null;record["rawResultSha256"]=Value::Null;
+        std::fs::create_dir(dir.join("native-runtime")).unwrap();
+        std::fs::write(dir.join("native-runtime/runtime-plan.json"),json!({"identity":failed_identity,"attemptId":prior}).to_string()).unwrap();
+        let mut saved=crate::text_sdk::test_append_wrapper_repair(&dir,&record,&effective);
+        saved["originalSettingsSha256"]=json!(hash(&executor.settings));saved["resourceHashes"]=next_snapshot[FIELD]["resourceHashes"].clone();
+        prepared["sdkWrapperPreparationRepair"]=saved.clone();
+        executor.store.event(&prior,"sdk_wrapper_preparation_repair_reserved",&saved).unwrap();
+        record["wrapperPreparationRepair"]=json!({"proof":saved["proof"],"effectiveIdentity":effective});
+        let attempt_file=executor.store.root.join("text-runs").join(&prior).join("sdk-attempt.json");
+        let mut attempt=FrozenAttempt::load(&attempt_file).unwrap();attempt.state=AttemptState::SubmissionUnknown;attempt.raw_result=None;attempt.last_sequence=1;attempt.persist(&attempt_file).unwrap();
+        let frozen_request=attempt.request.clone();let original_id=attempt.attempt_id.clone();
+        executor.store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown',prepared=?2,result=NULL,receipt=NULL WHERE id=?1",params![prior,prepared.to_string()]).unwrap();
+        executor.store.conn().unwrap().execute("DELETE FROM events WHERE job_id=?1 AND type IN ('text_received_raw','sdk_raw_result')",[&prior]).unwrap();
+        executor.store.conn().unwrap().execute("UPDATE workflow_steps SET state='running',result=NULL,error=NULL WHERE text_job_id=?1",[&prior]).unwrap();
+        let archive=std::fs::read(dir.join("wrapper-preparation-original.json")).unwrap();let old_intent=std::fs::read(dir.join("local-preparation-recovery.json")).unwrap();
+        record["state"]=json!("transport_completed");record["rawResult"]=raw.clone();record["rawResultSha256"]=json!(hash(&raw));
+        let text=record.to_string();std::fs::write(&file,format!("{},\"receiptEnvelopeSha256\":\"{}\"}}",&text[..text.len()-1],hash(&record))).unwrap();
+        attempt.observe(Observation{attempt_id:prior.clone(),sequence:2,kind:ObservationKind::Completed,thread_id:None,turn_id:None,raw_result:Some(raw)}).unwrap();
+        crate::text_sdk::recovered_receipt_bound(&executor.store.root,&attempt,&v1).unwrap();
+        crate::text_sdk::repaired_receipt_bound(&executor.store.root,&attempt,&saved).unwrap();attempt.persist(&attempt_file).unwrap();
+        let received=executor.sdk_receive(&prior_request,&snapshot,&prior,&attempt).unwrap();
+        executor.sdk_commit(&prior_request,&received,None).unwrap();
+        let accepted=executor.sdk_job(&prior).unwrap();assert_eq!(executor.sdk_raw(&accepted,&snapshot).unwrap(),received);
+        assert_eq!(attempt.attempt_id,original_id);assert_eq!(json!(attempt.request),json!(frozen_request));assert_eq!(accepted["prepared"]["sdkDispatchStarted"],true);
+        let predecessor=predecessor(&executor.store,&executor.store.conn().unwrap(),executor.workflow_id.as_deref().unwrap(),&step_key(&prior_request)).unwrap().unwrap();
+        let mut next_proof=next_snapshot[FIELD].clone();next_proof.as_object_mut().unwrap().remove("sha256");next_proof["predecessor"]=predecessor;next_snapshot[FIELD]=super::seal(next_proof);
+        let next=executor.store.add_sdk_handoff_node_atomic(&request,&next_snapshot,&executor.settings).unwrap();
+        complete(&executor,&request,&next_snapshot,&next,true);
+        let reopened=SavedTextExecutor{store:Store::open(executor.store.root.clone()).unwrap(),settings:executor.settings.clone(),workflow_id:executor.workflow_id.clone()};
+        for id in [&prior,&next] {let job=reopened.sdk_job(id).unwrap();assert!(reopened.sdk_raw(&job,&job["snapshot"]).is_ok());}
+        assert_eq!(std::fs::read(dir.join("wrapper-preparation-original.json")).unwrap(),archive);assert_eq!(std::fs::read(dir.join("local-preparation-recovery.json")).unwrap(),old_intent);
+        assert!(executor.store.add_sdk_handoff_node_atomic(&request,&next_snapshot,&executor.settings).is_err());
+        let count:i64=reopened.store.conn().unwrap().query_row("SELECT count(*) FROM events WHERE job_id=?1 AND type='sdk_wrapper_preparation_repair_reserved'",[&prior],|r|r.get(0)).unwrap();assert_eq!(count,1);
+    }
+    #[test]
+    fn sdk_local_recovery_next_node_rejects_unknown_prior_or_missing_durable_recovery_anchor() {
+        for mutation in ["unknown","missing-event","archive-changed","account"] {
+            let (_temp,executor,request,mut snapshot,prior)=recovered_chain_fixture();
+            match mutation {
+                "unknown"=>{executor.store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown' WHERE id=?1",[&prior]).unwrap();},
+                "missing-event"=>{executor.store.conn().unwrap().execute("DELETE FROM events WHERE job_id=?1 AND type='sdk_local_preparation_recovery_reserved'",[&prior]).unwrap();},
+                "archive-changed"=>std::fs::write(executor.store.root.join("sdk-worker").join(&prior).join("local-preparation-original.json"),"{}").unwrap(),
+                "account"=>snapshot["executorIdentity"]["accountFingerprint"]=json!("f".repeat(64)),_=>unreachable!(),
+            }
+            let before=evidence(&executor);
+            assert!(executor.store.add_sdk_handoff_node_atomic(&request,&snapshot,&executor.settings).is_err(),"{mutation}");
+            assert_eq!(evidence(&executor),before);
+        }
     }
     fn evidence(executor: &SavedTextExecutor) -> Value {
         let c = executor.store.conn().unwrap();

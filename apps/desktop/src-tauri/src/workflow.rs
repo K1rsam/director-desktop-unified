@@ -13,6 +13,40 @@ fn has_steps(store: &Store) -> Result<bool> {
     store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')",[],|r|r.get(0)).map_err(|e|e.to_string())
 }
 
+// A recovery keeps the original job unknown until its receipt is verified.
+// Expose only events after its persisted reservation; this is not submission
+// authority and never changes the frozen request or durable job state.
+fn sdk_recovery_progress(c: &Connection, job: &str) -> rusqlite::Result<Option<Value>> {
+    let reservation: Option<(i64, String)> = c.query_row(
+        "SELECT e.id,e.created_at FROM events e JOIN jobs j ON j.id=e.job_id
+         WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.state='submission_unknown'
+         AND ((e.type='sdk_local_preparation_recovery_reserved' AND json_extract(j.prepared,'$.sdkLocalPreparationRecovery')=json(e.data))
+           OR (e.type='sdk_wrapper_preparation_repair_reserved' AND json_extract(j.prepared,'$.sdkWrapperPreparationRepair')=json(e.data)))
+         ORDER BY e.id DESC LIMIT 1", [job], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    let Some((reservation_id, started)) = reservation else { return Ok(None); };
+    let event: Option<(String, Option<String>, Option<String>, String)> = c.query_row(
+        "SELECT type,json_extract(data,'$.rawEvent.type'),json_extract(data,'$.state'),created_at
+         FROM events WHERE job_id=?1 AND id>?2 AND type IN ('sdk_event','sdk_observation') ORDER BY id DESC LIMIT 1",
+        params![job,reservation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    let elapsed = chrono::DateTime::parse_from_rfc3339(&started).ok()
+        .map(|stamp| (chrono::Utc::now()-stamp.with_timezone(&chrono::Utc)).num_seconds().max(0));
+    let mut progress = json!({"backend":"codex_sdk","startedAt":started,"elapsedSeconds":elapsed,
+        "phase":"unknown","processAlive":null,"lastEventType":null,"lastEventAt":null,"observedAt":null});
+    if let Some((kind, raw_type, state, stamp)) = event {
+        let safe_type = raw_type.as_deref().filter(|v| ["thread.started","turn.started","turn.completed","turn.failed","item.started","item.updated","item.completed","error"].contains(v));
+        progress["phase"] = json!(if kind == "sdk_observation" {
+            if state.as_deref() == Some("transport_completed") { "output_received" } else { "unknown" }
+        } else if safe_type == Some("turn.failed") { "failed" }
+        else if safe_type.is_some() { "executing" } else { "unknown" });
+        progress["lastEventType"] = json!(if kind == "sdk_observation" { Some("sdk.observation") } else { safe_type });
+        progress["lastEventAt"] = json!(stamp);
+        progress["observedAt"] = json!(stamp);
+    }
+    Ok(Some(progress))
+}
+
 // Display-only plan from the original frozen selection. Do not derive progress
 // from published prompts: the design workflow publishes its results atomically.
 fn asset_design_progress_plan(stage: &str, context: &Value) -> Option<Value> {
@@ -799,6 +833,11 @@ impl Store {
                 let scope=r.get::<_,Option<String>>(5)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
                 let episode=r.get::<_,Option<String>>(6)?.or(r.get::<_,Option<String>>(7)?);
                 let mut execution=r.get::<_,Option<String>>(8)?.and_then(|v|serde_json::from_str::<Value>(&v).ok());
+                if execution.is_none() && status == "running" && r.get::<_,String>(2)? == "running" {
+                    if let Some(job) = r.get::<_,Option<String>>(12)? {
+                        execution = sdk_recovery_progress(&c, &job)?;
+                    }
+                }
                 if let Some(value) = execution.as_mut().filter(|v| v["phase"] == "executing") {
                     if let (Some(job), Some(provider)) = (r.get::<_,Option<String>>(12)?, r.get::<_,Option<String>>(13)?) {
                         if let Some(reconnect) = retry_progress::original_stream_reconnect(&c, &job, &provider) {
@@ -2068,6 +2107,46 @@ mod sdk_progress_tests {
         }
         let after: String = store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1", [&text], |r| r.get(0)).unwrap();
         assert_eq!(before, after, "progress never changes the frozen request");
+    }
+
+    #[test]
+    fn sdk_progress_recovery_uses_new_events_without_clearing_unknown_or_old_evidence() {
+        let (_dir, store, run, text, _started) = sdk_progress_fixture();
+        store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started"}})).unwrap();
+        store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown' WHERE id=?1",[&text]).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
+        let local = json!({"proof":{"private":"not for UI"},"effectiveIdentity":{"private":"not for UI"}});
+        let repair = json!({"proof":{"private":"repair identity"}});
+        let prepared = json!({"sdkDispatchStarted":true,"sdkLocalPreparationRecovery":local,"sdkWrapperPreparationRepair":repair});
+        store.conn().unwrap().execute("UPDATE jobs SET prepared=?1 WHERE id=?2",params![prepared.to_string(),text]).unwrap();
+        store.event(&text,"sdk_local_preparation_recovery_reserved",&local).unwrap();
+        store.event(&text,"sdk_observation",&json!({"state":"submission_unknown"})).unwrap();
+        store.event(&text,"sdk_wrapper_preparation_repair_reserved",&repair).unwrap();
+        let recovery_start = store.conn().unwrap().query_row("SELECT created_at FROM events WHERE job_id=?1 AND type='sdk_wrapper_preparation_repair_reserved'",[&text],|r|r.get::<_,String>(0)).unwrap();
+        let waiting = store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].clone();
+        assert_eq!(waiting["phase"],"unknown");
+        assert_eq!(waiting["startedAt"],recovery_start);
+        assert!(waiting["lastEventType"].is_null(),"older execution and observations are not new recovery progress");
+        store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started","private":"model payload"}})).unwrap();
+        let active = store.workflow_progress().unwrap();
+        assert_eq!(active[0]["nodes"][0]["execution"]["phase"],"executing");
+        assert!(active[0]["nodes"][0]["execution"]["processAlive"].is_null());
+        assert!(!serde_json::to_string(&active).unwrap().contains("private"));
+        store.event(&text,"sdk_observation",&json!({"state":"transport_completed","rawResult":"private raw"})).unwrap();
+        assert_eq!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"]["phase"],"output_received");
+        let stored: (String,String) = store.conn().unwrap().query_row("SELECT state,prepared FROM jobs WHERE id=?1",[&text],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(stored,("submission_unknown".into(),prepared.to_string()));
+        store.conn().unwrap().execute("UPDATE jobs SET state='failed' WHERE id=?1",[&run]).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
+    }
+
+    #[test]
+    fn sdk_progress_recovery_requires_matching_persisted_reservation() {
+        let (_dir, store, _run, text, _started) = sdk_progress_fixture();
+        store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown',prepared=?1 WHERE id=?2",params![json!({"sdkLocalPreparationRecovery":{"proof":"saved"}}).to_string(),text]).unwrap();
+        store.event(&text,"sdk_local_preparation_recovery_reserved",&json!({"proof":"changed"})).unwrap();
+        store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started"}})).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
     }
 
     #[test]

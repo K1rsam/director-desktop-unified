@@ -4533,6 +4533,8 @@ mod scoped_shot_replay;
 mod sdk_foundation_replay;
 #[path = "text_executor_sdk_supervisor_handoff.rs"]
 mod sdk_supervisor_handoff;
+#[path = "text_executor_sdk_local_recovery.rs"]
+mod sdk_local_recovery;
 pub(crate) use scoped_shot_replay::{
     scoped_author_replay_audit_valid, scoped_author_replay_receipt_bound, scoped_author_replay_stage,
     STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY,
@@ -11663,6 +11665,7 @@ impl SavedTextExecutor {
     fn sdk_raw(&self, job: &Value, snapshot: &Value) -> Result<Value> {
         use crate::text_transport::{AttemptState, FrozenAttempt};
         self.sdk_handoff_job_bound(job, snapshot)?;
+        self.sdk_local_recovery_bound(job)?;
         let fail = || {
             "SDK_RAW_BINDING_MISMATCH: 原请求、原始文本、事件、回执或执行身份不一致；证据与预算保留"
                 .to_string()
@@ -11805,6 +11808,9 @@ impl SavedTextExecutor {
             )?;
             if self.workflow_id.as_deref().unwrap_or("standalone") != original.workflow_id {
                 return Err("SDK_EXISTING_ATTEMPT_UNRESOLVED: 新工作流不能替换原未知执行".into());
+            }
+            if let Some(value) = self.sdk_recover_local_preparation(request, snapshot, &job, &original).await? {
+                return Ok(value);
             }
             // A bridge update never executes an old worker just to read it.
             // No promotion from unknown is permitted across bridge versions.
