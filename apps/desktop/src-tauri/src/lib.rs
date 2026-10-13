@@ -13,6 +13,8 @@ pub mod project_library;
 pub mod providers;
 pub mod store;
 mod store_foundation_projection;
+mod source_migration;
+mod store_source_migration;
 pub mod tasks;
 pub mod text_cli;
 pub mod text_executor;

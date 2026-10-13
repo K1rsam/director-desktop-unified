@@ -112,3 +112,38 @@ test('分镜重做弹窗在其他制作启动后同时阻止按钮与表单提�
   nodes(ready).find(node => node.type === 'form').props.onSubmit({ preventDefault() {} }); await tick();
   assert.deepEqual(ui.calls, [{ action: 'units.regenerate', payload: { unitId: 'u1', instruction: '保留原文，优化动作衔接', expectedVersion: 3 } }]);
 });
+
+test('镜表仅在已冻结声音合同及精确事件枚举同时满足时显示非人声提示', async () => {
+  const ui = await view();
+  Object.assign(ui.workspace, { assets: [], providers: [], rules: [], settings: {}, foundation: {} });
+  const parts = [
+    { speaker: 'Vo', channel: '现场', presentation: '声音事件' },
+    { speaker: '旁白', channel: 'VO', presentation: 'VO' },
+    { speaker: '小王', channel: 'OS', presentation: 'OS' },
+    { speaker: '小王', channel: '现场', presentation: '画内' },
+    { speaker: 'Vo', channel: '现场', presentation: '声音事件 ' },
+  ].map(part => ({ ...part, text: '群众笑声戛然而止。', delivery: '声音事件', voiceStart: 0, voiceEnd: 0.3 }));
+  Object.assign(ui.workspace.units[0], { version: 3, prompt: '合成原完整稿', shots: [{ id: 's1', duration: 2, sound: '环境声', dialogueParts: parts }] });
+  shared.__refineApi = async request => { assert.equal(request.action, 'units.get'); return structuredClone(ui.workspace.units[0]); };
+  for (const profile of [undefined, 'unknown', 'source-bound-sound-events/v1']) {
+    Object.assign(ui.workspace.units[0], { storyboardSoundEventProfile: profile });
+    const before = structuredClone(ui.workspace), host = new HookHost();
+    const render = () => host.render(Stage3Panel, ui.props);
+    render(); await host.flush();
+    nodes(render()).find(node => node.props?.role === 'tab' && text(node) === '镜表').props.onClick();
+    const table = nodes(render()).find(node => node.type === 'table');
+    const rows = nodes(table).filter(node => node.type === 'p' && nodes(node).some(child => child.type === 'strong'));
+    assert.equal(rows.length, parts.length);
+    assert.equal(text(rows[0]), profile === 'source-bound-sound-events/v1'
+      ? '声音事件：群众笑声戛然而止。镜内 0.0—0.3 秒 · 按原文执行声音变化，不作人声朗读'
+      : 'Vo：群众笑声戛然而止。镜内 0.0—0.3 秒');
+    assert.deepEqual(rows.slice(1).map(text), [
+      '旁白：群众笑声戛然而止。镜内 0.0—0.3 秒',
+      '小王 OS：群众笑声戛然而止。镜内 0.0—0.3 秒',
+      '小王：群众笑声戛然而止。镜内 0.0—0.3 秒',
+      'Vo：群众笑声戛然而止。镜内 0.0—0.3 秒',
+    ]);
+    assert.deepEqual(ui.workspace, before, '展示不得重分类或修改原单元数据');
+  }
+  assert.deepEqual(ui.calls, []);
+});

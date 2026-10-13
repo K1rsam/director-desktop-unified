@@ -67,6 +67,7 @@ fn reference() -> Value {
 /// The range clock concatenates only the supplied units. It never claims elapsed
 /// story time, an entire episode, a performed voice or an empty tail.
 fn locate(input: &Value, draft: Option<&Value>, rows: &[SourceRow], source_status: &str) -> Value {
+    let sound_profile = crate::pipeline::storyboard_sound_events::enabled(input).unwrap_or(false);
     let mut result = json!({"version":crate::pipeline::stage3_pack::RHYTHM_PROFILE,
         "reference":reference(),"sourceRowsStatus":source_status,
         "sourceRowsSha256":digest(&input["sourceRows"].to_string()),
@@ -111,6 +112,8 @@ fn locate(input: &Value, draft: Option<&Value>, rows: &[SourceRow], source_statu
     let mut windows = Vec::new();
     let mut invalid_voice = Vec::new();
     let mut unknown_source = Vec::new();
+    let mut sound_events = Vec::new();
+    let mut invalid_sound_events = Vec::new();
     let mut offset = 0.0;
     let mut shot_count = 0usize;
     let mut common_count = 0usize;
@@ -144,6 +147,7 @@ fn locate(input: &Value, draft: Option<&Value>, rows: &[SourceRow], source_statu
                 .enumerate()
             {
                 let part_coordinate = format!("{coordinate}.dialogueParts[{part_index}]");
+                let sound_event = sound_profile && crate::pipeline::storyboard_sound_events::is_event(unit, part);
                 let matches: Vec<_> = lines
                     .iter()
                     .filter(|line| line.id == text(part, "lineId"))
@@ -167,9 +171,18 @@ fn locate(input: &Value, draft: Option<&Value>, rows: &[SourceRow], source_statu
                             && *end <= duration
                     })
                 else {
-                    invalid_voice.push(json!({"coordinate":part_coordinate,"lineId":part["lineId"],"voiceStart":part["voiceStart"],"voiceEnd":part["voiceEnd"],"shotSeconds":duration}));
+                    let invalid = json!({"coordinate":part_coordinate,"lineId":part["lineId"],"voiceStart":part["voiceStart"],"voiceEnd":part["voiceEnd"],"shotSeconds":duration});
+                    if sound_event { invalid_sound_events.push(invalid); }
+                    else { invalid_voice.push(invalid); }
                     continue;
                 };
+                if sound_event {
+                    sound_events.push(json!({"coordinate":part_coordinate,"lineId":part["lineId"],
+                        "quoteStart":part["quoteStart"],"quoteEnd":part["quoteEnd"],
+                        "rangeStart":offset+local+start,"rangeEnd":offset+local+end,
+                        "sourceIntervalKnown":characters.is_some(),"spoken":false}));
+                    continue;
+                }
                 windows.push(Window {
                     coordinate: part_coordinate,
                     line_id: text(part, "lineId").into(),
@@ -287,6 +300,13 @@ fn locate(input: &Value, draft: Option<&Value>, rows: &[SourceRow], source_statu
             "turnGaps":turn_entries,"omittedTurnGaps":turn_omitted,"fragmentSkews":skew_entries,"omittedFragmentSkews":skew_omitted,
             "tailIntervals":tail,"invalidVoiceWindows":voice_entries,"omittedInvalidVoiceWindows":voice_omitted,
             "unknownSourceIntervals":source_entries,"omittedUnknownSourceIntervals":source_omitted}});
+    if sound_profile {
+        let (events, omitted) = limited(&sound_events);
+        let (invalid, omitted_invalid) = limited(&invalid_sound_events);
+        result["audit"]["soundEvents"] = json!({"version":crate::pipeline::storyboard_sound_events::PROFILE,
+            "windows":events,"omittedWindows":omitted,"invalidWindows":invalid,"omittedInvalidWindows":omitted_invalid,
+            "eventWindowsKnown":invalid_sound_events.is_empty(),"speechFreeDoesNotMeanSilent":true});
+    }
     result
 }
 
@@ -448,6 +468,28 @@ mod rhythm_locator_tests {
         assert_eq!(speech["tailIntervals"][0]["seconds"], 2.75);
         assert_eq!(speech["tailIntervals"][0]["isEmptyTime"], Value::Null);
         assert_eq!(speech["fragmentSkews"][0]["uniformRateRequired"], false);
+    }
+    #[test]
+    fn typed_sound_events_are_not_speech_rate_but_still_have_validated_windows() {
+        let (mut input, mut draft, rows)=fixture();
+        let field=crate::pipeline::storyboard_sound_events::PROFILE_FIELD;
+        let profile=crate::pipeline::storyboard_sound_events::PROFILE;
+        let before=locate(&input,Some(&draft),&rows,"present");
+        assert!(before["audit"].get("soundEvents").is_none());
+        input[field]=json!(profile);
+        draft["units"][0][field]=json!(profile);
+        for shot in draft["units"][0]["shots"].as_array_mut().unwrap() {
+            shot["dialogueParts"][0]["presentation"]=json!(crate::pipeline::storyboard_sound_events::PRESENTATION);
+        }
+        let report=locate(&input,Some(&draft),&rows,"present");
+        assert_eq!(report["audit"]["speech"]["lineTimings"].as_array().unwrap().len(),1);
+        assert_eq!(report["audit"]["soundEvents"]["windows"].as_array().unwrap().len(),2);
+        assert_eq!(report["audit"]["soundEvents"]["eventWindowsKnown"],true);
+        assert!(report["audit"]["speech"]["continuityGaps"].as_array().unwrap().is_empty());
+        draft["units"][0]["shots"][0]["dialogueParts"][0]["voiceEnd"]=json!(99.0);
+        let report=locate(&input,Some(&draft),&rows,"present");
+        assert_eq!(report["audit"]["soundEvents"]["eventWindowsKnown"],false);
+        assert_eq!(report["audit"]["soundEvents"]["invalidWindows"][0]["voiceEnd"],99.0);
     }
 
     #[test]

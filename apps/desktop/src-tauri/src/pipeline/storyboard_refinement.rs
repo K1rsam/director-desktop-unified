@@ -168,6 +168,7 @@ fn basis(input: &Value) -> Result<Basis, String> {
     if creative::uses_scene_profile(input)? {
         binding[creative::SCENE_PROFILE_FIELD] = input[creative::SCENE_PROFILE_FIELD].clone();
     }
+    super::storyboard_sound_events::inherit(&mut binding, input)?;
     super::asset_use_binding::inherit(&mut binding, input)?;
     let input_binding = digest(&binding.to_string());
     Ok(Basis {
@@ -232,7 +233,8 @@ fn creative_body(units: &[Value]) -> Value {
 fn validate_delta(input: &Value, basis: &Basis, raw: &Value) -> Result<(Value, Value), String> {
     let mut material = json!({"assets":basis.assets,"sourceRows":basis.rows});
     super::asset_use_binding::inherit(&mut material, input)?;
-    let projected = super::asset_use_binding::materialize(&material, raw)?;
+    super::storyboard_sound_events::inherit(&mut material, input)?;
+    let projected = storyboard::materialize_role_result(&material, raw)?;
     let raw = &projected;
     let groups = raw["replacements"].as_array().ok_or("精修缺少差量替换组")?;
     let decisions = raw["reviewDecisions"]
@@ -851,6 +853,76 @@ pub(crate) mod tests {
         assert_eq!(reopened.get("units",text(&retained,"id")).unwrap(),retained);
         assert_eq!(reopened.job(&run).unwrap()["result"]["rawDelta"],raw);
         reopened.publish_storyboard_refinement(&run,text(&candidate,"candidateSha256"),&input).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sound_event_three_roles_keep_old_replay_and_prepared_requests_exact() {
+        use super::super::storyboard_sound_events as sound;
+        let source = super::super::prepare_source("第一集\n场景：门口\n小王：原话完整保留。\n").unwrap();
+        let mut old = json!({"source":source,"assets":[],"foundation":{"facts":[]},"settings":{"fantasyMode":"off","visualStyle":"16:9真人"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":0},"selection":{"episodeIds":[source.episodes[0].id]}});
+        stage3_pack::mark_input(&mut old).unwrap();
+        let executor = Model::default();
+        let before = storyboard::run_storyboard(&old, &executor, "offline", "medium").await.unwrap();
+        let old_calls = executor.calls.lock().await.clone();
+        assert_eq!(old_calls.len(), 3);
+        let mut fresh = old.clone();
+        sound::freeze_new(&mut fresh).unwrap();
+        let output = storyboard::run_storyboard(&fresh, &executor, "offline", "medium").await.unwrap();
+        assert_eq!(output["status"], "completed", "{}", output["blocked"]);
+        let calls = executor.calls.lock().await.clone();
+        assert_eq!(calls.len(), 6);
+        for request in &calls[3..] {
+            assert_eq!(request.input[sound::PROFILE_FIELD], sound::PROFILE);
+            assert_eq!(request.rule_snapshot["runtimeContract"][sound::PROFILE_FIELD], sound::PROFILE);
+            for prepared in [creative::prepare_request(request.clone()).unwrap(), stage3_pack::prepare_request(request.clone()).unwrap()] {
+                assert_eq!(serde_json::to_vec(&prepared).unwrap(), serde_json::to_vec(request).unwrap(), "{} keeps frozen identity", request.stage);
+            }
+        }
+        assert!(output["units"].as_array().unwrap().iter().all(|unit| unit[sound::PROFILE_FIELD] == sound::PROFILE));
+        assert_eq!(storyboard::run_storyboard(&fresh, &executor, "offline", "medium").await.unwrap(), output);
+        assert_eq!(storyboard::run_storyboard(&old, &executor, "offline", "medium").await.unwrap(), before);
+        assert_eq!(executor.calls.lock().await.len(), 6, "both frozen versions reuse accepted results");
+        assert_eq!(serde_json::to_vec(&executor.calls.lock().await[..3]).unwrap(), serde_json::to_vec(&old_calls).unwrap());
+        for request in &old_calls {
+            assert!(request.input.get(sound::PROFILE_FIELD).is_none());
+            assert!(request.rule_snapshot["runtimeContract"].get(sound::PROFILE_FIELD).is_none());
+        }
+        fresh[sound::PROFILE_FIELD] = json!("unknown");
+        assert!(storyboard::run_storyboard(&fresh, &executor, "offline", "medium").await.is_err());
+        assert_eq!(executor.calls.lock().await.len(), 6, "unknown contracts fail before dispatch");
+    }
+
+    #[tokio::test]
+    async fn sound_event_refinement_reopens_without_retyping_raw_or_retained_units() {
+        use super::super::storyboard_sound_events as sound;
+        let (directory, store, old, _origin) = fixture().await;
+        let mut current = old.clone();
+        sound::freeze_new(&mut current).unwrap();
+        assert_ne!(basis(&old).unwrap().input_binding, basis(&current).unwrap().input_binding);
+        let executor = Model { mode: "scattered", ..Default::default() };
+        let old_candidate = run_storyboard_refinement(&old, &executor, "offline", "medium").await.unwrap();
+        let new_candidate = run_storyboard_refinement(&current, &executor, "offline", "medium").await.unwrap();
+        assert!(adopt_storyboard_refinement(&old, &new_candidate).is_err());
+        assert!(adopt_storyboard_refinement(&current, &old_candidate).is_err());
+        let calls = executor.calls.lock().await.clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].input[sound::PROFILE_FIELD], sound::PROFILE);
+        assert_eq!(serde_json::to_vec(&creative::prepare_request(calls[1].clone()).unwrap()).unwrap(), serde_json::to_vec(&calls[1]).unwrap());
+        assert_eq!(calls[1].input["previousDraft"], calls[0].input["previousDraft"]);
+        run_storyboard_refinement(&old, &executor, "offline", "medium").await.unwrap();
+        assert_eq!(executor.calls.lock().await.len(), 2);
+        let retained = current["existingUnits"][1].clone();
+        let (run, candidate) = saved_candidate(&store, &current, "scattered").await;
+        let raw = candidate["rawDelta"].clone();
+        let original = store.job(&run).unwrap()["result"].clone();
+        assert!(raw["replacements"][0]["units"][0].get(sound::PROFILE_FIELD).is_none());
+        assert_eq!(candidate["validatedDelta"]["replacements"][0]["units"][0][sound::PROFILE_FIELD], sound::PROFILE);
+        let reopened = Store::open(directory.path().join("isolated-source")).unwrap();
+        reopened.publish_storyboard_refinement(&run, text(&candidate, "candidateSha256"), &current).unwrap();
+        assert_eq!(reopened.job(&run).unwrap()["result"], original);
+        assert_eq!(reopened.get("units", text(&retained, "id")).unwrap(), retained);
+        assert_eq!(reopened.job(&run).unwrap()["result"]["rawDelta"], raw);
+        reopened.publish_storyboard_refinement(&run, text(&candidate, "candidateSha256"), &current).unwrap();
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ pub(crate) mod foundation_wire;
 mod scene_edits;
 mod source;
 mod storyboard;
+pub(crate) mod storyboard_sound_events;
 pub mod stage3_pack;
 pub(crate) mod storyboard_refinement;
 pub use storyboard_refinement::{run_storyboard_refinement, adopt_storyboard_refinement};

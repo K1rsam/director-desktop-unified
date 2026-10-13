@@ -1240,7 +1240,14 @@ impl Engine {
                 };
                 let resolved = serde_json::to_value(resolved).map_err(|e| e.to_string())?;
                 if action == "source.reparse" {
-                    store.save_reparsed_source_if_current(resolved, expected)?;
+                    if resolved["parserVersion"] == "source-parser/v10" {
+                        // Own the writer through the protected source/foundation/unit
+                        // transaction; a live or unknown node cannot be superseded.
+                        let _lease = self.acquire_pipeline(&store)?;
+                        store.save_v10_reparsed_source_if_current(resolved, expected)?;
+                    } else {
+                        store.save_reparsed_source_if_current(resolved, expected)?;
+                    }
                 } else {
                     store.save_source_if_current(resolved, expected)?;
                 }
@@ -3063,6 +3070,7 @@ impl Engine {
         // resume returns above and saved-snapshot recovery keep their exact input.
         if matches!(stage, "storyboard.run" | "storyboard.refine") {
             pipeline::freeze_scene_input_profile(&mut input)?;
+            pipeline::storyboard_sound_events::freeze_new(&mut input)?;
             pipeline::asset_coverage::freeze_new(&mut input)?;
         }
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;

@@ -223,6 +223,7 @@ pub fn pack_sha256() -> Result<String, String> {
 }
 
 pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> {
+    super::storyboard_sound_events::inherit(target, frozen)?;
     super::asset_coverage::inherit(target, frozen)?;
     super::asset_use_binding::inherit(target, frozen)?;
     let rhythm = uses_rhythm_profile(frozen)?;
@@ -333,6 +334,10 @@ pub(super) fn runtime_contract(stage: &str, delta: bool) -> Result<Value, String
 }
 
 pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, String> {
+    // Reject unknown markers even when another profile would return early.
+    if super::storyboard_sound_events::enabled(&request.input)? && !uses_profile(&request.input)? {
+        return Err("声音事件合同缺少冻结第三阶段生产规则".into());
+    }
     let asset_use = super::asset_use_binding::enabled(&request.input)?;
     if asset_use && !uses_profile(&request.input)? { return Err("素材使用绑定缺少冻结生产规则".into()); }
     let asset_coverage = super::asset_coverage::enabled(&request.input)?;
@@ -372,6 +377,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         request.rule_snapshot["runtimeContract"] = runtime;
     }
     super::asset_coverage::storyboard_request(&mut request)?;
+    super::storyboard_sound_events::prepare_request(&mut request)?;
     if rhythm {
         super::storyboard::original::rhythm::attach(&mut request)?;
     }

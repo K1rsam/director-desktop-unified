@@ -953,7 +953,7 @@ fn display_header(value: &str, shots: &[Value]) -> String {
 
 /// Direct port of quality.mjs renderDraft(seedance-execution-v3). Stored dialogue
 /// remains untouched; only proven redundant enclosing display quotes are omitted.
-pub(super) fn render_units(
+pub(in crate::pipeline) fn render_units(
     draft: &Value,
     source: Option<&LockedSource>,
     style: &str,
@@ -1005,6 +1005,7 @@ pub(super) fn render_units(
     };
     let mut output = Vec::new();
     for (ui, u) in units.iter().enumerate() {
+        super::super::storyboard_sound_events::validate_unit(u)?;
         let shots = u["shots"].as_array().ok_or("缺少完整镜表")?;
         let total: f64 = shots.iter().filter_map(|s| s["duration"].as_f64()).sum();
         let common = [
@@ -1076,12 +1077,17 @@ pub(super) fn render_units(
             let start = offset;
             offset += duration;
             let mut speech = Vec::new();
+            let mut sound_events = Vec::new();
             for (pi, p) in s["dialogueParts"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .enumerate()
             {
+                if super::super::storyboard_sound_events::is_event(u, p) {
+                    sound_events.push(super::super::storyboard_sound_events::render_event(p, start));
+                    continue;
+                }
                 let q = quotes.get(text(p, "lineId"));
                 let speaker = q.map(|q| q.1.as_str()).unwrap_or(text(p, "speaker"));
                 let speaker = if speaker.trim().is_empty() {
@@ -1168,8 +1174,9 @@ pub(super) fn render_units(
                         speech.join("\n台词：")
                     }
                 ),
-                format!("转场：{}", text(s, "transition")),
             ]);
+            lines.extend(sound_events);
+            lines.push(format!("转场：{}", text(s, "transition")));
         }
         // Independent local units also expose the continuity exit explicitly.
         if !text(u, "exitState").trim().is_empty() {

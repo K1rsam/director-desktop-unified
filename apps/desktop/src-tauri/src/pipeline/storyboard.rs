@@ -23,6 +23,11 @@ pub fn freeze_scene_input_profile(input: &mut Value) -> Result<(), String> {
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
+
+pub(super) fn materialize_role_result(input: &Value, raw: &Value) -> Result<Value, String> {
+    let bound = super::asset_use_binding::materialize(input, raw)?;
+    super::storyboard_sound_events::materialize(input, &bound)
+}
 fn strings(value: &Value, key: &str) -> Result<Vec<String>, String> {
     value
         .get(key)
@@ -1288,6 +1293,7 @@ fn validate_storyboard_repair_scope(
     let mut prior_dialogue_order = 0;
     for unit in units {
         super::asset_use_binding::validate_unit_for_repair(unit, assets, defer_shot_source)?;
+        super::storyboard_sound_events::validate_unit(unit)?;
         let uid = text(unit, "id");
         if uid.is_empty() || !unit_ids.insert(uid) {
             return Err("分镜单元 id 为空或重复".into());
@@ -1757,6 +1763,7 @@ fn compile_prompt(unit: &Value, visual_style: &str) -> String {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|p| !super::storyboard_sound_events::is_event(unit, p))
             .map(|p| {
                 format!(
                     "{}{}（{}；{:.2}–{:.2}秒）：{}；演法：{}",
@@ -1793,6 +1800,11 @@ fn compile_prompt(unit: &Value, visual_style: &str) -> String {
             },
             text(shot, "transition")
         ));
+        for part in shot["dialogueParts"].as_array().into_iter().flatten() {
+            if super::storyboard_sound_events::is_event(unit, part) {
+                parts.push(super::storyboard_sound_events::render_event(part, offset));
+            }
+        }
         offset += duration;
     }
     parts.join("\n\n")
@@ -2517,7 +2529,7 @@ pub async fn run_storyboard(
                         author_input.clone(),
                         schema.clone(),&methods,|value| {
                             let raw=value.clone();
-                            *value=super::asset_use_binding::materialize(&author_input, &raw)?;
+                            *value=materialize_role_result(&author_input, &raw)?;
                             let candidate_raw=value.clone();
                             if let Err(reason)=validate_authored(&source,value,&current_assets,caps,&batch.source_refs,style,&prefix) {
                                 if creative_enabled && crate::text_executor::author_repairable_rejection(&reason) {
@@ -2605,7 +2617,7 @@ pub async fn run_storyboard(
                     let mut response=executor.execute(request.clone()).await?;
                     let original_response=response.clone();
                     let validated=(|| {
-                        let projected=super::asset_use_binding::materialize(&request.input,&original_response)?;
+                        let projected=materialize_role_result(&request.input,&original_response)?;
                         let mut draft=apply_finish_delta(&base,&projected)?;
                         for unit in draft["units"].as_array().unwrap() { super::asset_use_binding::validate_unit(unit,&current_assets)?; }
                         let preserved_units:HashSet<_>=base["units"].as_array().unwrap().iter().map(|unit|text(unit,"id").to_string()).collect();
@@ -2628,7 +2640,7 @@ pub async fn run_storyboard(
                             // The editor can reintroduce a reference rejected in
                             // an author. The original coordinator routes either
                             // unadopted role back to the same bounded editor.
-                            let projected=super::asset_use_binding::materialize(&request.input,&original_response)?;
+                            let projected=materialize_role_result(&request.input,&original_response)?;
                             let mut candidate=apply_finish_delta(&base,&projected)?;
                             let preserved_units:HashSet<_>=base["units"].as_array().unwrap().iter().map(|unit|text(unit,"id").to_string()).collect();
                             let preserved_shots:HashSet<_>=base["units"].as_array().unwrap().iter().flat_map(|unit|unit["shots"].as_array().unwrap()).map(|shot|text(shot,"id").to_string()).collect();
@@ -3615,7 +3627,7 @@ async fn repair_author_scope(
                     );
                 }
             }
-            let projected = super::asset_use_binding::materialize(&request.input, &raw)?;
+            let projected = materialize_role_result(&request.input, &raw)?;
             let mut draft = apply_finish_delta(&base, &projected)?;
             let preserved_units: HashSet<_> = base["units"]
                 .as_array()
@@ -4058,7 +4070,7 @@ async fn repair_video_carrier(
                     );
                 }
             }
-            let projected = super::asset_use_binding::materialize(&request.input, &raw)?;
+            let projected = materialize_role_result(&request.input, &raw)?;
             let mut next = apply_finish_delta(&base, &projected)?;
             if next["units"][0]["initialState"] != base["units"][0]["initialState"]
                 || next["units"].as_array().unwrap().last().unwrap()["exitState"]
@@ -4710,7 +4722,7 @@ async fn run_storyboard_revision(
             let authored = call_validated(executor,"storyboardCreate","unit-performance-director",model,reasoning,
                 author_input.clone(),
                 draft_schema(&rows,&context,&current_assets,&event_ids,&episode.id),&methods,|value| {
-                    *value=super::asset_use_binding::materialize(&author_input,value)?;
+                    *value=materialize_role_result(&author_input,value)?;
                     validate_authored(source,value,&current_assets,caps,&refs,style,&format!("{prefix}create:"))?;
                     validate_event_bindings(value,&plan)?;
                     validate_fantasy_profile(value,&candidates,creative_enabled)?;
@@ -4738,7 +4750,7 @@ async fn run_storyboard_revision(
             let finished = call_validated(executor,"storyboardFinish","episode-finishing-editor",model,reasoning,
                 finish_input.clone(),
                 finish_schema,&finish_methods,|value| {
-                    *value=super::asset_use_binding::materialize(&finish_input,value)?;
+                    *value=materialize_role_result(&finish_input,value)?;
                     for unit in value["units"].as_array().unwrap() { super::asset_use_binding::validate_unit(unit,&current_assets)?; }
                     original::pack_event_units(value,&plan,caps["maxDuration"].as_f64().unwrap())?;
                     let validation_caps=carrier_validation_caps(value,caps,creative_enabled);
@@ -5232,6 +5244,35 @@ mod tests {
         validate_storyboard(&s, &d, &a, &c).unwrap();
         d["units"][0]["shots"][0]["dialogueParts"][0]["text"] = json!("先走，别回头。");
         assert!(validate_storyboard(&s, &d, &a, &c).is_err());
+    }
+    #[test]
+    fn typed_sound_events_keep_exact_source_coverage_and_time_window_validation() {
+        let source = prepare_source("第一集\n场景：门口\nVo：群众笑声戛然而止。\n旁白：后来我们才知道。\n甲：群众笑声戛然而止。\n").unwrap();
+        let original_source = serde_json::to_value(&source).unwrap();
+        let rows: Vec<_> = source.rows.iter().filter(|row| row.dialogue.is_some()).collect();
+        let refs: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+        let shots:Vec<_>=rows.iter().enumerate().map(|(index,row)| {
+            let q=row.dialogue.as_ref().unwrap();
+            json!({"id":format!("s{index}"),"duration":3.0,"camera":"中景","picture":"众人看向门外","lighting":"日光","sound":"声音依原文发生","transition":"切出","sourceRefs":[row.id],"contextRefs":[],"dialogueParts":[{"lineId":q.id,"quoteStart":q.range.start,"quoteEnd":q.range.end,"presentation":if index==0 {super::super::storyboard_sound_events::PRESENTATION} else if index==1 {"VO"} else {"画内"},"delivery":"按原文演绎","voiceStart":0.0,"voiceEnd":if index==0 {0.3} else {2.0}}]})
+        }).collect();
+        let raw=json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"U","episodeId":source.episodes[0].id,"sceneId":source.scenes[0].id,"eventId":"E","title":"声音","unitDirection":"原文声画","scene":"门口","initialState":"笑声未止","exitState":"众人安静","lighting":"日光","participants":[],"props":[],"sourceRefs":refs,"assetRefs":[],"shots":shots}],"fantasyRealization":[],"revisionNotes":[],"unresolved":[]});
+        let saved_raw=raw.clone();
+        let input=json!({super::super::storyboard_sound_events::PROFILE_FIELD:super::super::storyboard_sound_events::PROFILE});
+        let mut material=materialize_role_result(&input,&raw).unwrap();
+        let caps=json!({"minDuration":0,"maxDuration":15,"imageLimit":1});
+        validate_authored(&source,&mut material,&[],&caps,&refs,"","P:").unwrap();
+        assert_eq!(raw,saved_raw); assert_eq!(serde_json::to_value(&source).unwrap(),original_source);
+        for (index,row) in rows.iter().enumerate() {
+            let part=&material["units"][0]["shots"][index]["dialogueParts"][0];
+            let q=row.dialogue.as_ref().unwrap();
+            assert_eq!(part["text"],q.quote); assert_eq!(part["speaker"],q.speaker); assert_eq!(part["channel"],q.channel);
+        }
+        let mut bad=material.clone(); bad["units"][0]["shots"][0]["dialogueParts"][0]["text"]=json!("删改");
+        assert!(validate_storyboard_scope(&source,&bad,&[],&caps,Some(&refs)).is_err());
+        let mut bad=material.clone(); bad["units"][0]["shots"][0]["dialogueParts"][0]["voiceEnd"]=json!(4.0);
+        assert!(validate_storyboard_scope(&source,&bad,&[],&caps,Some(&refs)).unwrap_err().contains("声窗"));
+        let mut bad=material; bad["units"][0]["shots"][0]["dialogueParts"]=json!([]);
+        assert!(validate_storyboard_scope(&source,&bad,&[],&caps,Some(&refs)).is_err());
     }
     #[test]
     fn voice_windows_assets_and_capacity_cannot_be_clamped() {
