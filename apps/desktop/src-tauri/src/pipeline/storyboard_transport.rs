@@ -1,4 +1,4 @@
-//! Mechanical, reversible transport for oversized original three-role requests.
+//! Mechanical, reversible transport for oversized original directing requests.
 //! The canonical request and every accepted draft remain unchanged.
 use super::{digest, TextRequest, Value};
 use serde_json::json;
@@ -33,12 +33,23 @@ const LEGACY_FINISH_INPUT_RULE: &str = "【资料单跳等值引用】本次输�
 pub(crate) const STORYBOARD_LOSSLESS_INPUT_RULE: &str = "【资料单跳等值引用】本次输入中的{\"$same\":\"#/路径\"}表示本JSON对应路径处的完整原值，数字为0基数组下标；目标保留完整且不含引用。{\"$rowIds\":[[\"sourceRows\",起,止],...]}表示按列举顺序取本输入sourceRows或contextRows对应行目录的id，0基且含末项；不变更行顺序或制作覆盖。若原行目录为{\"$sourceRows\":{\"columns\":...,\"values\":...}}，values逐行与columns.row列名一一对应；其中range数组对应columns.range，dialogue数组对应columns.dialogue，spokenSegments/performanceSegments每项数组对应columns.segment，其range同样对应columns.range。null仍为原null，未压缩的对象仍是完整原行。所有原行正文、quote、说者、声道、分段正文及绝对UTF16半开区间均直接存在，不须猜测、摘要或补全；原id完整不变。plan.sourceFingerprints的{\"$sourceFingerprints\":\"SHA256_UTF8_ROWS\"}仅代表执行核已逐项验证的程序核验元数据：两原行目录各id对应其text UTF-8字节SHA256；若有literal字典，该部分原样保留本输入未展示原行的既有核验值，不是新增原行或本批事实权限。模型不要猜测或重算hash，不由此派生创作内容、覆盖或事实权限。这些只替代已由程序逐值核同的重复资料，不是摘要、删减或新的身份；引用不改变制作范围、前情边界或事实权限。按目标完整资料照常审查，输出schema及原始完整id不变。previousDraft完整现稿、sourceRows/contextRows原行、声道与前后连续态保持直接可读，原岗位和方法规则全部生效。";
 const SHARED_ROW_RULE: &str = "【原行共享列补充】shared.version=source-row-shared/v1时，tuple行的episodeId/sceneId若为整数，分别取shared.episodeIds/shared.sceneIds中0基位置的完整字符串；null仍为原null。dialogue.id若为null，完整值是字符串dialogue:加该行完整id；分段text若为null，完整值就是同一dialogue的完整quote。只有程序已逐值验证相等的重复字段使用上述写法；行text、quote、说者、声道、分段坐标均保留。输出始终使用完整原id，不输出共享列索引。";
 fn shared_row_rule() -> String { format!("{STORYBOARD_LOSSLESS_INPUT_RULE}\n{SHARED_ROW_RULE}") }
+const REFINEMENT_AUDIT_RULE: &str = "【精修审计共享列】capacityBrief.rhythm.audit.speech中的{\"$auditRows\":{\"kind\":...,\"columns\":...,\"values\":...}}仅压缩lineTimings或turnGaps审计表的重复列名。values中的数组按columns顺序逐列对应完整原值，null仍为原null；对象仍是完整原行。所有审计数值、标识和行顺序均已由程序逐值核同，不得重算、省略或推测。previousDraft完整现稿保持直接可读。";
+fn refinement_audit_rule() -> String { format!("{}\n{REFINEMENT_AUDIT_RULE}", shared_row_rule()) }
 
 fn supported_request(request: &TextRequest) -> bool {
     matches!(
         request.stage.as_str(),
-        "storyboardPlan" | "storyboardCreate"
+        "storyboardPlan" | "storyboardCreate" | "storyboardRefine"
     ) || (request.stage == "storyboardFinish" && request.input["finishMode"] == "delta")
+}
+
+// Refine previously sent the full canonical request. Preserve every fitting
+// CLI/SDK wire even when the escaped API envelope is larger. Keep measurement
+// out of supported_request: envelope measurement asks transport_rule for trust.
+fn preserve_fitting_refinement(request: &TextRequest) -> bool {
+    request.stage == "storyboardRefine"
+        && crate::text_executor::codex_wire_characters(request, &request.input, &request.schema)
+            <= STORYBOARD_TRANSPORT_LIMIT
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +70,10 @@ pub(crate) fn storyboard_transport_rule(
         Some(rule) if rule == shared_row_rule() => {
             static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
             RULE.get_or_init(shared_row_rule).as_str()
+        },
+        Some(rule) if request.stage == "storyboardRefine" && rule == refinement_audit_rule() => {
+            static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
+            RULE.get_or_init(refinement_audit_rule).as_str()
         },
         Some(rule)
             if rule == LEGACY_FINISH_INPUT_RULE
@@ -88,6 +103,7 @@ fn has_notation(value: &Value) -> bool {
                 || map.contains_key("$rowIds")
                 || map.contains_key("$sourceFingerprints")
                 || map.contains_key("$sourceRows")
+                || map.contains_key("$auditRows")
                 || map.values().any(has_notation)
         }
         Value::Array(items) => items.iter().any(has_notation),
@@ -388,11 +404,67 @@ fn compact_direct_copies(input: &mut Value, canonical: &Value) {
     }
 }
 
+fn audit_columns(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "lineTimings" => Some(&["channel", "elapsedCharactersPerMinute", "elapsedSeconds", "firstCoordinate", "lastCoordinate", "lineId", "partCount", "providedEffectiveCharacters", "rangeEnd", "rangeStart", "sourceEffectiveCharacters", "speaker", "voiceWindowCharactersPerMinute", "voiceWindowSeconds"]),
+        "turnGaps" => Some(&["fromCoordinate", "fromLineId", "rangeEnd", "rangeStart", "seconds", "toCoordinate", "toLineId"]),
+        _ => None,
+    }
+}
+
+fn audit_cell_valid(column: &str, value: &Value) -> bool {
+    value.is_null() || if matches!(column, "channel" | "firstCoordinate" | "lastCoordinate" | "lineId" | "speaker" | "fromCoordinate" | "fromLineId" | "toCoordinate" | "toLineId") {
+        value.is_string()
+    } else {
+        value.is_number()
+    }
+}
+
+fn decode_audit_rows(value: &Value) -> Result<Value, String> {
+    let wrapper = value.as_object().filter(|map| map.len() == 1).ok_or("精修审计表含额外字段")?;
+    let table = wrapper.get("$auditRows").and_then(Value::as_object).filter(|map| map.len() == 3).ok_or("精修审计表结构无效")?;
+    let columns = table.get("kind").and_then(Value::as_str).and_then(audit_columns).ok_or("精修审计表类型未知")?;
+    if table.get("columns") != Some(&json!(columns)) { return Err("精修审计表列定义不匹配".into()); }
+    let rows = table.get("values").and_then(Value::as_array).ok_or("精修审计表缺少行数组")?;
+    let mut restored = Vec::new();
+    for row in rows {
+        if row.is_object() && !has_notation(row) { restored.push(row.clone()); continue; }
+        let cells = row.as_array().filter(|cells| cells.len() == columns.len()).ok_or("精修审计表列数不匹配")?;
+        let mut restored_row = serde_json::Map::new();
+        for (column, cell) in columns.iter().zip(cells) {
+            if !audit_cell_valid(column, cell) { return Err("精修审计表字段类型不匹配".into()); }
+            restored_row.insert((*column).into(), cell.clone());
+        }
+        restored.push(Value::Object(restored_row));
+    }
+    Ok(Value::Array(restored))
+}
+
+fn compact_refinement_audit(input: &mut Value, canonical: &Value) {
+    for kind in ["lineTimings", "turnGaps"] {
+        let path = format!("/capacityBrief/rhythm/audit/speech/{kind}");
+        let Some(rows) = canonical.pointer(&path).and_then(Value::as_array) else { continue; };
+        let columns = audit_columns(kind).unwrap();
+        let values: Vec<_> = rows.iter().map(|row| {
+            if row.as_object().is_some_and(|map| map.len() == columns.len()
+                && columns.iter().all(|column| map.get(*column).is_some_and(|cell| audit_cell_valid(column, cell)))) {
+                json!(columns.iter().map(|column| row[*column].clone()).collect::<Vec<_>>())
+            } else { row.clone() }
+        }).collect();
+        let table = json!({"$auditRows":{"kind":kind,"columns":columns,"values":values}});
+        if table.to_string().encode_utf16().count() < canonical.pointer(&path).unwrap().to_string().encode_utf16().count()
+            && decode_audit_rows(&table).ok().as_ref() == canonical.pointer(&path) {
+            if let Some(wire) = input.pointer_mut(&path) { *wire = table; }
+        }
+    }
+}
+
 /// Expand only the documented single-hop notation. Targets must stay directly
 /// readable; neither a missing target nor reference chaining can be accepted.
 fn expand(value: &Value, input: &Value) -> Result<Value, String> {
     match value {
         Value::Object(map) if map.contains_key("$sourceRows") => decode_row_table(value),
+        Value::Object(map) if map.contains_key("$auditRows") => decode_audit_rows(value),
         Value::Object(map) if map.contains_key("$sourceFingerprints") => {
             if map["$sourceFingerprints"] != "SHA256_UTF8_ROWS"
                 || map
@@ -812,7 +884,8 @@ pub(super) fn expand_storyboard_input(input: &Value) -> Result<Value, String> {
         .get("losslessInputRule")
         .and_then(Value::as_str)
         .is_some_and(|rule| {
-            [STORYBOARD_LOSSLESS_INPUT_RULE, LEGACY_FINISH_INPUT_RULE].contains(&rule) || rule==shared_row_rule()
+            [STORYBOARD_LOSSLESS_INPUT_RULE, LEGACY_FINISH_INPUT_RULE].contains(&rule)
+                || rule==shared_row_rule() || rule==refinement_audit_rule()
         })
     {
         return Err("无损资料缺少已知运输声明".into());
@@ -839,6 +912,9 @@ pub(crate) fn compile_storyboard_dispatch_transport(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
     let original = compile_dispatch_before_metadata(request)?;
+    if request.stage == "storyboardRefine" {
+        return compile_refinement_audit_transport(request, original);
+    }
     let (old_input, old_schema) = original.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
     // Every already dispatchable historical wire, including partial continuity,
     // remains byte-exact. Compose lossless candidates only after that boundary.
@@ -862,6 +938,29 @@ pub(crate) fn compile_storyboard_dispatch_transport(
         return Ok(original);
     }
     Ok(Some(CompiledStoryboardTransport { profile: PROFILE, input, schema: old_schema.clone() }))
+}
+
+fn compile_refinement_audit_transport(
+    request: &TextRequest,
+    original: Option<CompiledStoryboardTransport>,
+) -> Result<Option<CompiledStoryboardTransport>, String> {
+    let (old_input, old_schema) = original.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+    if crate::text_executor::codex_wire_characters(request, old_input, old_schema) <= STORYBOARD_TRANSPORT_LIMIT
+        || has_notation(&request.input) || request.input.get("losslessInputRule").is_some() {
+        return Ok(original);
+    }
+    let mut input = old_input.clone();
+    input.as_object_mut().ok_or("精修输入不是对象")?.remove("losslessInputRule");
+    compact_refinement_audit(&mut input, &request.input);
+    if expand(&input, &input)? != request.input { return Err("精修审计共享列未完整还原原输入；未派发请求".into()); }
+    input["losslessInputRule"] = json!(refinement_audit_rule());
+    let before = crate::text_executor::transport_payload_characters(request, old_input, old_schema);
+    let after = crate::text_executor::transport_payload_characters(request, &input, old_schema);
+    if before.checked_sub(after).is_none_or(|saving| saving < 2_048)
+        || crate::text_executor::codex_wire_characters(request, &input, old_schema) > STORYBOARD_TRANSPORT_LIMIT {
+        return Ok(original);
+    }
+    Ok(Some(CompiledStoryboardTransport { profile: THREE_ROLE_PROFILE, input, schema: old_schema.clone() }))
 }
 
 pub(super) fn compile_dispatch_before_metadata(
@@ -1040,6 +1139,9 @@ fn compile_dispatch_transport(
     finish_repetitions: bool,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
     let gain_gated = uses_repetition_transport_profile(&request.input)?;
+    if preserve_fitting_refinement(request) {
+        return Ok(None);
+    }
     if finish_repetitions && request.stage == "storyboardFinish" {
         // Measure the old compiler's final selected wire, not an intermediate
         // candidate with an extra instruction. Unmarked frozen fitting bytes stay exact;
@@ -1123,7 +1225,9 @@ fn compile_transport(
     request: &TextRequest,
     legacy_grouping: bool,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
-    if !supported_request(request) || (legacy_grouping && request.stage != "storyboardFinish") {
+    if !supported_request(request) || (legacy_grouping && request.stage != "storyboardFinish")
+        || preserve_fitting_refinement(request)
+    {
         return Ok(None);
     }
     let canonical_characters = crate::text_executor::transport_payload_characters(
@@ -1225,6 +1329,171 @@ fn compile_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refinement_transport_fixture(target_chars: usize) -> TextRequest {
+        let mut request = dispatch_fixture();
+        request.stage = "storyboardRefine".into();
+        request.skill = "director-refinement".into();
+        request.input.as_object_mut().unwrap().remove("finishMode");
+        request.input["refinementScope"] = json!({"kind":"episode","sourceRefs":request.input["sourceRows"].as_array().unwrap().iter().map(|row|row["id"].clone()).collect::<Vec<_>>()});
+        request.input["acceptedProvenance"] = json!([{"unitId":"accepted-unit","unitVersion":2,"unitSha256":"unchanged"}]);
+        request.input["previousDraft"]["units"][0]["literalPadding"] = json!("");
+        let baseline=crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema);
+        assert!(target_chars>=baseline);
+        request.input["previousDraft"]["units"][0]["literalPadding"] = json!("a".repeat(target_chars-baseline));
+        assert_eq!(crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema),target_chars);
+        request
+    }
+
+    #[test]
+    fn refinement_fitting_transport_keeps_exact_legacy_cli_and_sdk_input_bytes() {
+        for limit in [100_000,199_999,200_000] {
+            let mut request=refinement_transport_fixture(limit);
+            for marked in [false,true] {
+                if marked {request.input[REPETITION_TRANSPORT_PROFILE_FIELD]=json!(REPETITION_TRANSPORT_PROFILE);}
+                // Retune after adding a future profile marker: it must not opt
+                // an already fitting Refine into the editor's gain-based path.
+                if marked {request.input["previousDraft"]["units"][0]["literalPadding"]=json!("");let n=crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema);request.input["previousDraft"]["units"][0]["literalPadding"]=json!("a".repeat(limit-n));}
+                let before=serde_json::to_vec(&request).unwrap();
+                assert!(compile_storyboard_transport(&request).unwrap().is_none());
+                assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+                assert!(compile_legacy_finish_grouping_transport(&request).unwrap().is_none());
+                let mut legacy=request.clone();legacy.stage="unsupported-refinement-baseline".into();
+                let expected=crate::text_executor::compile_codex_input(&legacy).unwrap();
+                let mut prompt:Value=serde_json::from_str(&expected.prompt).unwrap();prompt["stage"]=json!(request.stage);
+                let actual=crate::text_executor::compile_codex_input(&request).unwrap();
+                assert_eq!(actual.prompt,prompt.to_string());assert_eq!(actual.schema,expected.schema);
+                assert_eq!(serde_json::to_vec(&request).unwrap(),before);
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_oversize_transport_roundtrips_full_draft_rows_rules_and_provenance() {
+        let request=refinement_transport_fixture(200_001);let before=serde_json::to_vec(&request).unwrap();
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema)<=STORYBOARD_TRANSPORT_LIMIT);
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);
+        assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
+        for field in ["previousDraft","acceptedProvenance","refinementScope","nextBoundary","assets","facts"] {assert_eq!(wire.input[field],request.input[field],"{field}");}
+        assert!(storyboard_transport_rule(&request,&wire.input).is_some());
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();
+        let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();assert_eq!(prompt["rules"],request.rule_snapshot);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),before);
+        let mut tampered=wire.input.clone();tampered["previousDraft"]["units"][0]["id"]=json!("different-unit");
+        assert!(storyboard_transport_rule(&request,&tampered).is_none());
+    }
+
+    #[test]
+    fn refinement_source_markers_remain_literal_and_noncompressible_oversize_stays_blocked() {
+        for marker in [json!({"$same":"#/plan"}),json!({"$rowIds":[["sourceRows",0,1]]}),json!({"$sourceRows":{}}),json!({"$auditRows":{}})] {
+            let mut request=refinement_transport_fixture(210_000);request.input["ordinarySourceData"]=marker;
+            let before=serde_json::to_vec(&request).unwrap();
+            assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+            assert_eq!(serde_json::to_vec(&request).unwrap(),before);
+        }
+        let mut request=refinement_transport_fixture(210_000);
+        request.input=json!({"previousDraft":{"units":[{"prompt":"a".repeat(220_000)}]}});
+        assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+        assert!(crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema)>STORYBOARD_TRANSPORT_LIMIT);
+        let mut fitting=refinement_transport_fixture(100_000);
+        fitting.input[REPETITION_TRANSPORT_PROFILE_FIELD]=json!("unknown-profile");
+        assert!(compile_storyboard_dispatch_transport(&fitting).is_err());
+    }
+
+    fn refinement_audit_fixture() -> Value {
+        let mut speech=json!({});
+        for kind in ["lineTimings", "turnGaps"] {
+            let rows:Vec<_>=(0..40).map(|index| {
+                let mut row=serde_json::Map::new();
+                for column in audit_columns(kind).unwrap() {
+                    let value=if audit_cell_valid(column,&json!("text")) {json!(format!("exact-id-{index}-quote\"-slash\\-🙂"))} else {json!(index as f64+0.125)};
+                    row.insert((*column).into(),value);
+                }
+                Value::Object(row)
+            }).collect();
+            speech[kind]=json!(rows);
+        }
+        json!({"rhythm":{"audit":{"speech":speech}}})
+    }
+
+    #[test]
+    fn refinement_audit_tables_roundtrip_nulls_unknown_fields_and_reject_malformed_tuples() {
+        let mut canonical=json!({"capacityBrief":refinement_audit_fixture()});
+        for kind in ["lineTimings", "turnGaps"] {
+            let rows=canonical["capacityBrief"]["rhythm"]["audit"]["speech"][kind].as_array_mut().unwrap();
+            let column=audit_columns(kind).unwrap()[0];
+            rows[0][column]=Value::Null;
+            rows[1]["unknownFutureField"]=json!({"null":null,"literal":"exact extra bytes🙂"});
+            rows[2][column]=json!(false);
+            rows[3].as_object_mut().unwrap().remove(column);
+        }
+        let mut wire=canonical.clone();compact_refinement_audit(&mut wire,&canonical);
+        assert_eq!(expand(&wire,&wire).unwrap(),canonical);
+        for kind in ["lineTimings", "turnGaps"] {
+            let table=&wire["capacityBrief"]["rhythm"]["audit"]["speech"][kind];
+            assert!(table["$auditRows"]["values"][0][0].is_null());
+            for index in 1..=3 {assert_eq!(table["$auditRows"]["values"][index],canonical["capacityBrief"]["rhythm"]["audit"]["speech"][kind][index]);}
+            let mut truncated=table.clone();truncated["$auditRows"]["values"][0].as_array_mut().unwrap().pop();assert!(decode_audit_rows(&truncated).is_err());
+            let mut bad_type=table.clone();bad_type["$auditRows"]["values"][0][0]=json!(false);assert!(decode_audit_rows(&bad_type).is_err());
+            let mut bad_columns=table.clone();bad_columns["$auditRows"]["columns"][0]=json!("unknown");assert!(decode_audit_rows(&bad_columns).is_err());
+            let mut bad_kind=table.clone();bad_kind["$auditRows"]["kind"]=json!("unknown");assert!(decode_audit_rows(&bad_kind).is_err());
+            let mut chained=table.clone();chained["$auditRows"]["values"][0]=json!({"$same":"#/plan"});assert!(decode_audit_rows(&chained).is_err());
+        }
+        let unknown=json!({"capacityBrief":{"rhythm":{"audit":{"speech":{"lineTimings":[{"future":null}],"turnGaps":{"notRows":true}}}}}});
+        let mut literal=unknown.clone();compact_refinement_audit(&mut literal,&unknown);assert_eq!(literal,unknown);
+    }
+
+    #[test]
+    fn refinement_audit_recovers_only_oversize_wires_and_preserves_complete_draft_and_rules() {
+        let mut request=refinement_transport_fixture(230_000);
+        request.input["capacityBrief"]=refinement_audit_fixture();
+        for _ in 0..3 {
+            let wire=compile_dispatch_before_metadata(&request).unwrap().unwrap();
+            let chars=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);
+            let n=request.input["previousDraft"]["units"][0]["literalPadding"].as_str().unwrap().len();
+            request.input["previousDraft"]["units"][0]["literalPadding"]=json!("a".repeat((n as isize+203_131-chars as isize) as usize));
+        }
+        let old=compile_dispatch_before_metadata(&request).unwrap().unwrap();
+        assert_eq!(crate::text_executor::codex_wire_characters(&request,&old.input,&old.schema),203_131);
+        let frozen=serde_json::to_vec(&request).unwrap();
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert!(crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema)<=STORYBOARD_TRANSPORT_LIMIT);
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
+        for field in ["previousDraft","refinementScope","acceptedProvenance"] {assert_eq!(wire.input[field],request.input[field]);}
+        assert_eq!(storyboard_transport_rule(&request,&wire.input),Some(refinement_audit_rule().as_str()));
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();
+        assert_eq!(prompt["rules"],request.rule_snapshot);assert_eq!(serde_json::to_vec(&request).unwrap(),frozen);
+        let mut wrong_stage=request.clone();wrong_stage.stage="storyboardCreate".into();assert!(storyboard_transport_rule(&wrong_stage,&wire.input).is_none());
+        request.input["previousDraft"]["units"][0]["literalPadding"]=json!("");
+        let chars=crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema);
+        request.input["previousDraft"]["units"][0]["literalPadding"]=json!("a".repeat(200_000-chars));
+        assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "explicit captured Refine canonical request, read-only bytes, zero model/DB calls"]
+    fn refinement_captured_request_proves_full_roundtrip_and_real_envelope_capacity() {
+        let file=std::env::var("DIRECTOR_REFINE_READONLY_REQUEST").expect("explicit captured request path required");
+        let before=std::fs::read(&file).unwrap();let request:TextRequest=serde_json::from_slice(&before).unwrap();
+        assert_eq!(request.stage,"storyboardRefine");assert_eq!(request.skill,"director-refinement");
+        let frozen=serde_json::to_vec(&request).unwrap();
+        let canonical_cli=crate::text_executor::codex_wire_characters(&request,&request.input,&request.schema);
+        let canonical_max=crate::text_executor::transport_payload_characters(&request,&request.input,&request.schema);
+        assert!(canonical_cli>STORYBOARD_TRANSPORT_LIMIT);
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().expect("oversized Refine has a reversible projection");
+        let cli=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);
+        let max=crate::text_executor::transport_payload_characters(&request,&wire.input,&wire.schema);
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
+        for field in ["previousDraft","acceptedProvenance","refinementScope"] {assert_eq!(wire.input[field],request.input[field],"{field}");}
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();
+        assert_eq!(prompt["rules"],request.rule_snapshot);assert_eq!(prompt["input"],wire.input);
+        assert_eq!(compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),cli);
+        assert_eq!(serde_json::to_vec(&request).unwrap(),frozen);assert_eq!(std::fs::read(file).unwrap(),before);
+        println!("Refine canonicalCli={canonical_cli} canonicalMax={canonical_max} projectedCli={cli} projectedMax={max} exactInput=true exactSchema=true fullDraft=true fullRules=true sourceUnchanged=true modelCalls=0 databaseWrites=0");
+        assert!(cli<=STORYBOARD_TRANSPORT_LIMIT,"CLI/SDK wire still oversized: {cli}");
+        println!("SDK capacity accepted; API envelope within limit={} (API dispatch remains independently capacity-gated)",max<=STORYBOARD_TRANSPORT_LIMIT);
+    }
 
     #[test]
     fn joint_speaker_rows_stay_literal_and_all_metadata_roundtrips() {
