@@ -218,6 +218,14 @@ test('live execution proof excludes only the exact current readonly RPC and its 
   }
 });
 
+test('recovery alias parked on the homepage can prove its own native idle queue while looking up the absent original request',async()=>{
+  const requestedUrl='https://chatgpt.com/c/11111111-1111-4111-8111-111111111111';
+  const receipt=await fixture({records:{[PREFIX+'1']:{...sourceRecord,requestedUrl}}}).lookup();
+  assert.equal(receipt.status,'confirmed_absent');assert.equal(receipt.inventory.sourceExecutionProof.sourceTabId,1);
+  const result=await serverFixture(receipt,{requestedUrl}).ownedLaunchInventory(ID,runtime);
+  assert.equal(result.status,'confirmed_absent');assert.equal(result.complete,true);assert.equal(result.sourceClientId,runtime.sourceClientId);
+});
+
 test('server live idle receipt rejects stale, self-asserted or altered execution proof even after canonical hash recomputation',async()=>{
   const receipt=await fixture().lookup();
   const cases=[r=>{delete r.inventory.sourceExecutionProof},r=>{r.inventory.sourceExecutionProof.observedAt=Date.now()-6000},

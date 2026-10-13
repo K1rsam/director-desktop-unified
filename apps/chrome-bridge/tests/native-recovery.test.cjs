@@ -29,7 +29,8 @@ async function fixture(options = {}) {
   const fixturePrompt=options.markerless?'请生成一张原图。':prompt;
   let active = options.active || null;
   let launch = options.launch === undefined ? `director-desktop-${requestId}` : options.launch;
-  const calls = [], observed = [], messages = [];
+  let contentEpoch='content-epoch',domReads=0;
+  const calls = [], observed = [], messages = [], domDelays=[];
   const image = { isConnected: true, src: options.blob ? 'blob:https://chatgpt.com/synthetic' : '', currentSrc: '', naturalWidth: 0, naturalHeight: 0, closest: () => ({}), getAttribute: () => '' };
   const user = { isConnected: true, innerText: options.domPrompt || fixturePrompt, querySelectorAll: () => [] };
   if(options.presentationControls){
@@ -41,9 +42,19 @@ async function fixture(options = {}) {
   const assistant = { isConnected: true, innerText: options.reply||'', querySelectorAll: () => options.noImage?[]:[image] };
   const turns = [user, ...(options.noAssistant ? [] : [assistant]), ...(options.extraUser ? [user] : []), ...(options.extraAssistant ? [assistant] : [])];
   let reads = 0;
-  const context = vm.createContext({ URL, AbortController, TextEncoder, TextDecoder, Uint8Array, Response, crypto: webcrypto, setTimeout, clearTimeout,
+  const context = vm.createContext({ URL, AbortController, TextEncoder, TextDecoder, Uint8Array, Response, crypto: webcrypto,
+    setTimeout:(callback,ms)=>{if(ms<=250){domDelays.push(ms);return setTimeout(callback,options.fastDOMTimers?1:ms);}return setTimeout(callback,ms);},clearTimeout,
     location: { href: `https://chatgpt.com/c/${conversationId}`, pathname: `/c/${conversationId}` }, document: { title: 'Synthetic owned tab' },
-    ChatGptTurnDom: { createTurnDom: () => ({ getTurnNodes: () => turns, role: node => node === user ? 'user' : 'assistant' }) },
+    ChatGptTurnDom: { createTurnDom: () => ({ getTurnNodes: () => {
+      domReads++;
+      if(domReads===2){
+        if(options.domWaitMutation==='active')active={requestId:'different-request'};
+        if(options.domWaitMutation==='launch')launch='different-owned-page';
+        if(options.domWaitMutation==='epoch')contentEpoch='different-document';
+        if(options.domWaitMutation==='page')context.location.href='https://chatgpt.com/c/different';
+      }
+      return options.domNeverReady||domReads<=(options.domReadyAfterReads||0)?[]:turns;
+    }, role: node => node === user ? 'user' : 'assistant' }) },
     fetch: async (url, init) => {
       calls.push({ url, init });
       assert.equal(init.method || 'GET', 'GET', 'recovery cannot submit prompts or create jobs');
@@ -85,8 +96,8 @@ async function fixture(options = {}) {
   const expected = { mode: 'image_record_v1', requestId, conversationId, promptSha256: await proof.digest(fixturePrompt), imageCount: 1, allowReleasedRequest: options.allowReleasedRequest !== false, allowReloadedOriginalTab: options.allowReloadedOriginalTab === true };
   if(options.readOnlyRecoveryLaunch)expected.readOnlyRecoveryLaunch=options.readOnlyRecoveryLaunch;
   if(options.savedConversation)expected.savedConversation={version:'chrome-conversation-locator/v1',requestId,conversationId,promptSha256:expected.promptSha256,userMessageId:userId,...options.savedConversation};
-  const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => 'content-epoch', readLatestAssistantSnapshot: snapshot, onBound: () => options.onBound?.({user,assistant,image}) };
-  return { context, proof, expected, deps, snapshot, calls, observed, messages, user, assistant, image, get reads() { return reads; } };
+  const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => contentEpoch, readLatestAssistantSnapshot: snapshot, onBound: () => options.onBound?.({user,assistant,image}) };
+  return { context, proof, expected, deps, snapshot, calls, observed, messages, user, assistant, image, domDelays, get domReads(){return domReads;},get reads() { return reads; } };
 }
 
 test('verified final text without an image is a stable terminal receipt, never an image result',async()=>{
@@ -154,6 +165,48 @@ test('released task downloads its native original bytes only after exact branch 
     assert.equal(f.proof.downloadBytes(artifact, originalUrl), null, 'edited DOM revokes byte binding');
     assert.equal(f.proof.key(f.user), '');
   }
+});
+
+test('saved recovery page waits locally for its original conversation DOM before any native record read',async()=>{
+ const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+ const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias,domReadyAfterReads:3,fastDOMTimers:true});
+ const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.equal(p.status,'matched_complete');assert.equal(p.userMessageId,userId);assert.equal(p.bindings[0].bytesSha256,hash(png));
+ assert.equal(f.domDelays.length,3);assert.ok(f.domDelays.every(ms=>ms===250));assert.equal(f.reads,2);assert.ok(f.calls.every(call=>call.init.method==='GET'));
+});
+
+test('saved recovery DOM wait has an eight-second 32-delay ceiling and never calls the backend without its exact boundary',async()=>{
+ const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+ const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias,domNeverReady:true,fastDOMTimers:true});
+ const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.equal(p.reason,'dom_user_boundary');assert.equal(f.calls.length,0);assert.equal(f.domDelays.length,32);
+ assert.equal(f.domDelays.reduce((sum,ms)=>sum+ms,0),8000);assert.equal(f.proof.imageReady(f.image),false);
+});
+
+test('genuine multi-user, multi-assistant or nonempty prompt mismatch rejects immediately without waiting',async()=>{
+ const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+ for(const change of [{extraUser:true},{extraAssistant:true},{domPrompt:'different source text'}]){
+  const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias,...change});
+  assert.equal((await f.proof.read(f.expected,f.snapshot(),f.deps)).reason,'dom_user_boundary');assert.equal(f.domDelays.length,0);assert.equal(f.calls.length,0);
+ }
+});
+
+test('DOM wait rejects changed page launch document or active request without a native read',async()=>{
+ const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+ for(const domWaitMutation of ['active','launch','epoch','page']){
+  const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias,domNeverReady:true,fastDOMTimers:true,domWaitMutation});
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.equal(p.reason,domWaitMutation==='page'?'page_conversation_changed':'active_request_identity');assert.equal(f.calls.length,0);assert.ok(f.domDelays.length<=2);
+ }
+});
+
+test('caller cancellation ends the DOM wait within the original recovery timeout budget',async()=>{
+ const alias='bridge-director-desktop-22222222-2222-4222-8222-222222222222';
+ const f=await fixture({markerless:true,savedConversation:{},launch:alias,readOnlyRecoveryLaunch:alias,domNeverReady:true}),abort=new AbortController();f.deps.signal=abort.signal;
+ const stopped=setTimeout(()=>abort.abort(),10);try{
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);assert.equal(p.reason,'timeout_or_cancelled_conversation_dom_ready');assert.equal(f.calls.length,0);assert.ok(f.domDelays.length<=1);
+ }finally{clearTimeout(stopped);}
+});
+
+test('ordinary generation reads retain their original immediate boundary check',async()=>{
+ const f=await fixture({active:{requestId},domNeverReady:true});assert.equal((await f.proof.read(f.expected,f.snapshot(),f.deps)).reason,'dom_user_boundary');assert.equal(f.domDelays.length,0);assert.equal(f.calls.length,0);
 });
 
 test('presentation bubble controls do not enter full prompt hash or prevent original image recovery',async()=>{

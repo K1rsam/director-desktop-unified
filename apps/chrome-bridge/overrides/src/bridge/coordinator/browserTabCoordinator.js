@@ -61,7 +61,7 @@ export class BrowserTabCoordinator {
       : 'No connected extension client supports browser tab control.');
   }
 
-  async waitForBrowserClient(predicate, timeoutMs = 20_000) {
+  async waitForBrowserClient(predicate, timeoutMs = 20_000, { observeNavigation = false } = {}) {
     const existing = Array.from(this.hub.clients || []).find(predicate);
     if (existing) return existing;
     return await new Promise((resolve, reject) => {
@@ -71,6 +71,10 @@ export class BrowserTabCoordinator {
         settled = true;
         clearTimeout(timer);
         this.hub.off?.('client.ready', handler);
+        if (observeNavigation) {
+          this.hub.off?.('client.changed', handler);
+          this.hub.off?.('client.activity', activityHandler);
+        }
         if (err) reject(err);
         else resolve(client);
       };
@@ -78,7 +82,12 @@ export class BrowserTabCoordinator {
         if (!predicate(client)) return;
         finish(null, client);
       };
+      const activityHandler = (event) => handler(event?.client);
       this.hub.on?.('client.ready', handler);
+      if (observeNavigation) {
+        this.hub.on?.('client.changed', handler);
+        this.hub.on?.('client.activity', activityHandler);
+      }
       const timer = setTimeout(() => finish(new Error(`Timed out waiting for the new ChatGPT browser tab after ${timeoutMs}ms`)), Math.max(250, Number(timeoutMs) || 20_000));
       timer.unref?.();
       handler();
@@ -164,12 +173,23 @@ export class BrowserTabCoordinator {
       timeoutMs,
       bridgeServerUrl: options.bridgeServerUrl || this.runtimeOptions.publicBaseUrl,
     }, { sourceClientId: source.id, timeoutMs: Math.min(timeoutMs, 15_000) });
+    // A launch hello may arrive before navigation finishes. Bind readiness to
+    // the native creation receipt and the full requested URL, not just a token.
+    if (!Number.isSafeInteger(response?.tabId) || response.tabId <= 0
+      || response.launchToken !== launchToken || response.requestedUrl !== url) {
+      throw Object.assign(new Error('Created browser tab receipt does not match the requested page; preserving the original launch without reopening'), {
+        code: 'BROWSER_TAB_OPEN_RECEIPT_MISMATCH',
+      });
+    }
     const client = await this.waitForBrowserClient(
       (candidate) => candidate?.ready
         && candidate.compatible !== false
         && candidate.compatibility?.compatible !== false
-        && (candidate.launchToken === launchToken || browserLaunchMetadataFromUrl(candidate.url).launchToken === launchToken),
+        && candidate.browserTabId === response.tabId
+        && candidate.launchToken === launchToken
+        && candidate.url === url,
       timeoutMs,
+      { observeNavigation: true },
     );
     return { ...response, launchToken, client: normalizeLaunchedClient(client, launchToken), sourceClientId: source.id, openedBy: 'extension' };
   }

@@ -31,6 +31,26 @@ fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Value,Value,Value
  let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":"bridge-director-desktop-22222222-2222-4222-8222-222222222222"}});
  assert!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|_|panic!("no new intent")).is_err());f.thread.join().unwrap();assert!(f.requests.lock().unwrap().iter().all(|(r,_)|r.starts_with("GET ")));std::env::remove_var(cfg.bridge_token_env.unwrap());
 }
+#[test]fn chrome_conversation_existing_homepage_alias_navigates_once_after_durable_reservation(){
+ let tmp=fixture(vec![]);let(c,_,loc,root,native,mut alias)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ alias["launchToken"]=json!("bridge-director-desktop-33333333-3333-4333-8333-333333333333");alias["requestedUrl"]=loc["url"].clone();
+ let restored=alias.clone();alias["url"]=json!("https://chatgpt.com/");let list=json!({"ok":true,"clients":[root,alias]});
+ let f=fixture(vec![list.clone(),native,list,json!({"ok":true,"version":"director-owned-conversation-navigation/v1","status":"restored","openedNewTab":false,"submitCalled":false,"client":restored}),json!({"ok":true,"clients":[root,restored]})]);
+ let(cfg,p,loc,_,_,_)=setup(&f.endpoint);let original=json!(p);let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":alias["launchToken"]}});let events=Mutex::new(vec![]);
+ let result=conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|event|{if event["type"]=="recovery_navigation_intent"{assert_eq!(f.requests.lock().unwrap().len(),3);}events.lock().unwrap().push(event.clone());Ok(())}).unwrap();
+ f.thread.join().unwrap();assert_eq!(result["url"],loc["url"]);assert_eq!(json!(p),original);
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),5);assert!(calls[3].0.starts_with("POST /browser/tabs/recover-owned-conversation "));
+ let body:Value=serde_json::from_str(&calls[3].1).unwrap();assert_eq!(body["originalRequestId"],p.request.request_id);assert_eq!(body["expectedLaunchToken"],alias["launchToken"]);assert_eq!(body["targetUrl"],loc["url"]);
+ assert_eq!(events.lock().unwrap()[0]["type"],"recovery_navigation_intent");std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
+#[test]fn chrome_conversation_unknown_navigation_keeps_same_alias_without_another_navigation(){
+ let tmp=fixture(vec![]);let(c,_,loc,root,native,mut alias)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ alias["launchToken"]=json!("bridge-director-desktop-33333333-3333-4333-8333-333333333333");alias["requestedUrl"]=loc["url"].clone();alias["url"]=json!("https://chatgpt.com/");
+ let list=json!({"ok":true,"clients":[root,alias]});let f=fixture(vec![list.clone(),native,list]);let(cfg,p,loc,_,_,_)=setup(&f.endpoint);
+ let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":alias["launchToken"]},"recoveryNavigation":{"type":"recovery_navigation_intent"}});
+ assert_eq!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|_|panic!("cannot reserve again")).unwrap_err().code,"CHROME_LINK_RECOVERY_HELD");
+ f.thread.join().unwrap();assert!(f.requests.lock().unwrap().iter().all(|(r,_)|r.starts_with("GET ")));std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
 #[test]fn chrome_conversation_foreign_saved_url_user_or_frozen_prepared_changes_are_rejected(){
  let f=fixture(vec![]);let(cfg,p,loc,_,_,_)=setup(&f.endpoint);assert!(conversation::locator_valid(&cfg,&p,&loc));
  for field in ["requestId","sourceClientId","preparedSha256","promptSha256","conversationId","url","userMessageId","browserBinding"]{

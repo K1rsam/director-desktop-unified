@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
+#[path = "store_job_records.rs"]
+mod job_records;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub fn now() -> String {

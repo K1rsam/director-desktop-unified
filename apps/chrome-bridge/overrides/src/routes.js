@@ -787,6 +787,20 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     } catch (err) { next(err); }
   });
 
+  router.post('/browser/tabs/recover-owned-conversation', async (req, res, next) => {
+    try {
+      const result = await bridge.recoverOwnedConversation({
+        sourceClientId: req.body?.sourceClientId,
+        expectedLaunchToken: req.body?.expectedLaunchToken,
+        expectedCurrentUrl: req.body?.expectedCurrentUrl,
+        targetUrl: req.body?.targetUrl,
+        originalRequestId: req.body?.originalRequestId,
+        timeoutMs: req.body?.timeoutMs,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) { next(err); }
+  });
+
   router.post('/browser/tabs/reload', async (req, res, next) => {
     try {
       const sourceClientId = String(req.body?.sourceClientId || req.body?.clientId || '').trim();

@@ -80,14 +80,14 @@ test('channel cards keep one connection flow and save current input before check
     const policy = await server.ssrLoadModule('/src/executionPolicy.ts');
     const { SettingsPanel, ProjectSettingsPanel } = await server.ssrLoadModule('/src/Panels.tsx');
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
-    policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['files.choose', 'runtime.status', 'chrome.status', 'chrome.check', 'chrome.connect', 'chrome.open', 'chrome.bind', 'settings.global.save', 'providers.refresh', 'textCli.login', 'dreamina.login', 'dreamina.status', 'readiness.check', 'runtime.prepare'] });
+    policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['files.choose', 'runtime.status', 'chrome.status', 'chrome.check', 'chrome.connect', 'chrome.open', 'chrome.bind', 'chrome.managed.status', 'chrome.managed.login', 'chrome.managed.start', 'chrome.managed.recover', 'settings.global.save', 'providers.refresh', 'textCli.login', 'dreamina.login', 'dreamina.status', 'readiness.check', 'runtime.prepare'] });
     const makeSettings = () => ({ schemaVersion: 'app-settings/v1', revision: 0, providers: structuredClone(previewWorkspace.providers), rules: [], settings: { textProvider: 'api', bhEndpoint: 'https://old.example.test', bhAccountId: 'stable-bh', chromeAccountId: 'stable-chrome', codexPath: '/synthetic/codex', textSdkNodePath: '/synthetic/node', dreaminaPath: '/synthetic/dreamina' } });
 
     await t.test('one card for each channel, with no Canvas or editable program paths', async () => {
       const view = hookRenderer();
       try {
         const nodes = view.render(React.createElement(SettingsPanel, { appSettings: makeSettings(), writable: true, mutate: async () => { throw new Error('opening settings must not mutate'); } }));
-        for (const name of ['即梦生成 CLI', 'BH API', 'Chrome 网页']) assert.equal(nodes.filter(node => node.type === 'section' && node.props['aria-label'] === name).length, 1, name);
+        for (const name of ['即梦生成 CLI', 'BH API', 'ChatGPT 网页']) assert.equal(nodes.filter(node => node.type === 'section' && node.props['aria-label'] === name).length, 1, name);
         assert.equal(nodes.filter(node => node.type === 'button' && node.props['data-readiness-provider'] === 'dreamina').length, 1);
         assert.ok(!nodes.some(node => node.props['data-readiness-provider'] === 'dreamina_canvas' || node.props['data-canvas-path']));
         assert.ok(!nodes.some(node => node.type === 'input' && String(node.props.value || '').startsWith('/synthetic/')));
@@ -97,7 +97,7 @@ test('channel cards keep one connection flow and save current input before check
 
     for (const id of ['bh', 'chrome']) await t.test(`${id} saves typed configuration and preserves the stable account identity before checking`, async () => {
       const view = hookRenderer(), appSettings = makeSettings(), writes: any[] = [];
-      const title = id === 'bh' ? 'BH API' : 'Chrome 网页';
+      const title = id === 'bh' ? 'BH API' : 'ChatGPT 网页';
       const mutate = async (action: string, values: any) => { writes.push({ action, ...values }); return { ...appSettings, settings: values.settings || appSettings.settings }; };
       const element = React.createElement(SettingsPanel, { appSettings, writable: true, mutate });
       try {
@@ -135,8 +135,8 @@ test('channel cards keep one connection flow and save current input before check
         input(nodes, 'BH API 凭据').props.onChange({ target: { value: 'draft-token' } });
         const connect = view.render(element).find(node => node.type === 'button' && node.props['data-chrome-connect']); assert.ok(connect);
         connect.props.onClick(); await settle(); nodes = view.render(element);
-        assert.equal(input(nodes, 'Chrome 网页 服务地址').props.value, 'http://127.0.0.1:3010');
-        assert.ok(!nodes.some(node => node.type === 'input' && node.props['aria-label'] === 'Chrome 网页 账户名称'), 'Chrome identity is discovered, not user entered');
+        assert.equal(input(nodes, 'ChatGPT 网页 服务地址').props.value, 'http://127.0.0.1:3010');
+        assert.ok(!nodes.some(node => node.type === 'input' && node.props['aria-label'] === 'ChatGPT 网页 账户名称'), 'Chrome identity is discovered, not user entered');
         assert.equal(input(nodes, 'BH API 服务地址').props.value, 'https://draft-bh.example.test');
         assert.equal(input(nodes, 'BH API 凭据').props.value, 'draft-token');
         assert.deepEqual(calls.map(item => item.action), ['chrome.status', 'chrome.connect', 'chrome.status']);
@@ -349,11 +349,11 @@ test('channel cards keep one connection flow and save current input before check
         input(nodes, 'BH API 服务地址').props.onChange({ target: { value: 'https://submitted.example.test' } });
         check(view.render(element), 'bh').props.onClick();
         nodes = view.render(element);
-        input(nodes, 'Chrome 网页 服务地址').props.onChange({ target: { value: 'http://localhost:9123' } });
+        input(nodes, 'ChatGPT 网页 服务地址').props.onChange({ target: { value: 'http://localhost:9123' } });
         input(nodes, 'BH API 凭据').props.onChange({ target: { value: 'typed-during-save' } });
         resolveSave({ ...appSettings, settings: writes[0].settings }); await settle();
         nodes = view.render(element);
-        assert.equal(input(nodes, 'Chrome 网页 服务地址').props.value, 'http://localhost:9123');
+        assert.equal(input(nodes, 'ChatGPT 网页 服务地址').props.value, 'http://localhost:9123');
         assert.equal(input(nodes, 'BH API 凭据').props.value, 'typed-during-save');
         assert.equal(writes[0].settings.chromeToken, undefined, 'empty credentials do not overwrite stored ones');
         assert.equal(writes.filter(item => item.action === 'providers.refresh').length, 1);
@@ -403,13 +403,42 @@ test('channel cards keep one connection flow and save current input before check
       const element=React.createElement(SettingsPanel,{appSettings,writable:true,mutate});
       try {
         view.render(element);await settle();let nodes=view.render(element);
-        const select=nodes.find(node=>node.type==='select'&&node.props['aria-label']==='Chrome 执行浏览器');assert.ok(select);
+        const select=nodes.find(node=>node.type==='select'&&node.props['aria-label']==='网页出图执行浏览器');assert.ok(select);
         assert.equal(nodes.find(node=>node.type==='option'&&node.props.value===second)?.props.disabled,true);
         select.props.onChange({target:{value:first}});await settle();nodes=view.render(element);
         assert.equal(writes.length,1);assert.deepEqual(writes[0],{action:'chrome.bind',profileId:first});assert.equal((writes[0] as Record<string,unknown>).projectId,undefined);
-        assert.equal(nodes.find(node=>node.type==='select'&&node.props['aria-label']==='Chrome 执行浏览器')?.props.value,first);
+        assert.equal(nodes.find(node=>node.type==='select'&&node.props['aria-label']==='网页出图执行浏览器')?.props.value,first);
         const form=nodes.find(node=>node.type==='form');assert.ok(form);await form.props.onSubmit({preventDefault(){}});await settle();
         assert.equal(writes[1].expectedRevision,5);assert.equal(writes[1].settings.chromeProfileId,first);
+      } finally {view.unmount();}
+    });
+    await t.test('managed Edge is global, coalesces repeated clicks and only binds a ready browser', async () => {
+      const view=hookRenderer(), appSettings=makeSettings(), calls:any[]=[], writes:any[]=[];
+      const profile='b84d4521-56ba-4f84-9948-090f82d639e7';
+      const report={schemaVersion:'managed-browser/v1',ok:true,state:'login_window_open',reason:'login',message:'等待官方登录',installed:true,running:true,connected:true,authenticated:false,ready:false,extensionReady:true,process:{owned:true,running:true,pid:42},profileId:profile,requiresLogin:true,newBinding:false,modelSubmissions:0,videoSubmissions:0};
+      let finishLogin!:(value:unknown)=>void;
+      chromeRespond=async request=>{
+        if(request.action==='chrome.managed.login'){calls.push(request);return new Promise(resolve=>{finishLogin=resolve;});}
+        if(request.action==='chrome.managed.start'){calls.push(request);return {...report,state:'ready',authenticated:true,ready:true,requiresLogin:false};}
+        return chromeReport;
+      };
+      const mutate=async(action:string,values:any)=>{writes.push({action,...values});return {...appSettings,revision:3,settings:{...appSettings.settings,chromeProfileId:profile}};};
+      const element=React.createElement(SettingsPanel,{appSettings,writable:true,mutate});
+      const button=(nodes:Host[],label:string)=>{const node=nodes.find(n=>n.type==='button'&&content(n)===label);assert.ok(node,label);return node;};
+      try {
+        let nodes=view.render(element);await settle();nodes=view.render(element);
+        input(nodes,'BH API 服务地址').props.onChange({target:{value:'https://unsaved.example.test'}});
+        nodes=view.render(element);const login=button(nodes,'官方登录');
+        login.props.onClick();login.props.onClick();await settle();
+        assert.deepEqual(calls,[{action:'chrome.managed.login',scope:'global'}]);
+        finishLogin(report);await settle();nodes=view.render(element);
+        assert.ok(!nodes.some(n=>n.type==='button'&&content(n)==='用于后续新图片'));
+        assert.equal(input(nodes,'BH API 服务地址').props.value,'https://unsaved.example.test');
+        button(nodes,'后台启动').props.onClick();await settle();nodes=view.render(element);
+        assert.deepEqual(calls[1],{action:'chrome.managed.start',scope:'global'});
+        button(nodes,'用于后续新图片').props.onClick();await settle();nodes=view.render(element);
+        assert.deepEqual(writes,[{action:'chrome.bind',profileId:profile,managed:true}]);
+        assert.equal(input(nodes,'BH API 服务地址').props.value,'https://unsaved.example.test');
       } finally {view.unmount();}
     });
     await t.test('project production saves include fantasy preferences and exclude software connections', async () => {

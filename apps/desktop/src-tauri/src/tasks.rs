@@ -527,6 +527,19 @@ pub fn resume_job(
                 store.event(key, "query_error", &json!({"message":e.message}))?;
             } else if e.auth_required {
                 store.update_job(key, "auth_required", &json!({"error":e.message}))?;
+            } else if cfg.kind == "chrome" && s(&j, "provider") == "chrome"
+                && s(&j, "kind") == "image" && e.code == "CHROME_LINK_RECOVERY_HELD"
+            {
+                // A durable locator/open reservation awaiting proof cannot be
+                // repaired by polling it repeatedly. Pause this same original
+                // without spending or resetting its existing retry budgets.
+                store.claim_job_fields(key, s(&j, "status"), "recovery_paused", &json!({
+                    "error":e.message,"nextAttemptAt":0,
+                    "recoveryPause":{"code":e.code,"explicitResumeRequired":true,
+                        "providerTaskId":task,"requestId":j["snapshot"]["requestId"],
+                        "queryAttemptsPreserved":j["queryAttempts"],"downloadAttemptsPreserved":j["downloadAttempts"],
+                        "prepareCalled":false,"submitCalled":false}
+                }))?;
             } else {
                 store.retry_job(key, "query", &e.message)?;
             }

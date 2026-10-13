@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+const {webcrypto}=require('node:crypto');
 const token=id=>`bridge-director-desktop-00000000-0000-4000-8000-${String(id).padStart(12,'0')}`;
 function fixture(options={}){
   const writes=[],plans=[],queries=[],remembered=[],navigated=[],reloaded=[],tabs=[{id:1,url:'https://chatgpt.com/c/own-one'},{id:2,url:'https://chatgpt.com/c/own-two'},{id:3,url:'https://chatgpt.com/c/user'},...(options.tabs||[])],records={1:{launchToken:token(1)},2:{launchToken:token(2)},...options.records};
@@ -7,7 +8,7 @@ function fixture(options={}){
     'chatgptBridgeLaunchedTab:2':records[2],
     ...options.session,
   };
-  const context=vm.createContext({URL,URLSearchParams,Date,Math,console:{info(){},warn(){},error(){}},setTimeout(){return 0;},
+  const context=vm.createContext({URL,URLSearchParams,Date,Math,crypto:webcrypto,TextEncoder,console:{info(){},warn(){},error(){}},setTimeout(){return 0;},
     chrome:{tabs:{query:async q=>{queries.push(q);return tabs;},get:async id=>tabs.find(t=>t.id===id),reload:async()=>{}},storage:{
       local:{set:async value=>{writes.push(value);Object.assign(local,value);},get:async key=>({[key]:local[key]}),remove:async key=>{delete local[key];}},
       session:{get:async()=>{if(options.sessionReadError)throw Error('session unavailable');return {...session};}},
@@ -122,6 +123,18 @@ test('reserved, missing, changed or conflicting controller identity never receiv
   }
   const f=controllerFixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
   f.local[CONTROL_STATE].serverUrl='http://127.0.0.1:9999';await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated,undefined);
+});
+
+test('maintenance freezes the full original controller including predecessor marker before replacing it',async()=>{
+ const f=controllerFixture();f.local[CONTROL_STATE].reloadInvalidated={operationId:'old',tabId:99};
+ const old=structuredClone(f.local[CONTROL_STATE]);await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+ const proof=f.local.bridgePendingExtensionReload.idleControllers[CONTROL_STATE];assert.deepEqual(proof.originalController,old);assert.match(proof.originalControllerSha256,/^[a-f0-9]{64}$/);
+ await f.coordinator.recoverPendingExtensionReload();const marker=f.local[CONTROL_STATE].reloadInvalidated;
+ assert.equal(marker.operationId,'operation');assert.deepEqual(marker.preMaintenanceController,old);assert.equal(marker.preMaintenanceControllerSha256,proof.originalControllerSha256);
+});
+test('nonidentity controller drift after snapshot cannot acquire maintenance invalidation',async()=>{
+ const f=controllerFixture();await f.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false});
+ f.local[CONTROL_STATE].unexpectedContract='changed';await f.coordinator.recoverPendingExtensionReload();assert.equal(f.local[CONTROL_STATE].reloadInvalidated,undefined);
 });
 
 const ownReloadCommand={commandId:'command',commandType:'extension.reload',scope:'standalone',requestId:'',mode:'result',operation:'maintenance',status:'dispatched'};

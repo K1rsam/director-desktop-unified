@@ -37,6 +37,17 @@ pub(super) fn saved(store:&Store,job:&str)->Result<Value>{
   for pointer in ["/requestId","/launchToken","/client/url","/client/launchToken"]{let mut bad=opened.clone();*bad.pointer_mut(pointer).unwrap()=json!("foreign");assert!(observe(&bad).is_err());assert_eq!(saved(&store,"job").unwrap()["recovery"],intent);}
   observe(&opened).unwrap();assert_eq!(saved(&store,"job").unwrap()["recovery"],opened);
  }
+ #[test]fn chrome_conversation_navigation_is_reserved_once_without_replacing_recovery_or_locator(){
+  let(_tmp,store,p,cfg,loc)=fixture();let observe=observer(&store,"job",&p,&cfg);
+  observe(&json!({"type":"locator","locator":loc})).unwrap();
+  let recovery=json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":"bridge-director-desktop-33333333-3333-4333-8333-333333333333","url":loc["url"],"submitCalled":false});
+  observe(&recovery).unwrap();
+  let nav=json!({"type":"recovery_navigation_intent","requestId":p.request.request_id,"launchToken":recovery["launchToken"],"url":loc["url"],"expectedCurrentUrl":"https://chatgpt.com/","sourceClientId":"alias","browserTabId":22,"submitCalled":false});
+  for field in ["requestId","launchToken","url","expectedCurrentUrl","sourceClientId","browserTabId","submitCalled"]{let mut bad=nav.clone();bad[field]=json!("");assert!(observe(&bad).is_err(),"{field}");}
+  observe(&nav).unwrap();assert!(observe(&nav).is_err());
+  let reopened=Store::open(store.root.clone()).unwrap();let state=saved(&reopened,"job").unwrap();
+  assert_eq!(state["recovery"],recovery);assert_eq!(state["locator"],loc);assert_eq!(state["recoveryNavigation"],nav);
+ }
  #[test]fn chrome_conversation_metadata_unsent_upload_proof_is_durable_immutable_and_bound_to_original_prepared(){
   let(_tmp,store,_,cfg,_)=fixture();let base=crate::chrome_terminal::tests::upload_fixture();let mut value=base["prepared"].clone();value["wire"]["browserBinding"]=json!(cfg.chrome_binding.as_ref());
   value["capabilityVersion"]=json!("fixture");value["uploadReceipts"]=json!([]);value["preparedAt"]=json!("original");for(key,val)in [("prompt",json!("synthetic image")),("ratio",json!("16:9")),("resolution",json!("native")),("references",json!([])),("options",json!({}))]{value["request"][key]=val;}
@@ -61,6 +72,14 @@ pub(super) fn observer<'a>(store:&'a Store,job:&'a str,p:&'a PreparedRequest,cfg
    let mut same=state["locator"].clone();if same["userMessageId"].is_null()&&!same.is_null(){same["userMessageId"]=loc["userMessageId"].clone();}
    if !providers::chrome_locator_valid(cfg,p,loc)||!state["locator"].is_null()&&same!=*loc{return Err(fail());}
    if state["locator"]==*loc{return Ok(());}state["locator"]=loc.clone();
+  }else if event["type"]=="recovery_navigation_intent"{
+   if !providers::chrome_locator_valid(cfg,p,&state["locator"])||event["requestId"]!=p.request.request_id
+    ||state["recovery"].is_null()||!state["recoveryNavigation"].is_null()
+    ||event["launchToken"]!=state["recovery"]["launchToken"]||event["url"]!=state["locator"]["url"]
+    ||event["expectedCurrentUrl"]!="https://chatgpt.com/"||event["submitCalled"]!=false
+    ||!event["sourceClientId"].as_str().is_some_and(|s|!s.is_empty())
+    ||!event["browserTabId"].as_i64().is_some_and(|id|id>0){return Err(fail());}
+   state["recoveryNavigation"]=event.clone();
   }else if ["recovery_intent","recovery_opened"].contains(&s(event,"type")){
    if !providers::chrome_locator_valid(cfg,p,&state["locator"])||event["requestId"]!=p.request.request_id{return Err(fail());}
    if event["type"]=="recovery_intent"&&!state["recovery"].is_null(){return Err(fail());}

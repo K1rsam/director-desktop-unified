@@ -105,6 +105,7 @@ export class BrowserBridge {
   #passivePrompts;
   #runtimeOptions;
   #serverInstanceId;
+  #conversationNavigations = new Set();
 
   constructor(hub, fileStore = null, eventBus = null, runtimeOptions = {}) {
     this.#hub = hub;
@@ -224,6 +225,75 @@ export class BrowserBridge {
 
   async openBrowserTab(options = {}) {
     return await this.#browserClients.openBrowserTab(options);
+  }
+
+  async recoverOwnedConversation(options = {}) {
+    const held = (reason) => Object.assign(new Error(`Owned conversation navigation held: ${reason}; no replacement page or generation was requested`), {
+      code: 'CHROME_OWNED_NAVIGATION_HELD', reason,
+    });
+    const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
+    const sourceClientId = options.sourceClientId, launchToken = options.expectedLaunchToken, targetUrl = options.targetUrl;
+    const originalRequestId = options.originalRequestId;
+    if (typeof sourceClientId !== 'string' || !sourceClientId
+      || typeof launchToken !== 'string' || !/^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(launchToken)
+      || typeof originalRequestId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(originalRequestId)
+      || launchToken === `bridge-director-desktop-${originalRequestId}`
+      || options.expectedCurrentUrl !== 'https://chatgpt.com/'
+      || typeof targetUrl !== 'string' || !new RegExp(`^https://chatgpt\\.com/c/${uuid}$`).test(targetUrl)) throw held('invalid_navigation_identity');
+    if (this.#conversationNavigations.has(launchToken)) throw held('original_navigation_in_progress');
+    this.#conversationNavigations.add(launchToken);
+    try {
+      const before = this.health(), source = before.clients.find(client => client.id === sourceClientId);
+      const identity = ['id', 'browserTabId', 'launchToken', 'browserProfileId', 'extensionBundleId', 'backgroundEpoch', 'serverInstanceId'];
+      const frozen = Object.fromEntries(identity.map(key => [key, source?.[key]]));
+      const matches = (client, url, sameDocument = false) => client && identity.every(key => client[key] === frozen[key])
+        && client.ready === true && client.compatible !== false && client.compatibility?.compatible !== false
+        && client.transport === 'extension' && client.browserIncognito === false && client.activeRequest === null
+        && client.quarantined !== true && client.releasePending === false && client.releaseState === 'idle'
+        && client.focused === false && client.visibilityState === 'hidden' && client.url === url && client.requestedUrl === targetUrl
+        && typeof client.contentEpoch === 'string' && client.contentEpoch.length > 0 && (!sameDocument || client.contentEpoch === source.contentEpoch);
+      const idle = (health, url, sameDocument = false) => health.pendingRequests === 0 && health.pendingCommands === 0
+        && health.clients.filter(client => client.launchToken === launchToken).length === 1
+        && !health.clients.some(client => client.activeRequest || client.releasePending || client.quarantined)
+        && matches(health.clients.find(client => client.id === sourceClientId), url, sameDocument);
+      if (!source || !Number.isSafeInteger(source.browserTabId) || source.browserTabId <= 0 || source.launchToken !== launchToken
+        || !new RegExp(`^${uuid}$`).test(source.browserProfileId || '') || !/^[a-f0-9]{32}$/.test(source.extensionBundleId || '')
+        || !source.backgroundEpoch || source.serverInstanceId !== this.#serverInstanceId
+        || !idle(before, options.expectedCurrentUrl, true)) throw held('source_or_runtime_not_idle');
+      // This existing native command samples this alias's queue twice. Looking
+      // up the original request proves its former work page is still absent.
+      const native = await this.ownedLaunchInventory(originalRequestId, {
+        sourceClientId, profileId: source.browserProfileId, bundleId: source.extensionBundleId,
+        backgroundEpoch: source.backgroundEpoch, serverInstanceId: source.serverInstanceId, contentEpoch: source.contentEpoch,
+      });
+      if (native.status !== 'confirmed_absent' || native.complete !== true || native.match != null
+        || native.requestId !== originalRequestId || native.sourceClientId !== sourceClientId
+        || native.runtime?.sourceTabId !== source.browserTabId
+        || !Number.isSafeInteger(native.inventory?.sourceExecutionProof?.observedAt)
+        || Date.now() - native.inventory.sourceExecutionProof.observedAt < 0
+        || Date.now() - native.inventory.sourceExecutionProof.observedAt > 5000
+        || !idle(this.health(), options.expectedCurrentUrl, true)) throw held('native_idle_or_original_absence_unproved');
+      const timeoutMs = Math.max(1000, Math.min(30000, Number(options.timeoutMs) || 30000));
+      const waiting = this.#browserClients.tabs.waitForBrowserClient(
+        candidate => candidate?.id === sourceClientId && matches(this.health().clients.find(client => client.id === sourceClientId), targetUrl),
+        timeoutMs, { observeNavigation: true },
+      ).then(client => ({ client }), error => ({ error }));
+      // The old content runtime may disconnect during this one navigation.
+      // Its missing command result is not permission to send sessions.select again.
+      let commandOutcome;
+      try {
+        await this.#sendCommand('sessions.select', { sessionId: targetUrl }, { sourceClientId, timeoutMs: Math.min(timeoutMs, 8000) });
+        commandOutcome = 'received';
+      } catch { commandOutcome = 'interrupted'; }
+      const observed = await waiting;
+      if (observed.error || !idle(this.health(), targetUrl)) throw held('original_page_target_not_verified');
+      const client = this.health().clients.find(candidate => candidate.id === sourceClientId);
+      return { version: 'director-owned-conversation-navigation/v1', status: 'restored', sourceClientId,
+        tabId: source.browserTabId, launchToken, targetUrl, originalRequestId, client,
+        nativeBefore: native, commandOutcome, navigationCalled: true, submitCalled: false, openedNewTab: false };
+    } finally {
+      this.#conversationNavigations.delete(launchToken);
+    }
   }
 
   async closeBrowserTab(options = {}) {

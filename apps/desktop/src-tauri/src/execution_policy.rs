@@ -9,6 +9,7 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "settings.global.save",
     "runtime.status",
     "chrome.status",
+    "chrome.managed.status",
     "readiness.check",
     "textSdk.status",
     "images.previewPrompt",
@@ -37,6 +38,8 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "assets.restore",
     "jobs.detail",
     "jobs.close_unknown",
+    "jobs.archive",
+    "jobs.restore",
     "source.import",
     "source.resolve",
     "source.reparse",
@@ -52,6 +55,7 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
 pub const CREDENTIAL_FIELDS: &[&str] = &["bhToken", "chromeToken", "textApiKey"];
 pub const STANDARD_ACTIONS: &[&str] = &[
     "chrome.connect", "chrome.check", "chrome.open", "chrome.bind",
+    "chrome.managed.start", "chrome.managed.login", "chrome.managed.recover",
     "runtime.prepare",
     "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
     "workflows.resume", "providers.refresh", "videos.preflight", "videos.prepare", "videos.submit",

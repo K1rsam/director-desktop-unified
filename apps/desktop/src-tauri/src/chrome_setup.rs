@@ -58,13 +58,20 @@ fn profile_collision(clients: &[Value], profile: &str) -> bool {
         .map(|c|(c["backgroundEpoch"].to_string(),c["extensionBundleId"].to_string(),c["serverInstanceId"].to_string())).collect();
     runtimes.len()>1
 }
+fn controller_root_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| url.scheme()=="https" && url.host_str()==Some("chatgpt.com")
+        && url.port_or_known_default()==Some(443) && url.path()=="/" && url.username().is_empty() && url.password().is_none())
+}
 pub(crate) fn profile_execution_client<'a>(clients: &'a [Value], binding: &BrowserBinding) -> Result<&'a Value> {
     if profile_collision(clients,&binding.profile_id) {return Err("Chrome 浏览器身份出现多个运行实例，已停止新提交；请核对复制的浏览器配置。".into());}
     let filtered: Vec<Value>=profile_clients(clients).into_iter().filter(|c|c["browserProfileId"]==binding.profile_id && c["extensionBundleId"]==binding.bundle_id).cloned().collect();
     let controller=format!("bridge-director-control-{}",binding.profile_id);
     let controls:Vec<_>=filtered.iter().filter(|c|c["launchToken"]==controller).collect();
     if !controls.is_empty() {
-        if controls.len()!=1 || controls[0]["url"]!="https://chatgpt.com/" || !controls[0]["activeRequest"].is_null()
+        // Site-owned query parameters do not turn the same root controller
+        // into a conversation. This identifies an opener, not auth or image
+        // readiness; managed binding and each new worker verify those separately.
+        if controls.len()!=1 || !controller_root_url(s(controls[0],"url")) || !controls[0]["activeRequest"].is_null()
             || controls[0]["focused"]!=false || controls[0]["visibilityState"]!="hidden" || client_command_busy(controls[0]) {
             return Err("Chrome 专属控制页未就绪或身份不唯一，保留原浏览器等待，不改用用户页面。".into());
         }
@@ -294,11 +301,29 @@ fn hide(command: &mut Command) {
     #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
     #[cfg(not(windows))] { let _=command; }
 }
-fn node(settings: &Value) -> Result<PathBuf> {
+pub(crate) fn node(settings: &Value) -> Result<PathBuf> {
     let explicit=PathBuf::from(s(settings,"textSdkNodePath"));
     if native_exe(&explicit,"node.exe") { return Ok(explicit); }
     for key in ["ProgramFiles","LOCALAPPDATA"] { if let Some(root)=std::env::var_os(key) { let p=PathBuf::from(root).join("nodejs/node.exe"); if native_exe(&p,"node.exe"){return Ok(p);} } }
     Err("Chrome 桥接需要 Node.js，请先安装 OpenAI SDK 组件。".into())
+}
+/// Only an installed component and its recorded, matching local connection may
+/// supply the dedicated browser. No legacy discovery or credential migration.
+pub(crate) fn managed_connection(home: &Path, settings: &Value, token: &str) -> Result<(PathBuf, Value)> {
+    let root=component().ok_or("未找到已验证的浏览器桥接组件，请先连接现有网页渠道。")?;
+    let saved=stored(home,CONNECTION);
+    let recorded=PathBuf::from(s(&saved,"componentHome"));
+    if saved["schemaVersion"]!=VERSION || !crate::runtime_setup::safe_absolute(&recorded)
+        || recorded.canonicalize().ok()!=root.canonicalize().ok() {
+        return Err("桥接组件与本机连接记录不一致；未启动专属浏览器。".into());
+    }
+    let source=PathBuf::from(s(&saved,"sourceConfig"));
+    let config=parse_env(&bounded(&source,16*1024)?)?;
+    let base=endpoint(settings)?;
+    if base.host_str()!=Some("127.0.0.1") || base.port_or_known_default()!=Some(config.port) || token!=config.api {
+        return Err("专属浏览器仅复用已验证的当前回环连接；地址或凭据不一致。".into());
+    }
+    Ok((root,json!({"endpoint":base.as_str().trim_end_matches('/'),"apiToken":config.api,"bridgeToken":config.bridge})))
 }
 fn native_exe(path: &Path, name: &str) -> bool {
     if !crate::runtime_setup::safe_absolute(path) || !path.file_name().is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case(name)) { return false; }

@@ -16,6 +16,8 @@ struct Fake {
     pending:AtomicBool,
     prepare_busy:AtomicBool,
     query_error:AtomicBool,
+    link_recovery_held:AtomicBool,
+    saved_queries:Mutex<Vec<Value>>,
     refreshes:AtomicUsize,
     refresh_error:AtomicBool,
     refresh_payload_drift:AtomicBool,
@@ -63,12 +65,17 @@ impl Channels for Fake {
     }
     fn query(&self,c:&ProviderConfig,id:&str)->ProviderResult<QueryResult> {
         assert_eq!(c.kind,"chrome");self.queries.fetch_add(1,Ordering::SeqCst);
+        if self.link_recovery_held.load(Ordering::SeqCst){return Err(ProviderError::new("CHROME_LINK_RECOVERY_HELD","synthetic original locator and reopen receipt require confirmation"));}
         if self.query_error.load(Ordering::SeqCst){return Err(ProviderError::new("IMAGE_PROVENANCE","synthetic original proof mismatch"));}
         if self.pending.load(Ordering::SeqCst) {return Ok(QueryResult{task_id:id.into(),status:"processing".into(),result_urls:vec![],error:None,actual_cost:None,raw:json!({"synthetic":true})});}
         let requests=self.submits.lock().unwrap();
         let request=requests.iter().find(|request|request.request_id==id).unwrap();
         Ok(QueryResult{task_id:id.into(),status:"succeeded".into(),result_urls:vec![format!("https://fixture.invalid/{id}.png")],error:None,actual_cost:None,
             raw:json!({"synthetic":true,"nativeProof":{"status":"matched_complete","proofVersion":2,"requestId":id,"promptSha256":pipeline::digest(&request.prompt),"conversationId":"owned-synthetic-conversation"}})})
+    }
+    fn query_saved(&self,c:&ProviderConfig,p:&PreparedRequest,id:&str,saved:&Value,_observe:&crate::providers::PrepareObserver<'_>)->ProviderResult<QueryResult> {
+        self.saved_queries.lock().unwrap().push(json!({"taskId":id,"prepared":p,"saved":saved}));
+        self.query(c,id)
     }
     fn download(&self,c:&ProviderConfig,_:&str,path:&Path)->ProviderResult<DownloadReceipt> {
         assert_eq!(c.kind,"chrome");self.downloads.fetch_add(1,Ordering::SeqCst);
@@ -181,6 +188,45 @@ fn background_chrome_failed_paused_original_query_is_bounded_and_keeps_retry_bud
     assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());
     assert_eq!(f.store.job(key).unwrap()["status"],"recovery_paused");assert!(f.store.job(key).unwrap()["queryAttempts"].as_u64().unwrap()>=5);
     assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&j,&mut attempted).unwrap());assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);assert_eq!(f.count(),1);
+}
+
+#[test]
+fn background_chrome_link_recovery_held_pauses_first_query_and_preserves_frozen_data_and_budgets(){
+    let f=Fixture::new(&[("first",None),("second",None)]);let journal=f.queue();assert!(f.step(&journal));let key=s(&journal.jobs[0],"jobId");
+    f.store.conn().unwrap().execute("UPDATE jobs SET query_attempts=2,download_attempts=1,next_attempt_at=0 WHERE id=?1",[key]).unwrap();
+    let original=f.store.job(key).unwrap();
+    let saved=json!({"locator":{"requestId":original["providerTaskId"],"url":"https://chatgpt.com/c/original-synthetic-conversation","userMessageId":"original-user-message"},
+        "recovery":{"type":"recovery_intent","requestId":original["providerTaskId"],"launchToken":"original-read-only-reopen","at":"saved-before-disconnect"}});
+    let raw=saved.to_string();let metadata_key=format!("chrome_conversation:{key}");
+    f.store.conn().unwrap().execute("INSERT INTO metadata(key,value) VALUES(?1,?2)",rusqlite::params![metadata_key,raw]).unwrap();
+    f.fake.link_recovery_held.store(true,Ordering::SeqCst);let mut attempted=HashSet::new();
+    assert!(selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&journal,&mut attempted).unwrap());
+    let held=f.store.job(key).unwrap();assert_eq!(held["status"],"recovery_paused");assert_eq!(held["nextAttemptAt"],0);
+    assert_eq!(held["queryAttempts"],2);assert_eq!(held["downloadAttempts"],1);assert!(attempted.contains(key));
+    for field in ["snapshot","prepared","receipt","result","providerTaskId","accountId"]{assert_eq!(held[field],original[field],"{field}");}
+    for _ in 0..6 {assert!(!selected_step_with_paused_queries(&f.engine,&f.request,&f.store,&journal,&mut attempted).unwrap());}
+    assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);assert_eq!(f.count(),1);assert_eq!(f.fake.prepares.load(Ordering::SeqCst),1);assert_eq!(f.fake.downloads.load(Ordering::SeqCst),0);
+    // A new explicit continuation reads the same original once, without a new
+    // request, resetting budgets, or replacing the prior open reservation.
+    assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);assert_eq!(f.fake.queries.load(Ordering::SeqCst),2);assert_eq!(f.count(),1);
+    let repeated=f.store.job(key).unwrap();assert_eq!(repeated["queryAttempts"],2);assert_eq!(repeated["downloadAttempts"],1);
+    let after_raw:String=f.store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[metadata_key],|r|r.get(0)).unwrap();assert_eq!(after_raw,raw);
+    let queries=f.fake.saved_queries.lock().unwrap();assert_eq!(queries.len(),2);
+    for query in queries.iter(){assert_eq!(query["taskId"],original["providerTaskId"]);assert_eq!(query["prepared"],original["prepared"]);assert_eq!(query["saved"],saved);}
+    let retries:i64=f.store.conn().unwrap().query_row("SELECT count(*) FROM events WHERE job_id=?1 AND type IN ('retry_scheduled','retry_budget_exhausted')",[key],|r|r.get(0)).unwrap();assert_eq!(retries,0);
+}
+
+#[test]
+fn background_chrome_link_recovery_explicit_continuation_can_finish_same_original_and_never_demotes_downloaded(){
+    let f=Fixture::new(&[("first",None)]);let journal=f.queue();assert!(f.step(&journal));let key=s(&journal.jobs[0],"jobId");let original=f.store.job(key).unwrap();
+    f.fake.link_recovery_held.store(true,Ordering::SeqCst);assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),2);
+    assert_eq!(f.fake.queries.load(Ordering::SeqCst),1);assert_eq!(f.store.job(key).unwrap()["status"],"recovery_paused");
+    f.fake.link_recovery_held.store(false,Ordering::SeqCst);assert_eq!(run_owned(f.engine.clone(),&f.request).unwrap(),0);
+    let completed=f.store.job(key).unwrap();assert_eq!(completed["status"],"downloaded");assert_eq!(completed["providerTaskId"],original["providerTaskId"]);
+    assert_eq!(completed["prepared"],original["prepared"]);assert_eq!(completed["snapshot"],original["snapshot"]);assert_eq!(f.count(),1);
+    f.fake.link_recovery_held.store(true,Ordering::SeqCst);let (cfg,account)=f.engine.generation_config(&f.store,&completed).unwrap();
+    tasks::resume_job(&f.store,key,&cfg,&account,f.fake.as_ref(),true).unwrap();
+    assert_eq!(f.store.job(key).unwrap(),completed);assert_eq!(f.count(),1);assert_eq!(f.fake.downloads.load(Ordering::SeqCst),1);
 }
 
 fn failed_runtime_prepared(f:&Fixture,j:&Journal)->String{

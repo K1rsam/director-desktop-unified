@@ -429,6 +429,12 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         else if ["succeeded","download_failed"].contains(&state) {
             tasks::download_saved_result(store,key,&config,&account,engine.channels.as_ref())?;
         } else {tasks::resume_job(store,key,&config,&account,engine.channels.as_ref(),true)?;}
+        // A query that pauses for missing recovery proof has already used this
+        // invocation's one read. Do not immediately reinterpret the new paused
+        // state as another explicit continuation on the next loop iteration.
+        if known && store.job(key)?["status"]=="recovery_paused" {
+            paused_queries.insert(key.to_owned());
+        }
         return Ok(true);
     }
     // New generation/recovery operations above retain priority over cleanup.

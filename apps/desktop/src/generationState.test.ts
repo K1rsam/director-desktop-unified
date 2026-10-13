@@ -52,7 +52,7 @@ test('Chrome waiting warns after two minutes without a fresh bridge signal, but 
   assert.doesNotMatch(generationProgress(current, progressNow), /云端正在生成|原图已保存|已完成/);
   assert.doesNotMatch(generationProgress(current, Date.parse('2026-10-10T06:16:59Z')), /暂未收到/);
   for (const result of [null, [], { raw: [] }, { raw: { progress: [] } }, { raw: { progress: { message: 123, checkedAt: 'invalid' } } }]) {
-    assert.match(generationProgress({ ...current, result }, progressNow), /正在核对 Chrome.*不会重复提交/);
+    assert.match(generationProgress({ ...current, result }, progressNow), /正在核对 ChatGPT 网页.*不会重复提交/);
   }
   assert.doesNotMatch(generationProgress(chromeJob('processing', { createdAt: 'invalid' }), progressNow), /已等待|NaN|暂未收到/);
   assert.match(generationProgress(chromeJob('downloading'), progressNow), /^正在下载原图/);

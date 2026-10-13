@@ -5,6 +5,11 @@ const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}
 const terminal=new Set(['succeeded','rejected','cancelled']);
 function canonical(v){if(Array.isArray(v))return v.map(canonical);if(v&&typeof v==='object')return Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])]));return v;}
 function same(a,b){return JSON.stringify(canonical(a))===JSON.stringify(canonical(b));}
+function nativeInventory(tabs){
+  if(!Array.isArray(tabs)||tabs.some(t=>!Number.isSafeInteger(t.id)||t.id<=0||typeof t.url!=='string'||typeof t.incognito!=='boolean')
+    ||new Set(tabs.map(t=>t.id)).size!==tabs.length)throw Error('maintenance_rebind_native_inventory');
+  return tabs.map(t=>({id:t.id,url:t.url,incognito:t.incognito})).sort((a,b)=>a.id-b.id);
+}
 function socketAlive(state={}) {return state.ws?.readyState===WebSocket.CONNECTING || state.ws?.readyState===WebSocket.OPEN;}
 function root(url) {try{const u=new URL(url);return u.origin==='https://chatgpt.com'&&u.pathname==='/'&&!u.search&&!u.hash&&!u.username&&!u.password;}catch{return false;}}
 function idle(runtime) {
@@ -14,6 +19,36 @@ function idle(runtime) {
     && runtime.downloads&&Object.keys(runtime.downloads).length===0;
 }
 function archiveJournal(journal){if(!journal)return [];const {incidentHistory,...current}=journal;return [...(incidentHistory||[]),current];}
+async function maintenancePreimage(control,journal) {
+  const {reloadInvalidated,...plain}=control;
+  if(journal&&!['connection_confirmed','bootstrap_completed','reload_requested'].includes(journal.status))throw Error('maintenance_rebind_journal_status_unresolved');
+  if(journal&&!/^[a-f0-9]{64}$/.test(journal.controllerSha256||''))throw Error('maintenance_rebind_journal_hash_unresolved');
+  const pinned=reloadInvalidated.preMaintenanceController;
+  if(pinned!==undefined){
+    if(!pinned||!same(Object.fromEntries(Object.entries(pinned).filter(([k])=>k!=='reloadInvalidated')),plain)
+      ||reloadInvalidated.preMaintenanceControllerSha256!==await digest(pinned)
+      ||journal&&journal.controllerSha256!==reloadInvalidated.preMaintenanceControllerSha256)throw Error('maintenance_rebind_journal_hash_unresolved');
+    return {controller:pinned,source:'maintenance_snapshot'};
+  }
+  if(!journal)return {controller:plain,source:'no_previous_journal'};
+  if(await digest(plain)===journal.controllerSha256)return {controller:plain,source:'marker_free_preimage'};
+  // Older bootstrap code inherited its predecessor's marker. Maintenance then
+  // replaced that marker, while the confirmed journal still hashes the original
+  // complete controller. Only retained history can recover that exact preimage.
+  const candidates=[],seen=new Set();let examined=0;
+  const visit=(value,path,depth=0)=>{
+    if(!value||typeof value!=='object')return;
+    if(depth>32||++examined>10000)throw Error('maintenance_rebind_history_bounds');
+    if(value.reloadInvalidated&&typeof value.reloadInvalidated==='object'){
+      const marker=value.reloadInvalidated,key=JSON.stringify(canonical(marker));
+      if(!seen.has(key)){seen.add(key);candidates.push({controller:{...plain,reloadInvalidated:marker},source:path+'.reloadInvalidated'});}
+    }
+    for(const [key,child]of Object.entries(value))visit(child,path+'.'+key,depth+1);
+  };
+  visit(control.retiredControllers,'retiredControllers');visit(journal.incidentHistory,'incidentHistory');
+  for(const candidate of candidates)if(await digest(candidate.controller)===journal.controllerSha256)return candidate;
+  throw Error('maintenance_rebind_journal_hash_unresolved');
+}
 function maintenanceEpochProved(proof,epoch){return proof?.version==='director-controller-maintenance-rebind/v1'
   && typeof epoch==='string'&&epoch.length>0&&proof.backgroundEpoch===epoch
   && typeof proof.previousBackgroundEpoch==='string'&&proof.previousBackgroundEpoch.length>0&&proof.previousBackgroundEpoch!==epoch;}
@@ -47,29 +82,50 @@ export async function reconcileReloadedControllerIdentity({browser=chrome,connec
       if(evidence?.version!=='director-controller-maintenance-idle/v1'||evidence.profileId!==profile
         ||!evidence.previousBackgroundEpoch||evidence.previousBackgroundEpoch===backgroundEpoch
         ||!Number.isSafeInteger(evidence.requestedAt)||evidence.requestedAt<=0||evidence.requestedAt>now())throw Error('maintenance_rebind_proof_missing');
-      const {reloadInvalidated,...before}=control,journal=local[journalKey];
-      if(journal&&(!['connection_confirmed','bootstrap_completed','reload_requested'].includes(journal.status)
-        ||journal.controllerSha256!==await digest(before)))throw Error('maintenance_rebind_journal_unresolved');
+      const journal=local[journalKey],preimage=await maintenancePreimage(control,journal);
       const sid=session[SESSION_KEY];if(sid!==undefined&&!UUID.test(sid||''))throw Error('maintenance_rebind_session_damaged');
       const owners=Object.entries(session).filter(([k,v])=>k.startsWith('chatgptBridgeLaunchedTab:')&&v?.launchToken===control.launchToken);
-      if(owners.length!==1||owners[0][0]!=='chatgptBridgeLaunchedTab:'+control.tabId
+      const ownerKey='chatgptBridgeLaunchedTab:'+control.tabId;let ownerRestore=null;
+      if(owners.length===0&&session[ownerKey]===undefined){
+        const receipt=pending?.launchRecords?.[String(control.tabId)];
+        const pendingOwners=Object.entries(pending?.launchRecords||{}).filter(([,v])=>v?.launchToken===control.launchToken);
+        if(!anchored||!journal||pendingOwners.length!==1||pendingOwners[0][0]!==String(control.tabId)
+          ||receipt?.launchToken!==control.launchToken||receipt.serverUrl!==control.serverUrl||receipt.requestedUrl!==control.requestedUrl
+          ||!Number.isSafeInteger(receipt.createdAt)||receipt.createdAt<=0||receipt.createdAt>evidence.requestedAt
+          ||Object.keys(receipt).some(k=>!['launchToken','serverUrl','requestedUrl','createdAt'].includes(k)))throw Error('maintenance_rebind_owner_receipt_unproved');
+        const server=new URL(receipt.serverUrl);if(server.protocol!=='http:'||!['127.0.0.1','localhost'].includes(server.hostname)
+          ||server.username||server.password||server.pathname!=='/'||server.search||server.hash)throw Error('maintenance_rebind_owner_receipt_unproved');
+        ownerRestore={key:ownerKey,receipt,sha256:await digest(receipt),operationId:pending.operationId};
+      }else if(owners.length!==1||owners[0][0]!==ownerKey
         ||owners[0][1].serverUrl!==control.serverUrl||owners[0][1].requestedUrl!==control.requestedUrl)throw Error('maintenance_rebind_owner');
-      if(!Array.isArray(tabs)||tabs.filter(t=>t.id===control.tabId).length!==1)throw Error('maintenance_rebind_tab_missing');
+      if(Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).some(([,v])=>!idle(v))
+        ||[...connections.values()].some(s=>!s.closed&&s.activeRequest))throw Error('maintenance_rebind_execution_unresolved');
+      if(!Array.isArray(tabs))throw Error('maintenance_rebind_tab_missing');
+      const matches=tabs.filter(t=>t.id===control.tabId);
+      if(matches.length===0&&ownerRestore){
+        return {profile,key,journalKey,control,journal,session,evidence,preimage,ownerRestore,missingController:true,
+          nativeInventory:nativeInventory(tabs),pendingSha256:await digest(pending)};
+      }
+      if(matches.length!==1)throw Error('maintenance_rebind_tab_missing');
+      if(ownerRestore)nativeInventory(tabs);
       const tab=tabs.find(t=>t.id===control.tabId),window=await browser.windows.get(tab.windowId);
       if(!root(tab.url)||tab.incognito!==false||typeof tab.active!=='boolean'||window.id!==tab.windowId
         ||window.focused!==false||tab.active&&window.state!=='minimized')throw Error('maintenance_rebind_user_visible_or_changed');
-      if(Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).some(([,v])=>!idle(v))
-        ||[...connections.values()].some(s=>!s.closed&&s.activeRequest))throw Error('maintenance_rebind_execution_unresolved');
       return {profile,key,journalKey,control,journal:journal||null,session,tab:{id:tab.id,windowId:tab.windowId,url:tab.url,active:tab.active,incognito:tab.incognito},
-        window:{id:window.id,focused:window.focused,state:window.state},evidence,
+        window:{id:window.id,focused:window.focused,state:window.state},evidence,preimage,ownerRestore,
         navigationPendingUntil:anchored&&pending.recoveryStatus==='awaiting_source_ready'&&pending.tabIds?.includes(control.tabId)?pending.requestedAt+120000:0};
     };
     const first=await read();if(!first)return {status:'not_applicable'};
     if(!same(first,await read()))return held('maintenance_rebind_native_drift');
+    if(first.missingController)return {status:'controller_missing_proved',proof:{version:'director-maintained-controller-missing/v1',
+      profileId:first.profile,operationId:first.ownerRestore.operationId,tabId:first.control.tabId,backgroundEpoch,
+      currentControlSha256:await digest(first.control),journalSha256:await digest(first.journal),preimageSha256:await digest(first.preimage.controller),
+      nativeInventorySha256:await digest(first.nativeInventory),pendingSha256:first.pendingSha256,enumerations:2,observedAt:now(),foreground:false,generationCalled:false}};
     const oldSid=first.session[SESSION_KEY],sid=oldSid&&oldSid!==first.control.browserSession?oldSid:crypto.randomUUID().toLowerCase();
     if(!UUID.test(sid)||sid===first.control.browserSession)return held('maintenance_rebind_nonce');
-    if(sid!==oldSid){await browser.storage.session.set({[SESSION_KEY]:sid});}
-    const after=await read(),expected={...first,session:{...first.session,[SESSION_KEY]:sid}};
+    const sessionWrites={...(sid!==oldSid?{[SESSION_KEY]:sid}:{}),...(first.ownerRestore?{[first.ownerRestore.key]:first.ownerRestore.receipt}:{})};
+    if(Object.keys(sessionWrites).length)await browser.storage.session.set(sessionWrites);
+    const after=await read(),expected={...first,ownerRestore:null,session:{...first.session,...sessionWrites}};
     if(!after||!same(after,expected))return held('maintenance_rebind_session_write_unconfirmed');
     const {reloadInvalidated,retiredControllers:history,...retired}=first.control;
     const control={...retired,browserSession:sid,retiredControllers:[...(history||[]),{...retired,reloadInvalidated,retiredAt:now(),reason:'maintenance_session_rebound_same_hidden_controller'}]};
@@ -77,7 +133,9 @@ export async function reconcileReloadedControllerIdentity({browser=chrome,connec
       profileId:first.profile,tabId:control.tabId,browserSession:sid,backgroundEpoch,
       previousBackgroundEpoch:first.evidence.previousBackgroundEpoch,beforeContentEpoch:first.evidence.contentEpoch||null,
       navigationPendingUntil:first.navigationPendingUntil,
-      originalInvalidation:reloadInvalidated,originalControllerSha256:await digest(first.control)};
+      originalInvalidation:reloadInvalidated,originalControllerSha256:await digest(first.control),
+      ...(first.ownerRestore?{launchReceiptRestoration:first.ownerRestore}:{}),
+      journalPreimage:{source:first.preimage.source,controller:first.preimage.controller,sha256:await digest(first.preimage.controller)}};
     const journal={version:'director-owned-controller-maintenance-rebind/v1',status:'session_rebound',at:now(),
       controllerSha256:await digest(control),tabId:control.tabId,browserSession:sid,maintenanceRecovery:recovery,
       attempts:first.journal?.status==='connection_confirmed'?0:(first.journal?.attempts||0),
@@ -127,14 +185,15 @@ function localSubset(value,keys){return Object.fromEntries(keys.filter(k=>Object
 export async function reconcileBootstrapWindow({browser=chrome,connections,now=Date.now}={}) {
   const held=reason=>({status:'held',reason});
   try {
-    if(!browser.windows?.update||!browser.windows?.get)return held('bootstrap_window_capability_missing');
     const sample=async()=>{
       const identity=await browser.storage.local.get(PROFILE_KEY),profile=identity[PROFILE_KEY];
       if(!UUID.test(profile||''))throw Error('bootstrap_window_profile');
       const key='directorDesktop:controlTab:v1:'+profile,journalKey='directorDesktop:controlReconnect:v1:'+profile;
-      const [local,session,tabs]=await Promise.all([browser.storage.local.get([key,journalKey]),browser.storage.session.get(null),browser.tabs.query({})]);
+      const local=await browser.storage.local.get([key,journalKey]);
       const journal=local[journalKey],control=local[key];
       if(journal?.version!=='director-owned-controller-bootstrap/v2'||!['reserved','outcome_unknown'].includes(journal.status))return null;
+      if(!browser.windows?.update||!browser.windows?.get)throw Error('bootstrap_window_capability_missing');
+      const [session,tabs]=await Promise.all([browser.storage.session.get(null),browser.tabs.query({})]);
       if(!same(journal.originalController,control)||journal.foreground!==false||journal.generationCalled!==false
         ||!Number.isSafeInteger(journal.at)||!UUID.test(journal.browserSession||'')
         ||session[SESSION_KEY]!==undefined&&session[SESSION_KEY]!==journal.browserSession)throw Error('bootstrap_window_intent_unproved');
@@ -164,7 +223,8 @@ export async function reconcileBootstrapWindow({browser=chrome,connections,now=D
     const sessionId=first.sessionId||crypto.randomUUID().toLowerCase();
     if(!first.sessionId){await browser.storage.session.set({[SESSION_KEY]:sessionId});if((await browser.storage.session.get(SESSION_KEY))[SESSION_KEY]!==sessionId)return held('bootstrap_window_session_unconfirmed');}
     const {retiredControllers:history,...retired}=first.control;
-    const control={...retired,status:'opened',tabId:first.tab.id,browserSession:sessionId,
+    const {reloadInvalidated:oldInvalidation,...current}=retired;
+    const control={...current,status:'opened',tabId:first.tab.id,browserSession:sessionId,
       retiredControllers:[...(history||[]),{...retired,retiredAt:now(),reason:'reconciled_original_bootstrap_window'}]};
     await browser.tabs.update(first.tab.id,{autoDiscardable:false});
     const journal={...first.journal,status:'bootstrap_completed',controllerSha256:await digest(control),tabId:first.tab.id,windowId:first.window.id,attempts:1,
@@ -179,7 +239,7 @@ export async function reconcileBootstrapWindow({browser=chrome,connections,now=D
 // A worker/extension reload may clear session ownership. Never relabel or reload
 // the old page in that case. Allocate one NEW empty, minimized control window;
 // preserve the old opened receipt in history, and hold uncertain creation.
-export async function bootstrapOwnedController({browser=chrome,connections,now=Date.now}={}) {
+export async function bootstrapOwnedController({browser=chrome,connections,now=Date.now,maintenanceMissing}={}) {
   const held=reason=>({status:'held',reason});
   try{
     if(!browser.windows?.create||!browser.tabs?.update||!browser.storage?.session?.set)return held('bootstrap_native_capability_missing');
@@ -187,7 +247,7 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
     const read=async()=>{
       const identity=await browser.storage.local.get(PROFILE_KEY),profile=identity[PROFILE_KEY];if(!UUID.test(profile||''))throw Error('bootstrap_profile');
       const key='directorDesktop:controlTab:v1:'+profile,journalKey='directorDesktop:controlReconnect:v1:'+profile;
-      const [local,session,tabs]=await Promise.all([browser.storage.local.get([PROFILE_KEY,key,journalKey]),browser.storage.session.get(null),browser.tabs.query({})]);
+      const [local,session,tabs]=await Promise.all([browser.storage.local.get([PROFILE_KEY,key,journalKey,'bridgePendingExtensionReload']),browser.storage.session.get(null),browser.tabs.query({})]);
       const control=local[key],launch='bridge-director-control-'+profile;
       if(local[PROFILE_KEY]!==profile||control?.status!=='opened'||control.launchToken!==launch||!root(control.requestedUrl)
         ||!UUID.test(control.browserSession||'')||!Number.isSafeInteger(control.tabId)||control.tabId<=0)throw Error('bootstrap_original_not_opened');
@@ -197,7 +257,23 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
       if(Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).some(([,v])=>!idle(v)))throw Error('bootstrap_execution_unresolved');
       const sid=session[SESSION_KEY];if(sid!==undefined&&!UUID.test(sid||''))throw Error('bootstrap_session_damaged');
       let orderingRepair=null;const prior=local[journalKey];
-      if(prior?.status==='connection_confirmed'){
+      if(maintenanceMissing){
+        const proof=maintenanceMissing,pending=local.bridgePendingExtensionReload,invalidated=control.reloadInvalidated;
+        const original=pending?.idleControllers?.[key],receipt=pending?.launchRecords?.[String(control.tabId)];
+        if(proof.version!=='director-maintained-controller-missing/v1'||proof.enumerations!==2||proof.profileId!==profile||proof.tabId!==control.tabId
+          ||!proof.backgroundEpoch||!Number.isSafeInteger(proof.observedAt)||proof.observedAt<=0||proof.observedAt>now()||now()-proof.observedAt>10000||proof.foreground!==false||proof.generationCalled!==false
+          ||!prior||!invalidated||pending?.operationId!==proof.operationId||invalidated.operationId!==proof.operationId
+          ||pending.recoveryStatus!=='held'||pending.recoveryReason!=='source_ready_timeout'
+          ||pending.expectedRuntime?.profileId!==profile||!pending.expectedRuntime.backgroundEpoch||pending.expectedRuntime.backgroundEpoch===proof.backgroundEpoch
+          ||!original||['tabId','launchToken','browserSession','serverUrl','requestedUrl'].some(k=>original[k]!==control[k])
+          ||receipt?.launchToken!==launch||receipt.serverUrl!==control.serverUrl||receipt.requestedUrl!==control.requestedUrl
+          ||!Number.isSafeInteger(receipt.createdAt)||receipt.createdAt<=0||receipt.createdAt>pending.requestedAt
+          ||Object.values(pending.launchRecords||{}).filter(r=>r?.launchToken===launch).length!==1
+          ||proof.currentControlSha256!==await digest(control)||proof.journalSha256!==await digest(prior)
+          ||proof.pendingSha256!==await digest(pending)||tabs.some(t=>t.id===control.tabId)
+          ||proof.nativeInventorySha256!==await digest(nativeInventory(tabs))
+          ||proof.preimageSha256!==await digest((await maintenancePreimage(control,prior)).controller))throw Error('bootstrap_missing_controller_proof_changed');
+      }else if(prior?.status==='connection_confirmed'){
         if(prior.controllerSha256!==await digest(control)||prior.tabId!==control.tabId||prior.browserSession!==control.browserSession)throw Error('bootstrap_previous_confirmation_changed');
       }else if(prior){
         const order=['version','status','at','originalController','browserSession','foreground','generationCalled'];
@@ -215,7 +291,8 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
     };
     const first=await read(),second=await read();if(!same(first,second))return held('bootstrap_native_drift');
     const sid=first.sessionId||crypto.randomUUID().toLowerCase();if(!UUID.test(sid))return held('bootstrap_session_identity');
-    const intent={version:'director-owned-controller-bootstrap/v2',status:'reserved',at:now(),originalController:first.control,browserSession:sid,foreground:false,generationCalled:false,zeroCreateOrderingRepair:first.orderingRepair,incidentHistory:archiveJournal(first.prior)};
+    const intent={version:'director-owned-controller-bootstrap/v2',status:'reserved',at:now(),originalController:first.control,browserSession:sid,foreground:false,generationCalled:false,zeroCreateOrderingRepair:first.orderingRepair,incidentHistory:archiveJournal(first.prior),
+      ...(maintenanceMissing?{maintenanceMissingProof:maintenanceMissing}:{})};
     await browser.storage.local.set({[first.journalKey]:intent});
     if(!same((await browser.storage.local.get(first.journalKey))[first.journalKey],intent))return held('bootstrap_intent_not_persisted');
     const actual=(await browser.storage.local.get(first.key))[first.key];if(!same(actual,first.control))return held('bootstrap_controller_changed');
@@ -240,7 +317,8 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
       await browser.storage.local.set({[first.journalKey]:{...intent,status:'outcome_unknown'}});return held('bootstrap_window_hide_unconfirmed');
     }
     const {retiredControllers:history,...retired}=first.control;
-    const control={...retired,tabId,browserSession:sid,status:'opened',retiredControllers:[...(history||[]),{...retired,retiredAt:now(),reason:'session_ownership_lost_old_page_untouched'}]};
+    const {reloadInvalidated:oldInvalidation,...current}=retired;
+    const control={...current,tabId,browserSession:sid,status:'opened',retiredControllers:[...(history||[]),{...retired,retiredAt:now(),reason:'session_ownership_lost_old_page_untouched'}]};
     await browser.storage.local.set({[first.key]:control,[first.journalKey]:{...intent,status:'bootstrap_completed',controllerSha256:await digest(control),tabId,windowId:created.id,attempts:1}});
     return {status:'bootstrap_completed',tabId,windowId:created.id,foreground:false,generationCalled:false};
   }catch(error){return held(String(error.message||'bootstrap_read_failed'));}
@@ -250,10 +328,13 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
 // tab creation, extension reload, model submission or user-page navigation.
 export async function recoverOwnedController({browser=chrome,connections,backgroundEpoch,now=Date.now}={}) {
   const held=reason=>({status:'held',reason});
+  // An interrupted replacement must reconcile its original creation before
+  // maintenance preimage checks see the new reserved/unknown bootstrap journal.
+  const reconciliation=await reconcileBootstrapWindow({browser,connections,now});
+  if(reconciliation.status==='bootstrap_reconciled'||reconciliation.status==='held')return reconciliation;
   const maintenance=await reconcileReloadedControllerIdentity({browser,connections,backgroundEpoch,now});
   if(maintenance.status==='held')return maintenance;
-  const reconciliation=await reconcileBootstrapWindow({browser,connections,now});
-  if(reconciliation.status==='bootstrap_reconciled')return reconciliation;
+  if(maintenance.status==='controller_missing_proved')return bootstrapOwnedController({browser,connections,now,maintenanceMissing:maintenance.proof});
   if (!browser.storage?.local?.get || !browser.storage?.local?.set || !browser.storage?.session?.get
     || !browser.tabs?.query || !browser.tabs?.reload || !browser.windows?.get) return held('native_capability_missing');
   const sample=async()=>{

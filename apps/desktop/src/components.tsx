@@ -64,7 +64,7 @@ export function messageOf(value: unknown): string {
 }
 export function providerList(workspace: Pick<Workspace, 'providers'>): Provider[] { const stored = Array.isArray(workspace.providers) ? workspace.providers : Object.entries(workspace.providers || {}).map(([id, provider]) => ({ ...provider, id: provider.id || id })); return ['dreamina', 'bh', 'chrome'].map(id => { const value = stored.find(provider => providerId(provider) === id); return value ? { ...value, id, available: value.available ?? !!value.models?.length } : { id, name: providerName(id), available: false, configured: false, message: '保存本机配置后检查连接' }; }); }
 export function providerId(provider: Provider): string { return provider.id || provider.provider || ''; }
-export const PROVIDER_NAMES: Record<string, string> = { dreamina: '即梦官方 CLI', bh: 'BH API', chrome: 'Chrome 网页', codex: 'Codex CLI', api: '文本 API', local: '本地流程' };
+export const PROVIDER_NAMES: Record<string, string> = { dreamina: '即梦官方 CLI', bh: 'BH API', chrome: 'ChatGPT 网页', codex: 'Codex CLI', api: '文本 API', local: '本地流程' };
 export function providerName(id: string) { return PROVIDER_NAMES[id] || id; }
 export function kindName(value?: string) { const names: Record<string, string> = { CH: '人物', GROUP: '群像', BEAST: '非人角色', LOC: '场景', PROP: '道具', character: '人物', scene: '场景', prop: '道具', beast: '非人角色', image: '图片', video: '视频', audio: '音频', text: '文本', workflow: '制作流程' }; return names[value || ''] || value || '资产'; }
 export function adoptedImage(workspace: Workspace, asset: Asset): Media | undefined { return assetImages(workspace, asset).current; }

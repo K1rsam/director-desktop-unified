@@ -24,6 +24,8 @@ use std::{
 mod app_settings_engine;
 #[path = "background_chrome_images.rs"]
 pub mod background_chrome_images;
+#[path = "task_record_maintenance.rs"]
+pub mod task_record_maintenance;
 
 // Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
 const IMAGE_SUBMIT_WORKERS: usize = 8;
@@ -943,6 +945,7 @@ impl Engine {
             }
         }
         let mut summaries = jobs.clone();
+        let archived_task_records = store.archived_task_record_ids()?;
         let mut auto_query = c.prepare("SELECT id,json_extract(snapshot,'$.autoSubmit') FROM jobs WHERE kind IN ('image','video')").map_err(|e|e.to_string())?;
         let auto_submit = auto_query
             .query_map([], |row| {
@@ -953,6 +956,7 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         for j in &mut summaries {
             *j = workspace_job_summary(j.clone(),auto_submit.get(s(j,"id")).copied().flatten());
+            j["taskRecordArchived"] = json!(archived_task_records.contains(s(j,"id")));
         }
         let mut providers = Vec::new();
         let mut q = c
@@ -1196,6 +1200,7 @@ impl Engine {
             "assets.usage" => return store.asset_usage(s(&request, "assetId")),
             "jobs.detail" => {
                 let mut j = store.job(s(&request, "jobId"))?;
+                j["taskRecordArchived"] = json!(store.archived_task_record_ids()?.contains(s(&request,"jobId")));
                 let c = store.conn()?;
                 let mut q=c.prepare("SELECT type,data,created_at FROM events WHERE job_id=?1 ORDER BY id DESC LIMIT 100").map_err(|e|e.to_string())?;
                 let events=q.query_map([s(&request,"jobId")],|r|Ok(json!({"type":r.get::<_,String>(0)?,"data":r.get::<_,String>(1)?,"createdAt":r.get::<_,String>(2)?}))).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
@@ -1518,6 +1523,12 @@ impl Engine {
             }
             "foundation.run" | "images.design" | "images.produce" | "storyboard.run" | "storyboard.refine" => {
                 self.spawn_stage(store.clone(), request.clone())?;
+            }
+            "jobs.archive" | "jobs.restore" => {
+                let key = s(&request, "jobId");
+                let _guard = self.acquire_keys(vec![format!("job:{key}")])?;
+                let expected = request.get("expectedSnapshotSha256").map(|v| v.as_str().ok_or("冻结材料摘要参数无效")).transpose()?;
+                store.set_task_record_archived(key, action == "jobs.archive", expected)?;
             }
             "jobs.close_unknown" => {
                 let key = s(&request, "jobId");
@@ -6805,6 +6816,9 @@ mod chrome_cleanup_scheduler_tests;
 #[cfg(test)]
 #[path = "project_lifecycle_tests.rs"]
 mod project_lifecycle_tests;
+#[cfg(test)]
+#[path = "task_record_tests.rs"]
+mod task_record_tests;
 
 #[cfg(test)]
 #[path = "engine_refinement_cas_tests.rs"]

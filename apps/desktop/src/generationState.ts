@@ -56,7 +56,7 @@ function chromeProgress(job: Job, now: number): string {
   const started = Date.parse(job.createdAt || '');
   const elapsed = Number.isFinite(started) && Number.isFinite(now) ? Math.max(0, Math.floor((now - started) / 1000)) : null;
   const recent = !!message && !!phase && Number.isFinite(checked) && checked <= now && now - checked < 120000;
-  let result = message || (job.status === 'downloading' ? '正在下载原图到项目目录。' : job.status === 'succeeded' ? '正在获取并保存原图。' : '正在核对 Chrome 网页中的原任务。');
+  let result = message || (job.status === 'downloading' ? '正在下载原图到项目目录。' : job.status === 'succeeded' ? '正在获取并保存原图。' : '正在核对 ChatGPT 网页中的原任务。');
   if (elapsed !== null) result += ` · 已等待 ${elapsed < 60 ? `${elapsed} 秒` : `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`}`;
   if (elapsed !== null && elapsed >= 120 && !recent) result += ' · 暂未收到明确的新进度，仍在核对原任务，不会重复提交。';
   return result;

@@ -46,14 +46,14 @@ export function installExecutionPolicy(policy: ExecutionPolicy): void {
 const NATIVE_EXTRA_ACTIONS = new Set(['foundation.run', 'images.design', 'workflows.resume', 'textCli.status', 'storyboard.run', 'storyboard.decision.resolve']);
 
 const LOCAL_READ_ACTIONS = new Set([
-  'getExecutionPolicy', 'settings.global.get', 'runtime.status', 'chrome.status', 'textSdk.status', 'images.previewPrompt', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get',
+  'getExecutionPolicy', 'settings.global.get', 'runtime.status', 'chrome.status', 'chrome.managed.status', 'textSdk.status', 'images.previewPrompt', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get',
   'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail',
 ]);
 const LOCAL_WRITE_ACTIONS = new Set([
   'projects.create', 'projects.archive', 'projects.restore', 'projects.delete',
   'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save',
   'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete',
-  'assets.restore', 'jobs.close_unknown', 'source.import', 'source.resolve', 'source.reparse',
+  'assets.restore', 'jobs.close_unknown', 'jobs.archive', 'jobs.restore', 'source.import', 'source.resolve', 'source.reparse',
   'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt',
   'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',
 ]);
@@ -62,9 +62,10 @@ const GENERATION_ACTIONS = new Set([
   'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',
 ]);
 const PROVIDER_ACTIONS = new Set([
-  'runtime.prepare', 'chrome.connect', 'chrome.check', 'chrome.open', 'chrome.bind', 'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
+  'runtime.prepare', 'chrome.connect', 'chrome.check', 'chrome.open', 'chrome.bind', 'chrome.managed.start', 'chrome.managed.recover', 'providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile',
 ]);
 const CREDENTIAL_ACTIONS = new Set([
+  'chrome.managed.login',
   'canvas.login', 'canvas.loginStatus', 'canvas.openAuthorization', 'canvas.cancelLogin', 'canvas.logout',
   'textCli.status', 'textCli.login', 'textCli.loginStatus', 'textCli.cancelLogin', 'textCli.openLogin',
   'dreamina.status', 'dreamina.login', 'dreamina.logout', 'dreamina.open_authorization',

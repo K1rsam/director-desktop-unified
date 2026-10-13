@@ -75,6 +75,10 @@ impl Engine {
             "chrome.check",
             "chrome.bind",
             "chrome.open",
+            "chrome.managed.status",
+            "chrome.managed.start",
+            "chrome.managed.login",
+            "chrome.managed.recover",
             "readiness.check",
             "textSdk.status",
             "textCli.status",
@@ -96,6 +100,26 @@ impl Engine {
                 return Err("Chrome 连接只由本机标准桌面显式触发。".into());
             }
             return crate::chrome_setup::open(&self.home);
+        }
+        if action.starts_with("chrome.managed.") {
+            if !self.standard_native || !self.live_accounts {
+                return Err("专属浏览器仅由本机标准桌面显式使用。".into());
+            }
+            let saved = app_settings::load(&self.home)?
+                .map(|doc| app_settings::effective_from(&doc, &json!({})))
+                .unwrap_or_else(app_settings::defaults);
+            let token = app_settings::credential(&saved, "global", "chrome").ok();
+            if action == "chrome.managed.status" {
+                return crate::managed_browser::perform(&self.home, &saved, action, token.as_deref());
+            }
+            let _channel = self.acquire_keys(vec!["channel:chrome".into()])?;
+            let _lifecycle = self.lifecycle_mutex.lock().map_err(|e|e.to_string())?;
+            let _registry = crate::project_library::lock(&self.home)?;
+            if self.active.lock().map_err(|e|e.to_string())?.iter().any(|key|key.starts_with("project:")) {
+                return Err("本地项目操作尚未结束，保留专属浏览器；请等待当前操作完成后再恢复。".into());
+            }
+            crate::managed_browser::ensure_clear(&self.registry()?)?;
+            return crate::managed_browser::perform(&self.home, &saved, action, token.as_deref());
         }
         if action == "runtime.status" || action == "chrome.status" {
             let saved = app_settings::load(&self.home)?
@@ -130,8 +154,21 @@ impl Engine {
                 let token = app_settings::credential(&settings, "global", "chrome").ok();
                 if action=="chrome.bind" {
                     let token=token.as_deref().ok_or("请先连接 Chrome 网页。")?;
-                    let observed=crate::chrome_setup::inspect(&settings,token)?;
                     let profile=request["profileId"].as_str().filter(|s|!s.is_empty()).ok_or("请选择执行浏览器。")?;
+                    let managed=request["managed"]==true;
+                    let _managed_lifecycle=if managed {Some(self.lifecycle_mutex.lock().map_err(|e|e.to_string())?)}else{None};
+                    let _managed_registry=if managed {Some(crate::project_library::lock(&self.home)?)}else{None};
+                    if request["managed"]==true {
+                        if self.active.lock().map_err(|e|e.to_string())?.iter().any(|key|key.starts_with("project:")) {
+                            return Err("本地项目操作尚未结束，未切换图片执行浏览器。".into());
+                        }
+                        crate::managed_browser::ensure_clear(&self.registry()?)?;
+                        let status=crate::managed_browser::perform(&self.home,&settings,"chrome.managed.status",Some(token))?;
+                        if status["ready"]!=true || status["profileId"]!=profile {
+                            return Err("专属 Edge 尚未验证登录或执行身份，未切换新任务的浏览器。".into());
+                        }
+                    }
+                    let observed=crate::chrome_setup::inspect(&settings,token)?;
                     let patch=crate::chrome_setup::binding_patch(&settings,&observed,Some(profile))?.ok_or("所选浏览器无法绑定。")?;
                     let updated=app_settings::save(&self.home,&patch,doc["revision"].as_u64().unwrap_or(0))?;
                     return crate::chrome_setup::check(&self.home,&app_settings::effective_from(&updated,&json!({})),token);

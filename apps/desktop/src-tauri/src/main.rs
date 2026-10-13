@@ -35,6 +35,13 @@ fn startup_verification_report(
     let v = verification.as_ref().ok_or("未启用启动验证")?;
     v.diagnostics.mark(DiagnosticStage::ReportReceived);
     let mut report = report;
+    let background_window = app.get_webview_window("main").is_some_and(|window|
+        window.is_visible().ok()==Some(false) && window.is_focused().ok()==Some(false));
+    report["backgroundWindowVerified"]=serde_json::json!(background_window);
+    if !background_window {
+        report["ok"]=serde_json::json!(false);
+        report["error"]=serde_json::json!("Offline startup verification must remain hidden and unfocused");
+    }
     let frontend_url = app
         .get_webview_window("main")
         .and_then(|window| window.url().ok());
@@ -367,6 +374,17 @@ fn main() {
         return;
     }
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--maintain-task-records") {
+        let valid = args.iter().skip(1).enumerate().all(|(offset,arg)| {
+            offset + 1 == index || offset + 1 == index + 1 || arg == "--unvirtualized-desktop"
+        });
+        let Some(path) = args.get(index + 1).map(std::path::PathBuf::from).filter(|path|path.is_absolute()) else {
+            std::process::exit(64);
+        };
+        if !valid { std::process::exit(64); }
+        let code = director_core::engine::task_record_maintenance::run_file(&path).unwrap_or(2);
+        std::process::exit(code);
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--background-chrome-images") {
         let valid = args.iter().skip(1).enumerate().all(|(offset,arg)| {
             offset + 1 == index || offset + 1 == index + 1 || arg == "--unvirtualized-desktop"
@@ -409,6 +427,12 @@ fn main() {
     let build_verification = verification.clone();
     let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let force_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut context=tauri::generate_context!();
+    if verification.is_some() {
+        // Offline smoke tests exercise the real WebView/IPC with an isolated
+        // home, without opening a foreground window over the user's work.
+        for window in &mut context.config_mut().app.windows {window.visible=false;window.focus=false;}
+    }
     if let Some(v) = &verification { v.diagnostics.mark(DiagnosticStage::DesktopBuildStarted); }
     tauri::Builder::default()
         .manage(verification)
@@ -483,7 +507,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![desktop_request, startup_verification_report, startup_verification_progress])
-        .build(tauri::generate_context!())
+        .build(context)
         .inspect_err(|_| { if let Some(v) = &build_verification { v.diagnostics.mark(DiagnosticStage::DesktopBuildFailed); } })
         .expect("无法启动制作工作台")
         .run(move |app, event| {

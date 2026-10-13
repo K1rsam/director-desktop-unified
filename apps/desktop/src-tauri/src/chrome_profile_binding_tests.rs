@@ -7,6 +7,17 @@ fn page(id: &str, profile: &str, epoch: &str) -> Value {
         "browserProfileId":profile,"browserIncognito":false,"backgroundEpoch":epoch,"extensionBundleId":"bundle","serverInstanceId":"server"})
 }
 fn binding() -> BrowserBinding {BrowserBinding{profile_id:PROFILE.into(),endpoint:"http://127.0.0.1:53179".into(),bundle_id:"bundle".into()}}
+#[test] fn chrome_controller_accepts_root_queries_without_accepting_conversations_or_other_origins(){
+    let mut control=page("control",PROFILE,"epoch");
+    control["launchToken"]=json!(format!("bridge-director-control-{PROFILE}"));
+    control["focused"]=json!(false);control["visibilityState"]=json!("hidden");
+    for url in ["https://chatgpt.com/","https://chatgpt.com/?ref=desktop#home","https://chatgpt.com/?__cf_chl_rt_tk=fixture"] {
+        control["url"]=json!(url);assert!(profile_execution_client(&[control.clone()],&binding()).is_ok(),"{url}");
+    }
+    for url in ["https://chatgpt.com/c/fixture","https://chatgpt.com/auth/login","http://chatgpt.com/","https://chatgpt.com:444/","https://chatgpt.com.evil.test/","https://user@chatgpt.com/","about:blank"] {
+        control["url"]=json!(url);assert!(profile_execution_client(&[control.clone()],&binding()).is_err(),"{url}");
+    }
+}
 #[test] fn chrome_hello_snapshot_is_history_but_release_and_untyped_queue_still_hold(){
     let mut client=json!({"transportHealth":{"tabQueue":{"running":true,"pending":1}}});assert!(client_command_busy(&client));
     client["transportHealth"]["kind"]=json!("connect_snapshot");assert!(!client_command_busy(&client));

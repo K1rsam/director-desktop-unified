@@ -57,13 +57,31 @@ pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRe
     let alias=if saved["recovery"].is_null(){format!("bridge-director-desktop-{}",uuid::Uuid::new_v4())}else{s(&saved["recovery"],"launchToken").to_owned()};
     if !alias.strip_prefix("bridge-director-desktop-").is_some_and(|id|uuid::Uuid::parse_str(id).is_ok())||alias==launch{return Err(held());}
     let owners:Vec<_>=available.iter().filter(|c|c["launchToken"]==alias).collect();
-    let source=if owners.len()==1&&!saved["recovery"].is_null() {owners[0].clone()}
+    let mut source=if owners.len()==1&&!saved["recovery"].is_null() {owners[0].clone()}
     else if owners.is_empty()&&saved["recovery"].is_null(){
         observe(&json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":alias,"url":loc["url"],"nativeOriginalProof":native,"at":now(),"submitCalled":false}))?;
         let opened=json_request(config,client,"/browser/tabs/open",Some(&json!({"url":loc["url"],"sourceClientId":root["id"],"active":false,"select":false,"launchToken":alias,"timeoutMs":30000,"allowSystemFallback":false})),false)?;
         if opened["ok"]!=true||opened["tabState"]["active"]!=false||opened["tabState"]["discarded"]!=false{return Err(held());}
         opened["client"].clone()
     }else{return Err(held());};
+    // A failed website navigation may leave the one reserved recovery page on
+    // the homepage. Revisit its saved URL once; never allocate another alias.
+    if source["url"]!=loc["url"]&&!saved["recovery"].is_null(){
+        if source["url"]!="https://chatgpt.com/"||source["requestedUrl"]!=loc["url"]||!saved["recoveryNavigation"].is_null()
+            ||source["launchToken"]!=alias||source["focused"]!=false||source["visibilityState"]!="hidden"
+            ||!explicit_idle(&source)||!same_browser_runtime(&source,root,binding){return Err(held());}
+        observe(&json!({"type":"recovery_navigation_intent","requestId":p.request.request_id,"launchToken":alias,
+            "sourceClientId":source["id"],"browserTabId":source["browserTabId"],"expectedCurrentUrl":source["url"],"url":loc["url"],"at":now(),"submitCalled":false}))?;
+        let navigated=json_request(config,client,"/browser/tabs/recover-owned-conversation",Some(&json!({
+            "sourceClientId":source["id"],"originalRequestId":p.request.request_id,"expectedLaunchToken":alias,
+            "expectedCurrentUrl":source["url"],"targetUrl":loc["url"],"timeoutMs":30000})),false).map_err(|e|{
+                let mut error=held();error.context=Some(json!({"phase":"recovery_navigation","cause":e,"submitCalled":false}));error
+            })?;
+        if navigated["ok"]!=true||navigated["version"]!="director-owned-conversation-navigation/v1"||navigated["status"]!="restored"
+            ||navigated["openedNewTab"]!=false||navigated["submitCalled"]!=false||navigated["client"]["id"]!=source["id"]
+            ||navigated["client"]["browserTabId"]!=source["browserTabId"]{return Err(held());}
+        source=navigated["client"].clone();
+    }
     if source["url"]!=loc["url"]||source["launchToken"]!=alias||source["focused"]!=false||source["visibilityState"]!="hidden"||!explicit_idle(&source)||!same_browser_runtime(&source,root,binding){return Err(held());}
     let after=clients(config,client)?;let verified:Vec<_>=after.iter().filter(|c|c["launchToken"]==alias).collect();
     if verified.len()!=1||!same_idle_owned_source(verified[0],&source,binding)||verified[0]["contentEpoch"]!=source["contentEpoch"]{return Err(held());}

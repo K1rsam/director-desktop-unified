@@ -268,3 +268,176 @@ test('maintenance identity rebinding archives a real previous reconnect confirma
  assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7,'newer-content'),now:()=>1000000}),true);
  assert.equal(f.local[f.jkey].status,'connection_confirmed');assert.equal(f.reloads(),2);
 });
+
+function controllerSha(value){const canonical=v=>Array.isArray(v)?v.map(canonical):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])])):v;return require('node:crypto').createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');}
+function inheritedMaintenanceFixture(change=()=>{}){
+ return maintenanceFixture(f=>{
+  const c=f.local[f.key],marker={tabId:3,browserSession:SESSION,operationId:'retired-operation',launchToken:c.launchToken,serverUrl:c.serverUrl,requestedUrl:c.requestedUrl};
+  c.retiredControllers=[{status:'opened',tabId:3,browserSession:SESSION,reloadInvalidated:marker,reason:'session_ownership_lost_old_page_untouched'}];
+  const before={...structuredClone(c),reloadInvalidated:structuredClone(marker)};
+  f.local[f.jkey]={version:'director-owned-controller-confirmation/v1',status:'connection_confirmed',controllerSha256:controllerSha(before),attempts:0,incidentHistory:[]};
+  change(f,before);
+ });
+}
+test('legacy inherited marker is restored only from retained history and full original journal digest',async()=>{
+ const f=inheritedMaintenanceFixture(),old=structuredClone(f.local),out=await f.recover();assert.equal(out.status,'reload_requested');
+ const proof=f.local[f.jkey].maintenanceRecovery.journalPreimage;assert.equal(proof.sha256,old[f.jkey].controllerSha256);
+ assert.equal(proof.controller.reloadInvalidated.operationId,'retired-operation');assert.match(proof.source,/retiredControllers/);
+ const {incidentHistory,...oldJournal}=old[f.jkey];assert.deepEqual(f.local[f.jkey].incidentHistory.find(x=>x.status==='connection_confirmed'),oldJournal);
+ assert.equal(f.local[f.key].reloadInvalidated,undefined);assert.equal(f.reloads(),1);
+});
+test('retained marker cannot authorize changed controller, unknown journal, missing evidence or user page',async()=>{
+ for(const [change,reason]of [[f=>f.local[f.key].newContract='unbound','maintenance_rebind_journal_hash_unresolved'],
+  [f=>f.local[f.key].retiredControllers=[],'maintenance_rebind_journal_hash_unresolved'],
+  [f=>f.local[f.jkey].status='outcome_unknown','maintenance_rebind_journal_status_unresolved'],
+  [f=>f.tabs[0].url='https://chatgpt.com/c/user','maintenance_rebind_user_visible_or_changed']]){
+   const f=inheritedMaintenanceFixture(change),local=structuredClone(f.local),session=structuredClone(f.session);
+   assert.equal((await f.recover()).reason,reason);assert.deepEqual(f.local,local);assert.deepEqual(f.session,session);assert.equal(f.reloads(),0);
+ }
+});
+test('new maintenance snapshot preserves full preimage across repeated acknowledged maintenance',async()=>{
+ const f=fixture();f.session['chatgptBridgeV6:tab:7'].contentEpoch='old';await f.run();
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7),now:()=>800000}),true);
+ f.browser.storage.session.set=async v=>Object.assign(f.session,structuredClone(v));
+ for(let round=0;round<3;round++){
+  const old=structuredClone(f.local[f.key]),sha=controllerSha(old),clock=1000000+round*200001;
+  const identity={tabId:old.tabId,launchToken:old.launchToken,browserSession:old.browserSession,serverUrl:old.serverUrl,requestedUrl:old.requestedUrl};
+  f.local[f.key].reloadInvalidated={...identity,operationId:'maintenance-'+round,preMaintenanceController:old,preMaintenanceControllerSha256:sha,
+   maintenanceRecovery:{version:'director-controller-maintenance-idle/v1',profileId:PROFILE,previousBackgroundEpoch:'worker-'+round,requestedAt:clock-200000,contentEpoch:'before-'+round}};
+  delete f.session['directorDesktop:controllerBrowserSession:v1'];delete f.session['chatgptBridgeV6:tab:7'];
+  const result=await f.api.recoverOwnedController({browser:f.browser,connections:f.connections,backgroundEpoch:'worker-'+(round+1),now:()=>clock});assert.equal(result.status,'reload_requested');
+  assert.equal(f.local[f.jkey].maintenanceRecovery.journalPreimage.source,'maintenance_snapshot');
+  assert.equal(f.local[f.jkey].maintenanceRecovery.journalPreimage.sha256,sha);
+  assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:{...readyProof(7,'after-'+round),backgroundEpoch:'worker-'+(round+1)},now:()=>clock}),true);
+ }
+ assert.equal(f.reloads(),4);assert.equal(f.local[f.key].reloadInvalidated,undefined);
+});
+test('tampered pinned snapshot remains held even when a historical marker could match',async()=>{
+ const f=inheritedMaintenanceFixture((f,before)=>{f.local[f.key].reloadInvalidated.preMaintenanceController=before;f.local[f.key].reloadInvalidated.preMaintenanceControllerSha256='0'.repeat(64);});
+ const before=structuredClone(f.local);assert.equal((await f.recover()).reason,'maintenance_rebind_journal_hash_unresolved');assert.deepEqual(f.local,before);assert.equal(f.reloads(),0);
+});
+test('legacy incident history alone can prove its exact inherited marker without assuming one from current maintenance',async()=>{
+ const f=inheritedMaintenanceFixture((f,before)=>{
+  f.local[f.key].retiredControllers=[];before.retiredControllers=[];f.local[f.jkey].controllerSha256=controllerSha(before);
+  f.local[f.jkey].incidentHistory=[{status:'bootstrap_completed',originalController:{reloadInvalidated:structuredClone(before.reloadInvalidated)}}];
+ });assert.equal((await f.recover()).status,'reload_requested');assert.match(f.local[f.jkey].maintenanceRecovery.journalPreimage.source,/incidentHistory/);
+});
+test('new pinned preimage is checked even when there has never been a reconnect journal',async()=>{
+ const f=maintenanceFixture(f=>{
+  const {reloadInvalidated,...before}=f.local[f.key];reloadInvalidated.preMaintenanceController=before;reloadInvalidated.preMaintenanceControllerSha256='0'.repeat(64);
+ });const before=structuredClone(f.local);assert.equal((await f.recover()).reason,'maintenance_rebind_journal_hash_unresolved');assert.deepEqual(f.local,before);assert.equal(f.reloads(),0);
+});
+test('fresh bootstrap does not inherit unrelated invalidation and retains predecessor evidence',async()=>{
+ const f=bootstrapFixture(f=>f.local[f.key].reloadInvalidated={tabId:99,operationId:'old-marker'});assert.equal((await f.api.bootstrapOwnedController({browser:f.browser,connections:f.connections,now:()=>1000000})).status,'bootstrap_completed');
+ assert.equal(f.local[f.key].reloadInvalidated,undefined);assert.equal(f.local[f.key].retiredControllers[0].reloadInvalidated.operationId,'old-marker');
+ const r=interruptedWindowFixture(f=>f.local[f.key].reloadInvalidated={tabId:99,operationId:'old-marker'});
+ r.local[r.jkey].originalController=structuredClone(r.local[r.key]);assert.equal((await r.api.reconcileBootstrapWindow({browser:r.browser,connections:r.connections,now:()=>1000000})).status,'bootstrap_reconciled');
+ assert.equal(r.local[r.key].reloadInvalidated,undefined);assert.equal(r.local[r.key].retiredControllers.at(-1).reloadInvalidated.operationId,'old-marker');
+});
+
+function sessionClearedFixture(change=()=>{}){
+ return inheritedMaintenanceFixture(f=>{
+  const receipt={launchToken:f.local[f.key].launchToken,requestedUrl:f.local[f.key].requestedUrl,serverUrl:f.local[f.key].serverUrl,createdAt:1};
+  f.local.bridgePendingExtensionReload.recoveryStatus='held';f.local.bridgePendingExtensionReload.recoveryReason='source_ready_timeout';
+  f.local.bridgePendingExtensionReload.requestedAt=800000;f.local.bridgePendingExtensionReload.launchRecords={7:receipt};
+  for(const key of Object.keys(f.session))delete f.session[key];change(f);
+ });
+}
+test('expired maintenance with truly empty manual-reload session restores only original receipt then fresh nonce and exact hello',async()=>{
+ const f=sessionClearedFixture(),receipt=structuredClone(f.local.bridgePendingExtensionReload.launchRecords[7]),pending=structuredClone(f.local.bridgePendingExtensionReload);
+ assert.deepEqual(f.session,{});assert.equal((await f.recover()).status,'reload_requested');assert.deepEqual(f.session['chatgptBridgeLaunchedTab:7'],receipt);
+ assert.notEqual(f.session['directorDesktop:controllerBrowserSession:v1'],SESSION);assert.equal(f.session['chatgptBridgeV6:tab:7'],undefined);
+ assert.equal(f.local[f.jkey].maintenanceRecovery.launchReceiptRestoration.sha256,controllerSha(receipt));assert.deepEqual(f.local.bridgePendingExtensionReload,pending);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7),now:()=>1000000}),true);
+ assert.equal(f.local[f.jkey].status,'connection_confirmed');assert.equal(f.reloads(),1);await f.recover();assert.equal(f.reloads(),1);
+});
+test('empty-session receipt restore refuses missing or duplicate pending ownership, unknown journal, user pages and native drift',async()=>{
+ for(const change of [f=>delete f.local.bridgePendingExtensionReload.launchRecords[7],f=>f.local.bridgePendingExtensionReload.launchRecords[8]=structuredClone(f.local.bridgePendingExtensionReload.launchRecords[7]),
+  f=>f.local[f.jkey].status='outcome_unknown',f=>f.local.bridgePendingExtensionReload.launchRecords[7].createdAt=999999,
+  f=>f.tabs[0].url='https://chatgpt.com/c/user',f=>f.window.focused=true,f=>f.session['chatgptBridgeLaunchedTab:7']={launchToken:'foreign'},
+  f=>f.session['chatgptBridgeLaunchedTab:8']=structuredClone(f.local.bridgePendingExtensionReload.launchRecords[7])]){
+   const f=sessionClearedFixture(change),local=structuredClone(f.local),session=structuredClone(f.session);
+   assert.equal((await f.recover()).status,'held');assert.deepEqual(f.local,local);assert.deepEqual(f.session,session);assert.equal(f.reloads(),0);
+ }
+ const drift=sessionClearedFixture(f=>{let reads=0;f.browser.tabs.query=async()=>{if(++reads===2)f.tabs[0].url='https://chatgpt.com/c/user';return structuredClone(f.tabs);};});
+ assert.equal((await drift.recover()).status,'held');assert.deepEqual(drift.session,{});assert.equal(drift.reloads(),0);
+});
+test('unknown replacement of proved missing native controller retains one reservation and never receives a ghost original receipt',async()=>{
+ const f=missingControllerFixture({unknownCreate:true});
+ assert.equal((await f.recover()).reason,'bootstrap_create_unknown');assert.equal(f.session['chatgptBridgeLaunchedTab:7'],undefined);assert.equal(f.local[f.jkey].status,'outcome_unknown');assert.equal(f.creates(),1);
+ assert.equal((await f.recover()).status,'held');assert.equal(f.creates(),1);assert.equal(f.reloads(),0);
+});
+
+function missingControllerFixture({unknownCreate=false,change=()=>{}}={}){
+ let creates=0;const f=sessionClearedFixture(f=>{
+  f.tabs.splice(0,1);f.browser.windows.update=async()=>{};f.browser.tabs.update=async id=>assert.equal(id,31);
+  f.browser.windows.get=async id=>{assert.equal(id,10);return {id:10,focused:false,state:'minimized',incognito:false};};
+  f.browser.windows.create=async options=>{
+   creates++;assert.equal(options.focused,false);assert.equal(options.state,'minimized');assert.equal(options.incognito,false);
+   if(unknownCreate)throw Error('original create outcome unknown');
+   f.tabs.push({id:31,windowId:10,url:'https://chatgpt.com/',incognito:false,active:true});
+   return {id:10,focused:false,state:'minimized',incognito:false,tabs:[{id:31}]};
+  };change(f);
+ });return {...f,creates:()=>creates};
+}
+test('manual session reset and expired maintenance replace a proved absent controller once then accept exact new hello',async()=>{
+ const f=missingControllerFixture(),old=structuredClone(f.local[f.key]),pending=structuredClone(f.local.bridgePendingExtensionReload);
+ assert.deepEqual(f.session,{});assert.equal((await f.recover()).status,'bootstrap_completed');assert.equal(f.creates(),1);
+ assert.equal(f.session['chatgptBridgeLaunchedTab:7'],undefined);assert.equal(f.session['chatgptBridgeV6:tab:31'],undefined);
+ assert.equal(f.local[f.key].tabId,31);assert.equal(f.local[f.key].reloadInvalidated,undefined);assert.notEqual(f.local[f.key].browserSession,old.browserSession);
+ assert.deepEqual(f.local[f.key].retiredControllers.at(-1).reloadInvalidated,old.reloadInvalidated);assert.deepEqual(f.local.bridgePendingExtensionReload,pending);
+ assert.equal(f.local[f.jkey].maintenanceMissingProof.enumerations,2);assert.equal(f.local[f.jkey].maintenanceMissingProof.currentControlSha256,controllerSha(old));
+ for(let tick=0;tick<3;tick++){assert.equal((await f.recover()).status,'held');assert.equal(f.creates(),1);}
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7),now:()=>1000000}),false);
+ f.connections.set('new-live',{tabId:31,closed:false,ws:{readyState:1},protocolReady:true,directorReadyProof:readyProof(31)});
+ assert.equal((await f.recover()).status,'connected');assert.equal(f.local[f.jkey].status,'connection_confirmed');assert.equal(f.creates(),1);assert.equal(f.reloads(),0);
+ for(let tick=0;tick<3;tick++)assert.equal((await f.recover()).status,'connected');assert.equal(f.creates(),1);
+});
+test('absent-controller replacement refuses inventory drift, changed journal, foreign owner and unknown creation',async()=>{
+ for(const change of [f=>f.local[f.jkey].status='reserved',f=>f.local[f.jkey].status='outcome_unknown',
+  f=>f.session['chatgptBridgeLaunchedTab:8']=structuredClone(f.local.bridgePendingExtensionReload.launchRecords[7]),
+  f=>f.session['chatgptBridgeV6:tab:99']={schemaVersion:6,lease:{requestId:'unknown'},outbox:[],commands:{},effects:{},downloads:{}},
+  f=>f.local.bridgePendingExtensionReload.launchRecords[8]=structuredClone(f.local.bridgePendingExtensionReload.launchRecords[7]),
+  f=>f.tabs.push({id:7,windowId:9,url:'https://chatgpt.com/c/user',incognito:false,active:false})]){
+   const f=missingControllerFixture({change}),before=structuredClone(f.local);assert.equal((await f.recover()).status,'held');assert.equal(f.creates(),0);assert.deepEqual(f.local,before);
+ }
+ const drift=missingControllerFixture({change:f=>{let reads=0;f.browser.tabs.query=async()=>{if(++reads===3)f.tabs.push({id:55,url:'https://example.com/new-user-page',incognito:false});return structuredClone(f.tabs);};}});
+ assert.equal((await drift.recover()).reason,'bootstrap_missing_controller_proof_changed');assert.equal(drift.creates(),0);assert.deepEqual(drift.session,{});
+});
+test('interrupted absent-controller replacement reconciles the original created window instead of making another',async()=>{
+ const f=missingControllerFixture();let failHide=true;
+ f.browser.windows.get=async id=>{assert.equal(id,10);return {id:10,focused:false,state:failHide?'normal':'minimized',incognito:false};};
+ f.browser.windows.update=async()=>{failHide=false;};
+ assert.equal((await f.recover()).reason,'bootstrap_window_hide_unconfirmed');assert.equal(f.local[f.jkey].status,'outcome_unknown');assert.equal(f.creates(),1);
+ f.connections.set('original-new-page',{tabId:31,closed:false,activeRequest:null,protocolReady:true,ws:{readyState:1}});
+ f.session['chatgptBridgeV6:tab:31']={schemaVersion:6,lease:null,outbox:[],commands:{},effects:{},downloads:{}};
+ const recovered=await f.recover();assert.equal(recovered.status,'bootstrap_reconciled',recovered.reason);assert.equal(f.creates(),1);assert.equal(f.local[f.key].tabId,31);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(31),now:()=>1000000}),true);assert.equal(f.local[f.jkey].status,'connection_confirmed');
+});
+test('missing-controller native proof is bound to current hashes, original idle identity and a fresh observed incident',async()=>{
+ for(const change of [p=>p.enumerations=1,p=>p.observedAt=undefined,p=>p.observedAt=1,p=>p.backgroundEpoch='old-worker',
+  p=>p.currentControlSha256='0'.repeat(64),p=>p.journalSha256='0'.repeat(64),p=>p.preimageSha256='0'.repeat(64),
+  p=>p.nativeInventorySha256='0'.repeat(64),p=>p.pendingSha256='0'.repeat(64),p=>p.generationCalled=true]){
+  const f=missingControllerFixture(),result=await f.api.reconcileReloadedControllerIdentity({browser:f.browser,connections:f.connections,backgroundEpoch:'current-worker',now:()=>1000000});assert.equal(result.status,'controller_missing_proved');
+  change(result.proof);const before=structuredClone(f.local);assert.equal((await f.api.bootstrapOwnedController({browser:f.browser,connections:f.connections,maintenanceMissing:result.proof,now:()=>1000000})).status,'held');
+  assert.equal(f.creates(),0);assert.deepEqual(f.local,before);assert.deepEqual(f.session,{});
+ }
+});
+test('manual reload after source timeout traverses real maintenance return and watchdog recovery without source replay',async()=>{
+ for(const missing of [false,true]){
+ const f=missing?missingControllerFixture():sessionClearedFixture(),c=f.local[f.key],pending=f.local.bridgePendingExtensionReload;
+ const {reloadInvalidated,...before}=c;delete c.reloadInvalidated;f.local[f.jkey].controllerSha256=controllerSha(c);
+ pending.idleControllers[f.key]={tabId:c.tabId,launchToken:c.launchToken,browserSession:c.browserSession,serverUrl:c.serverUrl,requestedUrl:c.requestedUrl,contentEpoch:'old-content',originalController:structuredClone(c),originalControllerSha256:controllerSha(c)};
+ pending.recoveryStatus='awaiting_source_ready';delete pending.recoveryReason;pending.sourceTabId=7;pending.temporaryServerUrl=c.serverUrl;
+ f.browser.storage.local.remove=async key=>{delete f.local[key];};
+ const context=vm.createContext({chrome:f.browser,crypto:webcrypto,TextEncoder,URL,URLSearchParams,Date:class extends Date{static now(){return 1000000;}},console:{info(){}},setTimeout});
+ const factory=vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/extensionReloadCoordinator.js'),'utf8').replace(/^export /gm,'')+'\ncreateExtensionReloadCoordinator',context);
+ const coordinator=factory({maintenanceOperations:{read:async()=>({})},safeBridgeServerUrl:u=>u,launchTokenPattern:/^bridge-/,
+  rememberLaunchedTab:async()=>assert.fail('expired maintenance cannot blindly restore receipts'),navigateTab:async()=>assert.fail('expired source never navigates'),reloadTab:async()=>assert.fail('expired source never reloads')});
+ assert.equal((await coordinator.recoverPendingExtensionReload()).reason,'source_ready_timeout');assert.deepEqual(f.session,{});assert.ok(c!==f.local[f.key]);
+ const restored=await f.recover();assert.equal(restored.status,missing?'bootstrap_completed':'reload_requested',restored.reason);assert.equal(f.reloads(),missing?0:1);assert.equal(f.session['chatgptBridgeV6:tab:7'],undefined);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(missing?31:7),now:()=>1000000}),true);
+ assert.equal(f.local[f.jkey].status,'connection_confirmed');
+ if(missing){assert.equal(f.session['chatgptBridgeLaunchedTab:7'],undefined);for(let tick=0;tick<3;tick++)await f.recover();assert.equal(f.creates(),1);}
+ }
+});

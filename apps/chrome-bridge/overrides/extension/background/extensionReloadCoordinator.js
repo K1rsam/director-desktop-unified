@@ -6,6 +6,8 @@ const CONTROLLER_SESSION_UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab]
 const DIRECTOR_LAUNCH_TOKEN_RE = /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const CONTROLLER_LAUNCH_TOKEN_RE = /^bridge-director-control-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ownedDesktopLaunch = (token) => DIRECTOR_LAUNCH_TOKEN_RE.test(token) || CONTROLLER_LAUNCH_TOKEN_RE.test(token);
+function controllerCanonical(value){if(Array.isArray(value))return value.map(controllerCanonical);if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().map(key=>[key,controllerCanonical(value[key])]));return value;}
+async function controllerDigest(value){const bytes=new TextEncoder().encode(JSON.stringify(controllerCanonical(value)));return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export const EXTENSION_RELOAD_ALARM_PREFIX = 'chatgptBridge:extensionReload:';
 
 export function extensionReloadAlarmName(operationId = '') {
@@ -166,7 +168,8 @@ export function createExtensionReloadCoordinator({
       // This is proof of an already completed, currently idle creation, not
       // permission to restore its old browser-session nonce after a restart.
       controllers[stateKey] = { tabId, launchToken: prior.launchToken, browserSession: prior.browserSession,
-        serverUrl: prior.serverUrl, requestedUrl: prior.requestedUrl, contentEpoch: runtime.contentEpoch || null };
+        serverUrl: prior.serverUrl, requestedUrl: prior.requestedUrl, contentEpoch: runtime.contentEpoch || null,
+        originalController: prior, originalControllerSha256: await controllerDigest(prior) };
     }
     return controllers;
   }
@@ -180,12 +183,17 @@ export function createExtensionReloadCoordinator({
       if (prior?.status !== 'opened' || prior.tabId !== proof.tabId || prior.launchToken !== proof.launchToken
         || prior.browserSession !== proof.browserSession || prior.serverUrl !== proof.serverUrl
         || prior.requestedUrl !== proof.requestedUrl) continue;
+      if(proof.originalController!==undefined&&(!proof.originalControllerSha256
+        ||await controllerDigest(proof.originalController)!==proof.originalControllerSha256
+        ||await controllerDigest(prior)!==proof.originalControllerSha256))continue;
       const expected=pending.expectedRuntime;
       const maintenanceRecovery=expected?.profileId===proof.launchToken.slice('bridge-director-control-'.length)
         &&expected.backgroundEpoch&&Number.isSafeInteger(pending.requestedAt)&&pending.requestedAt>0
         ? {version:'director-controller-maintenance-idle/v1',profileId:expected.profileId,
           previousBackgroundEpoch:expected.backgroundEpoch,requestedAt:pending.requestedAt,contentEpoch:proof.contentEpoch||null}:null;
-      await chrome.storage.local.set({ [stateKey]: { ...prior, reloadInvalidated: { ...proof, operationId: pending.operationId,
+      const {originalController,originalControllerSha256,...identityProof}=proof;
+      await chrome.storage.local.set({ [stateKey]: { ...prior, reloadInvalidated: { ...identityProof, operationId: pending.operationId,
+        ...(originalController!==undefined?{preMaintenanceController:originalController,preMaintenanceControllerSha256:originalControllerSha256}:{}),
         ...(maintenanceRecovery?{maintenanceRecovery}:{}) } } });
     }
   }
@@ -254,6 +262,11 @@ export function createExtensionReloadCoordinator({
       tabCount: pending.tabIds.length,
     });
     const requestedAt = Number(pending.requestedAt || 0);
+    // A manual runtime reload clears storage.session even after this operation
+    // has timed out. Preserve its exact controller invalidation before the TTL
+    // return; receipt restoration still requires the watchdog's fresh native
+    // window and full controller-preimage proof. Never replay source navigation.
+    if(Number.isSafeInteger(requestedAt)&&requestedAt>0&&requestedAt<=Date.now())await markReloadedControllers(pending);
     if (!requestedAt || Date.now() - requestedAt > PENDING_EXTENSION_RELOAD_TTL_MS) {
       await disarmRecoveryWake(pending.recoveryAlarmName);
       await storage.set({ [PENDING_EXTENSION_RELOAD_KEY]: { ...pending, recoveryStatus: 'held', recoveryReason: 'source_ready_timeout' } });

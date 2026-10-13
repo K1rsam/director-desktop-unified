@@ -206,12 +206,39 @@
     const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),30000),cancel=()=>controller.abort();deps.signal?.addEventListener('abort',cancel,{once:true});if(deps.signal?.aborted)cancel();
     let authHeaders,readStage='record';const options={method:'GET',credentials:'include',cache:'no-store',redirect:'error',signal:controller.signal};
     try {
-      const dom=globalThis.ChatGptTurnDom.createTurnDom(),turns=dom.getTurnNodes(),users=turns.filter(n=>dom.role(n)==='user'),assistants=turns.filter(n=>dom.role(n)==='assistant');
+      const dom=globalThis.ChatGptTurnDom.createTurnDom();
+      const savedBound=savedIdentity && typeof saved.userMessageId==='string' && saved.userMessageId.length>0;
+      // URL navigation can finish before React has mounted the conversation.
+      // Only an already-bound recovery page gets a short read-only DOM wait;
+      // its final uniqueness, full prompt hash and native message checks stay exact.
+      if(savedBound && readOnlyLaunch && deps.getBrowserLaunchToken?.()===readOnlyLaunch && !deps.getActiveRequest?.()){
+        readStage='conversation_dom_ready';
+        const domReadyDeadline=Date.now()+8000;
+        for(let attempt=0;attempt<=32;attempt++){
+          if(controller.signal.aborted)return unavailable('timeout_or_cancelled_conversation_dom_ready');
+          if(!sameIdentity()||!requestMatches())return unavailable('active_request_identity');
+          if(location.href!==page.href)return unavailable('page_conversation_changed');
+          const current=dom.getTurnNodes(),currentUsers=current.filter(node=>dom.role(node)==='user'),currentAssistants=current.filter(node=>dom.role(node)==='assistant');
+          if(currentUsers.length>1||currentAssistants.length>1)break;
+          const currentText=userPromptText(currentUsers[0]),promptMatches=currentUsers.length===1&&await digest(currentText)===expected.promptSha256;
+          if(promptMatches&&currentAssistants.length===1)break;
+          if(currentUsers.length===1&&normalize(currentText)&&!promptMatches)break;
+          if(attempt===32||Date.now()>=domReadyDeadline)break;
+          await new Promise(resolve=>{
+            const stopped=()=>{clearTimeout(wait);resolve();};
+            const wait=setTimeout(()=>{controller.signal.removeEventListener('abort',stopped);resolve();},Math.min(250,Math.max(0,domReadyDeadline-Date.now())));
+            controller.signal.addEventListener('abort',stopped,{once:true});
+          });
+        }
+        if(!sameIdentity()||!requestMatches())return unavailable('active_request_identity');
+        if(location.href!==page.href)return unavailable('page_conversation_changed');
+        const refreshed=deps.readLatestAssistantSnapshot?.(1);if(refreshed)snapshot=refreshed;
+        readStage='record';
+      }
+      const turns=dom.getTurnNodes(),users=turns.filter(n=>dom.role(n)==='user'),assistants=turns.filter(n=>dom.role(n)==='assistant');
       const facts={userCount:users.length,assistantCount:assistants.length,userText:userPromptText(users[0]),assistantText:normalize(assistants[0]?.innerText||assistants[0]?.textContent)};
       const pendingAssistant=facts.assistantCount===0 && deps.getActiveRequest?.()?.requestId===expected.requestId;
       if(facts.userCount!==1||!(facts.assistantCount===1||pendingAssistant)||await digest(facts.userText)!==expected.promptSha256)return result(expected,'mismatch','dom_user_boundary',{domFacts:{userCount:facts.userCount,assistantCount:facts.assistantCount,promptMatches:await digest(facts.userText)===expected.promptSha256}});
-      const savedBound=saved?.version==='chrome-conversation-locator/v1' && saved.requestId===expected.requestId && saved.conversationId===expected.conversationId
-        && saved.promptSha256===expected.promptSha256 && typeof saved.userMessageId==='string' && saved.userMessageId.length>0;
       if(expected.mode!=='image_record_probe' && !deps.getActiveRequest?.() && !savedBound && !normalize(facts.userText).includes('任务关联码：'+expected.requestId+'。'))return unavailable('released_task_marker');
       const endpoint=`${page.origin}/backend-api/conversation/${encodeURIComponent(expected.conversationId)}`;let response=await fetch(endpoint,options);
       if([401,403,404].includes(response.status)){const session=await fetch(`${page.origin}/api/auth/session`,options);if(!session.ok)return unavailable('authentication_unavailable');const token=(await session.json())?.accessToken;if(typeof token!=='string'||!token)return unavailable('authentication_unavailable');authHeaders={Authorization:`Bearer ${token}`};response=await fetch(endpoint,{...options,headers:authHeaders});}
