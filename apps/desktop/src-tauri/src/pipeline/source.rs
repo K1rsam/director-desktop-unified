@@ -289,13 +289,17 @@ const FIDELITY_PARSER_VERSION: &str = "source-parser/v6";
 const MULTILINE_DISPLAY_PARSER_VERSION: &str = "source-parser/v7";
 const JOINT_SPEAKER_PARSER_VERSION: &str = "source-parser/v8";
 const TITLE_METADATA_PARSER_VERSION: &str = "source-parser/v9";
+const EXPLICIT_INLINE_PARSER_VERSION: &str = "source-parser/v10";
+
+#[path = "source_explicit_inline.rs"]
+mod explicit_inline;
 
 fn uses_joint_speaker_rules(version: &str) -> bool {
-    [JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&version)
+    [JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&version)
 }
 
 fn uses_fidelity_rules(version: &str) -> bool {
-    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&version)
+    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&version)
 }
 
 fn display_block_header(text: &str) -> bool {
@@ -349,7 +353,7 @@ fn display_enclosure_field(line: &str) -> Option<&str> {
 /// of speakers: the same labels outside that exact enclosure remain dialogue.
 /// Incomplete enclosures and explicit speech cues never grant an exemption.
 fn multiline_display_row_ids(source: &LockedSource, named: &HashSet<String>) -> HashSet<String> {
-    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION].contains(&source.parser_version.as_str()) {
+    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&source.parser_version.as_str()) {
         return HashSet::new();
     }
     let mut ids = HashSet::new();
@@ -446,6 +450,7 @@ fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
+        EXPLICIT_INLINE_PARSER_VERSION,
     ]
     .contains(&source.parser_version.as_str())
     {
@@ -613,7 +618,7 @@ fn title_metadata_row_indices(text: &str) -> HashSet<usize> {
     indices
 }
 
-fn fresh_parser_version(text: &str) -> &'static str {
+fn prior_title_parser_version(text: &str) -> &'static str {
     let prior = prior_joint_parser_version(text);
     if title_metadata_row_indices(text).is_empty() { return prior; }
     if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, TITLE_METADATA_PARSER_VERSION)) {
@@ -622,6 +627,15 @@ fn fresh_parser_version(text: &str) -> &'static str {
         old.as_object_mut().unwrap().remove("parserVersion");
         new.as_object_mut().unwrap().remove("parserVersion");
         if old != new { return TITLE_METADATA_PARSER_VERSION; }
+    }
+    prior
+}
+
+fn fresh_parser_version(text: &str) -> &'static str {
+    let prior = prior_title_parser_version(text);
+    if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, EXPLICIT_INLINE_PARSER_VERSION)) {
+        // Only an actual explicit-inline change opts new imports into v10.
+        if explicit_inline::changes_dialogue_rows(&old, &new) { return EXPLICIT_INLINE_PARSER_VERSION; }
     }
     prior
 }
@@ -937,6 +951,7 @@ fn parse_dialogue_with_label(text: &str, start: usize, row_id: &str, parser_vers
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
+        EXPLICIT_INLINE_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let (channel_text, channel_label) = if current_voice_rules {
@@ -1117,6 +1132,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
+        EXPLICIT_INLINE_PARSER_VERSION,
     ]
     .contains(&parser_version)
     {
@@ -1129,6 +1145,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         MULTILINE_DISPLAY_PARSER_VERSION,
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
+        EXPLICIT_INLINE_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let fidelity = uses_fidelity_rules(parser_version);
@@ -1190,7 +1207,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
     let mut continued_metadata = HashSet::new();
     let mut previous_heading_number = None;
     let lines = raw_lines(text);
-    let title_metadata = if parser_version == TITLE_METADATA_PARSER_VERSION {
+    let title_metadata = if [TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&parser_version) {
         title_metadata_row_indices(text)
     } else { HashSet::new() };
     let first_nonempty = lines.iter().position(|line| !line.trim().is_empty());
@@ -1526,17 +1543,21 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         offset = end;
     }
     apply_joint_dialogues(&mut source);
+    if parser_version == EXPLICIT_INLINE_PARSER_VERSION {
+        explicit_inline::apply(&mut source);
+    }
     let display_ids = display_only_row_ids(&source);
     for row in &mut source.rows {
         if display_ids.contains(&row.id) {
             row.dialogue = None;
         }
     }
-    let speaker_names: HashSet<_> = source
+    let mut speaker_names: HashSet<_> = source
         .rows
         .iter()
         .filter_map(|r| r.dialogue.as_ref().map(|q| q.speaker.clone()))
         .collect();
+    if parser_version == EXPLICIT_INLINE_PARSER_VERSION { speaker_names.extend(declared_speaker_names(&source)); }
     let inline_re = Regex::new(
         r"(?:^|[\s；;])([\p{L}][\p{L}\p{N}·・_]{0,23})(?:\s*[（(][^\r\n:：()（）]*[）)])?\s*[:：]",
     )
@@ -1545,7 +1566,8 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         if let Some(q) = &row.dialogue {
             if inline_re
                 .captures_iter(&q.quote)
-                .any(|c| fidelity || speaker_names.contains(c.get(1).unwrap().as_str()))
+                .any(|c| ((parser_version != EXPLICIT_INLINE_PARSER_VERSION && fidelity) || speaker_names.contains(c.get(1).unwrap().as_str()))
+                    && (parser_version != EXPLICIT_INLINE_PARSER_VERSION || explicit_inline::outside_enclosure(&q.quote,c.get(1).unwrap().start())))
             {
                 source.diagnostics.push(SourceDiagnostic{code:"DIALOGUE_MULTI_SPEAKER_UNCONFIRMED".into(),row_ids:vec![row.id.clone()],message:"同一原行含多个明确说者，保留原行；需按原坐标明确对白分段，不能把后段读给首位说者".into(),blocking:true});
             }
@@ -1758,6 +1780,7 @@ fn migrate_scene_edits(
 fn validate_integrity(source: &LockedSource) -> Result<(), String> {
     let display_ids = display_only_row_ids(source);
     let joint_names = uses_joint_speaker_rules(&source.parser_version).then(|| joint_speaker_grammar(source));
+    let inline_names = (source.parser_version == EXPLICIT_INLINE_PARSER_VERSION).then(|| explicit_inline::speaker_names(source));
     if source.schema_version != "locked-source/v1"
         || source.coordinate_system != "utf16"
         || source.sha256 != digest(&source.text)
@@ -1777,7 +1800,8 @@ fn validate_integrity(source: &LockedSource) -> Result<(), String> {
             return Err("来源行存在遗漏、重叠、错序或回读不一致".into());
         }
         let expected_dialogue = if row.kind == "body" && !display_ids.contains(&row.id) {
-            joint_names.as_ref().and_then(|names| joint_row_dialogue(row, names)).unwrap_or_else(|| row_dialogue(&row.text, row.range.start, &row.id, &source.parser_version))
+            inline_names.as_ref().and_then(|names| explicit_inline::marked_dialogue(row, names))
+                .or_else(|| joint_names.as_ref().and_then(|names| joint_row_dialogue(row, names)).unwrap_or_else(|| row_dialogue(&row.text, row.range.start, &row.id, &source.parser_version)))
         } else {
             None
         };
