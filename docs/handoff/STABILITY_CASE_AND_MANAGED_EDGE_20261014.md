@@ -150,3 +150,11 @@ Windows 原生 5 项新增回归通过，Refine 相关广组 20 passed、1 ignor
 Windows 合成 Planner **3/3**，原事件规则组 **8/8**，共享 SDK F2/Q1/Planner **13 passed、3 ignored**；显式真实捕获 **2/2**，分别为只读完整证明及 SQLite 一致隔离副本中的原节点采用、两次保存重开和重复采用（零模型提交）。原项目 DB 原字与三份传输文件哈希保持。证据 `planner-order-native-v1/`、`planner-order-original-native-v2/`、`planner-order-shared-replay-native-v2/`、`planner-order-capture-native-v3/`。初次捕获工具经 JavaScript 重序列化将 `1.0` 变为 `1`，导致严格 Rust Value 比较失败；后来改用数据库原字符串捕获，旧失败证据保留，不改产品原回包。
 
 首集精修已使用原 workflow 实际完成，人工审核确认只修改两个声音事件枚举与 17 秒回接的一致表述，仍为 34 镜、100 秒，其余三个单元和本集末态保持。**目前尚未采用**：真实客户端采用入口重建材料漏带冻结 scene/sound 合同，触发上下文变化拒绝，原候选与原采用稿均保留。此入口正在补修，不重新调用模型。
+
+## 精修采用入口补齐及正式采用
+
+上述采用阻断已修复：`Engine::dispatch` 在重读当前源文、资产、单元及制作材料后，只继承候选原先冻结的 scene/sound/asset-use 合同，继续使用原冻结执行设置。所有合同先验证后一次写入；历史缺省不升级，显式 null/未知合同保持拒绝，真实源文/资产/单元变化仍走原 CAS。
+
+Windows 合同 helper **1/1**、真实 Engine 分发合成采用 **1/1**、显式隔离实库采用与重复采用 **1/1**；领域精修组 **10/10**、Engine 精修相关组 **10 passed、1 ignored**。测试 EXE SHA-256 `d822ac1977f4447c043af0ac444d69b6563c55703be1bfb7d5b906e107171b21`，证据 `refine-adopt-profile-helper-native-v1/`、`refine-adopt-dispatch-native-v1/`、`refine-adopt-isolated-native-v1/`、`refine-adopt-domain-all-native-v1/`、`refine-adopt-engine-all-native-v1/`。
+
+05:40 在正式新案例采用同一已审核候选成功，未重新调用模型。原9个单元中仅许可的末单元更新，其余8个逐值保持，未产生 continuityStale。源、资产、原候选、原父快照及旧失败证据保留。随后正常恢复原第3–10集工作流，第3集同一 Planner 节点已零调用复验为 completed；后续主创与整编仍须继续验收。证据 `refine-adopt-proof.json`、`refine-adopt-profiles-result.json`、`storyboard-plan-repair-intent.json`。

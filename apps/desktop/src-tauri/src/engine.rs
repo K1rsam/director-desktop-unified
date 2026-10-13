@@ -1549,7 +1549,7 @@ impl Engine {
                 let original = &old["snapshot"]["input"];
                 if old["snapshot"]["savedSettingsSha256"] != pipeline::digest(&store.settings()?.to_string()) { return Err("项目参数已变化，精修结果已保留，请核对后重新精修".into()); }
                 let mut current = refinement_input_with_capabilities(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}),original.get("capabilities"))?;
-                pipeline::asset_use_binding::inherit(&mut current, original)?;
+                pipeline::storyboard_refinement::inherit_frozen_profiles(&mut current, original)?;
                 // Execution identity is frozen by preflight, not editable project state.
                 current["settings"] = original["settings"].clone();
                 store.publish_storyboard_refinement(run, s(&request,"candidateSha256"), &current)?;
@@ -5577,6 +5577,60 @@ fn accepted_storyboard_revision_contexts(
 mod refinement_lineage_tests {
     use super::*;
     use crate::pipeline::storyboard_refinement::tests::{fixture,saved_candidate,Model};
+
+    #[test]
+    #[ignore = "explicit isolated database copy; no production writes, model or channel calls"]
+    fn refinement_dispatch_isolated_saved_candidate_adopts_without_changing_original_evidence() {
+        let root=PathBuf::from(std::env::var("DIRECTOR_REFINEMENT_ISOLATED_ADOPTION_ROOT").expect("isolated copy root required"));
+        let marker:Value=serde_json::from_slice(&fs::read(root.join("isolated-refinement-adoption.json")).unwrap()).unwrap();
+        assert_eq!(marker["purpose"],"isolated-refinement-adoption/v1");
+        assert_eq!(fs::canonicalize(&root).unwrap(),fs::canonicalize(s(&marker,"isolatedRoot")).unwrap());
+        assert_ne!(fs::canonicalize(&root).unwrap(),fs::canonicalize(s(&marker,"sourceRoot")).unwrap());
+        let store=Store::open(root.clone()).unwrap();let run=s(&marker,"workflowId");let saved=store.job(run).unwrap();
+        assert_eq!(saved["result"]["candidateSha256"],marker["candidateSha256"]);assert!(saved["prepared"].get("refinementAdoption").is_none());
+        let frozen=&saved["snapshot"]["input"];let request=json!({"episodeId":frozen["episodeId"],"refinementScope":frozen["refinementScope"],"reviewNotes":frozen["reviewNotes"],"preserveNotes":frozen["preserveNotes"]});
+        let mut old_input=refinement_input_with_capabilities(&store,&request,frozen.get("capabilities")).unwrap();pipeline::asset_use_binding::inherit(&mut old_input,frozen).unwrap();old_input["settings"]=frozen["settings"].clone();
+        assert!(pipeline::adopt_storyboard_refinement(&old_input,&saved["result"]).is_err(),"old dispatch must reproduce the saved candidate rejection");
+        let source=store.source().unwrap();let assets=store.values("assets").unwrap();let settings=store.settings().unwrap();
+        let count_jobs=||store.conn().unwrap().query_row("SELECT COUNT(*) FROM jobs",[],|r|r.get::<_,i64>(0)).unwrap();let jobs=count_jobs();
+        let engine=Engine::with_channels(root.join("isolated-engine-home"),Arc::new(crate::execution_policy::OfflineChannels)).unwrap();engine.register(&store).unwrap();
+        let adoption=json!({"action":"storyboard.refinement.adopt","projectId":store.project().unwrap()["id"],"workflowId":run,"candidateSha256":marker["candidateSha256"]});
+        engine.dispatch(adoption.clone()).unwrap();let adopted=store.values("units").unwrap();engine.dispatch(adoption).unwrap();
+        assert_eq!(store.values("units").unwrap(),adopted);assert_eq!(store.source().unwrap(),source);assert_eq!(store.values("assets").unwrap(),assets);assert_eq!(store.settings().unwrap(),settings);assert_eq!(count_jobs(),jobs);
+        let after=store.job(run).unwrap();assert_eq!(after["snapshot"],saved["snapshot"]);assert_eq!(after["result"],saved["result"]);assert_eq!(after["prepared"]["refinementAdoption"]["candidateSha256"],marker["candidateSha256"]);
+        println!("isolated saved candidate adopted and replayed: newModelJobs=0 originalSnapshot=true rawCandidate=true source=true assets=true settings=true productionDatabaseWrites=0");
+    }
+
+    #[tokio::test]
+    async fn refinement_dispatch_adoption_inherits_all_frozen_profiles_without_upgrading_legacy() {
+        for marked in [false,true] {
+            let (_directory,store,base,_origin)=fixture().await;
+            let request=json!({"episodeId":base["episodeId"],"refinementScope":{},"reviewNotes":"审阅本集","preserveNotes":"保留原话"});
+            let mut input=refinement_input_with_capabilities(&store,&request,Some(&base["capabilities"])).unwrap();
+            if marked {
+                input["storyboardSceneInputProfile"]=json!("unit-local-scene/v1");
+                pipeline::storyboard_sound_events::freeze_new(&mut input).unwrap();
+                pipeline::asset_use_binding::freeze_new(&mut input).unwrap();
+            }
+            let (run,candidate)=saved_candidate(&store,&input,"scattered").await;
+            let source=store.source().unwrap();let settings=store.settings().unwrap();let raw=store.job(&run).unwrap()["result"].clone();
+            let retained=input["existingUnits"][1].clone();
+            let mut prior=refinement_input_with_capabilities(&store,&request,Some(&base["capabilities"])).unwrap();
+            pipeline::asset_use_binding::inherit(&mut prior,&input).unwrap();prior["settings"]=input["settings"].clone();
+            if marked {assert!(pipeline::adopt_storyboard_refinement(&prior,&candidate).unwrap_err().contains("上下文已变化"),"reproduce old dispatch omission");}
+            let engine=Engine::with_channels(store.root.join("isolated-adopt-engine"),Arc::new(crate::execution_policy::OfflineChannels)).unwrap();engine.register(&store).unwrap();
+            let result=engine.dispatch(json!({"action":"storyboard.refinement.adopt","projectId":store.project().unwrap()["id"],"workflowId":run,"candidateSha256":candidate["candidateSha256"]})).unwrap();
+            assert!(result.is_object());
+            let saved=store.job(&run).unwrap();assert_eq!(saved["result"],raw);
+            assert_eq!(saved["prepared"]["refinementAdoption"]["candidateSha256"],candidate["candidateSha256"]);
+            assert_eq!(store.get("units",s(&retained,"id")).unwrap(),retained);
+            assert_eq!(store.source().unwrap(),source);assert_eq!(store.settings().unwrap(),settings);
+            for field in ["storyboardSceneInputProfile","storyboardSoundEventProfile","assetUseBindingProfile"] {
+                assert_eq!(saved["snapshot"]["input"].get(field),input.get(field));
+                if !marked {assert!(saved["snapshot"]["input"].get(field).is_none());}
+            }
+        }
+    }
 
     #[tokio::test]
     async fn delta_finisher_and_refinement_adoption_keep_the_original_plan_for_further_work() {

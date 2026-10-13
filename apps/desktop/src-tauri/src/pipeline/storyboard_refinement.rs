@@ -9,6 +9,58 @@ use std::collections::HashSet;
 pub const CANDIDATE_VERSION: &str = "storyboard-refinement-candidate/v1";
 pub const FEEDBACK_VERSION: &str = "director-refinement-feedback/rust-v1";
 
+/// Restore only the interpretation contracts sealed into the candidate binding.
+/// Source, assets, adopted units and project settings must come from fresh reads.
+/// Validate the full batch before mutation; missing, null or unknown historical
+/// contracts must never opt into a newly introduced interpretation.
+pub(crate) fn inherit_frozen_profiles(target: &mut Value, frozen: &Value) -> Result<(), String> {
+    if !target.is_object() || !frozen.is_object() { return Err("精修冻结合同输入必须为对象".into()); }
+    creative::uses_scene_profile(target)?;
+    super::storyboard_sound_events::enabled(target)?;
+    super::asset_use_binding::enabled(target)?;
+    let mut inherited=json!({});
+    creative::attach_scene_profile(&mut inherited,frozen)?;
+    super::storyboard_sound_events::inherit(&mut inherited,frozen)?;
+    super::asset_use_binding::inherit(&mut inherited,frozen)?;
+    for field in [creative::SCENE_PROFILE_FIELD,super::storyboard_sound_events::PROFILE_FIELD,super::asset_use_binding::FIELD] {
+        if target.get(field).is_some() && target.get(field)!=inherited.get(field) {
+            return Err("精修采用不能向原冻结候选新增或变更演绎合同".into());
+        }
+    }
+    target.as_object_mut().unwrap().extend(inherited.as_object().unwrap().clone());
+    Ok(())
+}
+
+#[cfg(test)]
+mod frozen_profile_tests {
+    use super::*;
+
+    #[test]
+    fn adoption_profiles_preserve_fresh_material_and_reject_partial_or_unknown_upgrades() {
+        let profiles=json!({
+            creative::SCENE_PROFILE_FIELD:creative::SCENE_PROFILE,
+            super::super::storyboard_sound_events::PROFILE_FIELD:super::super::storyboard_sound_events::PROFILE,
+            super::super::asset_use_binding::FIELD:super::super::asset_use_binding::PROFILE
+        });
+        let fresh=json!({"source":{"sha256":"current-source"},"assets":[{"id":"current-asset"}],"existingUnits":[{"id":"current-unit","version":9}],"settings":{"model":"current-settings"},"refinementScope":{"unitIds":["current-unit"]}});
+        let mut target=fresh.clone();let before=profiles.clone();inherit_frozen_profiles(&mut target,&profiles).unwrap();
+        for (key,value) in fresh.as_object().unwrap() {assert_eq!(target[key],*value,"fresh {key}");}
+        for (key,value) in profiles.as_object().unwrap() {assert_eq!(target[key],*value,"frozen {key}");}
+        assert_eq!(profiles,before);
+        let mut legacy=fresh.clone();inherit_frozen_profiles(&mut legacy,&json!({})).unwrap();assert_eq!(legacy,fresh);
+        for field in [creative::SCENE_PROFILE_FIELD,super::super::storyboard_sound_events::PROFILE_FIELD,super::super::asset_use_binding::FIELD] {
+            for invalid in [Value::Null,json!("unknown/v99"),json!(false)] {
+                let mut frozen=profiles.clone();frozen[field]=invalid.clone();let mut target=fresh.clone();
+                assert!(inherit_frozen_profiles(&mut target,&frozen).is_err(),"{field} {invalid}");assert_eq!(target,fresh);
+                let mut target=fresh.clone();target[field]=invalid;let old=target.clone();
+                assert!(inherit_frozen_profiles(&mut target,&profiles).is_err());assert_eq!(target,old);
+            }
+            let mut target=fresh.clone();target[field]=profiles[field].clone();let old=target.clone();
+            assert!(inherit_frozen_profiles(&mut target,&json!({})).is_err());assert_eq!(target,old);
+        }
+    }
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
