@@ -1,4 +1,4 @@
-//! Two exact SDK foundation regressions: revalidate original bytes, never dispatch again.
+//! Exact SDK validator regressions: revalidate original bytes, never dispatch again.
 use super::*;
 use crate::text_transport::{AttemptState, Backend, FrozenAttempt};
 
@@ -6,24 +6,33 @@ const POLICY: &str = "sdk-f2-scene-episode-projection-replay/v1";
 const REJECTION: &str = "资产用途集号与本次场引用不一致";
 const Q1_POLICY: &str = "sdk-q1-confirmed-scene-split-replay/v1";
 const Q1_REJECTION: &str = "制作选择场范围不在当前原文";
+const PLAN_POLICY: &str = "sdk-planner-package-source-order-replay/v1";
+const PLAN_REJECTION: &str = "工作包必须依源顺序覆盖正文恰好一次";
 
 struct ReplayPolicy {
     name: &'static str,
     stage: &'static str,
+    workflow: &'static str,
     rejection: &'static str,
     accepted_event: &'static str,
     rejected_event: &'static str,
 }
 
-const F2: ReplayPolicy = ReplayPolicy { name: POLICY, stage: "foundation:F2", rejection: REJECTION,
+const F2: ReplayPolicy = ReplayPolicy { name: POLICY, stage: "foundation:F2", workflow:"foundation.run", rejection: REJECTION,
     accepted_event: "sdk_f2_episode_replay_accepted", rejected_event: "sdk_f2_episode_replay_rejected" };
-const Q1: ReplayPolicy = ReplayPolicy { name: Q1_POLICY, stage: "foundation:Q1", rejection: Q1_REJECTION,
+const Q1: ReplayPolicy = ReplayPolicy { name: Q1_POLICY, stage: "foundation:Q1", workflow:"foundation.run", rejection: Q1_REJECTION,
     accepted_event: "sdk_q1_scene_split_replay_accepted", rejected_event: "sdk_q1_scene_split_replay_rejected" };
+const PLAN: ReplayPolicy = ReplayPolicy { name:PLAN_POLICY, stage:"storyboardPlan", workflow:"storyboard.run", rejection:PLAN_REJECTION,
+    accepted_event:"sdk_planner_source_order_replay_accepted", rejected_event:"sdk_planner_source_order_replay_rejected" };
 
 fn policy(snapshot: &Value) -> Option<&'static ReplayPolicy> {
     let input = &snapshot["input"];
-    if snapshot["executorIdentity"]["provider"] != "codex_sdk"
-        || input["method"] != "foundation-delivery/v2"
+    if snapshot["executorIdentity"]["provider"] != "codex_sdk" {return None;}
+    if snapshot["stage"]==PLAN.stage && snapshot["skill"]=="episode-emotion-planner"
+        && input["storyboardCreativeProfile"]=="original-production-contract/v1"
+        && input["sourceRows"].is_array() && input["contextRows"].is_array() && input["episode"]["id"].is_string()
+    {return Some(&PLAN);}
+    if input["method"] != "foundation-delivery/v2"
         || input["modelInputProfile"] != "foundation-compact/v1"
         || input["catalogueContract"] != "light-catalogue/v1"
         || input["sourceReferenceEncoding"] != "row-coordinates/v1"
@@ -51,6 +60,13 @@ fn source_bound(snapshot: &Value, parent: &Value) -> bool {
         return false;
     };
     let input = &snapshot["input"];
+    if policy(snapshot).is_some_and(|p|p.name==PLAN_POLICY) {
+        let Some(episode)=locked.episodes.iter().find(|e|input["episode"]["id"]==e.id) else{return false;};
+        let expected:Vec<_>=locked.rows.iter().filter(|r|r.kind=="body"&&r.episode_id.as_deref()==Some(&episode.id)).collect();
+        return crate::pipeline::validate_source(&locked).is_ok() && source["version"]==parent["sourceVersion"]
+            && parent["sourceVersion"].as_u64().is_some_and(|v|v>0) && json!(episode)==input["episode"]
+            && json!(expected)==input["sourceRows"] && input["contextRows"].as_array().is_some_and(|rows|rows.iter().all(|r|locked.rows.iter().any(|old|json!(old)==*r)));
+    }
     if crate::pipeline::digest(&locked.text) != locked.sha256
         || input["sourceSha256"] != locked.sha256
         || parent["sourceVersion"] != parent["input"]["sourceVersion"]
@@ -148,8 +164,8 @@ fn audit_valid(audit: &Value) -> bool {
     eligible(&snapshot)
         && snapshot.to_string() == s(audit, "originalSnapshotJson")
         && crate::pipeline::digest(s(audit, "originalSnapshotJson")) == s(audit, "requestHash")
-        && parent["stage"] == "foundation.run"
-        && frozen_text_parent_matches("foundation.run", &parent, &request)
+        && parent["stage"] == policy.workflow
+        && frozen_text_parent_matches(policy.workflow, &parent, &request)
         && settings["textProvider"] == "codex_sdk"
         && settings["textSdkIdentity"] == snapshot["executorIdentity"]
         && settings["textModel"] == request.model
@@ -245,6 +261,14 @@ fn files_bound(root: &Path, audit: &Value) -> bool {
         && prepared["compiledSchemaSha256"] == expected["schemaSha256"]
 }
 
+fn domain_result_matches(snapshot:&Value,parent:&Value,raw:&Value,result:&Value)->bool {
+    if policy(snapshot).is_some_and(|p|p.name==PLAN_POLICY) {
+        let Ok(source)=serde_json::from_value(parent["input"]["source"].clone()) else{return false;};
+        return crate::pipeline::planner_source_order_replay_result(&source,&snapshot["input"],raw).is_ok_and(|value|value==*result);
+    }
+    crate::pipeline::foundation_delivery::accepted_scope_reason_raw_matches(&snapshot["input"],raw,result)
+}
+
 fn database_bound(
     c: &rusqlite::Connection,
     audit: &Value,
@@ -256,8 +280,8 @@ fn database_bound(
     let snapshot: Value = serde_json::from_str(s(audit, "originalSnapshotJson")).map_err(|e|e.to_string())?;
     let Some(policy) = policy(&snapshot) else { return Ok(false); };
     c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN jobs p ON p.id=w.workflow_id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.snapshot=?2 AND j.result=?3 AND j.prepared=?4 AND j.receipt=?5 AND j.state=?6 AND j.error IS ?7 AND w.workflow_id=?8 AND w.node_key=?9 AND w.stage=?18 AND w.request_hash=?10 AND w.state=?11 AND w.result=?12 AND w.error IS ?7 AND p.kind='workflow' AND p.entity_id='foundation.run' AND p.snapshot=?13 AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='text_received_raw' AND e.id=?14 AND e.data=?15 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='text_received_raw')) AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='sdk_raw_result' AND e.id=?16 AND e.data=?17 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='sdk_raw_result')))",
-        params![s(audit,"originalJobId"),s(audit,"originalSnapshotJson"),s(audit,"originalResultJson"),prepared.to_string(),receipt.to_string(),if accepted {"completed"} else {"rejected"},if accepted {None} else {Some(policy.rejection)},s(audit,"workflowId"),s(audit,"nodeKey"),s(audit,"requestHash"),if accepted {"accepted"} else {"rejected"},result.to_string(),s(audit,"originalWorkflowSnapshotJson"),audit["originalRawEventId"].as_i64(),s(audit,"originalRawEventDataJson"),audit["originalSdkRawEventId"].as_i64(),s(audit,"originalSdkRawEventDataJson"),policy.stage],
+        "SELECT EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN jobs p ON p.id=w.workflow_id WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.snapshot=?2 AND j.result=?3 AND j.prepared=?4 AND j.receipt=?5 AND j.state=?6 AND j.error IS ?7 AND w.workflow_id=?8 AND w.node_key=?9 AND w.stage=?18 AND w.request_hash=?10 AND w.state=?11 AND w.result=?12 AND w.error IS ?7 AND p.kind='workflow' AND p.entity_id=?19 AND p.snapshot=?13 AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='text_received_raw' AND e.id=?14 AND e.data=?15 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='text_received_raw')) AND EXISTS(SELECT 1 FROM events e WHERE e.job_id=j.id AND e.type='sdk_raw_result' AND e.id=?16 AND e.data=?17 AND e.id=(SELECT MAX(id) FROM events WHERE job_id=j.id AND type='sdk_raw_result')))",
+        params![s(audit,"originalJobId"),s(audit,"originalSnapshotJson"),s(audit,"originalResultJson"),prepared.to_string(),receipt.to_string(),if accepted {"completed"} else {"rejected"},if accepted {None} else {Some(policy.rejection)},s(audit,"workflowId"),s(audit,"nodeKey"),s(audit,"requestHash"),if accepted {"accepted"} else {"rejected"},result.to_string(),s(audit,"originalWorkflowSnapshotJson"),audit["originalRawEventId"].as_i64(),s(audit,"originalRawEventDataJson"),audit["originalSdkRawEventId"].as_i64(),s(audit,"originalSdkRawEventDataJson"),policy.stage,policy.workflow],
         |r|r.get(0)).map_err(|e|e.to_string())
 }
 
@@ -281,7 +305,7 @@ impl SavedTextExecutor {
         expected_prepared["sdkDomainResult"] = result.clone();
         expected_prepared["sdkDomainResultSha256"] =
             json!(crate::pipeline::digest(&result.to_string()));
-        let completed_event_bound = if policy.name == Q1_POLICY {
+        let completed_event_bound = if matches!(policy.name,Q1_POLICY|PLAN_POLICY) {
             let expected = json!({"policy":policy.name,"migrationAudit":audit,"generationRequestsSent":0,
                 "validation":"accepted","error":null,"validatedResultSha256":crate::pipeline::digest(&result.to_string()),"originalEvidencePreserved":true});
             self.store.conn()?.query_row("SELECT COUNT(*)=1 AND SUM(CASE WHEN type=?2 AND data=?4 THEN 1 ELSE 0 END)=1 FROM events WHERE job_id=?1 AND type IN (?2,?3)",
@@ -296,11 +320,7 @@ impl SavedTextExecutor {
             && receipt
                 == &json!({"contract":"desktop-runner/v1","validation":"accepted","migrationPolicy":policy.name,"migrationAudit":audit,"acceptedRequestHash":audit["requestHash"],"validatedResultSha256":crate::pipeline::digest(&result.to_string())})
             && job["prepared"] == expected_prepared
-            && crate::pipeline::foundation_delivery::accepted_scope_reason_raw_matches(
-                &snapshot["input"],
-                &original,
-                result,
-            )
+            && domain_result_matches(snapshot,&serde_json::from_str::<Value>(s(audit,"originalWorkflowSnapshotJson")).map_err(|e|e.to_string())?,&original,result)
             && database_bound(
                 &self.store.conn()?,
                 audit,
@@ -346,7 +366,7 @@ impl SavedTextExecutor {
         let policy = policy(snapshot).ok_or_else(held)?;
         let run = self.workflow_id.as_deref().ok_or_else(held)?;
         let c = self.store.conn()?;
-        let parent: String = c.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='foundation.run'",[run],|r|r.get(0)).map_err(|_|held())?;
+        let parent: String = c.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id=?2",params![run,policy.workflow],|r|r.get(0)).map_err(|_|held())?;
         let (event_id,event):(i64,String) = c.query_row("SELECT id,data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",[s(job,"id")],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|held())?;
         let (sdk_id,sdk_event):(i64,String) = c.query_row("SELECT id,data FROM events WHERE job_id=?1 AND type='sdk_raw_result' ORDER BY id DESC LIMIT 1",[s(job,"id")],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|held())?;
         let path = self.store.root.join("text-runs").join(s(job, "id"));
@@ -360,10 +380,10 @@ impl SavedTextExecutor {
     }
 
     pub(super) fn sdk_q1_replay_already_rejected(&self, job: &Value, snapshot: &Value) -> Result<bool> {
-        if !policy(snapshot).is_some_and(|p| p.name == Q1_POLICY)
-            || job["status"] != "rejected" || job["error"] != Q1_REJECTION { return Ok(false); }
+        let Some(policy)=policy(snapshot).filter(|p|matches!(p.name,Q1_POLICY|PLAN_POLICY)) else{return Ok(false);};
+        if job["status"] != "rejected" || job["error"] != policy.rejection { return Ok(false); }
         self.store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type=?2)",
-            params![s(job,"id"), Q1.rejected_event], |r|r.get(0)).map_err(|e|e.to_string())
+            params![s(job,"id"), policy.rejected_event], |r|r.get(0)).map_err(|e|e.to_string())
     }
 }
 
@@ -871,12 +891,8 @@ impl Store {
         let snapshot: Value =
             serde_json::from_str(s(audit, "originalSnapshotJson")).map_err(|e| e.to_string())?;
         let policy = policy(&snapshot).ok_or("SDK_FOUNDATION_REPLAY_PROOF_INVALID")?;
-        if reason.is_none()
-            && !crate::pipeline::foundation_delivery::accepted_scope_reason_raw_matches(
-                &snapshot["input"],
-                &raw,
-                result,
-            )
+        let parent:Value=serde_json::from_str(s(audit,"originalWorkflowSnapshotJson")).map_err(|e|e.to_string())?;
+        if reason.is_none() && !domain_result_matches(&snapshot,&parent,&raw,result)
         {
             return Err(
                 "SDK_F2_REPLAY_DOMAIN_RESULT_CHANGED: 仅允许原冻结引用规范化，不改事实".into(),
@@ -891,7 +907,7 @@ impl Store {
         {
             return Ok(false);
         }
-        if policy.name == Q1_POLICY && tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type IN (?2,?3))",
+        if matches!(policy.name,Q1_POLICY|PLAN_POLICY) && tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type IN (?2,?3))",
             params![s(audit,"originalJobId"), policy.accepted_event, policy.rejected_event], |r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
             return Ok(false);
         }
@@ -917,3 +933,7 @@ impl Store {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path="text_executor_sdk_planner_replay_tests.rs"]
+mod planner_replay_tests;

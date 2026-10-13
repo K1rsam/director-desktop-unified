@@ -70,6 +70,40 @@ fn combine_emotion(items: &[Value], fields: &[&str]) -> Value {
     Value::Object(combined)
 }
 
+/// Repair only the order of an otherwise exact contiguous source set inside
+/// each package. Package/event order and every creative value remain unchanged.
+pub(super) fn normalize_package_source_order(plan: &mut Value, rows: &[SourceRow]) -> Result<(), String> {
+    let error = || "工作包必须依源顺序覆盖正文恰好一次".to_owned();
+    let order:HashMap<_,_>=rows.iter().enumerate().map(|(i,row)|(row.id.as_str(),i)).collect();
+    if order.len()!=rows.len() || rows.is_empty() {return Err(error());}
+    let packages=plan["workPackages"].as_array().ok_or_else(error)?;
+    let mut normalized=Vec::new();let mut coverage=Vec::new();let mut changes=Vec::new();
+    for package in packages {
+        let refs=strings(package,"sourceRefs")?;
+        let mut seen=HashSet::new();let mut positions=Vec::new();
+        for id in &refs {
+            if !seen.insert(id) {return Err(error());}
+            positions.push(*order.get(id.as_str()).ok_or_else(error)?);
+        }
+        positions.sort_unstable();
+        if positions.is_empty() || positions.windows(2).any(|p|p[1]!=p[0]+1) {return Err(error());}
+        coverage.extend(positions.iter().copied());
+        let sorted:Vec<_>=positions.into_iter().map(|p|rows[p].id.clone()).collect();
+        if refs!=sorted {changes.push(json!({"packageId":package["id"],"originalSourceRefs":refs,"normalizedSourceRefs":sorted}));}
+        normalized.push(sorted);
+    }
+    if coverage!=(0..rows.len()).collect::<Vec<_>>() {return Err(error());}
+    if changes.is_empty() {return Ok(());}
+    if plan.get("packageSourceOrderNormalization").is_some() {return Err("规划已有源序证明，不覆写其原始来源".into());}
+    let original_hash=digest(&plan.to_string());
+    for (package,refs) in plan["workPackages"].as_array_mut().unwrap().iter_mut().zip(normalized) {
+        package["sourceRefs"]=json!(refs);
+    }
+    plan["packageSourceOrderNormalization"]=json!({"version":"planner-package-source-order/v1","originalPlanSha256":original_hash,
+        "sourceRowsSha256":digest(&json!(rows).to_string()),"changes":changes,"packageAndEventOrderUnchanged":true,"sourceSetUnchanged":true});
+    Ok(())
+}
+
 /// Mirrors normalizeEventPlan: continuous beats in the same real scene become
 /// one event/author owner; beat contracts and source anchors remain intact.
 pub(super) fn normalize_event_plan(plan: &mut Value, rows: &[SourceRow]) -> Result<(), String> {
@@ -677,6 +711,20 @@ mod tests {
             rows,
             json!({"schemaVersion":"storyboard-plan/v2","unitPackingPolicy":"event-first-v1","emotionArc":"挽留","events":events,"workPackages":packages,"provisionalUnits":units,"entryFacts":[],"fantasyCandidates":[]}),
         )
+    }
+
+    #[test]
+    fn ordered_package_sources_preserve_existing_and_event_normalized_bytes() {
+        let (rows, mut plan) = plan_fixture();
+        let original = plan.to_string();
+        normalize_package_source_order(&mut plan, &rows).unwrap();
+        assert_eq!(plan.to_string(), original);
+        assert!(plan.get("packageSourceOrderNormalization").is_none());
+        normalize_event_plan(&mut plan, &rows).unwrap();
+        let accepted = plan.to_string();
+        normalize_package_source_order(&mut plan, &rows).unwrap();
+        assert_eq!(plan.to_string(), accepted);
+        assert!(plan.get("packageSourceOrderNormalization").is_none());
     }
 
     #[test]

@@ -779,6 +779,45 @@ fn validate_emotion(contract: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn materialize_validated_plan(value:&mut Value,rows:&[SourceRow],context:&[SourceRow],scenes:&[SourceScene])->Result<(),String> {
+    if let Err(reason)=validate_plan(value,rows,context,scenes) {
+        if reason!="工作包必须依源顺序覆盖正文恰好一次" {return Err(reason);}
+        original::normalize_package_source_order(value,rows)?;
+        validate_plan(value,rows,context,scenes)?;
+    }
+    original::normalize_event_plan(value,rows)?;
+    for fact in value["entryFacts"].as_array_mut().ok_or("缺少入口事实")? {
+        let evidence:Vec<_>=strings(fact,"sourceRefs")?.iter().map(|id|rows.iter().chain(context).find(|r|&r.id==id).map(|r|r.text.clone()).ok_or("未知源证据")).collect::<Result<_,_>>()?;
+        fact["evidence"]=json!(evidence);fact["currentApplicability"]=json!("SOURCE_ANCHORED");
+    }
+    value["sourceFingerprints"]=json!(rows.iter().chain(context).map(|r|(r.id.clone(),digest(&r.text))).collect::<HashMap<_,_>>());
+    Ok(())
+}
+
+/// Exact source-bound output for the one historical package-order regression.
+/// Replays still pass the same complete planner validator and normalizer.
+pub(crate) fn planner_source_order_replay_result(source:&LockedSource,input:&Value,raw:&Value)->Result<Value,String> {
+    validate_source(source)?;
+    let rows:Vec<SourceRow>=serde_json::from_value(input["sourceRows"].clone()).map_err(|e|e.to_string())?;
+    let context:Vec<SourceRow>=serde_json::from_value(input["contextRows"].clone()).map_err(|e|e.to_string())?;
+    let episode=source.episodes.iter().find(|e|input["episode"]["id"]==e.id).ok_or("规划恢复缺少同一锁定集")?;
+    let expected:Vec<_>=source.rows.iter().filter(|r|r.kind=="body"&&r.episode_id.as_deref()==Some(&episode.id)).collect();
+    if json!(expected)!=input["sourceRows"] || json!(episode)!=input["episode"]
+        || context.iter().any(|r|!source.rows.iter().any(|old|json!(old)==json!(r))) {
+        return Err("规划恢复原行或集身份与冻结原文不一致".into());
+    }
+    let scenes:Vec<_>=source.scenes.iter().filter(|s|s.episode_id==episode.id).cloned().collect();
+    if validate_plan(raw,&rows,&context,&scenes).err().as_deref()!=Some("工作包必须依源顺序覆盖正文恰好一次") {
+        return Err("规划恢复不属于单包内部源序错误".into());
+    }
+    let mut result=raw.clone();materialize_validated_plan(&mut result,&rows,&context,&scenes)?;
+    if result["packageSourceOrderNormalization"]["version"]!="planner-package-source-order/v1" {return Err("规划恢复没有真实源序修复".into());}
+    if input["settings"]["fantasyMode"]=="off" && !result["fantasyCandidates"].as_array().unwrap().is_empty() {
+        return Err("关闭额外幻想时不得新增幻想候选".into());
+    }
+    Ok(result)
+}
+
 fn capabilities(input: &Value) -> Result<(f64, f64, usize), String> {
     let caps = input.get("capabilities").ok_or("缺少冻结的分镜制作规格")?;
     let max = caps
@@ -2418,16 +2457,10 @@ pub async fn run_storyboard(
                 let planned=call_validated(executor, "storyboardPlan", "episode-emotion-planner", model, reasoning,
                 plan_input.clone(), plan_schema_value.clone(), &plan_methods, |value| {
                     let raw=value.clone();
-                    validate_plan(value, &rows, &context, &scenes)?;
-                    if let Err(reason)=original::normalize_event_plan(value,&rows) {
+                    if let Err(reason)=materialize_validated_plan(value,&rows,&context,&scenes) {
                         if crate::text_executor::planner_repairable_rejection(&reason) {rejected_raw=Some(raw);}
                         return Err(reason);
                     }
-                    for fact in value["entryFacts"].as_array_mut().ok_or("缺少入口事实")? {
-                        let evidence:Vec<_>=strings(fact,"sourceRefs")?.iter().map(|id|rows.iter().chain(&context).find(|r|&r.id==id).map(|r|r.text.clone()).ok_or("未知源证据")).collect::<Result<_,_>>()?;
-                        fact["evidence"]=json!(evidence);fact["currentApplicability"]=json!("SOURCE_ANCHORED");
-                    }
-                    value["sourceFingerprints"]=json!(rows.iter().chain(&context).map(|r|(r.id.clone(),digest(&r.text))).collect::<HashMap<_,_>>());
                     if fantasy_mode == "off" && !value["fantasyCandidates"].as_array().unwrap().is_empty() { return Err("关闭额外幻想时不得新增幻想候选".into()); }
                     Ok(())
                 }).await;
