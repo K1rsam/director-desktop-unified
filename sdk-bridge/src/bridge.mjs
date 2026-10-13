@@ -19,10 +19,11 @@ export class BridgeError extends Error {
 }
 function requireThat(value, code, message) { if (!value) throw new BridgeError(code, message); }
 // The pinned official SDK defines ErrorItem as a non-fatal diagnostic, distinct
-// from a fatal top-level error. Runtime startup can emit it before turn.started.
+// from a fatal top-level error. The runtime can emit it at startup or during a
+// turn (for example, while falling back from WebSockets to HTTPS).
 // Validate the event contract, not the human-readable message. It grants no
 // turn, final text, tool permission or completion; the raw event stays durable.
-function preTurnDiagnostic(event) {
+function diagnosticItem(event) {
   const item = event.item;
   if (event.type !== 'item.completed' || !object(item) || item.type !== 'error'
     || !validId(item.id) || typeof item.message !== 'string'
@@ -377,7 +378,7 @@ export class OfficialSdkBridge {
           active.threadStarted = true; record.state = active.canceled ? 'cancel_requested' : 'running';
         } else if (event.type === 'turn.started') {
           requireThat(active.threadStarted && !active.turnStarted, 'OUT_OF_ORDER', 'Turn started without exactly one thread'); active.turnStarted = true;
-        } else if (active.threadStarted && !active.turnStarted && preTurnDiagnostic(event)) {
+        } else if (active.threadStarted && diagnosticItem(event)) {
           // The notice is already durably recorded. A real turn and final
           // agent_message are still mandatory before transport completion.
         } else if (['item.started', 'item.updated', 'item.completed'].includes(event.type)) {

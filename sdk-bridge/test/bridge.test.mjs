@@ -276,7 +276,7 @@ for (const [scenario, expected] of [
   ['policy-violation', 'POLICY_VIOLATION'], ['failed-after-text', 'SDK_TURN_FAILED'],
   ['same-item-mutated', 'ITEM_IDENTITY'], ['oversized-event', 'EVENT_LIMIT'],
   ['configuration-notice-only', 'INCOMPLETE_STREAM'], ['configuration-notice-before-thread', 'OUT_OF_ORDER'],
-  ['configuration-notice-malformed', 'OUT_OF_ORDER'], ['configuration-notice-after-turn', 'POLICY_VIOLATION'],
+  ['configuration-notice-malformed', 'OUT_OF_ORDER'],
   ['agent-before-turn', 'OUT_OF_ORDER'],
   ['notice-missing-id', 'OUT_OF_ORDER'], ['notice-too-long', 'OUT_OF_ORDER'],
   ['notice-extra-event-field', 'OUT_OF_ORDER'], ['tool-before-turn', 'OUT_OF_ORDER'],
@@ -619,6 +619,82 @@ test('reconnect diagnostics do not extend the existing execution deadline', asyn
   const start = Date.now(); const { receipt } = await completed(bridge);
   assert.ok(Date.now() - start < 5000);
   assert.ok(events.some(event => event.rawEvent?.type === 'error' && event.rawEvent.message.startsWith('Reconnecting...')));
+  assert.equal(receipt.state, 'submission_unknown'); assert.equal(receipt.error.code, 'CANCEL_UNCONFIRMED');
+  assert.equal(receipt.rawResult, null); assert.equal(receipt.processTreeStopProven, false);
+  await assert.rejects(bridge.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });
+});
+
+for (const scenario of ['configuration-notice-after-turn', 'diagnostic-in-turn-recovered', 'diagnostic-fallback-recovered']) {
+  test(`${scenario} preserves a non-fatal ErrorItem on the original stream until real completion`, async t => {
+    const { bridge, dir, events } = await fixture(t, scenario);
+    const { receipt } = await completed(bridge);
+    assert.equal(receipt.state, 'transport_completed');
+    assert.equal(receipt.rawResult.rawText, '{"ok":true,"text":"合成测试"}');
+    assert.equal(receipt.threadId, 'synthetic-thread-1');
+    assert.equal(receipt.domainAccepted, false);
+    const raw = events.filter(event => event.type === 'sdk_event');
+    const reconnects = scenario === 'diagnostic-fallback-recovered' ? Array(4).fill('error') : [];
+    assert.deepEqual(raw.map(event => event.rawEvent.type), ['thread.started', 'turn.started', ...reconnects, 'item.completed', 'item.completed', 'turn.completed']);
+    assert.deepEqual(raw.map(event => event.sequence), raw.map((_, index) => index + 1));
+    const diagnostic = raw.at(-3).rawEvent;
+    assert.equal(diagnostic.item.type, 'error');
+    assert.equal(raw.at(-2).rawEvent.item.type, 'agent_message');
+    if (reconnects.length) {
+      assert.deepEqual(raw.slice(2, 6).map(event => event.rawEvent.message), [2, 3, 4, 5].map(count => `Reconnecting... ${count}/5 (stream disconnected before completion: tls handshake eof)`));
+      assert.equal(diagnostic.item.message, 'Falling back from WebSockets to HTTPS transport. stream disconnected before completion: tls handshake eof');
+    }
+    const journal = await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8');
+    assert.deepEqual(journal.trim().split('\n').map(line => JSON.parse(line).rawEvent), raw.map(event => event.rawEvent));
+    const invocation = await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8');
+    assert.equal(JSON.parse(invocation).args.includes('resume'), false);
+    await assert.rejects(bridge.handle(executeCommand()), { code: 'ATTEMPT_EXISTS' });
+    await bridge.disconnect();
+    const restarted = new OfficialSdkBridge({ stateDirectory: dir }); await restarted.initialize();
+    try {
+      assert.equal(restarted.observe('attempt_1').state, 'transport_completed');
+      assert.equal(restarted.observe('attempt_1').rawResult.rawText, receipt.rawResult.rawText);
+      assert.equal(await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8'), journal);
+      assert.equal(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'), invocation);
+    } finally { await restarted.disconnect(); }
+  });
+}
+
+for (const [scenario, expected] of [
+  ['diagnostic-in-turn-only', 'INCOMPLETE_STREAM'], ['diagnostic-fallback-only', 'INCOMPLETE_STREAM'],
+  ['diagnostic-fallback-failed', 'SDK_TURN_FAILED'], ['diagnostic-no-final-text', 'OUT_OF_ORDER'],
+  ['diagnostic-before-thread', 'OUT_OF_ORDER'], ['diagnostic-after-terminal', 'OUT_OF_ORDER'],
+  ['diagnostic-missing-id', 'POLICY_VIOLATION'], ['diagnostic-invalid-id', 'POLICY_VIOLATION'],
+  ['diagnostic-empty-message', 'POLICY_VIOLATION'], ['diagnostic-too-long', 'POLICY_VIOLATION'],
+  ['diagnostic-extra-field', 'POLICY_VIOLATION'], ['diagnostic-extra-event-field', 'POLICY_VIOLATION'],
+  ['diagnostic-started', 'POLICY_VIOLATION'], ['diagnostic-updated', 'POLICY_VIOLATION'],
+  ['diagnostic-command', 'POLICY_VIOLATION'], ['diagnostic-file', 'POLICY_VIOLATION'],
+  ['diagnostic-search', 'POLICY_VIOLATION'], ['diagnostic-unknown', 'POLICY_VIOLATION'],
+]) test(`${scenario} stays unknown and never allows a replacement dispatch`, async t => {
+  const { bridge, dir } = await fixture(t, scenario);
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'submission_unknown'); assert.equal(receipt.error.code, expected);
+  assert.equal(receipt.rawResult, null); assert.equal(receipt.domainAccepted, false);
+  assert.equal(receipt.processTreeStopProven, false);
+  const journal = await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8');
+  assert.ok(journal.length > 0);
+  const invocation = await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8');
+  await assert.rejects(bridge.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });
+  await bridge.disconnect();
+  const restarted = new OfficialSdkBridge({ stateDirectory: dir, offlineFixture: offlineFixture('happy') }); await restarted.initialize();
+  try {
+    assert.equal(restarted.observe('attempt_1').state, 'submission_unknown');
+    assert.equal(restarted.observe('attempt_1').error.code, expected);
+    await assert.rejects(restarted.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });
+    assert.equal(await fs.readFile(path.join(dir, 'attempt_1/events.ndjson'), 'utf8'), journal);
+    assert.equal(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'), invocation);
+  } finally { await restarted.disconnect(); }
+});
+
+test('transport fallback ErrorItem does not reset the deadline or turn cancellation into completion', async t => {
+  const { bridge, events } = await fixture(t, 'diagnostic-fallback-hang', { limits: { executionMs: 1000 } });
+  const start = Date.now(); const { receipt } = await completed(bridge);
+  assert.ok(Date.now() - start < 5000);
+  assert.ok(events.some(event => event.rawEvent?.item?.type === 'error' && event.rawEvent.item.message.startsWith('Falling back from WebSockets')));
   assert.equal(receipt.state, 'submission_unknown'); assert.equal(receipt.error.code, 'CANCEL_UNCONFIRMED');
   assert.equal(receipt.rawResult, null); assert.equal(receipt.processTreeStopProven, false);
   await assert.rejects(bridge.handle(executeCommand('attempt_2')), { code: 'WORKER_OCCUPIED' });

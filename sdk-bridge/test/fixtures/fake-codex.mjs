@@ -27,7 +27,32 @@ const text = { type: 'item.completed', item: { id: 'synthetic-item-1', type: 'ag
 const complete = { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 1 } };
 const configurationNotice = { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `tools.view_image` is ignored.' } };
 const reconnect = { type: 'error', message: 'Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)' };
-if (scenario.startsWith('reconnect-') || scenario === 'fatal-error-during-turn') {
+if (scenario.startsWith('diagnostic-')) {
+  const diagnostic = { type: 'item.completed', item: { id: 'item_2', type: 'error', message: scenario.startsWith('diagnostic-fallback-')
+    ? 'Falling back from WebSockets to HTTPS transport. stream disconnected before completion: tls handshake eof'
+    : 'A non-fatal diagnostic during the original turn, 保留原始诊断。' } };
+  if (scenario === 'diagnostic-missing-id') delete diagnostic.item.id;
+  if (scenario === 'diagnostic-invalid-id') diagnostic.item.id = '../invalid';
+  if (scenario === 'diagnostic-empty-message') diagnostic.item.message = '';
+  if (scenario === 'diagnostic-too-long') diagnostic.item.message = '诊断'.repeat(683);
+  if (scenario === 'diagnostic-extra-field') diagnostic.item.text = 'must not be treated as agent text';
+  if (scenario === 'diagnostic-extra-event-field') diagnostic.command = 'synthetic-unexecuted-command';
+  if (scenario === 'diagnostic-started') diagnostic.type = 'item.started';
+  if (scenario === 'diagnostic-updated') diagnostic.type = 'item.updated';
+  if (scenario === 'diagnostic-command') diagnostic.item = { id: 'tool-1', type: 'command_execution', command: 'synthetic-unexecuted-command', status: 'in_progress' };
+  if (scenario === 'diagnostic-file') diagnostic.item = { id: 'file-1', type: 'file_change', changes: [], status: 'completed' };
+  if (scenario === 'diagnostic-search') diagnostic.item = { id: 'search-1', type: 'web_search', query: 'synthetic-unexecuted-search' };
+  if (scenario === 'diagnostic-unknown') diagnostic.item.type = 'unknown_item';
+  if (scenario !== 'diagnostic-before-thread') { event(thread); event(start); }
+  if (scenario.startsWith('diagnostic-fallback-')) for (let count = 2; count <= 5; count++) event({ ...reconnect, message: reconnect.message.replace('2/5', `${count}/5`) });
+  if (scenario === 'diagnostic-after-terminal') { event(text); event(complete); }
+  event(diagnostic);
+  if (scenario === 'diagnostic-fallback-failed') event({ type: 'turn.failed', error: { message: 'Synthetic terminal failure after fallback' } });
+  else if (scenario === 'diagnostic-fallback-hang') setTimeout(() => process.exit(0), 30_000);
+  else if (scenario === 'diagnostic-no-final-text') event(complete);
+  else if (!scenario.endsWith('-only') && scenario !== 'diagnostic-after-terminal') { event(text); event(complete); }
+}
+else if (scenario.startsWith('reconnect-') || scenario === 'fatal-error-during-turn') {
   event(thread);
   if (scenario !== 'reconnect-before-turn') event(start);
   event(scenario === 'reconnect-invalid-counter' ? { ...reconnect, message: reconnect.message.replace('2/5', '6/5') }

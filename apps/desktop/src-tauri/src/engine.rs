@@ -26,6 +26,8 @@ mod app_settings_engine;
 pub mod background_chrome_images;
 #[path = "task_record_maintenance.rs"]
 pub mod task_record_maintenance;
+#[path = "unit_save_guard.rs"]
+mod unit_save_guard;
 
 // Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
 const IMAGE_SUBMIT_WORKERS: usize = 8;
@@ -1312,7 +1314,9 @@ impl Engine {
                 let original = store
                     .get("units", s(&request["unit"], "id"))
                     .unwrap_or(json!({}));
-                let value = store.save_unit(merge(original.clone(), &request["unit"]))?;
+                let mut merged = merge(original.clone(), &request["unit"]);
+                unit_save_guard::check_shots_unchanged(&original, &mut merged)?;
+                let value = store.save_unit(merged)?;
                 if original["exitState"] != value["exitState"]
                     || original["prompt"] != value["prompt"]
                 {

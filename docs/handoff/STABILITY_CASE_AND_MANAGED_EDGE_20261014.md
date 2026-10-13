@@ -198,3 +198,35 @@ Windows 合同 helper **1/1**、真实 Engine 分发合成采用 **1/1**、显�
 Windows 运输组 **54 passed、0 failed、4 ignored**；明确环境绑定的真实请求只读验证另行 **1/1**。新增四组覆盖完整往返、创作字符串保留、null/未知字段、同身份不同证据、错误列/下标/目录、旧 fit 字节及无法容纳时拒绝。所有最终原生回执成功、无超时、进程树清空，零模型调用、零生产写入。证据 `finish-all-transport-v4/`、`finish-capacity-measure-v5/`。早期测量测试错误要求可选旧 grouping 结果必须存在，修正为前后完整可选字节一致后通过；失败日志保留，不修改原生产分组。
 
 恢复前另冻结原 73 个已完成文本任务、2 个源版本、47 个资产、13 个采用单元与 1,090 条历史事件的原数据库字段摘要，随后沿同一工作流恢复；恢复结果和后续集数仍需实际运行验收。此阶段尚未更新正式客户端 EXE。
+
+06:52 使用冻结的 v10 私有执行器沿原 `d202901b-5e0f-477e-973c-9e9fdc526ea7` 请求恢复，06:54 第四集首份整编已进入真实 SDK `running`，新节点 `f6d0044c-b095-4ac8-ada8-938d13052e65`；此前 73 个完成文本节点及所保护源、资产、单元、历史事件原数据库字段摘要仍一致。该执行器对应源码 `c7919be`，SHA-256 `3ac2de50ed2c149e6d6e7d99a79a93986900e3daaca9e7fe855dea911cb26842`。这是恢复派发证据，尚非第四集采用完成。
+
+首次测试启动误传 `--unvirtualized-desktop`，被 Windows 环境保护在打开项目之前拒绝；无 intent、无数据库变化、无模型提交。保留初次启动日志后，改用程序现有桌面重启入口正常启动，没有修改产品保护或重发原生成。证据 `storyboard-finish-capacity-repair-{initial-launch-error,native-launch,native-worker,intent}.json` 与 `capacity-resume-protection-latest.json`。
+
+## 第四集采用与第五集 SDK 网络回退误拦截
+
+第四集已沿原工作流完成两份整编并采用：6 单元、40 镜、127 秒；58 正文行全覆盖，台词、声窗、源与资产引用的结构核验通过。36 镜为 2–5 秒，最长 6.5 秒。前四集累计 19 单元、147 镜、428 秒。逐镜审核发现一个非尾单元的摄影描述要求人物入画后开口，但原声窗从镜头 0.1 秒开始；保留原话、声窗和镜长的局部修正建议已绑定单元版本及摘要，尚未改写正式采用稿。
+
+第五集 Planner 在网络重连 2/5 至 5/5 后收到 SDK `item.completed/error`，内容是从 WebSockets 回退到 HTTPS 的非致命诊断。旧桥只在 `turn.started` 之前接受这种 ErrorItem，运行中的同型诊断落入工具项拒绝分支，被错误标记为 `POLICY_VIOLATION`。原任务保留 `submission_unknown`、9 条原始事件及冻结请求，没有获得可信 `turn.completed` 或 raw result。原进程已退出；固定运行方式使用 ephemeral，未找到可被动读取的原 thread 文件。进程退出和 TLS 错误都不能证明上游未接受请求，因此本轮不创建替代工作流、不切换 CLI、不重发第五集，也不宣称十集验收完成。
+
+生产保护扩展到当前全部 SQL 表的原字段和第五集 SDK 文件摘要，另保存更新前的 9 份 SDK 静态资源。原 7 个项目、原文、已完成节点、资产、采用稿和历史事件继续核对一致；新案例图片与视频任务均为 0。专属 Edge 实测连接正常但仍未登录，真实图片仍未验收。证据：`unknown-stop-protected-before.json`、`unknown-stop-protection-latest.json`、`source-and-originals-audit.json`（以私有目录实际生成文件为准）。
+
+43 项设计合同升级暂未执行：它会改变当前第五集未知任务冻结的上游资产基线。第 5–10 集、完整十集后验收和真实图片不得用前四集的局部验证替代。后续只推进不改变这些冻结依赖的独立检查。
+
+## SDK 运行中诊断修复与独立真实验证
+
+固定官方 SDK 的 `item.completed/error` 是非致命诊断。桥接现在允许它出现在 `thread.started` 之后、终态之前，包含运行中的网络重连和 HTTPS 回退。仍严格校验事件/项目字段、合法 ID、非空且不超过 4096 字节的消息；不以英文文案白名单决定合法性。诊断不提供工具权限、正文或完成证明，成功仍需最终 agent message 和 `turn.completed`。异常顺序、工具/文件/搜索项目、非法字段、断流及超时仍拒绝或保留 unknown。
+
+Windows 本轮结果：桥接 `npm.cmd run verify` **123/123**；前端 **251/251**；原生核心 `sdk_ --test-threads=1` **94 passed / 0 failed / 5 ignored**，runner 380.107 秒、无超时、进程树为空。日志为私有 `sdk-erroritem-verify.log`、`frontend-final-20261014.log`、`sdk-diagnostic-native-core/`。5 个 ignored 专项没有批量运行。
+
+另执行一次独立合成输入的真实官方 SDK 调用，固定 SDK 0.160.1、runtime `codex-cli 0.162.0-alpha.17.2`、`gpt-6.1-sol / medium`。17.071 秒完成；execute 1 次、重开 execute 0 次，input 11,249 / output 23 tokens；没有读取生产项目，没有图片或视频提交。回执为 `sdk-diagnostic-live-corrected/sdk-worker/acceptance-receipt.json`。此成功调用未真实触发 HTTPS 回退，回退链由合成故障回归覆盖，不能将正常联网成功等同于真实故障复现。首次探针目录名不符合 wrapper 的 `sdk-worker` 要求，在执行前拒绝，sequence 0、无 thread、无模型调用；原失败证据与零派发证明保留，随后只更正该独立探针目录。
+
+新桥实现 SHA-256 为 `45ac627311ba6015bcbe825687f5d574dfeee54399961649eb2b71debd77d2f4`，组合桥身份为 `48af55f1835bd6959ede5801fa8ff2ca9068b267b36ec9f751949efdc9481dc7`。旧第五集继续冻结旧桥，未升级或重发。补丁解决误拦截，不宣称能找回已经缺失的上游终态。
+
+## 前四集保存、聚合与结构化编辑保护
+
+从生产 SQLite 只读一致备份创建隔离副本，验证前四集 19 个单元的全集投影等于逐集并集，保存重开及私有导出/隔离导入的正文、资产、单元一致；第四阶段纯素材绑定检查约 3 秒。缺图正确报告 118 次 `MISSING_IMAGE`、19 个 `UNBOUND_PLACEHOLDER`，没有调用 prepare/submit/start/tick，没有新增任何媒体任务，不能声称第四阶段真实制作已就绪。
+
+隔离检查发现 `units.save` 可修改结构化 shots 却保留旧 prompt/template。现在仅在 Engine 的手动保存入口拒绝已有单元的 shots 变更，返回 `UNIT_SHOTS_EDIT_REQUIRES_REFINEMENT`，引导导演精修与采用；同时传 prompt/override 不能绕过。正常文字、标题、配图编辑、相同或省略 shots、新单元及底层生产采用路径保留。兼容 JavaScript 将 `3.0` 回传为 `3` 的等值表示，并保存原 shots 数字表示；不容许大整数精度丢失或实际内容、顺序变化。
+
+Windows 原生守卫 **7/7** 通过，3.580 秒、无超时、进程树为空。最终源码真实隔离复验 35.616 秒通过：修改 camera/presentation 被明确拒绝，版本仍为 1，隔离全表原字段不变；保存重开、导出导入和聚合再次一致。生产 21 张表、第五集 unknown 完整记录/事件/文件、原 7 项目与源文均保持精确一致。证据 `unit-save-guard-native-v2/`、`partial-postflow-guard-native-v3/`、`partial-postflow-guard-v3/report.json`，详细私有报告 `UNIT_SAVE_STRUCTURED_GUARD_20261014.md`。第四集局部摄影修正建议仍未写入生产，完整十集验收门禁未放宽。
