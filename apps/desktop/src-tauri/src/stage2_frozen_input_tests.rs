@@ -88,3 +88,37 @@ async fn stage2_frozen_input_corrupt_restored_profile_blocks_before_model_call()
     let error=pipeline::run_asset_design(&project(&frozen),&executor,"offline","medium").await.unwrap_err();
     assert!(error.contains("合同版本"),"{error}");assert!(executor.requests.lock().unwrap().is_empty());assert_eq!(frozen,original);
 }
+
+#[tokio::test]
+async fn stage2_source_reparse_design_and_produce_keep_same_frozen_engineering_contract() {
+    let (mut frozen,old,proof)=pipeline::asset_visual_facts::source_reparse_tests::fixture();
+    pipeline::asset_visual_source_reparse::freeze(&mut frozen,old,proof).unwrap();
+    let original=serde_json::to_vec(&frozen).unwrap();
+    let restored:Value=serde_json::from_slice(&original).unwrap();
+    let projected=image_production_design_input(&restored,restored["assets"].as_array().unwrap(),&json!({}),"automatic",&[],&["person:base".into()]);
+    let field=pipeline::asset_visual_source_reparse::FIELD;
+    assert_eq!(projected[field],restored[field]);
+    let direct=LocalDesigner::default();let automatic=LocalDesigner::default();
+    let direct_result=pipeline::run_asset_design(&restored,&direct,"offline","medium").await.unwrap();
+    let auto_result=pipeline::run_asset_design(&projected,&automatic,"offline","medium").await.unwrap();
+    assert!(direct_result["blocked"].as_array().unwrap().is_empty(),"{direct_result}");
+    assert_eq!(direct_result["designs"],auto_result["designs"]);
+    let direct_calls=direct.requests.lock().unwrap();let auto_calls=automatic.requests.lock().unwrap();
+    assert_eq!(direct_calls.len(),1);assert_eq!(auto_calls.len(),1);
+    assert_eq!(direct_calls[0].stage,"assetDesign");assert_eq!(direct_calls[0].input,auto_calls[0].input);
+    assert!(direct_calls[0].input.get(field).is_none());
+    assert_eq!(serde_json::to_vec(&frozen).unwrap(),original);
+    drop(direct_calls);drop(auto_calls);
+    let mut next=projected;next["assets"]=auto_result["assets"].clone();next["foundation"]["facts"]=auto_result["facts"].clone();
+    next["foundation"]["visualFactBatches"]=auto_result["visualFactBatches"].clone();
+    assert!(!pipeline::automatic_design_required(&next,&next["assets"][0]));
+    let again=LocalDesigner::default();pipeline::run_asset_design(&next,&again,"offline","medium").await.unwrap();
+    assert!(again.requests.lock().unwrap().is_empty());
+    for value in [Value::Null,json!({"version":"unknown"})] {
+        let mut invalid=restored.clone();invalid[field]=value.clone();
+        let child=image_production_design_input(&invalid,invalid["assets"].as_array().unwrap(),&json!({}),"automatic",&[],&["person:base".into()]);
+        assert_eq!(child[field],value);let exec=LocalDesigner::default();
+        assert!(pipeline::run_asset_design(&child,&exec,"offline","medium").await.is_err());
+        assert!(exec.requests.lock().unwrap().is_empty());
+    }
+}

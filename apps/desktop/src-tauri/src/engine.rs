@@ -79,6 +79,7 @@ fn image_production_design_input(
         pipeline::asset_production_context::PROFILE_FIELD,
         pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD,
         pipeline::DESIGN_EVIDENCE_PROFILE_FIELD,
+        pipeline::asset_visual_source_reparse::FIELD,
     ] {
         if let Some(value) = context.get(key) { input[key] = value.clone(); }
     }
@@ -3390,6 +3391,9 @@ impl Engine {
             let projection = store.foundation_context_for_new_workflow()?;
             design_input["foundation"] = projection.foundation;
             design_input["foundationReasonProjection"] = projection.diagnostic;
+            if r.get("imageResumeOrigin").is_none() {
+                store.freeze_visual_fact_source_reparse(&mut design_input)?;
+            }
         }
         design_input["designRuleSha256"] = if original_context.is_object() {
             original_context["designRuleSha256"].clone()
@@ -3421,6 +3425,9 @@ impl Engine {
             design_input["foundation"]["productionDirection"] = original_context["foundation"]["productionDirection"].clone();
             for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD, pipeline::DESIGN_EVIDENCE_PROFILE_FIELD] {
                 if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
+            }
+            if let Some(value) = original_context.get(pipeline::asset_visual_source_reparse::FIELD) {
+                design_input[pipeline::asset_visual_source_reparse::FIELD] = value.clone();
             }
         } else {
             design_input["selection"]["explicitAssetIds"] = json!(r["assetIds"].as_array().cloned()

@@ -143,3 +143,26 @@ fn source_migration_changed_ordinary_foundation_reference_is_not_silently_rewrit
     assert!(store.save_v10_reparsed_source_if_current(candidate(&source),1).unwrap_err().contains("CONSUMED"));
     assert_eq!(store.source().unwrap(),source);assert_eq!(store.foundation().unwrap(),before);assert_eq!(protected_snapshot(&store),protected);
 }
+
+#[test]
+fn source_reparse_visual_freeze_requires_verified_store_proof_and_preserves_history() {
+    let (_dir,store,_)=setup();let old=store.source().unwrap();
+    let mut foundation=store.foundation().unwrap();foundation["visualFactBatches"][0]["inputFingerprint"]=json!("synthetic-packet");
+    store.save_foundation(foundation).unwrap();
+    let mut absent=json!({"source":old,"foundation":store.foundation().unwrap()});
+    store.freeze_visual_fact_source_reparse(&mut absent).unwrap();
+    assert!(absent.get(pipeline::asset_visual_source_reparse::FIELD).is_none());
+    store.save_v10_reparsed_source_if_current(candidate(&old),1).unwrap();
+    let before=protected_snapshot(&store);
+    let mut input=json!({"source":store.source().unwrap(),"foundation":store.foundation().unwrap()});
+    store.freeze_visual_fact_source_reparse(&mut input).unwrap();
+    // This fixture changes dialogue metadata only; its A15 row IDs survive,
+    // so the verified migration must not invent an unnecessary cache adapter.
+    assert!(input.get(pipeline::asset_visual_source_reparse::FIELD).is_none());
+    assert_eq!(protected_snapshot(&store),before);
+    let mut wrong=input.clone();wrong.as_object_mut().unwrap().remove(pipeline::asset_visual_source_reparse::FIELD);wrong["source"]["version"]=json!(3);
+    assert!(store.freeze_visual_fact_source_reparse(&mut wrong).is_err());
+    store.conn().unwrap().execute("DELETE FROM events WHERE type='source_reparse_migrated'",[]).unwrap();
+    let mut broken=input;broken.as_object_mut().unwrap().remove(pipeline::asset_visual_source_reparse::FIELD);
+    assert!(store.freeze_visual_fact_source_reparse(&mut broken).is_err());
+}

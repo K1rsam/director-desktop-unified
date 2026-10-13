@@ -275,6 +275,18 @@ impl Store {
         if count!=1 {return Err("SOURCE_MIGRATION_PROOF: 迁移事件缺失或不唯一".into());}
         Ok(Some(proof))
     }
+
+    /// Freeze engineering evidence only at a new Stage2 request boundary.
+    /// Never rewrite historical requests, accepted caches or repair budgets.
+    pub fn freeze_visual_fact_source_reparse(&self, input: &mut Value) -> Result<()> {
+        let Some(proof) = self.verified_source_reparse_migration()? else { return Ok(()); };
+        if proof["newSourceSha256"] != pipeline::digest(&input["source"].to_string()) {
+            return Err("SOURCE_MIGRATION_PROOF: Stage2 来源与已验证迁移不一致".into());
+        }
+        let old_version = proof["source"]["oldSourceVersion"].as_i64().ok_or("迁移证明缺旧来源版本")?;
+        let old = parse(self.conn()?.query_row("SELECT data FROM sources WHERE version=?1",[old_version],|r|r.get(0)).map_err(|e|e.to_string())?)?;
+        pipeline::asset_visual_source_reparse::freeze(input, old, proof)
+    }
 }
 
 #[cfg(test)]

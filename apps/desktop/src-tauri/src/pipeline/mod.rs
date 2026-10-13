@@ -1,5 +1,6 @@
 //! Source-bound production pipeline. Models author decisions; Rust copies and validates evidence.
 pub mod asset_visual_facts;
+pub(crate) mod asset_visual_source_reparse;
 pub(crate) mod asset_coverage;
 pub mod asset_design_contract;
 pub mod asset_production_context;

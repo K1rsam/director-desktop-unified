@@ -274,7 +274,9 @@ pub(crate) fn accepted_source_facts(input: &Value, source: &LockedSource) -> Res
     let registry = input["assetRegistry"].as_array().unwrap_or(assets);
     let current_rule = rule_snapshot("asset-visual-facts-extractor")?["sha256"].as_str().ok_or("视觉规则摘要缺失")?.to_owned();
     let mut accepted = Vec::new();
+    let reparse = asset_visual_source_reparse::Context::new(input, source)?;
     for cache in input["foundation"]["visualFactBatches"].as_array().into_iter().flatten() {
+        let Ok(source) = reparse.source(cache) else { continue; };
         let identities = if let Some(previous) = cache.get("identityCards").or_else(||cache.pointer("/repairProvenance/identityCards")).and_then(Value::as_array) {
             cached_identity_subset(input,registry,previous,source,cache)
         } else { Ok(identity_cards(input,registry)) };
@@ -1054,6 +1056,7 @@ pub(crate) fn cached_visual_check_asset_ids(input: &Value) -> Result<Vec<String>
         .ok_or("视觉事实规则摘要缺失")?
         .to_string();
     let mut needed = HashSet::new();
+    let reparse = asset_visual_source_reparse::Context::new(input, &source)?;
     for cache in caches {
         let pending: Vec<_> = cache["unassignedFacts"]
             .as_array()
@@ -1077,6 +1080,7 @@ pub(crate) fn cached_visual_check_asset_ids(input: &Value) -> Result<Vec<String>
             continue;
         }
         let validation = (|| -> Result<(), String> {
+            let source = reparse.source(cache)?;
             let previous = cache
                 .pointer("/repairProvenance/identityCards")
                 .and_then(Value::as_array)
@@ -1695,8 +1699,10 @@ async fn restore_persisted_fact_source_bindings(
     }
     let rule = rule_snapshot("asset-visual-facts-extractor")?["sha256"]
         .as_str().ok_or("视觉事实规则缺少SHA")?.to_owned();
+    let reparse = asset_visual_source_reparse::Context::new(input, source)?;
     for cache in input.pointer("/foundation/visualFactBatches")
         .and_then(Value::as_array).into_iter().flatten() {
+        let Ok(source) = reparse.source(cache) else { continue; };
         let previous = if let Some(cards) = cache.get("identityCards")
             .or_else(|| cache.pointer("/repairProvenance/identityCards")).and_then(Value::as_array) {
             Some(cards.clone())
@@ -1736,6 +1742,7 @@ pub async fn run_asset_visual_facts(
         serde_json::from_value(input.get("source").cloned().ok_or("视觉事实缺少锁定原文")?)
             .map_err(|e| e.to_string())?;
     validate_source(&source)?;
+    let reparse = asset_visual_source_reparse::Context::new(input, &source)?;
     let assets = input["assets"]
         .as_array()
         .ok_or("视觉事实缺少明确资产范围")?;
@@ -1900,20 +1907,13 @@ pub async fn run_asset_visual_facts(
             .into_iter()
             .flatten()
             .find(|cache| text(cache, "inputFingerprint") == packet_hash);
-        let mut supersets:Vec<_> = caches
-            .into_iter()
-            .flatten()
-            .filter(|cache| {
-                let Some(row_ids) = cache["rowIds"].as_array().and_then(|rows| {
-                    rows.iter()
-                        .map(|row| row.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                }) else {
-                    return false;
-                };
-                row_ids.len() >= ids.len() && ordered_subset(&ids, &row_ids)
-            })
-            .collect();
+        let mut supersets = Vec::new();
+        for cache in caches.into_iter().flatten() {
+            let row_ids = reparse.coverage_ids(cache)?;
+            if row_ids.len() >= ids.len() && ordered_subset(&ids, &row_ids) {
+                supersets.push(cache);
+            }
+        }
         supersets.sort_by_key(|cache| {
                 cache["rowIds"]
                     .as_array()
@@ -1926,18 +1926,28 @@ pub async fn run_asset_visual_facts(
             // proven packet for different subjects must not block new assets.
             let previous=if let Some(cards)=candidate.get("identityCards").or_else(||candidate.pointer("/repairProvenance/identityCards")).and_then(Value::as_array){Some(cards.clone())}else{executor.visual_fact_packet_identities(&source.sha256,text(candidate,"inputFingerprint")).await?};
             if let Some(previous)=previous {
-                if let Ok(rebuilt)=cached_identity_subset(input,registry,&previous,&source,candidate) {
-                    if validate_cached_packet(candidate,&source,&rebuilt,&ids,&current_rule_sha).is_ok()
+                if let (Ok(original_source), Ok(original_ids)) = (reparse.source(candidate), reparse.requested_ids(candidate, &ids)) {
+                if let Ok(rebuilt)=cached_identity_subset(input,registry,&previous,original_source,candidate) {
+                    if validate_cached_packet(candidate,original_source,&rebuilt,&original_ids,&current_rule_sha).is_ok()
                         && !identity_selection_is_covered(&identities,&rebuilt) {continue;}
+                }
                 }
             }
             superset=Some(candidate);break;
         }
         if let Some(cache) = exact.or(superset) {
+            let (original_source, original_ids) = match (reparse.source(cache), reparse.requested_ids(cache, &ids)) {
+                (Ok(source), Ok(ids)) => (source, ids),
+                (source_result, ids_result) => {
+                    let reason = source_result.err().or_else(||ids_result.err()).unwrap();
+                    blocked.extend(affected(&source, &missing, rows, &format!("旧缓存源行适配无效：{reason}，未重发提取")));
+                    continue;
+                }
+            };
             let mut adopted = cache.clone();
             let mut continuation_error = None;
             match continue_cached_production_choice(
-                input, &source, cache, registry, executor, model, reasoning,
+                input, original_source, cache, registry, executor, model, reasoning,
             )
             .await
             {
@@ -1949,11 +1959,11 @@ pub async fn run_asset_visual_facts(
             let full_registry = identity_cards(input, registry);
             let mut packet_identities = identities.clone();
             let mut validation =
-                validate_cached_packet(cache, &source, &packet_identities, &ids, &current_rule_sha)
+                validate_cached_packet(cache, original_source, &packet_identities, &original_ids, &current_rule_sha)
                     .map(|_| ());
             if validation.is_err()
                 && identity_selection_is_covered(&identities, &full_registry)
-                && validate_cached_packet(cache, &source, &full_registry, &ids, &current_rule_sha)
+                && validate_cached_packet(cache, original_source, &full_registry, &original_ids, &current_rule_sha)
                     .is_ok()
             {
                 packet_identities = full_registry;
@@ -1962,13 +1972,13 @@ pub async fn run_asset_visual_facts(
             if validation.is_err() {
                 let previous=if let Some(cards)=cache.get("identityCards").or_else(||cache.pointer("/repairProvenance/identityCards")).and_then(Value::as_array){Some(cards.clone())}else{executor.visual_fact_packet_identities(&source.sha256,text(cache,"inputFingerprint")).await?};
                 if let Some(previous) = previous.as_ref() {
-                    if let Ok(rebuilt) = cached_identity_subset(input, registry, previous, &source, cache) {
+                    if let Ok(rebuilt) = cached_identity_subset(input, registry, previous, original_source, cache) {
                         if identity_selection_is_covered(&identities, &rebuilt)
                             && validate_cached_packet(
                                 cache,
-                                &source,
+                                original_source,
                                 &rebuilt,
-                                &ids,
+                                &original_ids,
                                 &current_rule_sha,
                             )
                             .is_ok()
@@ -1980,9 +1990,9 @@ pub async fn run_asset_visual_facts(
                 }
             }
             let deferred_proofs = if validation.is_ok() {
-                let old_rows = cached_rows(&source, cache)?;
-                let old_wire = PacketWire::compile(&source, &packet_identities, &old_rows);
-                validate_deferred_cache(cache, &source, &old_wire, &packet_identities, registry)
+                let old_rows = cached_rows(original_source, cache)?;
+                let old_wire = PacketWire::compile(original_source, &packet_identities, &old_rows);
+                validate_deferred_cache(cache, original_source, &old_wire, &packet_identities, registry)
             } else {
                 Ok(Vec::new())
             };
@@ -2025,6 +2035,7 @@ pub async fn run_asset_visual_facts(
                     if text(cache, "inputFingerprint") != packet_hash {
                         cache_reuses.push(json!({"originalInputFingerprint":cache["inputFingerprint"],"requestedInputFingerprint":packet_hash,"sourceSha256":source.sha256,"ruleSha256":current_rule_sha,"identitySha256":digest(&json!(packet_identities).to_string()),"originalRowCount":cache["rowIds"].as_array().unwrap().len(),"requestedRowIds":ids,"requestedRowCount":ids.len(),"orderedSubsetVerified":true,"originalPacketRebuilt":true,"factsFullyValidated":true}));
                     }
+                    if let Some(proof) = reparse.proof(cache, &ids) { cache_reuses.push(proof); }
                     receipts.push(cache.clone());
                 }
                 Err(reason) => blocked.extend(affected(
@@ -2154,6 +2165,10 @@ pub async fn run_asset_visual_facts(
         json!({"facts":facts,"blocked":blocked,"visualFactBatches":receipts,"visualFactCacheReuses":cache_reuses}),
     )
 }
+
+#[cfg(test)]
+#[path = "asset_visual_source_reparse_tests.rs"]
+pub(crate) mod source_reparse_tests;
 
 #[cfg(test)]
 mod tests {
