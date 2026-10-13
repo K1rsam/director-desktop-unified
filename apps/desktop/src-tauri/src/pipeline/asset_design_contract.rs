@@ -81,6 +81,10 @@ pub const SCOPE_MATERIALS_FIELD: &str = "assetScopeProductionMaterials";
 pub const SCOPE_MATERIAL_PROFILE: &str = "asset-scope-production-material/v1";
 pub const IDENTITY_MATERIAL_POLICY: &str = "identityProductionMaterial/identityProductionMaterials 是已采用制作基础的主体身份说明，scopeProductionMaterial/assetScopeProductionMaterials 是准确形象适用范围的制作理由。两者仅供定位身份与理解制作意图，不是 SOURCE 视觉事实，不能写入 facts/deltaFacts 或代替原文证据。当前 asset.description、形象范围及 preparation 仍独立保留；说明不覆盖用户编辑、子形象说明或当前状态。涉及外观、年龄、物种和未来变化必须核对本包锁定原文、准确主体及适用版本；说明与原文或当前形象冲突时保留差异，不移植为外观事实。";
 pub const PRESENTATION_PROFILE: &str = "asset-image-presentation/v1";
+/// Applies only when compiling a new image request; it is deliberately not part
+/// of the asset-design basis, and never upgrades a frozen image request.
+pub const IMAGE_PROMPT_COMPILER_VERSION: &str = "asset-image-prompt/v2";
+const VISIBLE_TEXT_CONTRACT: &str = "文字与排版：保留资产设计正文明确要求的招牌、书封和纸面等可见文字，按正文原字呈现。画风或布局中的“无文字”“无标签”仅限制额外添加的标题、说明、资料栏、标签和水印，不删除或改写上述正文明确要求的文字；正文未要求的文字不新增。";
 pub const CH_PRESENTATION: &str = "左侧大幅肖像/近景，右侧正面、侧面、背面全身；各区保持同一身份、发型、衣装和当前状态，全身头脚完整，肖像保留头顶发型，各分区清晰，不以浅景深虚化其它视图，干净中性背景，无资料栏、标签。";
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v[k].as_str().unwrap_or("")
@@ -440,18 +444,20 @@ pub fn image_presentation(settings: &Value, asset: &Value) -> Value {
     json!({"version":PRESENTATION_PROFILE,"composition":composition,"ratio":ratio,"origin":if !explicit.is_empty(){"asset"}else if is_character(asset)&&!project_ch.is_empty(){"project"}else{"default"}})
 }
 /// Never sanitize source words (for example a sign reading 第十集). Exact existing
-/// components in legacy/manual prose are not duplicated, and saved prose is untouched.
+/// components in legacy/manual prose are not duplicated. Body/style bytes remain
+/// unchanged, and the appended contract disambiguates presentation-only bans.
 pub fn compile_image_prompt(body: &str, style: &str, presentation: &Value) -> String {
-    let body = body.trim();
-    let style = style.trim();
     let layout = s(presentation, "composition").trim();
     let mut parts = Vec::new();
-    if !style.is_empty() && !body.starts_with(style) {
+    if !style.trim().is_empty() && !body.starts_with(style) {
         parts.push(style);
     }
     parts.push(body);
     if !layout.is_empty() && !body.contains(layout) && style != layout {
         parts.push(layout);
+    }
+    if !parts.iter().any(|part| part.contains(VISIBLE_TEXT_CONTRACT)) {
+        parts.push(VISIBLE_TEXT_CONTRACT);
     }
     parts.join("\n\n")
 }
@@ -794,8 +800,38 @@ mod tests {
         let prompt = compile_image_prompt(body, "水墨国漫", &p);
         assert_eq!(prompt.matches("水墨国漫").count(), 1);
         assert_eq!(prompt.matches(CH_PRESENTATION).count(), 1);
+        assert_eq!(prompt.matches(VISIBLE_TEXT_CONTRACT).count(), 1);
         assert!(prompt.contains(body));
         assert_eq!(compile_image_prompt(&prompt, "水墨国漫", &p), prompt);
+    }
+    #[test]
+    fn compiler_keeps_body_style_and_source_text_exact_under_a_no_text_style() {
+        let style = "  三渲二；无文字\r\n";
+        let body = "\r\n招牌原字“第十集商店”；书封原字《测试手册》；泛黄纸条写“保持，原字！”。\n未限定处设计灰白石墙。  ";
+        let p = image_presentation(&json!({}), &json!({"kind":"LOC"}));
+        let prompt = compile_image_prompt(body, style, &p);
+        // Exact comparison includes the original whitespace, punctuation and
+        // model-authored sentence; no keyword filter rewrites either input.
+        assert_eq!(prompt, [style, body, VISIBLE_TEXT_CONTRACT].join("\n\n"));
+        assert!(prompt.contains("“无文字”“无标签”仅限制额外添加"));
+        assert!(prompt.contains("正文未要求的文字不新增"));
+        assert_eq!(compile_image_prompt(&prompt, style, &p), prompt);
+    }
+    #[test]
+    fn compiler_deduplicates_text_contract_and_respects_asset_presentation() {
+        for kind in ["CH", "GROUP", "BEAST", "LOC", "PROP"] {
+            let p = image_presentation(
+                &json!({"imagePresentation":CH_PRESENTATION}),
+                &json!({"kind":kind}),
+            );
+            let body = "同一资产的可见外形。";
+            let prompt = compile_image_prompt(body, "3D国漫；无文字", &p);
+            let compiled_again = compile_image_prompt(&prompt, "3D国漫；无文字", &p);
+            assert_eq!(compiled_again, prompt);
+            assert_eq!(prompt.matches(VISIBLE_TEXT_CONTRACT).count(), 1);
+            assert_eq!(prompt.matches(CH_PRESENTATION).count(), usize::from(kind == "CH"));
+            assert!(prompt.contains(body));
+        }
     }
     #[test]
     fn design_cache_tracks_rule_style_presentation_asset_source_but_not_other_designs_or_fact_rule()

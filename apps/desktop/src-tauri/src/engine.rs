@@ -1194,7 +1194,7 @@ impl Engine {
                 let asset = store.active_asset(s(&request,"assetId"))?;
                 let settings = store.settings()?;
                 let presentation = pipeline::asset_design_contract::image_presentation(&settings,&asset);
-                return Ok(json!({"prompt":pipeline::asset_design_contract::compile_image_prompt(s(&asset,"prompt"),pipeline::asset_design_contract::project_visual_style(&settings),&presentation),"promptBody":asset["prompt"],"imagePresentation":presentation,"assetVersion":asset["version"]}));
+                return Ok(json!({"prompt":pipeline::asset_design_contract::compile_image_prompt(s(&asset,"prompt"),pipeline::asset_design_contract::project_visual_style(&settings),&presentation),"promptCompilerVersion":pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION,"promptBody":asset["prompt"],"imagePresentation":presentation,"assetVersion":asset["version"]}));
             }
             "assets.get" => return store.get("assets", s(&request, "assetId")),
             "assets.usage" => return store.asset_usage(s(&request, "assetId")),
@@ -2927,6 +2927,7 @@ impl Engine {
                 let presentation = pipeline::asset_design_contract::image_presentation(settings, a);
                 let prompt = pipeline::asset_design_contract::compile_image_prompt(s(a, "prompt"), style, &presentation);
                 let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":settings.get("imageResolution").cloned().unwrap_or(json!("2K")),"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
+                snapshot["promptCompilerVersion"] = json!(pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION);
                 if let Some(binding) = r.get("backgroundChromeBinding") {
                     if provider != "chrome" { return Err("后台图片入口仅允许 Chrome".into()); }
                     snapshot["backgroundChromeBinding"] = binding.clone();

@@ -1672,6 +1672,32 @@ async fn planning_profile_generates_all_selected_episodes_with_exact_dialogue_an
 }
 
 #[test]
+fn stage2_visible_text_preview_matches_new_frozen_image_and_preserves_old_snapshot() {
+    let f = Fixture::new(Duration::ZERO);
+    let body = "店铺门头招牌写“春山医馆”，桌上纸条写“明日休息”。";
+    f.store.save_asset(json!({"id":"shop","variantId":"base","kind":"LOC","prompt":body,"promptOrigin":"MANUAL","sourceRefs":[]})).unwrap();
+    f.store.save_settings(&json!({"projectVisualStyle":"三渲二国漫；无文字","ratio":"16:9"})).unwrap();
+    let original_asset = f.store.get("assets", "shop").unwrap();
+    let original_settings = f.store.settings().unwrap();
+    let legacy_snapshot = json!({"requestId":"old-image-request","kind":"image","provider":"offline","model":"old","prompt":"已经提交的原提示词","promptBody":body,"ratio":"16:9","resolution":"original","autoSubmit":true});
+    let old = f.store.add_job("image", "old-shop", "offline", "local", &legacy_snapshot, "downloaded").unwrap();
+    let preview = f.engine.dispatch(json!({"action":"images.previewPrompt","projectId":f.project_id,"assetId":"shop"})).unwrap();
+    assert_eq!(preview["promptBody"], body);
+    assert_eq!(preview["promptCompilerVersion"], pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION);
+    assert!(s(&preview,"prompt").contains(body));
+    let queued = f.engine.queue_images(&f.store, &json!({"provider":"offline","model":"fake","assetIds":["shop"]})).unwrap();
+    let image = f.store.job(s(&queued["queued"][0],"jobId")).unwrap();
+    assert_eq!(image["snapshot"]["prompt"], preview["prompt"]);
+    assert_eq!(image["snapshot"]["promptCompilerVersion"], preview["promptCompilerVersion"]);
+    assert_eq!(tasks::generation_request(&image["snapshot"]).unwrap().prompt, s(&preview,"prompt"));
+    assert_eq!(f.store.get("assets","shop").unwrap(), original_asset);
+    assert_eq!(f.store.settings().unwrap(), original_settings);
+    assert_eq!(f.store.job(&old).unwrap()["snapshot"], legacy_snapshot);
+    assert_eq!(tasks::generation_request(&legacy_snapshot).unwrap().prompt, "已经提交的原提示词");
+    assert_eq!(f.channels.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn stage2_restart_resume_uses_original_settings_and_final_submission_snapshot() {
     let f = Fixture::new(Duration::ZERO);
     f.store.save_asset(json!({"id":"manual","variantId":"base","kind":"CH","prompt":"六十岁深肤色人物，招牌写第十集","promptOrigin":"MANUAL","sourceRefs":[]})).unwrap();
