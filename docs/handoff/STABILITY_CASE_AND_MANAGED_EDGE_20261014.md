@@ -230,3 +230,13 @@ Windows 本轮结果：桥接 `npm.cmd run verify` **123/123**；前端 **251/25
 隔离检查发现 `units.save` 可修改结构化 shots 却保留旧 prompt/template。现在仅在 Engine 的手动保存入口拒绝已有单元的 shots 变更，返回 `UNIT_SHOTS_EDIT_REQUIRES_REFINEMENT`，引导导演精修与采用；同时传 prompt/override 不能绕过。正常文字、标题、配图编辑、相同或省略 shots、新单元及底层生产采用路径保留。兼容 JavaScript 将 `3.0` 回传为 `3` 的等值表示，并保存原 shots 数字表示；不容许大整数精度丢失或实际内容、顺序变化。
 
 Windows 原生守卫 **7/7** 通过，3.580 秒、无超时、进程树为空。最终源码真实隔离复验 35.616 秒通过：修改 camera/presentation 被明确拒绝，版本仍为 1，隔离全表原字段不变；保存重开、导出导入和聚合再次一致。生产 21 张表、第五集 unknown 完整记录/事件/文件、原 7 项目与源文均保持精确一致。证据 `unit-save-guard-native-v2/`、`partial-postflow-guard-native-v3/`、`partial-postflow-guard-v3/report.json`，详细私有报告 `UNIT_SAVE_STRUCTURED_GUARD_20261014.md`。第四集局部摄影修正建议仍未写入生产，完整十集验收门禁未放宽。
+
+## 最终 Windows 本地安装与交付状态
+
+产品源码提交 `e1e099a2c547b2395f994a5c71eaa0f442b2e07f`。使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/update-client.ps1 -BuildOnly` 构建，通过 SDK 资源打包、TypeScript/Vite 与 Cargo release，随后经 Windows Job Object 原生 runner 对候选做两次隐藏 WebView 验收。首次启动 5.818 秒、保存重开 2.478 秒，均无超时且进程树清空；IPC、内嵌前端、素材协议、资产删除恢复、项目归档恢复删除、共享默认目录和保存持久化通过，生成请求/任务均为 0。它证明实际 Windows WebView 操作回路，不代表人工逐屏视觉验收或新案例十集制作完成。
+
+`-PublishOnly` 已成功替换同名 `apps/desktop/.local/client/director-desktop-next.exe`，当前 SHA-256 `e1e3803a84d84d0689e3b9a0a4ea4f14fab14c0ec3caebdd6b17a5bbda82ab8f`。唯一备用 `director-desktop-next-previous.exe` 保留原 `618204b` 产物，SHA-256 `45238ad5697b5731d18dc9050977108d31a52654c94a1fe0c11d55ff3c5957d2`。发布目录恰好两个 EXE，验收候选已由脚本清理；私有冻结测试程序不动。两版各自 9 份 SDK 资源的字节数和哈希均通过，当前桥等于新源码，旧版资源未覆盖。桌面 `director-desktop.lnk` 仍指向该同名当前版。
+
+证据：`final-e1e099a-client-build.log`、`final-e1e099a-startup-native-first/`、`final-e1e099a-startup-native-reopen/`、`final-e1e099a-startup/`、`final-e1e099a-client-publish.log`、`final-e1e099a-installed-proof.json`。发布后再次验证生产全表、原 unknown 文件及先前已完成源/资产/单元/回包/事件均未改变。
+
+最终仍未完成：第 5 集原 SDK 提交缺可信终态（sequence 9），第 5–10 集未采用；43 项设计合同升级暂缓以保护原任务依赖；专属 Edge 连接正常但尚未登录，新案例图片与视觉审核为 0；第四集局部摄影问题保留待修，不能通过手动结构化保存绕过精修采用。恢复时先被动核对同一原任务，不允许凭进程退出伪填“上游未接受”、重发、换渠道或新建 workflow 绕过。未触发任何视频提交，私人剧本、数据库、原请求和回包均未进入 Git。
