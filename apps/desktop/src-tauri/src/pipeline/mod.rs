@@ -19,6 +19,7 @@ pub mod asset_use_binding;
 pub use assets::{
     automatic_design_required, image_production_policy, resolve_asset_dependency, run_asset_design, validate_asset_visual_gate,
 };
+pub(crate) use assets::{freeze_design_evidence_profile, design_evidence_binding, DESIGN_EVIDENCE_PROFILE_FIELD};
 use async_trait::async_trait;
 pub use scene_edits::execute_foundation_scene_edits;
 use serde::{Deserialize, Serialize};

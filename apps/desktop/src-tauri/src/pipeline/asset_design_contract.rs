@@ -617,6 +617,9 @@ pub fn design_receipt(input: &Value, asset: &Value) -> Result<Value, String> {
     if let Some(context) = super::assets::inline_delta_context(input, asset)? {
         basis["inlineDeltaContext"] = context;
     }
+    if let Some(context) = super::assets::design_evidence_binding(input, asset)? {
+        basis["designEvidenceContext"] = context;
+    }
     let materials = consumed_identity_materials(input, &subjects)?;
     if !materials.is_empty() {
         basis["identityProductionMaterialsSha256"] = json!(digest(&json!(materials).to_string()));

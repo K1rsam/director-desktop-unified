@@ -8,6 +8,10 @@ use std::{
 
 const ASSET_DESIGN_CONCURRENCY: usize = 4;
 
+#[path = "assets_evidence_context.rs"]
+mod design_evidence;
+pub(crate) use design_evidence::{freeze_design_evidence_profile, design_evidence_binding, DESIGN_EVIDENCE_PROFILE_FIELD};
+
 pub(crate) const INLINE_DELTA_PROFILE_FIELD: &str = "stage2InlineDeltaProfile";
 pub(crate) const INLINE_DELTA_PROFILE: &str = "asset-inline-effective-delta/v1";
 
@@ -544,7 +548,8 @@ pub(super) fn automatic_design_stale(input: &Value, asset: &Value) -> bool {
     }
     let scope_source = serde_json::from_value::<LockedSource>(input["source"].clone()).ok();
     if let Some(source) = &scope_source {
-        for row in empty_design_scene_context(source, asset, &facts, &evidence) {
+        let Ok(context) = design_evidence::scene_context(input, source, asset, &facts, &evidence) else { return true; };
+        for row in context {
             evidence.insert(row.id.as_str());
         }
     }
@@ -576,6 +581,7 @@ pub async fn run_asset_design(
     reasoning: &str,
 ) -> Result<Value, String> {
     inline_delta_enabled(input)?;
+    let design_evidence_enabled = design_evidence::enabled(input)?;
     let incremental_comparisons = super::asset_design_contract::incremental_comparisons(input)?;
     let assets = input
         .get("assets")
@@ -803,7 +809,7 @@ pub async fn run_asset_design(
                 for fact in &facts {
                     evidence.extend(fact["sourceRefs"].as_array().into_iter().flatten().filter_map(Value::as_str));
                 }
-                let scope_context = empty_design_scene_context(&source, asset, &facts, &evidence);
+                let Ok(scope_context) = design_evidence::scene_context(&design_basis, &source, asset, &facts, &evidence) else { continue; };
                 evidence.extend(scope_context.iter().map(|row|row.id.as_str()));
                 let Ok(production_context) = super::asset_production_context::context(&design_basis,asset) else { continue; };
                 let production_rows = production_context.as_ref().map(|context|super::asset_production_context::evidence_rows(context,&source)).unwrap_or_default();
@@ -961,7 +967,13 @@ pub async fn run_asset_design(
                     }
                 }
             }
-            let scope_context = empty_design_scene_context(&source, asset, &facts, &evidence_ids);
+            let scope_context = match design_evidence::scene_context(&design_basis, &source, asset, &facts, &evidence_ids) {
+                Ok(context) => context,
+                Err(reason) => {
+                    blocked.push(json!({"assetId":id,"variantId":variant,"reason":reason}));
+                    failed.insert(id.clone()); pending.remove(&id); progress = true; continue;
+                }
+            };
             for row in &scope_context {
                 evidence_ids.insert(row.id.as_str());
             }
@@ -1014,7 +1026,14 @@ pub async fn run_asset_design(
                 .and_then(|p| available_designs.get(p));
             let mode = if parent.is_some() { "DERIVED" } else { "BASE" };
             let production_direction = super::asset_design_contract::production_direction(input);
-            let design_receipt = super::asset_design_contract::design_receipt(&design_basis, asset)?;
+            let design_receipt = match super::asset_design_contract::design_receipt(&design_basis, asset) {
+                Ok(receipt) => receipt,
+                Err(reason) if design_evidence_enabled => {
+                    blocked.push(json!({"assetId":id,"variantId":variant,"reason":reason}));
+                    failed.insert(id.clone()); pending.remove(&id); progress = true; continue;
+                }
+                Err(reason) => return Err(reason),
+            };
             let frozen_request = incremental_comparisons.then(||input[super::asset_design_contract::FROZEN_COMPARISON_REQUESTS].get(&id)).flatten();
             let comparison_designs = if let Some(saved) = frozen_request {
                 saved["input"]["comparisonDesigns"].as_array().cloned().ok_or("已派发人物设计缺少冻结对照")?
@@ -1053,10 +1072,14 @@ pub async fn run_asset_design(
             if incremental_comparisons {
                 design_input[super::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(super::asset_design_contract::COMPARISON_PROFILE);
             }
-            if !scope_context.is_empty() {
+            if !scope_context.is_empty() && !design_evidence_enabled {
                 design_input["sourceScopeContext"] = json!({"version":"asset-scene-context/v1","instruction":"evidence包含SOURCE_SCOPE标记所定位场次的锁定原文，不再只提供场次标题。先在原文中确认当前主体及其物种/空间/物件身份；空facts仅表示尚无已登记外观约束，不表示原文没有该主体。仍按原C/D岗位区分原文依据与普通非剧情美术补足，补足写入freeDesignScope；不得把同场其它主体或后期状态移植给当前形象，也不得把整场原文标成该资产的外观事实。"});
             }
             let mut frozen_context = json!({"version":super::asset_design_contract::DESIGN_PROFILE,"projectVisualStyle":design_input["projectVisualStyle"],"productionDirection":design_input["productionDirection"],"imagePresentation":design_input["imagePresentation"],"comparisonDesigns":design_input["comparisonDesigns"],"model":model,"reasoning":reasoning,"textProvider":input["settings"]["textProvider"],"textBackend":input["settings"]["textBackend"]});
+            if let Some(binding) = design_receipt["basis"].get("designEvidenceContext") {
+                design_input["designEvidenceContext"] = design_evidence::request_context(input, binding);
+                frozen_context["designEvidenceContext"] = binding.clone();
+            }
             if incremental_comparisons {
                 frozen_context[super::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(super::asset_design_contract::COMPARISON_PROFILE);
             }
@@ -1084,6 +1107,7 @@ pub async fn run_asset_design(
                 || parent
                     .and_then(|id| by_id.get(id))
                     .is_some_and(|asset| has_program_source_scope(asset))
+                || design_evidence_enabled
             {
                 design_input["sourceEvidencePolicy"] = json!(SOURCE_SCOPE_POLICY);
                 let scope_ids: HashSet<_> = if has_program_source_scope(asset) {

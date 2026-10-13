@@ -3385,7 +3385,7 @@ impl Engine {
             // comparisons remain those captured by the original workflow.
             design_input["foundation"]["directionConfirmed"] = original_context["foundation"]["directionConfirmed"].clone();
             design_input["foundation"]["productionDirection"] = original_context["foundation"]["productionDirection"].clone();
-            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD] {
+            for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD, pipeline::DESIGN_EVIDENCE_PROFILE_FIELD] {
                 if let Some(value) = original_context.get(key) { design_input[key] = value.clone(); }
             }
         } else {
@@ -3402,6 +3402,7 @@ impl Engine {
             // new productions opt in; resumes retain their original comparison
             // contract (including absence of a profile).
             if r.get("imageResumeOrigin").is_none() {
+                pipeline::freeze_design_evidence_profile(&mut design_input);
                 design_input[pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD] = json!(pipeline::asset_design_contract::COMPARISON_PROFILE);
             }
         }

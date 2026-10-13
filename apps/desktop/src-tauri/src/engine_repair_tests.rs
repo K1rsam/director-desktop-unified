@@ -177,6 +177,8 @@ fn native_resume_of_legacy_completed_but_blocked_image_production_preserves_reco
     assert!(resumed["snapshot"]["stage2Context"].get(pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD).is_none(),
         "reconstructing missing legacy context must not opt a resume into a new comparison policy");
     assert!(resumed["snapshot"]["stage2Context"].get(pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS).is_none());
+    assert!(resumed["snapshot"]["stage2Context"].get(pipeline::DESIGN_EVIDENCE_PROFILE_FIELD).is_none(),
+        "legacy resume must not gain source material or a new art completion policy");
     assert_eq!(resumed["snapshot"]["settings"], snapshot["settings"]);
     assert_eq!(
         resumed["snapshot"]["request"]["assetIds"],
@@ -1695,6 +1697,30 @@ fn stage2_visible_text_preview_matches_new_frozen_image_and_preserves_old_snapsh
     assert_eq!(f.store.job(&old).unwrap()["snapshot"], legacy_snapshot);
     assert_eq!(tasks::generation_request(&legacy_snapshot).unwrap().prompt, "已经提交的原提示词");
     assert_eq!(f.channels.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn stage2_evidence_policy_persists_on_new_workflow_and_exact_resume_without_calls() {
+    let f = Fixture::new(Duration::ZERO);
+    f.store.save_asset(json!({"id":"manual","variantId":"base","kind":"CH","prompt":"用户手写完整形象","promptOrigin":"MANUAL","sourceRefs":[]})).unwrap();
+    let request = json!({"action":"images.produce","projectId":f.project_id,"provider":"offline","model":"fake","assetIds":["manual"]});
+    f.engine.dispatch(request).unwrap();
+    assert!(f.engine.await_worker_shutdown(3));
+    let old = f.store.jobs().unwrap().into_iter().find(|j| j["kind"] == "workflow").unwrap();
+    let profile = old["snapshot"]["stage2Context"][pipeline::DESIGN_EVIDENCE_PROFILE_FIELD].clone();
+    assert!(!profile.is_null(), "new workflow must capture evidence policy before dispatch");
+    f.store.update_job(s(&old,"id"),"completed",&json!({"result":{"status":"partiallyQueued","blocked":[{"assetId":"manual","reason":"offline hold"}]}})).unwrap();
+    let before = raw_job_record(&f.store, s(&old,"id"));
+    let reopened = Store::open(f.store.root.clone()).unwrap();
+    f.engine.dispatch(json!({"action":"workflows.resume","projectId":f.project_id,"workflowId":old["id"]})).unwrap();
+    assert!(f.engine.await_worker_shutdown(3));
+    let jobs = reopened.jobs().unwrap();
+    let resumed = jobs.iter().find(|j| j["kind"] == "workflow" && j["id"] != old["id"]).unwrap();
+    assert_eq!(resumed["snapshot"]["stage2Context"][pipeline::DESIGN_EVIDENCE_PROFILE_FIELD],profile);
+    assert_eq!(raw_job_record(&f.store, s(&old,"id")),before);
+    assert_eq!(jobs.iter().filter(|j| j["kind"] == "image").count(),1);
+    assert_eq!(f.store.get("assets","manual").unwrap()["prompt"],"用户手写完整形象");
+    assert_eq!(f.channels.calls.load(Ordering::SeqCst),0);
 }
 
 #[test]
