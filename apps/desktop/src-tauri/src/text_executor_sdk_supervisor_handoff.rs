@@ -1,9 +1,10 @@
-//! Only an absent later SDK node can bind a replacement native supervisor.
+//! Only a proven absent SDK node can bind a replacement native supervisor.
 //! Existing requests, raw results and parent settings are never rewritten.
 use super::*;
 use crate::text_transport::FrozenAttempt;
 
 const POLICY: &str = "sdk-new-node-supervisor-handoff/v1";
+const FIRST_NODE_POLICY: &str = "sdk-first-node-supervisor-handoff/v1";
 const LOCAL_RECOVERY_POLICY: &str = "sdk-new-node-local-recovery-handoff/v1";
 const FIELD: &str = "sdkSupervisorHandoff";
 const HELD: &str =
@@ -40,7 +41,7 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
-    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY)
+    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY || proof["policy"] == FIRST_NODE_POLICY)
         && proof["sha256"] == hash(&unsigned)
         && proof["workflowId"] == run
         && proof["nodeKey"] == key
@@ -65,9 +66,9 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
                         .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                 })
         })
-        && proof["predecessor"]
-            .as_object()
-            .is_some_and(|p| p.len() == 14)
+        && if proof["policy"] == FIRST_NODE_POLICY {
+            proof["predecessor"] == first_node_evidence(run)
+        } else { proof["predecessor"].as_object().is_some_and(|p| p.len() == 14) }
 }
 
 fn parent_bound(c: &rusqlite::Connection, proof: &Value, settings: &Value) -> Result<bool> {
@@ -154,6 +155,14 @@ fn predecessor(
     ))
 }
 fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value) -> Result<bool> {
+    if proof["policy"] == FIRST_NODE_POLICY {
+        // The absence proof is checked before reservation. After reservation,
+        // bind the original first step, allowing later steps without re-sending.
+        return c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_steps first WHERE first.workflow_id=?1 AND first.node_key=?2 AND NOT EXISTS(SELECT 1 FROM workflow_steps older WHERE older.workflow_id=first.workflow_id AND older.rowid<first.rowid))",
+            params![s(proof,"workflowId"),s(proof,"nodeKey")], |r| r.get(0),
+        ).map_err(|e|e.to_string());
+    }
     Ok(predecessor(
         store,
         c,
@@ -162,6 +171,31 @@ fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value) -> 
     )?
     .as_ref()
         == Some(&proof["predecessor"]))
+}
+
+fn first_node_evidence(run: &str) -> Value {
+    json!({"policy":"sdk-workflow-never-dispatched/v1","workflowId":run,"workflowSteps":0,"textJobs":0,"attempts":0})
+}
+
+fn first_node_absent(store: &Store, c: &rusqlite::Connection, run: &str) -> Result<()> {
+    let occupied: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1) OR EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND (json_extract(prepared,'$.sdkOriginWorkflowId')=?1 OR json_extract(snapshot,'$.sdkSupervisorHandoff.workflowId')=?1))",
+        [run], |r|r.get(0),
+    ).map_err(|e|e.to_string())?;
+    if occupied { return Err(HELD.into()); }
+    let root=store.root.join("text-runs");
+    if root.exists() {
+        for (index,entry) in std::fs::read_dir(root).map_err(|e|e.to_string())?.enumerate() {
+            if index>=20_000 { return Err(HELD.into()); }
+            let path=entry.map_err(|e|e.to_string())?.path().join("sdk-attempt.json");
+            if path.exists() {
+                let attempt=FrozenAttempt::load(&path).map_err(|_|HELD.to_string())?;
+                // Any node and any attempt state blocks the first-node route.
+                if attempt.workflow_id==run { return Err(HELD.into()); }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn no_node_or_attempt(
@@ -227,6 +261,29 @@ fn no_node_or_attempt(
 }
 
 impl SavedTextExecutor {
+    fn sdk_handoff_predecessor(&self, original: &Value, local_recovery: bool) -> Result<(&'static str, Value)> {
+        let run=self.workflow_id.as_deref().ok_or(HELD)?;
+        let c=self.store.conn()?;
+        let previous_key: Option<String> = c.query_row("SELECT w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.provider='codex_sdk' AND j.state='completed' ORDER BY w.updated_at DESC,w.rowid DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let Some(previous_key)=previous_key else {
+            if local_recovery { return Err(HELD.into()); }
+            first_node_absent(&self.store,&c,run)?;
+            return Ok((FIRST_NODE_POLICY,first_node_evidence(run)));
+        };
+        let prior=predecessor(&self.store,&c,run,&previous_key)?.ok_or(HELD)?;
+        let previous_job=self.sdk_job(s(&prior,"jobId"))?;
+        if previous_job["snapshot"]["model"]!=self.settings["textModel"]
+            || previous_job["snapshot"]["reasoning"]!=self.settings["reasoning"]
+            || (previous_job["snapshot"]["executorIdentity"]!=original["executorIdentity"] && previous_job["snapshot"].get(FIELD).is_none()) {
+            return Err(HELD.into());
+        }
+        self.sdk_handoff_job_bound(&previous_job,&previous_job["snapshot"])?;
+        self.sdk_raw(&previous_job,&previous_job["snapshot"])?;
+        if local_recovery && self.sdk_local_recovery_bound(&previous_job)?.is_none()
+            && previous_job["snapshot"][FIELD]["policy"]!=LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
+        Ok((if local_recovery {LOCAL_RECOVERY_POLICY}else{POLICY},prior))
+    }
+
     pub(super) fn sdk_handoff_saved_snapshot(
         &self,
         request: &TextRequest,
@@ -338,24 +395,8 @@ impl SavedTextExecutor {
         };
         self.sdk_parent_binding()?;
         self.sdk_request_policy(request)?;
+        let (policy,prior)=self.sdk_handoff_predecessor(original,local_recovery)?;
         let c = self.store.conn()?;
-        let previous_key: Option<String> = c.query_row("SELECT w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.provider='codex_sdk' AND j.state='completed' ORDER BY w.updated_at DESC,w.rowid DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-        let previous_key = previous_key.ok_or(HELD)?;
-        let prior = predecessor(&self.store, &c, run, &previous_key)?.ok_or(HELD)?;
-        let previous_job = self.sdk_job(s(&prior, "jobId"))?;
-        if previous_job["snapshot"]["model"] != self.settings["textModel"]
-            || previous_job["snapshot"]["reasoning"] != self.settings["reasoning"]
-            || (previous_job["snapshot"]["executorIdentity"] != original["executorIdentity"]
-                && previous_job["snapshot"].get(FIELD).is_none())
-        {
-            return Err(HELD.into());
-        }
-        // Reuse the genuine original raw/attempt/receipt verifier, including an
-        // accepted zero-call F2 replay. No receipt is inferred from a status label.
-        self.sdk_handoff_job_bound(&previous_job, &previous_job["snapshot"])?;
-        self.sdk_raw(&previous_job, &previous_job["snapshot"])?;
-        if local_recovery && self.sdk_local_recovery_bound(&previous_job)?.is_none()
-            && previous_job["snapshot"][FIELD]["policy"] != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
         let original_parent: String = c
             .query_row(
                 "SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow'",
@@ -366,7 +407,7 @@ impl SavedTextExecutor {
         let mut snapshot = original.clone();
         snapshot["executorIdentity"] = verified.identity;
         snapshot[FIELD] = seal(
-            json!({"policy":if local_recovery {LOCAL_RECOVERY_POLICY}else{POLICY},"workflowId":run,"nodeKey":step_key(request),"stage":request.stage,
+            json!({"policy":policy,"workflowId":run,"nodeKey":step_key(request),"stage":request.stage,
             "domainRequestSha256":hash(&domain(original)?),"parentSnapshotSha256":crate::pipeline::digest(&original_parent),
             "originalSettingsSha256":hash(&self.settings),"originalIdentity":original["executorIdentity"],
             "effectiveIdentitySha256":hash(&snapshot["executorIdentity"]),"resourceHashes":verified.resource_hashes,
@@ -403,9 +444,12 @@ impl Store {
         let tx = c
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        if !parent_bound(&tx, proof, original_settings)? || !predecessor_bound(self, &tx, proof)? {
+        if !parent_bound(&tx, proof, original_settings)? {
             return Err(HELD.into());
         }
+        if proof["policy"]==FIRST_NODE_POLICY {
+            first_node_absent(self,&tx,run)?;
+        } else if !predecessor_bound(self,&tx,proof)? { return Err(HELD.into()); }
         if proof["policy"] == LOCAL_RECOVERY_POLICY {
             let prior = executor.sdk_job(s(&proof["predecessor"],"jobId"))?;
             executor.sdk_raw(&prior,&prior["snapshot"])?;
@@ -787,6 +831,136 @@ mod tests {
         executor
             .store
             .add_sdk_handoff_node_atomic(request, snapshot, &executor.settings)
+    }
+
+    fn first_node_fixture() -> (tempfile::TempDir, SavedTextExecutor, TextRequest, Value) {
+        let (temp,mut executor,request,mut snapshot)=fixture();
+        let parent=executor.store.job(executor.workflow_id.as_deref().unwrap()).unwrap()["snapshot"].clone();
+        let run=executor.store.add_job("workflow","storyboard.refine","local","local",&parent,"failed").unwrap();
+        executor.workflow_id=Some(run.clone());
+        let original=executor.request_snapshot(&request).unwrap();
+        let (policy,prior)=executor.sdk_handoff_predecessor(&original,false).unwrap();
+        assert_eq!(policy,FIRST_NODE_POLICY);
+        snapshot[FIELD]["policy"]=json!(policy);
+        snapshot[FIELD]["workflowId"]=json!(run);
+        snapshot[FIELD]["parentSnapshotSha256"]=json!(hash(&parent));
+        snapshot[FIELD]["predecessor"]=prior;
+        snapshot[FIELD].as_object_mut().unwrap().remove("sha256");
+        snapshot[FIELD]=seal(snapshot[FIELD].clone());
+        assert!(proof_valid(&snapshot,&executor.settings,&run,&step_key(&request)));
+        (temp,executor,request,snapshot)
+    }
+
+    fn first_node_stored_evidence(executor:&SavedTextExecutor)->Value {
+        let c=executor.store.conn().unwrap();
+        let mut query=c.prepare("SELECT id,job_id,type,data FROM events ORDER BY id").unwrap();
+        let events=query.query_map([],|r|Ok(json!([r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?]))).unwrap().map(|r|r.unwrap()).collect::<Vec<_>>();
+        json!({"stored":evidence(executor),"events":events})
+    }
+
+    #[tokio::test]
+    async fn sdk_first_node_handoff_reserves_once_continues_normal_chain_and_replays_without_dispatch() {
+        let (_temp,executor,request,snapshot)=first_node_fixture();
+        let run=executor.workflow_id.as_deref().unwrap();
+        let parent_before: String=executor.store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1",[run],|r|r.get(0)).unwrap();
+        let before=evidence(&executor);
+        let first=add(&executor,&request,&snapshot).unwrap();
+        assert_eq!(executor.sdk_job(&first).unwrap()["prepared"]["sdkDispatchStarted"],false);
+        assert_eq!(executor.request_snapshot(&request).unwrap(),snapshot);
+        for (index,job) in before["jobs"].as_array().unwrap().iter().enumerate() {assert_eq!(&evidence(&executor)["jobs"][index],job);}
+        let reserved=first_node_stored_evidence(&executor);
+        assert!(add(&executor,&request,&snapshot).is_err());
+        assert_eq!(first_node_stored_evidence(&executor),reserved);
+        complete(&executor,&request,&snapshot,&first,true);
+        let mut next=request.clone();next.stage="foundation:HANDOFF_AFTER_FIRST".into();
+        let original=executor.request_snapshot(&next).unwrap();
+        let (policy,prior)=executor.sdk_handoff_predecessor(&original,false).unwrap();
+        assert_eq!(policy,POLICY);assert_eq!(prior["jobId"],first);
+        let mut next_snapshot=original.clone();next_snapshot["executorIdentity"]=snapshot["executorIdentity"].clone();
+        let mut proof=snapshot[FIELD].clone();proof.as_object_mut().unwrap().remove("sha256");
+        proof["policy"]=json!(policy);proof["predecessor"]=prior;proof["nodeKey"]=json!(step_key(&next));proof["stage"]=json!(next.stage);proof["domainRequestSha256"]=json!(hash(&domain(&original).unwrap()));
+        next_snapshot[FIELD]=seal(proof);
+        let second=add(&executor,&next,&next_snapshot).unwrap();complete(&executor,&next,&next_snapshot,&second,true);
+        let final_evidence=first_node_stored_evidence(&executor);
+        for _ in 0..2 {
+            let reopened=SavedTextExecutor{store:Store::open(executor.store.root.clone()).unwrap(),settings:executor.settings.clone(),workflow_id:executor.workflow_id.clone()};
+            assert_eq!(reopened.request_snapshot(&request).unwrap(),snapshot);
+            assert_eq!(reopened.execute(request.clone()).await.unwrap(),json!({"ok":true}));
+            assert_eq!(reopened.execute(next.clone()).await.unwrap(),json!({"ok":true}));
+            assert_eq!(first_node_stored_evidence(&executor),final_evidence);
+            assert!(!executor.store.root.join("sdk-worker").exists());
+        }
+        let parent_after:String=executor.store.conn().unwrap().query_row("SELECT snapshot FROM jobs WHERE id=?1",[run],|r|r.get(0)).unwrap();
+        assert_eq!(parent_after,parent_before);
+    }
+
+    #[test]
+    fn sdk_first_node_handoff_rejects_other_steps_orphan_jobs_all_attempt_states_and_unknown_submissions() {
+        for case in ["step-running","step-rejected","orphan-job","orphan-proof","same-domain","prepared-attempt","unknown-attempt","completed-attempt","malformed-attempt","global-unknown"] {
+            let (_temp,executor,request,snapshot)=first_node_fixture();
+            let run=executor.workflow_id.as_deref().unwrap();
+            match case {
+                "step-running"|"step-rejected"=>executor.store.checkpoint(run,"unrelated-first-key","other","hash",if case=="step-running" {"running"}else{"rejected"},None,None,None).unwrap(),
+                "orphan-job"|"orphan-proof"|"same-domain"|"global-unknown"=>{
+                    let old=if case=="same-domain" {executor.request_snapshot(&request).unwrap()} else if case=="orphan-proof" {json!({"stage":"other","sdkSupervisorHandoff":{"workflowId":run}})} else {json!({"stage":"other"})};
+                    let job=executor.store.add_job("text","orphan","codex_sdk","synthetic",&old,if case=="global-unknown" {"submission_unknown"}else{"queued"}).unwrap();
+                    if case=="orphan-job"||case=="global-unknown" {
+                        let prepared=if case=="orphan-job" {json!({"sdkOriginWorkflowId":run,"sdkDispatchStarted":false})} else {json!({"sdkDispatchStarted":true})};
+                        executor.store.conn().unwrap().execute("UPDATE jobs SET prepared=?2 WHERE id=?1",params![job,prepared.to_string()]).unwrap();
+                    }
+                },
+                _=>{
+                    let path=executor.store.root.join("text-runs/first-orphan/sdk-attempt.json");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    if case=="malformed-attempt" {std::fs::write(path,"malformed").unwrap();} else {
+                        let mut other=request.clone();other.stage="foundation:OTHER_ORPHAN".into();
+                        let mut attempt=FrozenAttempt::prepare("first-orphan",run,&step_key(&other),Backend::CodexSdk,other,&executor.settings["textSdkIdentity"]).unwrap();
+                        if case=="unknown-attempt" {attempt.begin_dispatch(Backend::CodexSdk).unwrap();attempt.state=AttemptState::SubmissionUnknown;}
+                        if case=="completed-attempt" {attempt.begin_dispatch(Backend::CodexSdk).unwrap();attempt.state=AttemptState::Completed;}
+                        attempt.persist(&path).unwrap();
+                    }
+                }
+            }
+            let before=first_node_stored_evidence(&executor);
+            assert!(add(&executor,&request,&snapshot).is_err(),"{case}");
+            assert_eq!(first_node_stored_evidence(&executor),before,"{case}");
+        }
+    }
+
+    #[test]
+    fn sdk_first_node_handoff_drift_and_invalid_zero_dispatch_proofs_fail_atomically() {
+        for case in ["node","runtime","supervisor","old-resource","new-resource","parent","model","reasoning","account","zero-count","local-recovery"] {
+            let (temp,executor,mut request,mut snapshot)=first_node_fixture();
+            match case {
+                "node"|"runtime"|"supervisor"|"old-resource"|"new-resource"=>{
+                    let file=match case {"node"=>"node.exe","runtime"=>"codex.exe","supervisor"=>"new-supervisor.exe","old-resource"=>"old-resources/src/main.mjs",_=>"new-resources/src/bridge.mjs"};
+                    std::fs::write(temp.path().join(file),"changed").unwrap();
+                },
+                "parent"=>{executor.store.conn().unwrap().execute("UPDATE jobs SET snapshot='{}' WHERE id=?1",[executor.workflow_id.as_ref().unwrap()]).unwrap();},
+                "model"=>request.model="different-model".into(),
+                "reasoning"=>request.reasoning="high".into(),
+                "account"=>snapshot["executorIdentity"]["accountFingerprint"]=json!("c".repeat(64)),
+                "zero-count"=>{snapshot[FIELD]["predecessor"]["attempts"]=json!(1);snapshot[FIELD].as_object_mut().unwrap().remove("sha256");snapshot[FIELD]=seal(snapshot[FIELD].clone());},
+                "local-recovery"=>{assert!(executor.sdk_handoff_predecessor(&executor.request_snapshot(&request).unwrap(),true).is_err());snapshot[FIELD]["policy"]=json!(LOCAL_RECOVERY_POLICY);},
+                _=>unreachable!(),
+            }
+            let before=first_node_stored_evidence(&executor);
+            assert!(add(&executor,&request,&snapshot).is_err(),"{case}");assert_eq!(first_node_stored_evidence(&executor),before,"{case}");
+        }
+    }
+
+    #[test]
+    fn sdk_first_node_handoff_saved_proof_event_and_parent_must_remain_bound() {
+        for case in ["event","prepared","parent","proof"] {
+            let (_temp,executor,request,snapshot)=first_node_fixture();let job=add(&executor,&request,&snapshot).unwrap();let c=executor.store.conn().unwrap();
+            match case {
+                "event"=>{c.execute("UPDATE events SET data='{}' WHERE job_id=?1 AND type='sdk_supervisor_handoff_frozen'",[&job]).unwrap();},
+                "prepared"=>{c.execute("UPDATE jobs SET prepared='{}' WHERE id=?1",[&job]).unwrap();},
+                "parent"=>{c.execute("UPDATE jobs SET snapshot='{}' WHERE id=?1",[executor.workflow_id.as_ref().unwrap()]).unwrap();},
+                "proof"=>{let mut changed=snapshot.clone();changed[FIELD]["predecessor"]["attempts"]=json!(1);c.execute("UPDATE jobs SET snapshot=?2 WHERE id=?1",params![job,changed.to_string()]).unwrap();},
+                _=>unreachable!(),
+            }
+            let before=first_node_stored_evidence(&executor);assert!(executor.request_snapshot(&request).is_err(),"{case}");assert_eq!(first_node_stored_evidence(&executor),before);
+        }
     }
 
     #[test]

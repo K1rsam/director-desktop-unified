@@ -132,3 +132,11 @@ Windows 原生 5 项新增回归通过，Refine 相关广组 20 passed、1 ignor
 证据：`refine-transport-narrow-native-v3/`、`refine-transport-native-v3/`、`refine-capacity-native-v3/`。上述是工程与只读容量证据；原精修任务已据此恢复，实际模型候选及采用另行验收。
 
 此前候选 SHA `f80bdacd4eb94182ed8636660b61301e86813332336b46672566c4a5c1d3e886` 已完成 Windows 原生隐藏 WebView 启动和保存重开，UI IPC、资产删除恢复、项目归档恢复和持久化通过，零生成且进程树清空。第一次工具环境缺少 Get-FileHash，应用未启动；改用 .NET 哈希后通过。证据 `sound-startup-native-first-v2/`、`sound-startup-native-reopen-v1/`。该候选尚不含本节运输和一键合同修复，最终发布需绑定新候选重新验证。
+
+## SDK 首节点升级恢复
+
+精修恢复在模型调用前遇到 `SDK_SUPERVISOR_HANDOFF_HELD`：旧协议只允许已有成功前驱的后继节点更换原生监督器，本例在首节点创建前就因容量拒绝。新增独立 `sdk-first-node-supervisor-handoff/v1`，只在原工作流完全没有 step、关联 text job 和任何状态的 attempt 时预约首节点；事务前和事务内重复核对，继续逐字节校验执行资源、原父快照、账户、模型及推理档。不修改父设置、原请求和回包，也不放宽 local-recovery 或未知提交。
+
+保存重开时核验最早节点、证明、冻结事件和父快照一致，首节点完成后沿用原后继链。Windows 新增四项和完整交接组 **15/15** 通过，含孤儿/unknown/漂移拒绝、重复预约拒绝、保存重开原回包零调用。证据 `sdk-first-node-native-v2/`、`sdk-handoff-all-native-v1/`，冻结测试 EXE SHA-256 `8f81630a718c8d2b99bd730fe822f20000f275fd255f882febfe0ddc3d4403e1`；无超时、进程树清空。首集真实精修恢复结果仍须单独验收。
+
+第 3 集 Planner 已返回原稿，当前因同一工作包内相邻两条 sourceRefs 次序颠倒被拒绝；成员完整且事件顺序正确。原回包、冻结请求和预算保留。尚未将其标记通过，也未重复生成；正在验证仅规范引用数组顺序的窄恢复策略。第 4–10 集尚未生成。
