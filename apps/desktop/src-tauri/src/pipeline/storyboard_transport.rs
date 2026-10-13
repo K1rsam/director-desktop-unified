@@ -35,6 +35,9 @@ const SHARED_ROW_RULE: &str = "【原行共享列补充】shared.version=source-
 fn shared_row_rule() -> String { format!("{STORYBOARD_LOSSLESS_INPUT_RULE}\n{SHARED_ROW_RULE}") }
 const REFINEMENT_AUDIT_RULE: &str = "【精修审计共享列】capacityBrief.rhythm.audit.speech中的{\"$auditRows\":{\"kind\":...,\"columns\":...,\"values\":...}}仅压缩lineTimings或turnGaps审计表的重复列名。values中的数组按columns顺序逐列对应完整原值，null仍为原null；对象仍是完整原行。所有审计数值、标识和行顺序均已由程序逐值核同，不得重算、省略或推测。previousDraft完整现稿保持直接可读。";
 fn refinement_audit_rule() -> String { format!("{}\n{REFINEMENT_AUDIT_RULE}", shared_row_rule()) }
+const FINISH_BINDING_RULE: &str = "【整编身份定位共享列 v1】$assetBindings仅把assetRefs重复的登记身份、原行和镜号改成显式共享列。values数组按columns列名还原：sourceRefs整数逐项取unit路径的sourceRefs；useShotIds整数逐项取该unit的shots中同下标的完整id；identityEvidence整数取identities完整身份对象，identities若为路径则取该路径的直接原值。均为0基、保留顺序与重复。非数组行仍是完整原对象。$sourceCoverage同理，values按columns，rowId整数取unit.sourceRefs，start/end仍为原绝对区间。先还原这两类元数据表，再解释单跳$same；镜头画面、运镜、台词、时长和所有创作文字仍是直接原值。capacityBrief中的$auditRows只按其columns逐列还原原审计表。所有还原已由程序逐值验证，不得推测、重算身份或扩大制作范围。输出仍使用原完整id及原schema。";
+const FINISH_ID_RULE:&str="【完整ID共享字典】losslessIdDictionary逐项列出完整原ID；已知身份字段或已知表列中的{\"$id\":n}只表示该字典0基n项完整字符串。先恢复这些ID，再还原身份定位表及单跳引用。字典和引用已逐值校验；不缩写、重命名身份，不替换任何创作文字；输出须用字典中的完整原ID。";
+fn finish_binding_rule()->String {format!("{}\n{FINISH_BINDING_RULE}\n{FINISH_ID_RULE}",shared_row_rule())}
 
 fn supported_request(request: &TextRequest) -> bool {
     matches!(
@@ -75,6 +78,10 @@ pub(crate) fn storyboard_transport_rule(
             static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
             RULE.get_or_init(refinement_audit_rule).as_str()
         },
+        Some(rule) if request.stage == "storyboardFinish" && rule == finish_binding_rule() => {
+            static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
+            RULE.get_or_init(finish_binding_rule).as_str()
+        },
         Some(rule)
             if rule == LEGACY_FINISH_INPUT_RULE
                 && request.stage == "storyboardFinish"
@@ -93,7 +100,8 @@ pub(crate) fn storyboard_transport_rule(
     }
     let mut projected = input.clone();
     projected.as_object_mut()?.remove("losslessInputRule");
-    (expand(&projected, &projected).ok().as_ref() == Some(&request.input)).then_some(rule)
+    let restored=if rule==finish_binding_rule(){expand_finish_bindings(&projected)}else{expand(&projected,&projected)};
+    (restored.ok().as_ref() == Some(&request.input)).then_some(rule)
 }
 
 fn has_notation(value: &Value) -> bool {
@@ -104,6 +112,10 @@ fn has_notation(value: &Value) -> bool {
                 || map.contains_key("$sourceFingerprints")
                 || map.contains_key("$sourceRows")
                 || map.contains_key("$auditRows")
+                || map.contains_key("$assetBindings")
+                || map.contains_key("$sourceCoverage")
+                || map.contains_key("$id")
+                || map.contains_key("losslessIdDictionary")
                 || map.values().any(has_notation)
         }
         Value::Array(items) => items.iter().any(has_notation),
@@ -457,6 +469,162 @@ fn compact_refinement_audit(input: &mut Value, canonical: &Value) {
             if let Some(wire) = input.pointer_mut(&path) { *wire = table; }
         }
     }
+}
+
+const BINDING_COLUMNS:&[&str]=&["assetId","variantId","order","role","use","sourceRefsPurpose","sourceRefs","useShotIds","identityEvidence"];
+const COVERAGE_COLUMNS:&[&str]=&["rowId","start","end"];
+
+fn finish_unit_paths(input:&Value)->Vec<String> {
+    let mut paths=vec!["/acceptedContinuity/unit".into()];
+    paths.extend((0..input["previousDraft"]["units"].as_array().map_or(0,Vec::len)).map(|i|format!("/previousDraft/units/{i}")));
+    paths.push("/nextBoundary".into());paths
+}
+
+fn finish_binding_row(row:&Value)->bool {
+    row.as_object().is_some_and(|m|m.len()==BINDING_COLUMNS.len() && BINDING_COLUMNS.iter().all(|k|m.contains_key(*k)))
+        && ["assetId","variantId","role","use","sourceRefsPurpose"].iter().all(|k|row[*k].is_string())
+        && row["order"].is_number() && row["identityEvidence"].is_object() && !has_notation(row)
+        && ["sourceRefs","useShotIds"].iter().all(|k|row[*k].as_array().is_some_and(|ids|ids.iter().all(Value::is_string)))
+}
+
+// Only duplicate identity/location metadata changes representation. Every
+// authored field stays literal, including the complete shot and dialogue text.
+fn compact_finish_bindings(input:&mut Value,canonical:&Value) {
+    let paths=finish_unit_paths(canonical);
+    let mut identities=Vec::<Value>::new();
+    for path in &paths { for row in canonical.pointer(path).and_then(|u|u["assetRefs"].as_array()).into_iter().flatten() {
+        if finish_binding_row(row) && !identities.contains(&row["identityEvidence"]) {identities.push(row["identityEvidence"].clone());}
+    }}
+    let mut catalog_path:Option<String>=None;
+    for path in paths {
+        let Some(unit)=canonical.pointer(&path) else {continue;};
+        let Some(literal)=input.pointer(&path) else {continue;};
+        let Some(refs)=unit["sourceRefs"].as_array().filter(|a|a.iter().all(Value::is_string)) else {continue;};
+        let Some(shots)=unit["shots"].as_array().filter(|a|a.iter().all(|s|s["id"].is_string())) else {continue;};
+        if literal["sourceRefs"]!=unit["sourceRefs"] || literal["shots"]!=unit["shots"] {continue;}
+        let ids:Vec<_>=shots.iter().map(|s|s["id"].clone()).collect();
+        if let Some(rows)=unit["assetRefs"].as_array().filter(|_|literal["assetRefs"]==unit["assetRefs"]) {
+            let values:Vec<_>=rows.iter().map(|row| {
+                if !finish_binding_row(row) {return row.clone();}
+                let indices=|key:&str,catalog:&[Value]|->Option<Vec<usize>> {row[key].as_array()?.iter().map(|id|catalog.iter().position(|v|v==id)).collect()};
+                let (Some(source),Some(uses))=(indices("sourceRefs",refs),indices("useShotIds",&ids)) else {return row.clone();};
+                json!([row["assetId"],row["variantId"],row["order"],row["role"],row["use"],row["sourceRefsPurpose"],source,uses,identities.iter().position(|v|v==&row["identityEvidence"]).unwrap()])
+            }).collect();
+            let table=json!({"$assetBindings":{"version":"unit-bindings/v1","unit":format!("#{path}"),"columns":BINDING_COLUMNS,"identities":catalog_path.as_ref().map(|p|json!(format!("#{p}"))).unwrap_or_else(||json!(identities)),"values":values}});
+            if table.to_string().len()<unit["assetRefs"].to_string().len() {
+                input.pointer_mut(&path).unwrap()["assetRefs"]=table;
+                if catalog_path.is_none(){catalog_path=Some(format!("{path}/assetRefs/$assetBindings/identities"));}
+            }
+        }
+        if let Some(rows)=unit["sourceCoverage"].as_array().filter(|_|input.pointer(&path).unwrap()["sourceCoverage"]==unit["sourceCoverage"]) {
+            let values:Vec<_>=rows.iter().map(|row| {
+                if row.as_object().is_some_and(|m|m.len()==3 && COVERAGE_COLUMNS.iter().all(|k|m.contains_key(*k))) && row["start"].is_number() && row["end"].is_number() {
+                    if let Some(index)=refs.iter().position(|v|v==&row["rowId"]) {return json!([index,row["start"],row["end"]]);}
+                }
+                row.clone()
+            }).collect();
+            let table=json!({"$sourceCoverage":{"version":"unit-coverage/v1","unit":format!("#{path}"),"columns":COVERAGE_COLUMNS,"values":values}});
+            if table.to_string().len()<unit["sourceCoverage"].to_string().len() {input.pointer_mut(&path).unwrap()["sourceCoverage"]=table;}
+        }
+    }
+}
+
+fn visit_finish_id_fields(value:&mut Value,key:&str,visitor:&mut impl FnMut(&mut Value)) {
+    const IDS:&[&str]=&["id","assetId","variantId","identityId","baseAssetId","sourceVariantId","sourceSha256","episodeId","sceneId","lineId","fromLineId","toLineId","rowId","sourceRefsSha256","unitId","shotId","eventId","packageId"];
+    const LISTS:&[&str]=&["sourceRefs","contextRefs","sourceRowIds","contextRowIds","anchorRefs","packageIds","dependsOn","provisionalUnitIds","shotIds","useShotIds"];
+    if value.is_string() {if IDS.contains(&key)||LISTS.contains(&key){visitor(value);}return;}
+    if let Some(items)=value.as_array_mut(){for item in items{visit_finish_id_fields(item,key,visitor);}return;}
+    let Some(map)=value.as_object_mut() else{return;};
+    if map.contains_key("$same")||map.contains_key("$rowIds"){return;}
+    if let Some(table)=map.get_mut("$sourceRows") {
+        let columns=table["columns"].clone();
+        if let Some(rows)=table["values"].as_array_mut(){for row in rows{
+            if let Some(cells)=row.as_array_mut(){for (name,cell) in columns["row"].as_array().into_iter().flatten().zip(cells){
+                if name=="dialogue" && cell.is_array(){for (name,cell) in columns["dialogue"].as_array().into_iter().flatten().zip(cell.as_array_mut().unwrap()){visit_finish_id_fields(cell,name.as_str().unwrap_or(""),visitor);}}
+                else {visit_finish_id_fields(cell,name.as_str().unwrap_or(""),visitor);}
+            }}else{visit_finish_id_fields(row,"",visitor);}
+        }}return;
+    }
+    for kind in ["$assetBindings","$sourceCoverage","$auditRows"] {
+        if let Some(table)=map.get_mut(kind){let columns=table["columns"].clone();
+            if let Some(rows)=table["values"].as_array_mut(){for row in rows{if let Some(cells)=row.as_array_mut(){for (name,cell) in columns.as_array().into_iter().flatten().zip(cells){visit_finish_id_fields(cell,name.as_str().unwrap_or(""),visitor);}}else{visit_finish_id_fields(row,"",visitor);}}}
+            if table["identities"].is_array(){visit_finish_id_fields(&mut table["identities"],"",visitor);}return;
+        }
+    }
+    for (key,value) in map {visit_finish_id_fields(value,key,visitor);}
+}
+
+fn compact_finish_id_dictionary(input:&mut Value) {
+    let mut counts=std::collections::BTreeMap::<String,usize>::new();
+    visit_finish_id_fields(input,"",&mut |v|{*counts.entry(v.as_str().unwrap().into()).or_default()+=1;});
+    let mut dictionary=Vec::new();let mut indices=HashMap::new();
+    for (id,count) in counts {
+        let index=dictionary.len();let chars=json!(id).to_string().encode_utf16().count();
+        let reference=json!({"$id":index}).to_string().encode_utf16().count();
+        if count<2 || count*chars <= count*reference+chars+1 {continue;}
+        indices.insert(id.clone(),index);dictionary.push(id);
+    }
+    if dictionary.is_empty(){return;}
+    visit_finish_id_fields(input,"",&mut |v|{if let Some(index)=indices.get(v.as_str().unwrap()){*v=json!({"$id":index});}});
+    input["losslessIdDictionary"]=json!(dictionary);
+}
+
+fn expand_finish_bindings(input:&Value)->Result<Value,String> {
+    fn visit(value:&Value,root:&Value)->Result<Value,String>{
+        let kind=if value.get("$assetBindings").is_some(){Some("$assetBindings")}else if value.get("$sourceCoverage").is_some(){Some("$sourceCoverage")}else{None};
+        if let Some(kind)=kind {
+            if value.as_object().is_none_or(|m|m.len()!=1){return Err("整编定位表含额外字段".into());}
+            let table=value[kind].as_object().ok_or("整编定位表无效")?;
+            let binding=kind=="$assetBindings";
+            let columns=if binding{BINDING_COLUMNS}else{COVERAGE_COLUMNS};
+            if table.len()!=if binding{5}else{4} || table.get("columns")!=Some(&json!(columns))
+                || table.get("version")!=Some(&json!(if binding{"unit-bindings/v1"}else{"unit-coverage/v1"})) {return Err("整编定位表版本或列定义无效".into());}
+            let path=table.get("unit").and_then(Value::as_str).and_then(|p|p.strip_prefix('#')).ok_or("整编定位表单元路径无效")?;
+            if !finish_unit_paths(root).iter().any(|p|p==path){return Err("整编定位表目标不是已知单元".into());}
+            let unit=root.pointer(path).ok_or("整编定位表单元缺失")?;
+            let refs=unit["sourceRefs"].as_array().filter(|a|a.iter().all(Value::is_string)).ok_or("整编定位表原行必须直接保留")?;
+            let shot_ids:Vec<_>=unit["shots"].as_array().ok_or("整编定位表镜号缺失")?.iter().map(|s|s["id"].clone()).collect();
+            if !shot_ids.iter().all(Value::is_string){return Err("整编定位表镜号必须直接保留".into());}
+            let identities=if binding {
+                let supplied=&table["identities"];
+                let ids=if let Some(p)=supplied.as_str(){root.pointer(p.strip_prefix('#').ok_or("整编身份路径无效")?).ok_or("整编身份目录缺失")?}else{supplied};
+                Some(ids.as_array().filter(|a|a.iter().all(|v|v.is_object() && !has_notation(v))).ok_or("整编身份目录必须直接保留")?)
+            }else{None};
+            let index=|v:&Value,catalog:&[Value]|->Result<Value,String>{v.as_u64().and_then(|n|usize::try_from(n).ok()).and_then(|i|catalog.get(i)).cloned().ok_or("整编定位表下标越界".into())};
+            let list=|v:&Value,catalog:&[Value]|->Result<Value,String>{v.as_array().ok_or("整编定位表下标列表无效")?.iter().map(|v|index(v,catalog)).collect::<Result<Vec<_>,_>>().map(Value::Array)};
+            let mut restored=Vec::new();
+            for row in table.get("values").and_then(Value::as_array).ok_or("整编定位表行缺失")? {
+                if row.is_object() && !has_notation(row){restored.push(row.clone());continue;}
+                let cells=row.as_array().filter(|r|r.len()==columns.len()).ok_or("整编定位表列数无效")?;
+                let result=if binding {
+                    let mut m:serde_json::Map<_,_>=columns.iter().zip(cells).map(|(k,v)|((*k).into(),v.clone())).collect();
+                    m.insert("sourceRefs".into(),list(&cells[6],refs)?);m.insert("useShotIds".into(),list(&cells[7],&shot_ids)?);m.insert("identityEvidence".into(),index(&cells[8],identities.unwrap())?);
+                    let row=Value::Object(m);if !finish_binding_row(&row){return Err("整编资产身份列类型无效".into());}row
+                }else{
+                    if !cells[1].is_number()||!cells[2].is_number(){return Err("整编覆盖区间类型无效".into());}
+                    json!({"rowId":index(&cells[0],refs)?,"start":cells[1],"end":cells[2]})
+                };
+                restored.push(result);
+            }
+            return Ok(Value::Array(restored));
+        }
+        match value {Value::Object(m)=>m.iter().map(|(k,v)|Ok((k.clone(),visit(v,root)?))).collect::<Result<serde_json::Map<_,_>,String>>().map(Value::Object),Value::Array(a)=>a.iter().map(|v|visit(v,root)).collect::<Result<Vec<_>,_>>().map(Value::Array),_=>Ok(value.clone())}
+    }
+    fn restore_ids(value:&Value,dictionary:&[Value])->Result<Value,String>{
+        if let Some(index)=value.get("$id") {
+            if value.as_object().is_none_or(|m|m.len()!=1){return Err("整编ID引用含额外字段".into());}
+            return index.as_u64().and_then(|n|usize::try_from(n).ok()).and_then(|i|dictionary.get(i)).cloned().ok_or("整编ID字典下标越界".into());
+        }
+        match value {Value::Object(m)=>m.iter().map(|(k,v)|Ok((k.clone(),restore_ids(v,dictionary)?))).collect::<Result<serde_json::Map<_,_>,String>>().map(Value::Object),Value::Array(a)=>a.iter().map(|v|restore_ids(v,dictionary)).collect::<Result<Vec<_>,_>>().map(Value::Array),_=>Ok(value.clone())}
+    }
+    let mut original=input.clone();
+    let dictionary=original.as_object_mut().ok_or("整编输入不是对象")?.remove("losslessIdDictionary");
+    if let Some(dictionary)=dictionary {
+        let ids=dictionary.as_array().filter(|ids|ids.iter().all(Value::is_string)).ok_or("整编ID字典不是直接字符串目录")?;
+        original=restore_ids(&original,ids)?;
+    } else {original=restore_ids(&original,&[])?;}
+    let normalized=visit(&original,&original)?;
+    expand(&normalized,&normalized)
 }
 
 /// Expand only the documented single-hop notation. Targets must stay directly
@@ -885,7 +1053,7 @@ pub(super) fn expand_storyboard_input(input: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .is_some_and(|rule| {
             [STORYBOARD_LOSSLESS_INPUT_RULE, LEGACY_FINISH_INPUT_RULE].contains(&rule)
-                || rule==shared_row_rule() || rule==refinement_audit_rule()
+                || rule==shared_row_rule() || rule==refinement_audit_rule() || rule==finish_binding_rule()
         })
     {
         return Err("无损资料缺少已知运输声明".into());
@@ -895,7 +1063,7 @@ pub(super) fn expand_storyboard_input(input: &Value) -> Result<Value, String> {
         .as_object_mut()
         .ok_or("无损资料必须为对象")?
         .remove("losslessInputRule");
-    expand(&projected, &projected)
+    if input["losslessInputRule"]==finish_binding_rule(){expand_finish_bindings(&projected)}else{expand(&projected,&projected)}
 }
 
 /// Model-input transport only: all cache identities and the output schema use
@@ -911,6 +1079,34 @@ pub(crate) fn compile_storyboard_transport(
 pub(crate) fn compile_storyboard_dispatch_transport(
     request: &TextRequest,
 ) -> Result<Option<CompiledStoryboardTransport>, String> {
+    let original=compile_dispatch_before_bindings(request)?;
+    let (old_input,old_schema)=original.as_ref().map(|w|(&w.input,&w.schema)).unwrap_or((&request.input,&request.schema));
+    if request.stage!="storyboardFinish" || !supported_request(request) || has_notation(&request.input)
+        || request.input.get("losslessInputRule").is_some()
+        || crate::text_executor::codex_wire_characters(request,old_input,old_schema)<=STORYBOARD_TRANSPORT_LIMIT {return Ok(original);}
+    let candidate=compile_finish_binding_candidate(request,old_input,old_schema)?;
+    let before=crate::text_executor::transport_payload_characters(request,old_input,old_schema);
+    let after=crate::text_executor::transport_payload_characters(request,&candidate.input,&candidate.schema);
+    if before.checked_sub(after).is_none_or(|gain|gain<2048)
+        || crate::text_executor::codex_wire_characters(request,&candidate.input,&candidate.schema)>STORYBOARD_TRANSPORT_LIMIT {return Ok(original);}
+    Ok(Some(candidate))
+}
+
+fn compile_finish_binding_candidate(request:&TextRequest,old_input:&Value,old_schema:&Value)->Result<CompiledStoryboardTransport,String>{
+    let mut input=old_input.clone();input.as_object_mut().ok_or("整编输入不是对象")?.remove("losslessInputRule");
+    compact_finish_repetitions(&mut input,&request.input);
+    compact_partial_continuity(&mut input,&request.input);
+    compact_shared_source_rows(&mut input,&request.input);
+    compact_metadata_copies(&mut input,&request.input);
+    compact_finish_bindings(&mut input,&request.input);
+    compact_refinement_audit(&mut input,&request.input);
+    compact_finish_id_dictionary(&mut input);
+    if expand_finish_bindings(&input)?!=request.input {return Err("整编身份定位共享列未逐值还原完整输入；未提交".into());}
+    input["losslessInputRule"]=json!(finish_binding_rule());
+    Ok(CompiledStoryboardTransport{profile:PROFILE,input,schema:old_schema.clone()})
+}
+
+fn compile_dispatch_before_bindings(request:&TextRequest)->Result<Option<CompiledStoryboardTransport>,String>{
     let original = compile_dispatch_before_metadata(request)?;
     if request.stage == "storyboardRefine" {
         return compile_refinement_audit_transport(request, original);
@@ -1493,6 +1689,102 @@ mod tests {
         println!("Refine canonicalCli={canonical_cli} canonicalMax={canonical_max} projectedCli={cli} projectedMax={max} exactInput=true exactSchema=true fullDraft=true fullRules=true sourceUnchanged=true modelCalls=0 databaseWrites=0");
         assert!(cli<=STORYBOARD_TRANSPORT_LIMIT,"CLI/SDK wire still oversized: {cli}");
         println!("SDK capacity accepted; API envelope within limit={} (API dispatch remains independently capacity-gated)",max<=STORYBOARD_TRANSPORT_LIMIT);
+    }
+
+    #[test]
+    #[ignore = "explicit captured Finish canonical request; read-only original, zero model/DB calls"]
+    fn finish_captured_request_proves_full_roundtrip_and_real_envelope_capacity() {
+        let file=std::env::var("DIRECTOR_FINISH_READONLY_REQUEST").expect("explicit captured Finish request");
+        let before=std::fs::read(&file).unwrap();let request:TextRequest=serde_json::from_slice(&before).unwrap();
+        assert_eq!(request.stage,"storyboardFinish");assert_eq!(request.input["finishMode"],"delta");
+        let wire=compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert!(expand_storyboard_input(&wire.input).unwrap()==request.input,"complete input roundtrip");
+        assert!(expand_storyboard_schema(&wire.schema).unwrap()==request.schema,"complete schema roundtrip");
+        let cli=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);
+        let max=crate::text_executor::transport_payload_characters(&request,&wire.input,&wire.schema);
+        let metric=|value:&Value|value.to_string().encode_utf16().count();
+        let fields:serde_json::Map<_,_>=wire.input.as_object().unwrap().iter().map(|(key,value)|(key.clone(),json!(metric(value)))).collect();
+        let old=compile_dispatch_before_bindings(&request).unwrap().unwrap();
+        let candidate=compile_finish_binding_candidate(&request,&old.input,&old.schema).unwrap();
+        println!("bindingCandidateSdk={} bindingCandidateMax={}",crate::text_executor::codex_wire_characters(&request,&candidate.input,&candidate.schema),crate::text_executor::transport_payload_characters(&request,&candidate.input,&candidate.schema));
+        println!("{}",json!({"sdkWire":cli,"apiMax":max,"schema":metric(&wire.schema),"rules":metric(&request.rule_snapshot),"inputFields":fields,"roundtrip":true,"modelCalls":0,"databaseWrites":0}));
+        if let Ok(path)=std::env::var("DIRECTOR_FINISH_READONLY_WIRE_OUTPUT") {std::fs::write(format!("{path}.candidate.json"),serde_json::to_vec_pretty(&json!({"input":candidate.input,"schema":candidate.schema})).unwrap()).unwrap();std::fs::write(path,serde_json::to_vec_pretty(&json!({"input":wire.input,"schema":wire.schema})).unwrap()).unwrap();}
+        assert_eq!(std::fs::read(file).unwrap(),before);
+        assert!(cli<=STORYBOARD_TRANSPORT_LIMIT,"actual SDK wire still over capacity: {cli}");
+        assert_eq!(wire.schema,old.schema,"unchanged output schema transport");
+        let compiled=crate::text_executor::compile_codex_input(&request).unwrap();let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();
+        assert!(prompt["input"]==wire.input && prompt["rules"]==request.rule_snapshot);
+        assert_eq!(compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),cli);
+        let root=std::path::Path::new(&std::env::var("DIRECTOR_FINISH_READONLY_REQUEST").unwrap()).parent().unwrap().to_path_buf();
+        for (index,expected) in [(0,151118),(2,179733)] {
+            let raw=std::fs::read(root.join(format!("finish-capacity-canonical-{index}.json"))).unwrap();let accepted:TextRequest=serde_json::from_slice(&raw).unwrap();
+            let grouping_bytes=|w:Option<CompiledStoryboardTransport>|w.map(|w|serde_json::to_vec(&json!([w.input,w.schema])).unwrap());
+            let grouping=grouping_bytes(compile_storyboard_transport(&accepted).unwrap());
+            let legacy_grouping=grouping_bytes(compile_legacy_finish_grouping_transport(&accepted).unwrap());
+            let old=compile_dispatch_before_bindings(&accepted).unwrap().unwrap();let new=compile_storyboard_dispatch_transport(&accepted).unwrap().unwrap();
+            assert!(new.input==old.input && new.schema==old.schema,"accepted wire changed");
+            assert_eq!(crate::text_executor::codex_wire_characters(&accepted,&new.input,&new.schema),expected);
+            assert_eq!(grouping_bytes(compile_storyboard_transport(&accepted).unwrap()),grouping);
+            assert_eq!(grouping_bytes(compile_legacy_finish_grouping_transport(&accepted).unwrap()),legacy_grouping);
+        }
+    }
+
+    fn binding_fixture()->TextRequest {
+        let ids:Vec<_>=(0..16).map(|i|json!(format!("row:{}:{i}:{}","a".repeat(48),i+1))).collect();
+        let units:Vec<_>=(0..5).map(|unit|{
+            let shots:Vec<_>=(0..8).map(|shot|json!({"id":format!("unit:{unit}:{}:shot:{shot}","b".repeat(70)),"sourceRefs":ids[shot..shot+3],"contextRefs":[],"camera":"平移镜头，保持角色主体。","picture":"原画面保持。","dialogueParts":[{"lineId":format!("dialogue:{}",ids[shot].as_str().unwrap()),"speaker":"甲","channel":"OS","text":"原话不换词。","quoteStart":0,"quoteEnd":6,"voiceStart":0,"voiceEnd":2}],"duration":3})).collect();
+            let shot_ids:Vec<_>=shots.iter().map(|s|s["id"].clone()).collect();
+            let refs:Vec<_>=(0..6).map(|i|json!({"assetId":format!("asset:{}:{i}","c".repeat(60)),"variantId":format!("variant:{}:{i}","d".repeat(40)),"role":"character","use":"character","order":i,"sourceRefsPurpose":"CURRENT_USE_ANCHORS","sourceRefs":ids,"useShotIds":shot_ids,"identityEvidence":{"assetId":format!("asset:{}:{i}","c".repeat(60)),"assetVersion":if unit==4{2}else{1},"purpose":"REGISTERED_IDENTITY_NOT_ACTION","sourceRefsSha256":"e".repeat(64),"variantId":format!("variant:{}:{i}","d".repeat(40))}})).collect();
+            json!({"id":format!("unit:{unit}"),"sourceRefs":ids,"sourceCoverage":ids.iter().enumerate().map(|(i,id)|json!({"rowId":id,"start":i*10,"end":i*10+10})).collect::<Vec<_>>(),"shots":shots,"assetRefs":refs,"prompt":"完整已采用文字","extra":null})
+        }).collect();
+        TextRequest{stage:"storyboardFinish".into(),skill:"episode-finishing-editor".into(),model:"offline".into(),reasoning:"medium".into(),schema:json!({"type":"object"}),rule_snapshot:json!({"primary":{"content":"完整规则不变"}}),input:json!({"finishMode":"delta","previousDraft":{"units":units},"plan":{},"sourceRows":[],"contextRows":[]})}
+    }
+
+    #[test]
+    fn finish_binding_tables_and_id_dictionary_restore_exact_metadata_and_literal_creative_text() {
+        let r=binding_fixture();let before=r.input.clone();let mut wire=before.clone();
+        compact_finish_bindings(&mut wire,&before);compact_finish_id_dictionary(&mut wire);
+        assert!(wire["losslessIdDictionary"].is_array());assert!(wire!=before);
+        assert_eq!(expand_finish_bindings(&wire).unwrap(),before);
+        assert_eq!(wire["previousDraft"]["units"][0]["shots"][0]["picture"],before["previousDraft"]["units"][0]["shots"][0]["picture"]);
+        assert_eq!(wire["previousDraft"]["units"][0]["shots"][0]["dialogueParts"][0]["text"],before["previousDraft"]["units"][0]["shots"][0]["dialogueParts"][0]["text"]);
+        let restored=expand_finish_bindings(&wire).unwrap();assert_ne!(restored["previousDraft"]["units"][0]["assetRefs"][0]["identityEvidence"],restored["previousDraft"]["units"][4]["assetRefs"][0]["identityEvidence"]);
+        assert_eq!(r.input,before);
+    }
+
+    #[test]
+    fn finish_binding_unknown_null_missing_fields_and_empty_lists_remain_exact() {
+        let mut r=binding_fixture();let refs=r.input["previousDraft"]["units"][0]["assetRefs"].as_array_mut().unwrap();
+        refs[0]["future"]=Value::Null;refs[1].as_object_mut().unwrap().remove("identityEvidence");refs[2]["identityEvidence"]=Value::Null;refs[3]["sourceRefs"]=json!([]);refs[3]["useShotIds"]=json!([]);
+        r.input["previousDraft"]["units"][0]["sourceCoverage"].as_array_mut().unwrap().push(json!({"rowId":null,"start":null,"end":null,"future":"untouched"}));
+        let mut wire=r.input.clone();compact_finish_bindings(&mut wire,&r.input);compact_finish_id_dictionary(&mut wire);
+        assert_eq!(expand_finish_bindings(&wire).unwrap(),r.input);
+        for index in 0..3 {assert_eq!(wire["previousDraft"]["units"][0]["assetRefs"]["$assetBindings"]["values"][index].is_object(),true);}
+    }
+
+    #[test]
+    fn finish_binding_decoder_rejects_bad_columns_indexes_identity_chains_and_missing_dictionary() {
+        let r=binding_fixture();let mut wire=r.input.clone();compact_finish_bindings(&mut wire,&r.input);
+        for change in ["column","version","sourceIndex","shotIndex","identityIndex","identityChain","rowType","coverageIndex"] {
+            let mut bad=wire.clone();let table=&mut bad["previousDraft"]["units"][0]["assetRefs"]["$assetBindings"];
+            match change {"column"=>{table["columns"].as_array_mut().unwrap().pop();},"version"=>table["version"]=json!("unknown"),"sourceIndex"=>table["values"][0][6]=json!([-1]),"shotIndex"=>table["values"][0][7]=json!([10000]),"identityIndex"=>table["values"][0][8]=json!(10000),"identityChain"=>table["identities"]=json!("#/previousDraft/units/1/assetRefs/$assetBindings/identities"),"rowType"=>table["values"][0][2]=json!("not a number"),_=>bad["previousDraft"]["units"][0]["sourceCoverage"]["$sourceCoverage"]["values"][0][0]=json!(10000)}
+            assert!(expand_finish_bindings(&bad).is_err(),"{change}");
+        }
+        for bad in [json!({"id":{"$id":0}}),json!({"losslessIdDictionary":[null],"id":{"$id":0}}),json!({"losslessIdDictionary":["x"],"id":{"$id":-1}}),json!({"losslessIdDictionary":["x"],"id":{"$id":0,"extra":1}})] {assert!(expand_finish_bindings(&bad).is_err());}
+    }
+
+    #[test]
+    fn finish_binding_transport_preserves_fitting_wire_and_rejects_unfitting_or_reserved_input() {
+        let mut r=binding_fixture();r.input["literalPadding"]=json!("");
+        for target in [199_000,208_000,300_000] {
+            r.input["literalPadding"]=json!("");let old=compile_dispatch_before_bindings(&r).unwrap();let(i,s)=old.as_ref().map(|w|(&w.input,&w.schema)).unwrap_or((&r.input,&r.schema));let size=crate::text_executor::codex_wire_characters(&r,i,s);
+            r.input["literalPadding"]=json!("x".repeat(target-size));
+            let old=compile_dispatch_before_bindings(&r).unwrap();let new=compile_storyboard_dispatch_transport(&r).unwrap();
+            let bytes=|w:&Option<CompiledStoryboardTransport>|w.as_ref().map(|w|serde_json::to_vec(&json!([w.input,w.schema])).unwrap());
+            if target==208_000 {let wire=new.unwrap();assert_eq!(expand_storyboard_input(&wire.input).unwrap(),r.input);assert!(crate::text_executor::codex_wire_characters(&r,&wire.input,&wire.schema)<=STORYBOARD_TRANSPORT_LIMIT);assert_eq!(storyboard_transport_rule(&r,&wire.input),Some(finish_binding_rule().as_str()));}
+            else {assert_eq!(bytes(&old),bytes(&new));}
+        }
+        for marker in [json!({"$id":0}),json!({"$assetBindings":{}}),json!({"$sourceCoverage":{}}),json!({"losslessIdDictionary":["data"]})] {let mut r=binding_fixture();r.input["ordinaryData"]=marker;assert!(compile_storyboard_dispatch_transport(&r).unwrap().is_none());}
     }
 
     #[test]
