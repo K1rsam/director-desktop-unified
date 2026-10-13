@@ -13,7 +13,7 @@ function fixture(change=()=>{}){
  const browser={storage:{local:{get:async keys=>get(local,keys),set:async values=>{writes++;Object.assign(local,copy(values));}},session:{get:async keys=>get(session,keys)}},tabs:{query:async()=>{queries++;return copy(tabs);},reload:async id=>{assert.equal(id,7);reloads++;}},windows:{get:async id=>{assert.equal(id,9);return copy(window);}}};
  const facts={local,session,tabs,window,connections,browser,key,jkey};change(facts);
  const context=vm.createContext({chrome:browser,WebSocket:{CONNECTING:0,OPEN:1},crypto:webcrypto,TextEncoder,URL,URLSearchParams,Date,console,clearTimeout,structuredClone});
- const api=vm.runInContext(fs.readFileSync(file,'utf8').replace(/^export /gm,'')+'\n({recoverOwnedController,bootstrapOwnedController,reconcileBootstrapWindow,confirmOwnedControllerReady,createConnectionWatchdog});',context);
+ const api=vm.runInContext(fs.readFileSync(file,'utf8').replace(/^export /gm,'')+'\n({recoverOwnedController,bootstrapOwnedController,reconcileBootstrapWindow,reconcileReloadedControllerIdentity,confirmOwnedControllerReady,createConnectionWatchdog});',context);
  return {...facts,api,run:()=>api.recoverOwnedController({browser,connections,now:()=>1000000}),reloads:()=>reloads,writes:()=>writes,queries:()=>queries};
 }
 test('zero content connections recovers only proved original minimized controller without focus or generation',async()=>{
@@ -172,4 +172,99 @@ test('reconciliation after owned maintenance uses a fresh session nonce instead 
  const f=interruptedWindowFixture(f=>{delete f.session['directorDesktop:controllerBrowserSession:v1'];f.browser.storage.session.set=async v=>Object.assign(f.session,structuredClone(v));});
  assert.equal((await f.run()).status,'bootstrap_reconciled');assert.notEqual(f.local[f.key].browserSession,SESSION);
  assert.equal(f.local[f.key].browserSession,f.session['directorDesktop:controllerBrowserSession:v1']);
+});
+
+test('frequent worker wakes preserve the existing watchdog deadline and concurrent arms create once',async()=>{
+ const f=fixture();let now=0,alarm=null,creates=0;
+ const alarms={get:async()=>alarm,create:async(name,options)=>{creates++;alarm={name,scheduledTime:now+options.periodInMinutes*60000,periodInMinutes:options.periodInMinutes};}};
+ for(now=0;now<=270000;now+=30000){const dog=f.api.createConnectionWatchdog({alarms,connections:new Map(),openConnection(){}});await Promise.all([dog.arm(),dog.arm()]);}
+ assert.equal(creates,1);assert.equal(alarm.scheduledTime,60000);
+ alarm=null;const afterBrowserRestart=f.api.createConnectionWatchdog({alarms,connections:new Map(),openConnection(){}});await afterBrowserRestart.arm();assert.equal(creates,2);
+});
+
+function maintenanceFixture(change=()=>{}){
+ const f=fixture(f=>{
+  const control=f.local[f.key],proof={tabId:control.tabId,launchToken:control.launchToken,browserSession:control.browserSession,
+   serverUrl:control.serverUrl,requestedUrl:control.requestedUrl,contentEpoch:'old-content'};
+  control.reloadInvalidated={...proof,operationId:'known-maintenance'};
+  f.local.bridgePendingExtensionReload={operationId:'known-maintenance',recoveryStatus:'awaiting_source_ready',requestedAt:900000,
+   tabIds:[99],idleControllers:{[f.key]:proof},expectedRuntime:{profileId:PROFILE,backgroundEpoch:'old-worker'}};
+  delete f.session['directorDesktop:controllerBrowserSession:v1'];delete f.session['chatgptBridgeV6:tab:7'];
+  f.browser.storage.session.set=async values=>Object.assign(f.session,structuredClone(values));
+  f.browser.windows.create=async()=>assert.fail('same controller must be kept');
+  f.browser.tabs.update=async()=>assert.fail('no navigation or focus update');change(f);
+ });
+ return {...f,recover:()=>f.api.recoverOwnedController({browser:f.browser,connections:f.connections,backgroundEpoch:'current-worker',now:()=>1000000})};
+}
+
+test('zero-client maintained controller rebinds a fresh session and recovers its original hidden page',async()=>{
+ const f=maintenanceFixture(),old=structuredClone(f.local[f.key]),owner=structuredClone(f.session['chatgptBridgeLaunchedTab:7']);
+ assert.equal((await f.recover()).status,'reload_requested');assert.equal(f.reloads(),1);
+ const control=f.local[f.key];assert.notEqual(control.browserSession,SESSION);assert.equal(control.browserSession,f.session['directorDesktop:controllerBrowserSession:v1']);
+ assert.equal(control.tabId,7);assert.equal(control.reloadInvalidated,undefined);assert.equal(f.session['chatgptBridgeV6:tab:7'],undefined,'missing runtime is never fabricated');
+ assert.deepEqual(f.session['chatgptBridgeLaunchedTab:7'],owner);assert.deepEqual(f.local[f.jkey].maintenanceRecovery.originalInvalidation,old.reloadInvalidated);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7),now:()=>1000000}),true);
+ assert.equal(f.local[f.jkey].status,'connection_confirmed');assert.equal(f.reloads(),1);
+});
+
+test('fresh same-source maintenance navigation gets its original bounded opportunity before watchdog reload',async()=>{
+ const f=maintenanceFixture(f=>f.local.bridgePendingExtensionReload.tabIds=[7]);
+ assert.equal((await f.recover()).reason,'maintenance_navigation_pending');assert.equal(f.reloads(),0);
+ assert.equal(f.local[f.jkey].status,'session_rebound');
+ assert.equal((await f.api.recoverOwnedController({browser:f.browser,connections:f.connections,backgroundEpoch:'current-worker',now:()=>1020001})).status,'reload_requested');assert.equal(f.reloads(),1);
+});
+
+test('maintenance durable idle proof survives removal of the reload anchor by its exact hello',async()=>{
+ const f=maintenanceFixture(f=>{
+  f.local[f.key].reloadInvalidated.maintenanceRecovery={version:'director-controller-maintenance-idle/v1',profileId:PROFILE,
+   previousBackgroundEpoch:'old-worker',requestedAt:900000,contentEpoch:'old-content'};
+  delete f.local.bridgePendingExtensionReload;
+  f.session['chatgptBridgeV6:tab:7']={schemaVersion:6,lease:null,outbox:[],commands:{},effects:{},downloads:{},contentEpoch:'fresh'};
+  f.connections.set('live',{tabId:7,closed:false,ws:{readyState:1},protocolReady:true,directorReadyProof:readyProof(7)});
+ });assert.equal((await f.recover()).status,'connected');assert.equal(f.reloads(),0);assert.equal(f.local[f.jkey].status,'connection_confirmed');
+});
+
+test('missing historical content epoch requires exact new worker proof instead of inventing an epoch',async()=>{
+ const f=maintenanceFixture(f=>f.local.bridgePendingExtensionReload.idleControllers[f.key].contentEpoch=null);
+ await f.recover();assert.equal(f.local[f.jkey].beforeContentEpoch,null);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:{...readyProof(7),backgroundEpoch:'other-worker'}}),false);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7)}),true);
+});
+
+test('maintenance rebind holds foreign identity, user pages, damaged ownership, unknown journal and unresolved execution',async()=>{
+ for(const change of [f=>f.local[f.key].status='reserved',f=>f.local[f.key].reloadInvalidated.tabId=99,
+  f=>f.local.bridgePendingExtensionReload.expectedRuntime.profileId=SESSION,
+  f=>f.local.bridgePendingExtensionReload.expectedRuntime.backgroundEpoch='current-worker',f=>delete f.local.bridgePendingExtensionReload,
+  f=>f.tabs[0].url='https://chatgpt.com/c/user',f=>f.window.focused=true,f=>f.window.state='normal',
+  f=>f.session['chatgptBridgeLaunchedTab:8']=structuredClone(f.session['chatgptBridgeLaunchedTab:7']),
+  f=>f.local[f.jkey]={status:'outcome_unknown'},f=>f.local[f.jkey]={status:'reserved'},
+  f=>f.session['chatgptBridgeV6:tab:99']={schemaVersion:6,lease:{requestId:'unknown'},outbox:[],commands:{},effects:{},downloads:{}},
+  f=>f.connections.set('busy',{tabId:99,closed:false,activeRequest:{requestId:'unknown'}})]){
+   const f=maintenanceFixture(change),before=structuredClone(f.local),session=structuredClone(f.session);
+   assert.equal((await f.recover()).status,'held');assert.equal(f.reloads(),0);assert.deepEqual(f.local,before);assert.deepEqual(f.session,session);
+ }
+});
+
+test('interruption after new nonce persistence resumes that same nonce without replaying browser effects',async()=>{
+ const f=maintenanceFixture(),write=f.browser.storage.local.set;
+ f.browser.storage.local.set=async()=>{throw Error('simulated worker stop');};
+ assert.equal((await f.recover()).status,'held');const nonce=f.session['directorDesktop:controllerBrowserSession:v1'];assert.notEqual(nonce,SESSION);assert.equal(f.reloads(),0);
+ f.browser.storage.local.set=write;assert.equal((await f.recover()).status,'reload_requested');assert.equal(f.local[f.key].browserSession,nonce);assert.equal(f.reloads(),1);
+ await f.recover();assert.equal(f.reloads(),1);
+});
+
+test('maintenance identity rebinding archives a real previous reconnect confirmation and updates its digest atomically',async()=>{
+ const f=fixture();f.session['chatgptBridgeV6:tab:7'].contentEpoch='old-content';await f.run();
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7),now:()=>800000}),true);
+ const previous=structuredClone(f.local[f.jkey]),old=structuredClone(f.local[f.key]);
+ const proof={tabId:old.tabId,launchToken:old.launchToken,browserSession:old.browserSession,serverUrl:old.serverUrl,requestedUrl:old.requestedUrl,contentEpoch:'fresh'};
+ f.local[f.key].reloadInvalidated={...proof,operationId:'second-maintenance'};
+ f.local.bridgePendingExtensionReload={operationId:'second-maintenance',recoveryStatus:'held',recoveryReason:'source_ready_timeout',requestedAt:850000,tabIds:[7],idleControllers:{[f.key]:proof},expectedRuntime:{profileId:PROFILE,backgroundEpoch:'old-worker'}};
+ delete f.session['directorDesktop:controllerBrowserSession:v1'];delete f.session['chatgptBridgeV6:tab:7'];
+ f.browser.storage.session.set=async v=>Object.assign(f.session,structuredClone(v));
+ const result=await f.api.recoverOwnedController({browser:f.browser,connections:f.connections,backgroundEpoch:'current-worker',now:()=>1000000});
+ assert.equal(result.status,'reload_requested');assert.notEqual(f.local[f.jkey].controllerSha256,previous.controllerSha256);
+ assert.deepEqual(f.local[f.jkey].incidentHistory.find(j=>j.status==='connection_confirmed').readyProof,previous.readyProof);
+ assert.equal(await f.api.confirmOwnedControllerReady({browser:f.browser,proof:readyProof(7,'newer-content'),now:()=>1000000}),true);
+ assert.equal(f.local[f.jkey].status,'connection_confirmed');assert.equal(f.reloads(),2);
 });

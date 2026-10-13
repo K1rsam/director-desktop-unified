@@ -13,7 +13,7 @@ function fixture(options={}){
       session:{get:async()=>{if(options.sessionReadError)throw Error('session unavailable');return {...session};}},
     }}});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/extensionReloadCoordinator.js'),'utf8').replace(/export /g,''),context);
-  const coordinator=context.createExtensionReloadCoordinator({backgroundState:{read:async id=>({lease:options.busyId===id?{requestId:'original'}:null,commands:options.commands?.[id]||{},outbox:[]})},
+  const coordinator=context.createExtensionReloadCoordinator({backgroundState:{read:async id=>({lease:options.busyId===id?{requestId:'original'}:null,commands:options.commands?.[id]||{},outbox:[],...options.runtimes?.[id]})},
     maintenanceOperations:{plan:async(type,p)=>{plans.push(p);return {accepted:true,state:{active:{operationId:'operation'}}};},dispatch:async()=>({accepted:true}),succeed:async()=>{},fail:async()=>{}},
     safeBridgeServerUrl:u=>u,readLaunchedTab:async id=>records[id],launchTokenPattern:/^bridge-/,
     rememberLaunchedTab:async(id,record)=>{remembered.push({id,record});records[id]=record;session[`chatgptBridgeLaunchedTab:${id}`]=record;},
@@ -139,4 +139,15 @@ test('self-maintenance exception never ignores other commands, unknown outcomes,
   failures.push({busyId:4,commands:{4:{command:{...ownReloadCommand}}}});
   for(const options of failures){const f=controllerFixture(options);await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');assert.equal(f.plans.length,0);assert.equal(f.writes.length,0);}
   const other=controllerFixture({commands:{4:{command:{...ownReloadCommand}}}});await assert.rejects(other.coordinator.scheduleExtensionReload({sourceTabId:1,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');assert.equal(other.plans.length,0);
+});
+
+test('idle maintenance proof cannot discard pending effect, download or foreign outbox on runtime reset',async()=>{
+ for(const runtime of [{effects:{upload:{status:'uncertain'}}},{downloads:{capture:{}}},{outbox:[{commandId:'foreign',messageType:'command.accepted'}]},
+  {outbox:[{commandId:'command',messageType:'effect.completed'}]}]){
+  const f=controllerFixture({commands:{4:{command:{...ownReloadCommand}}},runtimes:{4:runtime}});
+  await assert.rejects(f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:false}),e=>e.code==='MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE');
+  assert.equal(f.plans.length,0);assert.equal(f.writes.length,0);
+ }
+ const f=controllerFixture({commands:{4:{command:{...ownReloadCommand}}},runtimes:{4:{outbox:[{commandId:'command',messageType:'command.accepted'}],effects:{old:{status:'succeeded'}},downloads:{}}}});
+ assert.equal((await f.coordinator.scheduleExtensionReload({sourceTabId:4,commandId:'command',reloadTabs:false})).scheduled,true);
 });

@@ -14,6 +14,80 @@ function idle(runtime) {
     && runtime.downloads&&Object.keys(runtime.downloads).length===0;
 }
 function archiveJournal(journal){if(!journal)return [];const {incidentHistory,...current}=journal;return [...(incidentHistory||[]),current];}
+function maintenanceEpochProved(proof,epoch){return proof?.version==='director-controller-maintenance-rebind/v1'
+  && typeof epoch==='string'&&epoch.length>0&&proof.backgroundEpoch===epoch
+  && typeof proof.previousBackgroundEpoch==='string'&&proof.previousBackgroundEpoch.length>0&&proof.previousBackgroundEpoch!==epoch;}
+
+// Maintenance restores launch receipts after storage.session is cleared. Those
+// receipts alone cannot resurrect a browser-session nonce. Rebind only the
+// exact, proved idle controller in its still-hidden original native window.
+export async function reconcileReloadedControllerIdentity({browser=chrome,connections,backgroundEpoch,now=Date.now}={}) {
+  const held=reason=>({status:'held',reason});
+  try {
+    const read=async()=>{
+      const identity=await browser.storage.local.get(PROFILE_KEY),profile=identity[PROFILE_KEY];
+      if(!UUID.test(profile||''))return null;
+      const key='directorDesktop:controlTab:v1:'+profile,journalKey='directorDesktop:controlReconnect:v1:'+profile;
+      const keys=[PROFILE_KEY,key,journalKey,'bridgePendingExtensionReload'];
+      const local=await browser.storage.local.get(keys);
+      const control=local[key],invalidated=control?.reloadInvalidated;if(!invalidated)return null;
+      const [session,tabs]=await Promise.all([browser.storage.session.get(null),browser.tabs.query({})]);
+      if(!browser.storage.session.set||!backgroundEpoch)throw Error('maintenance_rebind_capability_missing');
+      if(local[PROFILE_KEY]!==profile||control.status!=='opened'||!UUID.test(control.browserSession||'')
+        ||control.launchToken!=='bridge-director-control-'+profile||!root(control.requestedUrl)
+        ||!Number.isSafeInteger(control.tabId)||control.tabId<=0||!invalidated.operationId
+        ||['tabId','launchToken','browserSession','serverUrl','requestedUrl'].some(k=>invalidated[k]!==control[k]))throw Error('maintenance_rebind_identity');
+      const pending=local.bridgePendingExtensionReload,original=pending?.idleControllers?.[key];
+      const anchored=pending?.operationId===invalidated.operationId&&original
+        && ['tabId','launchToken','browserSession','serverUrl','requestedUrl'].every(k=>original[k]===control[k])
+        && (pending.recoveryStatus==='awaiting_source_ready'||pending.recoveryStatus==='held'&&pending.recoveryReason==='source_ready_timeout');
+      const evidence=invalidated.maintenanceRecovery||(anchored?{version:'director-controller-maintenance-idle/v1',
+        profileId:pending.expectedRuntime?.profileId,previousBackgroundEpoch:pending.expectedRuntime?.backgroundEpoch,
+        requestedAt:pending.requestedAt,contentEpoch:original.contentEpoch||null}:null);
+      if(evidence?.version!=='director-controller-maintenance-idle/v1'||evidence.profileId!==profile
+        ||!evidence.previousBackgroundEpoch||evidence.previousBackgroundEpoch===backgroundEpoch
+        ||!Number.isSafeInteger(evidence.requestedAt)||evidence.requestedAt<=0||evidence.requestedAt>now())throw Error('maintenance_rebind_proof_missing');
+      const {reloadInvalidated,...before}=control,journal=local[journalKey];
+      if(journal&&(!['connection_confirmed','bootstrap_completed','reload_requested'].includes(journal.status)
+        ||journal.controllerSha256!==await digest(before)))throw Error('maintenance_rebind_journal_unresolved');
+      const sid=session[SESSION_KEY];if(sid!==undefined&&!UUID.test(sid||''))throw Error('maintenance_rebind_session_damaged');
+      const owners=Object.entries(session).filter(([k,v])=>k.startsWith('chatgptBridgeLaunchedTab:')&&v?.launchToken===control.launchToken);
+      if(owners.length!==1||owners[0][0]!=='chatgptBridgeLaunchedTab:'+control.tabId
+        ||owners[0][1].serverUrl!==control.serverUrl||owners[0][1].requestedUrl!==control.requestedUrl)throw Error('maintenance_rebind_owner');
+      if(!Array.isArray(tabs)||tabs.filter(t=>t.id===control.tabId).length!==1)throw Error('maintenance_rebind_tab_missing');
+      const tab=tabs.find(t=>t.id===control.tabId),window=await browser.windows.get(tab.windowId);
+      if(!root(tab.url)||tab.incognito!==false||typeof tab.active!=='boolean'||window.id!==tab.windowId
+        ||window.focused!==false||tab.active&&window.state!=='minimized')throw Error('maintenance_rebind_user_visible_or_changed');
+      if(Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).some(([,v])=>!idle(v))
+        ||[...connections.values()].some(s=>!s.closed&&s.activeRequest))throw Error('maintenance_rebind_execution_unresolved');
+      return {profile,key,journalKey,control,journal:journal||null,session,tab:{id:tab.id,windowId:tab.windowId,url:tab.url,active:tab.active,incognito:tab.incognito},
+        window:{id:window.id,focused:window.focused,state:window.state},evidence,
+        navigationPendingUntil:anchored&&pending.recoveryStatus==='awaiting_source_ready'&&pending.tabIds?.includes(control.tabId)?pending.requestedAt+120000:0};
+    };
+    const first=await read();if(!first)return {status:'not_applicable'};
+    if(!same(first,await read()))return held('maintenance_rebind_native_drift');
+    const oldSid=first.session[SESSION_KEY],sid=oldSid&&oldSid!==first.control.browserSession?oldSid:crypto.randomUUID().toLowerCase();
+    if(!UUID.test(sid)||sid===first.control.browserSession)return held('maintenance_rebind_nonce');
+    if(sid!==oldSid){await browser.storage.session.set({[SESSION_KEY]:sid});}
+    const after=await read(),expected={...first,session:{...first.session,[SESSION_KEY]:sid}};
+    if(!after||!same(after,expected))return held('maintenance_rebind_session_write_unconfirmed');
+    const {reloadInvalidated,retiredControllers:history,...retired}=first.control;
+    const control={...retired,browserSession:sid,retiredControllers:[...(history||[]),{...retired,reloadInvalidated,retiredAt:now(),reason:'maintenance_session_rebound_same_hidden_controller'}]};
+    const recovery={version:'director-controller-maintenance-rebind/v1',operationId:reloadInvalidated.operationId,
+      profileId:first.profile,tabId:control.tabId,browserSession:sid,backgroundEpoch,
+      previousBackgroundEpoch:first.evidence.previousBackgroundEpoch,beforeContentEpoch:first.evidence.contentEpoch||null,
+      navigationPendingUntil:first.navigationPendingUntil,
+      originalInvalidation:reloadInvalidated,originalControllerSha256:await digest(first.control)};
+    const journal={version:'director-owned-controller-maintenance-rebind/v1',status:'session_rebound',at:now(),
+      controllerSha256:await digest(control),tabId:control.tabId,browserSession:sid,maintenanceRecovery:recovery,
+      attempts:first.journal?.status==='connection_confirmed'?0:(first.journal?.attempts||0),
+      incidentHistory:archiveJournal(first.journal),foreground:false,generationCalled:false};
+    await browser.storage.local.set({[first.key]:control,[first.journalKey]:journal});
+    const committed=await browser.storage.local.get([first.key,first.journalKey]);
+    if(!same(committed[first.key],control)||!same(committed[first.journalKey],journal))return held('maintenance_rebind_commit_unconfirmed');
+    return {status:'session_rebound',tabId:control.tabId,foreground:false,generationCalled:false};
+  }catch(error){return held(String(error.message||'maintenance_rebind_read_failed'));}
+}
 
 export async function confirmOwnedControllerReady({browser=chrome,proof,now=Date.now}={}) {
   try {
@@ -26,10 +100,13 @@ export async function confirmOwnedControllerReady({browser=chrome,proof,now=Date
     if(local[PROFILE_KEY]!==proof.profileId||control?.status!=='opened'||control.tabId!==proof.tabId
       ||control.launchToken!==proof.launchToken||proof.launchToken!=='bridge-director-control-'+proof.profileId
       ||control.serverUrl!==proof.serverUrl||!root(control.requestedUrl)||!journal
-      ||!['bootstrap_completed','reload_requested','connection_confirmed'].includes(journal.status)
+      ||!['bootstrap_completed','reload_requested','connection_confirmed','session_rebound'].includes(journal.status)
       ||journal.controllerSha256!==await digest(control))return false;
     if(journal.status==='connection_confirmed')return true;
-    if(journal.version==='director-owned-controller-reconnect/v2'&&(!journal.beforeContentEpoch||journal.beforeContentEpoch===proof.contentEpoch))return false;
+    if(journal.version==='director-owned-controller-reconnect/v2'&&(!journal.beforeContentEpoch||journal.beforeContentEpoch===proof.contentEpoch)){
+      if(journal.beforeContentEpoch||!maintenanceEpochProved(journal.maintenanceRecovery,proof.backgroundEpoch))return false;
+    }
+    if(journal.status==='session_rebound'&&!maintenanceEpochProved(journal.maintenanceRecovery,proof.backgroundEpoch))return false;
     const session=await browser.storage.session.get(null),record=session['chatgptBridgeLaunchedTab:'+proof.tabId];
     if(session[SESSION_KEY]!==control.browserSession||record?.launchToken!==control.launchToken
       ||record.serverUrl!==control.serverUrl||record.requestedUrl!==control.requestedUrl)return false;
@@ -171,8 +248,10 @@ export async function bootstrapOwnedController({browser=chrome,connections,now=D
 
 // Runs in the extension, independently of content ports or server clients. No
 // tab creation, extension reload, model submission or user-page navigation.
-export async function recoverOwnedController({browser=chrome,connections,now=Date.now}={}) {
+export async function recoverOwnedController({browser=chrome,connections,backgroundEpoch,now=Date.now}={}) {
   const held=reason=>({status:'held',reason});
+  const maintenance=await reconcileReloadedControllerIdentity({browser,connections,backgroundEpoch,now});
+  if(maintenance.status==='held')return maintenance;
   const reconciliation=await reconcileBootstrapWindow({browser,connections,now});
   if(reconciliation.status==='bootstrap_reconciled')return reconciliation;
   if (!browser.storage?.local?.get || !browser.storage?.local?.set || !browser.storage?.session?.get
@@ -196,8 +275,13 @@ export async function recoverOwnedController({browser=chrome,connections,now=Dat
     const states=[...connections.values()].filter(c=>c.tabId===control.tabId&&!c.closed);
     if(states.some(socketAlive))return {connected:true,readyProof:states.find(s=>s.directorReadyProof)?.directorReadyProof};
     if(states.some(c=>c.activeRequest || c.protocolReady))throw Error('transport_outcome_unresolved');
-    const runtime=session['chatgptBridgeV6:tab:'+control.tabId];
-    if(!idle(runtime))throw Error('controller_execution_unresolved');
+    const runtime=session['chatgptBridgeV6:tab:'+control.tabId],journal=local[journalKey];
+    // Absence after a proved maintenance reset is not a fabricated empty
+    // runtime. Keep it absent and carry the old/new worker proof to hello ACK.
+    const resetIdle=runtime===undefined&&['session_rebound','reserved','reload_requested','outcome_unknown'].includes(journal?.status)
+      &&journal.controllerSha256===await digest(control)&&maintenanceEpochProved(journal.maintenanceRecovery,backgroundEpoch)
+      &&Object.entries(session).filter(([k])=>k.startsWith('chatgptBridgeV6:tab:')).every(([,v])=>idle(v));
+    if(!idle(runtime)&&!resetIdle)throw Error('controller_execution_unresolved');
     return {profile,key,journalKey,control,record,runtime,tab:{id:tab.id,windowId:tab.windowId,url:tab.url,active:tab.active,incognito:tab.incognito,discarded:tab.discarded},window:{id:window.id,state:window.state,focused:window.focused},journal:local[journalKey]||null};
   };
   try {
@@ -207,13 +291,15 @@ export async function recoverOwnedController({browser=chrome,connections,now=Dat
     // interrupted/failed reservation; wait for the original page's handshake.
     if(old && old.controllerSha256!==await digest(first.control))return held('journal_identity_changed');
     if(old?.status==='reserved'||old?.status==='outcome_unknown')return held('original_reload_unconfirmed');
-    if(old && now()-old.at<120000)return held('reconnect_cooldown');
+    if(old?.status==='session_rebound'&&now()<Number(old.maintenanceRecovery?.navigationPendingUntil||0))return held('maintenance_navigation_pending');
+    if(old && old.status!=='session_rebound' && now()-old.at<120000)return held('reconnect_cooldown');
     const attempts=old?.status==='connection_confirmed'?0:(old?.attempts||0);
     if(attempts>=2)return held('reconnect_budget_exhausted');
     const second=await sample();if(second.connected)return {status:'connected'};
     if(!same(first,second))return held('native_state_changed');
     const intent={version:'director-owned-controller-reconnect/v2',incidentId:old?.status==='reload_requested'?old.incidentId:crypto.randomUUID().toLowerCase(),
-      beforeContentEpoch:[...connections.values()].find(s=>s.tabId===first.tab.id&&!s.closed)?.contentEpoch||first.runtime.contentEpoch||null,
+      beforeContentEpoch:[...connections.values()].find(s=>s.tabId===first.tab.id&&!s.closed)?.contentEpoch||first.runtime?.contentEpoch||old?.maintenanceRecovery?.beforeContentEpoch||null,
+      ...(old?.maintenanceRecovery?{maintenanceRecovery:old.maintenanceRecovery}:{}),
       controllerSha256:await digest(first.control),tabId:first.tab.id,
       browserSession:first.control.browserSession,launchToken:first.control.launchToken,status:'reserved',attempts:attempts+1,at:now(),foreground:false,generationCalled:false,incidentHistory:archiveJournal(old)};
     await browser.storage.local.set({[first.journalKey]:intent});
@@ -244,6 +330,15 @@ export function createConnectionWatchdog({alarms,connections,openConnection,peri
     if(typeof recoverController==='function')await recoverController();
     return retries.length;})();try{return await running;}finally{running=null;}
   }
-  async function arm(){if(!alarms?.create)return false;await alarms.create(CONNECTION_WATCHDOG_ALARM,{periodInMinutes:Math.max(1,Number(periodInMinutes)||1)});return true;}
+  let arming=null;
+  async function arm(){
+    if(arming)return arming;
+    arming=(async()=>{if(!alarms?.create)return false;
+      // Creating an existing Chrome alarm replaces its schedule. Re-arming on
+      // every worker wake can otherwise postpone recovery indefinitely.
+      if(alarms.get&&await alarms.get(CONNECTION_WATCHDOG_ALARM))return true;
+      await alarms.create(CONNECTION_WATCHDOG_ALARM,{periodInMinutes:Math.max(1,Number(periodInMinutes)||1)});return true;
+    })();try{return await arming;}finally{arming=null;}
+  }
   return Object.freeze({arm,run,handlesAlarm:name=>String(name||'')===CONNECTION_WATCHDOG_ALARM});
 }

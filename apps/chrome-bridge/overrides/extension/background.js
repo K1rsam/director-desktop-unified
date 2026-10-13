@@ -19,7 +19,7 @@ import {
   isExtensionReloadAlarm,
 } from './background/extensionReloadCoordinator.js';
 import { createTabController } from './background/tabController.js';
-import { checkBridgeAuth } from './background/authPreflight.js';
+import { checkBridgeAuth, reportBackgroundHealth } from './background/authPreflight.js';
 import { createConnectionWatchdog, recoverOwnedController, confirmOwnedControllerReady } from './background/connectionWatchdog.js';
 import { tabScopedClientId } from './shared/tabClientIdentity.js';
 import './shared/buildIdentity.js';
@@ -429,8 +429,11 @@ const connectionWatchdog = createConnectionWatchdog({
   connections,
   openConnection,
   recoverController: async () => {
-    const result=await recoverOwnedController({connections});
+    const result=await recoverOwnedController({connections,backgroundEpoch});
     console.info('[chatgpt-bridge] owned controller reconnect', result.status, result.reason || '', result.tabId || '');
+    await reportBackgroundHealth({backgroundEpoch, bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,
+      extensionVersion:backgroundManifestVersion,recovery:result,
+      connectionCount:[...connections.values()].filter(state=>!state.closed&&state.protocolReady&&state.ws?.readyState===WebSocket.OPEN).length});
   },
 });
 
@@ -455,29 +458,31 @@ const { recoverPendingExtensionReload, scheduleExtensionReload, confirmSourceRea
 function reportMaintenanceRecoveryFailure(error) {
   console.error('[chatgpt-bridge] maintenance recovery failed', error);
 }
-chrome.runtime.onInstalled?.addListener?.((details) => {
-  void connectionWatchdog.arm();
-  if (details?.reason === 'update') void recoverPendingExtensionReload()
-    .then(async (result) => { if (result?.reason === 'missing') await maintenanceOperations.recover(); })
-    .catch(reportMaintenanceRecoveryFailure);
-});
-chrome.runtime.onStartup?.addListener?.(() => {
-  void connectionWatchdog.arm();
-  void connectionWatchdog.run();
-});
+let backgroundRecovery=null;
+function recoverBackgroundConnections() {
+  if(backgroundRecovery)return backgroundRecovery;
+  backgroundRecovery=(async()=>{
+    await connectionWatchdog.arm();
+    const result=await recoverPendingExtensionReload();
+    if(result?.reason==='missing')await maintenanceOperations.recover();
+    // A service-worker restart does not emit runtime.onStartup. Always run
+    // after durable maintenance restoration, including ordinary cold wakes.
+    await connectionWatchdog.run();
+  })().finally(()=>{backgroundRecovery=null;});
+  return backgroundRecovery;
+}
+chrome.runtime.onInstalled?.addListener?.(() => {void recoverBackgroundConnections().catch(reportMaintenanceRecoveryFailure);});
+chrome.runtime.onStartup?.addListener?.(() => {void recoverBackgroundConnections().catch(reportMaintenanceRecoveryFailure);});
 chrome.alarms?.onAlarm?.addListener?.((alarm) => {
   if (connectionWatchdog.handlesAlarm(alarm?.name)) {
-    void connectionWatchdog.run();
+    void recoverBackgroundConnections().catch(reportMaintenanceRecoveryFailure);
     return;
   }
   if (!isExtensionReloadAlarm(alarm?.name)) return;
   console.info('[chatgpt-bridge] Extension reload recovery alarm fired', { name: String(alarm?.name || '') });
   void recoverPendingExtensionReload().catch(reportMaintenanceRecoveryFailure);
 });
-void connectionWatchdog.arm();
-void recoverPendingExtensionReload()
-  .then(async (result) => { if (result?.reason === 'missing') await maintenanceOperations.recover(); })
-  .catch(reportMaintenanceRecoveryFailure);
+void recoverBackgroundConnections().catch(reportMaintenanceRecoveryFailure);
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || message.type !== 'bridge.http') return false;
   const senderTabId = sender?.tab?.id ?? null;

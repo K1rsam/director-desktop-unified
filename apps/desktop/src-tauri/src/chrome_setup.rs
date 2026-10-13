@@ -213,6 +213,16 @@ pub(crate) fn execution_client(clients: &[Value]) -> Option<&Value> {
     ))
 }
 
+fn background_status(health: &Value, binding: Option<&BrowserBinding>) -> Option<Value> {
+    let binding=binding?;
+    let matching:Vec<_>=health["backgroundRuntimes"].as_array()?.iter().filter(|r|
+        r["schemaVersion"]=="extension-background-health/v1"
+        && r["profileId"]==binding.profile_id && r["bundleId"]==binding.bundle_id
+        && r["ageMs"].as_u64().is_some_and(|age|age<=90_000)
+        && r["backgroundEpoch"].as_str().is_some_and(|epoch|!epoch.is_empty())).collect();
+    if matching.len()!=1 { return None; }
+    Some(matching[0].clone())
+}
 pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let base = endpoint(settings)?.as_str().trim_end_matches('/').to_string();
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(3)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"无法检查 Chrome 连接。")?;
@@ -230,6 +240,7 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let suggestion=browser_profiles.first().filter(|_|browser_profiles.len()==1 && unidentified==0)
         .filter(|p|p["collision"]==false).map(|p|BrowserBinding{profile_id:s(p,"profileId").into(),bundle_id:s(p,"bundleId").into(),endpoint:base.clone()});
     let selected_binding=binding.as_ref().ok().and_then(|b|b.as_ref()).or(suggestion.as_ref());
+    let background=background_status(&health,selected_binding);
     let opener=selected_binding.and_then(|b|profile_execution_client(clients,b).ok());
     let busy = health["pendingRequests"].as_u64().unwrap_or(0)>0
         || health["pendingCommands"].as_u64().unwrap_or(0)>0
@@ -240,7 +251,12 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     let (state,message) = if binding.is_err() {("needs_selection","执行浏览器绑定与当前连接不一致，请在软件设置重新选择。")}
         else if selected_binding.is_some_and(|b|profile_collision(clients,&b.profile_id)) {("needs_selection","浏览器身份出现多个运行实例，已停止新提交；请核对复制的配置。")}
         else if selected_binding.is_none() && browser_profiles.iter().any(|p|p["collision"]==true) {("needs_selection","浏览器身份出现多个运行实例，未绑定或发送任务；请核对复制的配置。")}
-        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy {("waiting_browser","已绑定浏览器未连接，请重新打开原浏览器；未改用其他配置。")}
+        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy && background.is_some() {
+            if background.as_ref().is_some_and(|r|r["status"]=="held") {
+                ("waiting_browser","扩展后台已连接，正在核对原工作页的恢复状态；图片保留排队。")
+            } else { ("waiting_browser","扩展后台已连接，专属工作页正在恢复；恢复后自动继续图片队列。") }
+        }
+        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy {("waiting_browser","尚未收到已绑定浏览器的后台连接。请确认 Chrome 已运行且扩展已启用；图片保留排队。")}
         else if browser_profiles.len()>1 && selected_binding.is_none() {("needs_selection","发现多个浏览器配置，请在软件设置绑定执行浏览器一次。")}
         else if busy && selected_binding.is_some_and(|b|profile_clients(clients).iter().any(|c|c["browserProfileId"]==b.profile_id && c["extensionBundleId"]==b.bundle_id)) {("busy","浏览器正在执行已有任务，完成后可继续。")}
         else if opener.is_none() && !usable.is_empty() {("waiting_browser","浏览器尚未提供持久身份，请重新连接扩展；隐身页面不用于新生成。")}
@@ -254,6 +270,7 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
     value["pendingStandaloneClients"]=json!(clients.iter().filter(|c|client_command_busy(c)).count());
     value["browserProfiles"]=json!(browser_profiles);value["unidentifiedClients"]=json!(unidentified);
     value["boundProfileId"]=settings["chromeProfileId"].clone();
+    value["backgroundRuntime"]=background.unwrap_or(Value::Null);
     Ok(value)
 }
 pub fn check(home: &Path, settings: &Value, token: &str) -> Result<Value> {
@@ -389,6 +406,21 @@ pub fn connect(home: &Path, settings: &Value, token: Option<&str>, source: Optio
 }
 
 #[cfg(test)] mod tests {
+    #[test] fn background_health_requires_fresh_exact_binding_and_never_creates_a_ready_client() {
+        let binding=BrowserBinding{profile_id:"5948d446-fd4e-4f69-bb6d-6eb7c204d148".into(),bundle_id:"a".repeat(32),endpoint:"http://127.0.0.1:53179".into()};
+        let runtime=json!({"schemaVersion":"extension-background-health/v1","profileId":binding.profile_id,"bundleId":binding.bundle_id,
+            "backgroundEpoch":"worker-one","ageMs":100,"status":"held","reason":"controller_identity","connectionCount":0});
+        let health=json!({"backgroundRuntimes":[runtime.clone()]});
+        assert!(background_status(&health,Some(&binding)).is_some());
+        assert!(background_status(&health,None).is_none());
+        for (key,value) in [("ageMs",json!(90_001)),("profileId",json!("other")),("bundleId",json!("other")),("backgroundEpoch",json!(""))] {
+            let mut changed=health.clone();changed["backgroundRuntimes"][0][key]=value;
+            assert!(background_status(&changed,Some(&binding)).is_none());
+        }
+        assert!(background_status(&json!({"backgroundRuntimes":[runtime.clone(),runtime]}),Some(&binding)).is_none());
+        assert!(background_status(&json!({}),Some(&binding)).is_none());
+        assert!(execution_client(&[]).is_none());
+    }
     use super::*;
     #[test] fn rejects_remote_and_ambiguous_config(){let t="a".repeat(40);let valid=format!("HOST=127.0.0.1\nPORT=53179\nAPI_TOKEN={t}\nBRIDGE_TOKEN={t}");assert_eq!(parse_env(&valid).unwrap().port,53179);assert!(parse_env(&(valid.clone()+"\nPORT=8080")).is_err());assert!(parse_env(&valid.replace("127.0.0.1","0.0.0.0")).is_err());assert!(endpoint(&json!({"chromeEndpoint":"http://remote.invalid"})).is_err());assert!(endpoint(&json!({"chromeEndpoint":"http://127.0.0.1:53179?token=x"})).is_err());}
     fn fixture(health:Value, browsers:Option<Value>)->(Value,std::thread::JoinHandle<()>) {

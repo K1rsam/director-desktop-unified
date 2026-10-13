@@ -143,7 +143,11 @@ export function createExtensionReloadCoordinator({
         && command.mode === 'result' && command.operation === 'maintenance'
         && command.requestId === '' && command.status === 'dispatched';
       if (runtime.lease || Object.entries(runtime.commands || {}).some(([key, command]) =>
-        !['succeeded', 'rejected'].includes(command.status) && !ownMaintenanceCommand(key, command))) {
+        !['succeeded', 'rejected'].includes(command.status) && !ownMaintenanceCommand(key, command))
+        || Object.values(runtime.effects || {}).some(effect => !['succeeded', 'rejected', 'cancelled'].includes(effect.status))
+        || Object.keys(runtime.downloads || {}).length
+        || (runtime.outbox || []).some(entry => !(tabId === currentMaintenance.sourceTabId
+          && entry.commandId === currentMaintenance.commandId && entry.messageType === 'command.accepted'))) {
         const error = new Error('Controller recovery is blocked while original browser work is unresolved');
         error.code = 'MAINTENANCE_BLOCKED_BY_ACTIVE_LEASE';
         throw error;
@@ -162,7 +166,7 @@ export function createExtensionReloadCoordinator({
       // This is proof of an already completed, currently idle creation, not
       // permission to restore its old browser-session nonce after a restart.
       controllers[stateKey] = { tabId, launchToken: prior.launchToken, browserSession: prior.browserSession,
-        serverUrl: prior.serverUrl, requestedUrl: prior.requestedUrl };
+        serverUrl: prior.serverUrl, requestedUrl: prior.requestedUrl, contentEpoch: runtime.contentEpoch || null };
     }
     return controllers;
   }
@@ -176,7 +180,13 @@ export function createExtensionReloadCoordinator({
       if (prior?.status !== 'opened' || prior.tabId !== proof.tabId || prior.launchToken !== proof.launchToken
         || prior.browserSession !== proof.browserSession || prior.serverUrl !== proof.serverUrl
         || prior.requestedUrl !== proof.requestedUrl) continue;
-      await chrome.storage.local.set({ [stateKey]: { ...prior, reloadInvalidated: { ...proof, operationId: pending.operationId } } });
+      const expected=pending.expectedRuntime;
+      const maintenanceRecovery=expected?.profileId===proof.launchToken.slice('bridge-director-control-'.length)
+        &&expected.backgroundEpoch&&Number.isSafeInteger(pending.requestedAt)&&pending.requestedAt>0
+        ? {version:'director-controller-maintenance-idle/v1',profileId:expected.profileId,
+          previousBackgroundEpoch:expected.backgroundEpoch,requestedAt:pending.requestedAt,contentEpoch:proof.contentEpoch||null}:null;
+      await chrome.storage.local.set({ [stateKey]: { ...prior, reloadInvalidated: { ...proof, operationId: pending.operationId,
+        ...(maintenanceRecovery?{maintenanceRecovery}:{}) } } });
     }
   }
 

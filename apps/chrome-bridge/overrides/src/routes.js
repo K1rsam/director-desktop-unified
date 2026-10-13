@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from './runtime/express.js';
 import { config } from './config.js';
 import { error as logError, log } from './logger.js';
@@ -44,6 +45,39 @@ function bridgeTokenFromRequest(req) {
   return String(req.query?.token || req.body?.token || req.headers['x-bridge-token'] || '');
 }
 
+// The desktop installer and Chrome profile binding both use component/extension.
+// Resolve relative to this module, never cwd or the unpatched tools/ archive.
+const PACKAGED_EXTENSION_ROOT = fileURLToPath(new URL('../extension/', import.meta.url));
+
+async function packagedExtensionInfo() {
+  const root = PACKAGED_EXTENSION_ROOT;
+  const directory = await fs.lstat(root).catch(() => null);
+  if (!directory?.isDirectory() || directory.isSymbolicLink()) {
+    throw new HttpError(503, 'The packaged extension directory is unavailable. Repair the desktop Chrome component.');
+  }
+  const entries = await collectDirectoryEntries(root);
+  let manifest;
+  try { manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')); }
+  catch { throw new HttpError(503, 'The packaged extension manifest is unavailable. Repair the desktop Chrome component.'); }
+  if (manifest?.manifest_version !== 3 || manifest.version !== EXTENSION_COMPATIBILITY.recommendedExtensionVersion
+    || !manifest.background?.service_worker || !Array.isArray(manifest.content_scripts)
+    || manifest.content_scripts.some((script) => !script || (script.js != null && !Array.isArray(script.js))
+      || (script.css != null && !Array.isArray(script.css)))) {
+    throw new HttpError(503, 'The packaged extension manifest does not match this bridge. Repair the desktop Chrome component.');
+  }
+  const required = ['manifest.json', manifest.background.service_worker,
+    ...manifest.content_scripts.flatMap((script) => [...(script.js || []), ...(script.css || [])])];
+  const names = new Set(entries.map((entry) => entry.name));
+  if (required.some((name) => typeof name !== 'string' || !names.has(name))) {
+    throw new HttpError(503, 'The packaged extension is incomplete. Repair the desktop Chrome component.');
+  }
+  return { root, version: manifest.version, entries };
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
+
 async function collectDirectoryEntries(rootDir, prefix = '') {
   const entries = [];
   const items = await fs.readdir(rootDir, { withFileTypes: true });
@@ -51,6 +85,7 @@ async function collectDirectoryEntries(rootDir, prefix = '') {
     if (item.name.startsWith('.') || item.name === 'node_modules') continue;
     const absolute = path.join(rootDir, item.name);
     const name = prefix ? `${prefix}/${item.name}` : item.name;
+    if (item.isSymbolicLink()) throw new HttpError(503, 'Linked files are not allowed in the packaged extension. Repair the desktop Chrome component.');
     if (item.isDirectory()) entries.push(...await collectDirectoryEntries(absolute, name));
     else if (item.isFile()) entries.push({ name, path: absolute });
   }
@@ -92,16 +127,17 @@ function bridgeForLocal(req) {
 }
 
 
-function setupHtml() {
+function setupHtml(extension) {
   const extensionZipUrl = `${config.publicBaseUrl}/extensions/chrome-bridge-extension.zip`;
-  const extensionVersion = EXTENSION_COMPATIBILITY.recommendedExtensionVersion;
+  const extensionVersion = extension.version;
+  const extensionPath = escapeHtml(extension.root);
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ChatGPT Bridge Setup</title>
 <style>
 :root{color-scheme:light dark;--bg:#f7f7f8;--card:#fff;--text:#18181b;--muted:#71717a;--line:#e4e4e7;--primary:#2563eb;--primary2:#1d4ed8;--ok:#15803d;--okbg:#f0fdf4;--warn:#a16207;--warnbg:#fffbeb;--bad:#be123c;--badbg:#fff1f2}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,rgba(37,99,235,.08),transparent 28rem),var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{max-width:980px;margin:0 auto;padding:48px 24px 72px}.hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:start;margin-bottom:28px}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:11px;font-weight:800;color:var(--primary)}h1{margin:5px 0 8px;font-size:38px;line-height:1.08;letter-spacing:-.035em}.lead{max-width:700px;margin:0;color:var(--muted);font-size:17px}.version{padding:8px 11px;border:1px solid var(--line);border-radius:999px;background:var(--card);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 14px 40px rgba(0,0,0,.05)}.card h2{display:flex;align-items:center;gap:10px;margin:0 0 9px;font-size:18px}.step{display:grid;place-items:center;width:27px;height:27px;border-radius:9px;background:#dbeafe;color:#1d4ed8;font-size:13px}.muted{color:var(--muted)}ol{padding-left:21px;margin:13px 0}li{margin:7px 0}.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 14px;border:1px solid var(--line);border-radius:11px;background:var(--card);color:var(--text);font-weight:700;text-decoration:none;cursor:pointer}.button:hover{background:#f4f4f5}.button.primary{background:var(--primary);border-color:var(--primary);color:#fff}.button.primary:hover{background:var(--primary2)}.field{margin-top:13px}.field label{display:flex;justify-content:space-between;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:700}.copyrow{display:flex;gap:7px}.copyrow input{min-width:0;flex:1;padding:10px 11px;border:1px solid var(--line);border-radius:11px;background:var(--card);color:var(--text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.copyrow button{padding:8px 11px}.notice{margin-top:13px;padding:11px 12px;border-radius:12px;background:var(--warnbg);color:var(--warn);font-size:12px}.status{display:flex;gap:12px;align-items:flex-start;padding:14px;border:1px solid var(--line);border-radius:14px;background:#fafafa}.statusdot{width:11px;height:11px;border-radius:50%;margin-top:5px;background:#a1a1aa;box-shadow:0 0 0 4px rgba(161,161,170,.13)}.status[data-tone=ok]{background:var(--okbg);border-color:#bbf7d0}.status[data-tone=ok] .statusdot{background:#22c55e}.status[data-tone=warn]{background:var(--warnbg);border-color:#fde68a}.status[data-tone=warn] .statusdot{background:#f59e0b}.status[data-tone=bad]{background:var(--badbg);border-color:#fecdd3}.status[data-tone=bad] .statusdot{background:#f43f5e}.status h3{margin:0;font-size:15px}.status p{margin:3px 0 0;color:var(--muted);font-size:13px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}details{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}summary{cursor:pointer;color:var(--muted);font-weight:700;font-size:13px}pre{max-height:300px;overflow:auto;padding:12px;border-radius:12px;background:#18181b;color:#e4e4e7;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.wide{grid-column:1/-1}@media(max-width:760px){.shell{padding:30px 15px 50px}.hero{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.wide{grid-column:auto}h1{font-size:31px}}@media(prefers-color-scheme:dark){:root{--bg:#0f0f10;--card:#18181b;--text:#f4f4f5;--muted:#a1a1aa;--line:#3f3f46;--okbg:#10251a;--warnbg:#2b2411;--badbg:#30151b}.button:hover{background:#27272a}.status{background:#202024}.copyrow input{background:#202024}}
 </style></head><body><main class="shell"><header class="hero"><div><div class="eyebrow">Local browser companion</div><h1>Connect ChatGPT Bridge</h1><p class="lead">Install the extension once, paste the local Bridge token, and verify that this browser tab is ready. Diagnostics stay out of the way unless you need them.</p></div><div class="version">bridge ${BRIDGE_VERSION} · extension ${extensionVersion}</div></header>
 <div class="grid">
-<section class="card"><h2><span class="step">1</span>Install or update the extension</h2><p class="muted">Use the extension packaged by this running bridge so the protocol and artifact-download code match.</p><div class="actions"><a class="button primary" href="${extensionZipUrl}">Download extension ${extensionVersion}</a></div><ol><li>Open <code>chrome://extensions</code>.</li><li>Enable <b>Developer mode</b>.</li><li>For the first install, choose <b>Load unpacked</b>. For an existing unpacked copy, click <b>Reload</b>; do not remove and add it again.</li><li>Select <code>tools/chrome-bridge-extension</code> and reload the ChatGPT chat tab.</li></ol></section>
+<section class="card"><h2><span class="step">1</span>Install or update the extension</h2><p class="muted">The desktop app carries this extension and updates this same directory. Keep this location so Chrome retains the existing extension identity and connection settings.</p><div class="field"><label>Packaged extension directory</label><div class="copyrow"><input readonly value="${extensionPath}"><button class="button" onclick="copyValue(this)">Copy path</button></div></div><ol><li>For the first install, open <code>chrome://extensions</code> and enable <b>Developer mode</b>.</li><li>Choose <b>Load unpacked</b> and select the packaged extension directory shown above.</li><li>For an installed copy, keep its directory. After an extension update, use <b>Reload</b> only if the desktop app requests it; do not remove and add the extension again.</li></ol><details><summary>Export a copy</summary><p class="muted">This archive contains the same packaged files. Loading it from a different folder creates a separate unpacked extension identity; use the directory above for this desktop connection.</p><a class="button" href="${extensionZipUrl}">Export extension ${extensionVersion}</a></details></section>
 <section class="card"><h2><span class="step">2</span>Copy connection details</h2><div class="field"><label><span>Local bridge URL</span><span>safe to share locally</span></label><div class="copyrow"><input readonly value="${config.publicBaseUrl}"><button class="button" onclick="copyValue(this)">Copy</button></div></div><div class="field"><label><span>Bridge token</span><span>keep private</span></label><div class="copyrow"><input readonly type="password" value="${config.bridgeToken}"><button class="button" onclick="copyValue(this)">Copy</button></div></div><div class="notice">Use the <b>Bridge token</b>, not the API token. Paste it into the floating Bridge button inside an actual ChatGPT chat.</div></section>
 <section class="card wide"><h2><span class="step">3</span>Verify the connection</h2><div id="friendly-status" class="status" data-tone="warn"><span class="statusdot"></span><div><h3>Waiting for a ChatGPT tab</h3><p>Open a chat, configure the floating Bridge panel, then return here.</p></div></div><div class="actions"><a class="button primary" href="https://chatgpt.com" target="_blank" rel="noreferrer">Open ChatGPT chat</a><button class="button" onclick="refreshStatus()">Refresh status</button><a class="button" href="/diagnostics">Open diagnostics</a></div><details><summary>Advanced & diagnostics</summary><pre id="status-json">Loading…</pre></details></section>
 </div></main><script>
@@ -261,8 +297,35 @@ async function streamOpenAIResponse(req, res, bridge, request) {
   }
 }
 
+export function createBackgroundHealthRegistry(now = Date.now) {
+  const records = new Map();
+  const fields = ['schemaVersion','profileId','bundleId','backgroundEpoch','extensionVersion','status','reason','connectionCount'];
+  const prune = () => { for (const [key, value] of records) if (now()-value.receivedAt>300_000) records.delete(key); };
+  return {
+    accept(body) {
+      if (!body || Array.isArray(body) || Object.keys(body).length!==fields.length || fields.some(key=>!Object.hasOwn(body,key))
+        || body.schemaVersion!=='extension-background-health/v1'
+        || typeof body.profileId!=='string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(body.profileId)
+        || typeof body.bundleId!=='string' || !/^[a-f0-9]{32}$/.test(body.bundleId)
+        || typeof body.backgroundEpoch!=='string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(body.backgroundEpoch)
+        || typeof body.extensionVersion!=='string' || !/^[a-zA-Z0-9._-]{1,40}$/.test(body.extensionVersion)
+        || typeof body.status!=='string' || !/^[a-z0-9_]{1,96}$/.test(body.status)
+        || typeof body.reason!=='string' || !/^[a-z0-9_]{0,96}$/.test(body.reason)
+        || !Number.isSafeInteger(body.connectionCount) || body.connectionCount<0 || body.connectionCount>1000) {
+        throw new HttpError(400, 'Invalid extension background status');
+      }
+      prune();
+      const key=[body.profileId,body.bundleId,body.backgroundEpoch].join(':');
+      if(!records.has(key)&&records.size>=64)throw new HttpError(429,'Too many extension background runtimes');
+      records.set(key,{...body,receivedAt:now()});
+    },
+    snapshot() { prune(); return [...records.values()].map(({receivedAt,...value})=>({...value,ageMs:Math.max(0,now()-receivedAt)})); },
+  };
+}
+
 export function createRouter(bridge, fileStore, eventBus = null, turnManager = null, projectService = null, workflowManager = null) {
   const router = express.Router();
+  const backgroundHealth=createBackgroundHealthRegistry();
   router.use((req, _res, next) => { req.app.locals.bridge = bridge; next(); });
 
 
@@ -274,11 +337,11 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     } catch (err) { next(err); }
   });
 
-  router.get('/setup', (req, res, next) => {
+  router.get('/setup', async (req, res, next) => {
     try {
       if (!bridge.isLocalRequest(req)) throw new HttpError(403, 'Setup page is only available from localhost');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(setupHtml());
+      res.send(setupHtml(await packagedExtensionInfo()));
     } catch (err) { next(err); }
   });
 
@@ -298,6 +361,7 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     try {
       if (!bridge.isLocalRequest(req)) throw new HttpError(403, 'Setup status is only available from localhost');
       const health = bridge.health();
+      const clients = Array.isArray(health.clients) ? health.clients : [];
       res.json({
         ok: true,
         setupUrl: `${config.publicBaseUrl}/setup`,
@@ -311,12 +375,12 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
         extensionTransport: 'extension-websocket',
         bridgeVersion: BRIDGE_VERSION,
         extensionCompatibility: EXTENSION_COMPATIBILITY,
-        clients: health.clients,
+        clients,
         activeClient: health.activeClient,
         error: health.ok
           ? ''
-          : health.clients.some((client) => client.compatible === false || client.compatibility?.compatible === false)
-            ? (health.clients.find((client) => client.compatible === false || client.compatibility?.compatible === false)?.compatibility?.message
+          : clients.some((client) => client.compatible === false || client.compatibility?.compatible === false)
+            ? (clients.find((client) => client.compatible === false || client.compatibility?.compatible === false)?.compatibility?.message
               || `Extension update required. Install version ${EXTENSION_COMPATIBILITY.recommendedExtensionVersion}.`)
             : health.needsSelection
               ? 'Multiple compatible clients connected; select one.'
@@ -336,12 +400,20 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     } catch (err) { next(err); }
   });
 
+  router.post('/extension/background/status', (req, res, next) => {
+    try {
+      if (!bridge.isLocalRequest(req)) throw new HttpError(403, 'Background status only accepts localhost requests');
+      if (!bridge.validateBridgeToken(bridgeTokenFromRequest(req))) throw new HttpError(403, 'Invalid bridge token');
+      backgroundHealth.accept(req.body);
+      res.json({ok:true});
+    } catch(error) { next(error); }
+  });
+
 
   router.get('/extensions/chrome-bridge-extension.zip', async (req, res, next) => {
     try {
       if (!bridge.isLocalRequest(req)) throw new HttpError(403, 'Extension package is only available from localhost');
-      const root = path.resolve('tools/chrome-bridge-extension');
-      const entries = await collectDirectoryEntries(root);
+      const { entries } = await packagedExtensionInfo();
       const output = path.join(config.dataDir, 'setup', 'chrome-bridge-extension.zip');
       await writeZip(output, entries);
       res.download(output, 'chrome-bridge-extension.zip');
@@ -494,10 +566,15 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
       activeRequests: health.activeRequests,
       activeClient: health.activeClient,
       artifacts: health.artifacts,
+        backgroundRuntimes: backgroundHealth.snapshot(),
       error: health.ok ? undefined : health.needsSelection
         ? 'Multiple browser extension clients connected. Select one before sending prompts.'
         : 'No selected browser extension client connected',
     });
+  });
+
+  router.get('/browser/background/status', (_req,res) => {
+    res.json({ok:true,backgroundRuntimes:backgroundHealth.snapshot()});
   });
 
   router.get('/browser/clients', async (_req, res) => {

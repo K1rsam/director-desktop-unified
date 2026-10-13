@@ -52,7 +52,7 @@
     {
       "path": "extension/background/extensionReloadCoordinator.js",
       "beforeSha256": "8c346f68ddf20e9d887338f99a5d08c127a0c536dac701f2201c6e1c6efc8cb6",
-      "afterSha256": "28df2ceb4eebc30c954ff98d87a710f76e2858fe1974b4024c2b9fd4f4cc7a88",
+      "afterSha256": "4e45aec8d89364547b7f72d5b6d6e31c5e0d40a40eca2b31ec78c450d689764f",
       "previousAfterSha256s": [
         "55e262bd2aa3d326f2b4dbf9ab26ac5772f710e1065d9edf0490b72d9b14e28f",
         "898eed0f3a7833818b7315255bc71004e2b1f46714cc56577b6dc16852dbba1d",
@@ -60,7 +60,8 @@
         "68796f3e83295453ab6d6724823812962a0d2b1250f1ae0059c064eac2bcc01c",
         "5912b4f8adbac3804f29529f2267e52228b5aacd32bffd23449d1e640bb21db6",
         "48dc6a26b1171b5b05c990585e1ad09ba414fd060b2fee53b2285b5e600f4b15",
-        "e338bf9e5d8724ca21d39c177b113f148fe766b7854c508ad58340330c292c41"
+        "e338bf9e5d8724ca21d39c177b113f148fe766b7854c508ad58340330c292c41",
+        "28df2ceb4eebc30c954ff98d87a710f76e2858fe1974b4024c2b9fd4f4cc7a88"
       ]
     },
     {
@@ -121,10 +122,12 @@
     {
       "path": "src/routes.js",
       "beforeSha256": "4890d540e84c81b4ad8afc6363cca3a177fd6c71f2d4679c5905435b0ed5e0fe",
-      "afterSha256": "69901853a668d50bf0d88ff9639b83feb4b56d47a8b8615a461cbc10d10900d6",
+      "afterSha256": "15f71c5ef5db9f337392ba1d1c5a066ffa52602520f213adff592243552b70d5",
       "previousAfterSha256s": [
+        "69901853a668d50bf0d88ff9639b83feb4b56d47a8b8615a461cbc10d10900d6",
         "8d507a2b000d9c34b68e7e6320fd6e3073c013d11e17ae5d31cdd067c257708f",
-        "aeeb0d11c00ddab8f37537faeb904dce01e8507398043db9054852cbc1b97d94"
+        "aeeb0d11c00ddab8f37537faeb904dce01e8507398043db9054852cbc1b97d94",
+        "6098417410d01c235e99c00fd645489eb99e280d492f7b14e2b2054336249669"
       ]
     },
     {
@@ -143,14 +146,15 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "cbd5a9123d694fcbc222923159622c0a2815e3dd9c61cc53be58f679fd2ae705",
+      "afterSha256": "692a7f203bf2e56602c1406f85a8552bd16e18d1563d1c8b40e15edaad1bbeca",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
         "aa81eb9a777a71dae8d84e2d5dae730743bfbaf84af3b75cf4998f2c27a3d095",
         "01019ec1cb66ac1b8c7ee1f2058688a39048008b8e67695ddf955d132fa049ed",
         "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2",
-        "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941"
+        "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941",
+        "cbd5a9123d694fcbc222923159622c0a2815e3dd9c61cc53be58f679fd2ae705"
       ]
     },
     {
@@ -161,18 +165,22 @@
     {
       "path": "extension/background/connectionWatchdog.js",
       "beforeSha256": "2809b469459963b4971c1c19c27e4cc2aa8c7ffdbc6c11b79537a0d34aef71ee",
-      "afterSha256": "9a066654da0da6cb4adf5fce38dc2caa052c2b50663ddbf70608c0da37574bc5",
+      "afterSha256": "73b41e7f79560ae4e36559e90605664dcb24c29cfb4488d807b9a7ce23bf1f99",
       "previousAfterSha256s": [
         "ae2aaf99dd322d5263f3c767122603547e9d36e71aca52df39755206d8b63849",
         "6b587f95d078655c551c582f2344bd7fd628ca9da81df68385fea1ece636fce0",
         "0aaa0d41285afd630ba671c12eb9d4cb5f78993650038d7384d0bfed88235666",
-        "57cc3e013f97e96a4bf11b5c2a09ce222c26b452c378146e26e34659e2a3906e"
+        "57cc3e013f97e96a4bf11b5c2a09ce222c26b452c378146e26e34659e2a3906e",
+        "9a066654da0da6cb4adf5fce38dc2caa052c2b50663ddbf70608c0da37574bc5"
       ]
     },
     {
       "path": "extension/background/authPreflight.js",
       "beforeSha256": "fb858bca7936b180e71c65ccc6921e6e989e0d35fb1c17326b881ab5eaebb5b5",
-      "afterSha256": "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452"
+      "afterSha256": "57886f37d31cbc2fc42c2597c8243122eb073086d9577aa19d7cc36e74d10ca5",
+      "previousAfterSha256s": [
+        "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452"
+      ]
     },
     {
       "path": "src/bridge/coordinator/browserClientCoordinator.js",
