@@ -59,6 +59,32 @@ fn image_production_resume_eligible(job: &Value) -> bool {
         && ["partiallyQueued", "partially_blocked"].contains(&s(&job["result"], "status"))
 }
 
+/// Project the frozen workflow into automatic design without upgrading or
+/// dropping a saved contract. This same path is used for new runs and resumes.
+fn image_production_design_input(
+    context: &Value,
+    assets: &[Value],
+    settings: &Value,
+    policy: &str,
+    active: &[Value],
+    wanted: &[String],
+) -> Value {
+    let mut input = json!({"source":context["source"],"foundation":context["foundation"],"assets":assets,"settings":settings,"comparisonDesignsByAssetId":context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active,"selection":{"assetIds":wanted}});
+    for key in [
+        pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD,
+        pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS,
+        pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD,
+        pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD,
+        pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD,
+        pipeline::asset_production_context::PROFILE_FIELD,
+        pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD,
+        pipeline::DESIGN_EVIDENCE_PROFILE_FIELD,
+    ] {
+        if let Some(value) = context.get(key) { input[key] = value.clone(); }
+    }
+    input
+}
+
 pub struct Engine {
     pub home: PathBuf,
     pub channels: Arc<dyn Channels>,
@@ -3476,13 +3502,7 @@ impl Engine {
                         let basis_version=basis["version"].as_i64().unwrap_or(0);
                         let policy=r["imageProductionPolicy"].as_str().filter(|p|["automatic","trialReview"].contains(p)).unwrap_or_else(||pipeline::image_production_policy(&settings));
                         let active_image_ids:Vec<_>=store.job_summaries()?.iter().filter(|j|s(j,"kind")=="image"&&is_active_generation(s(j,"status"))).map(|j|j["entityId"].clone()).collect();
-                        let mut input=json!({"source":stage2_context["source"],"foundation":basis,"assets":all,"settings":settings,"comparisonDesignsByAssetId":stage2_context["comparisonDesignsByAssetId"],"imageProductionPolicy":policy,"automaticDesign":true,"activeImageAssetIds":active_image_ids,"selection":{"assetIds":wanted}});
-                        for key in [pipeline::asset_design_contract::COMPARISON_PROFILE_FIELD,pipeline::asset_design_contract::FROZEN_COMPARISON_REQUESTS] {
-                            if let Some(value)=stage2_context.get(key) { input[key]=value.clone(); }
-                        }
-                        for key in [pipeline::asset_design_contract::IDENTITY_MATERIAL_PROFILE_FIELD, pipeline::asset_design_contract::IDENTITY_MATERIALS_FIELD, pipeline::asset_design_contract::SCOPE_MATERIALS_FIELD, pipeline::asset_production_context::PROFILE_FIELD, pipeline::asset_design_contract::INLINE_DELTA_PROFILE_FIELD] {
-                            if let Some(value) = stage2_context.get(key) { input[key] = value.clone(); }
-                        }
+                        let input=image_production_design_input(&stage2_context,&all,&settings,policy,&active_image_ids,&wanted);
                         let needs_design=all.iter().any(|a|wanted.iter().any(|id|id==s(a,"id"))&&pipeline::automatic_design_required(&input,a));
                         let needs_visual_check=pipeline::asset_visual_facts::cached_visual_check_required(&input)?;
                         let needs_asset_step=needs_design||needs_visual_check;
@@ -6955,6 +6975,10 @@ async fn resolve_text_execution_settings(settings:&Value)->Result<Value> {
 #[cfg(test)]
 #[path = "readiness_engine_tests.rs"]
 mod readiness_engine_tests;
+
+#[cfg(test)]
+#[path = "stage2_frozen_input_tests.rs"]
+mod stage2_frozen_input_tests;
 
 #[cfg(test)]
 mod joint_unknown_boundary_tests {
