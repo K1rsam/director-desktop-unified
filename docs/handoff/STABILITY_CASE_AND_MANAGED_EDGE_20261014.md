@@ -158,3 +158,13 @@ Windows 合成 Planner **3/3**，原事件规则组 **8/8**，共享 SDK F2/Q1/P
 Windows 合同 helper **1/1**、真实 Engine 分发合成采用 **1/1**、显式隔离实库采用与重复采用 **1/1**；领域精修组 **10/10**、Engine 精修相关组 **10 passed、1 ignored**。测试 EXE SHA-256 `d822ac1977f4447c043af0ac444d69b6563c55703be1bfb7d5b906e107171b21`，证据 `refine-adopt-profile-helper-native-v1/`、`refine-adopt-dispatch-native-v1/`、`refine-adopt-isolated-native-v1/`、`refine-adopt-domain-all-native-v1/`、`refine-adopt-engine-all-native-v1/`。
 
 05:40 在正式新案例采用同一已审核候选成功，未重新调用模型。原9个单元中仅许可的末单元更新，其余8个逐值保持，未产生 continuityStale。源、资产、原候选、原父快照及旧失败证据保留。随后正常恢复原第3–10集工作流，第3集同一 Planner 节点已零调用复验为 completed；后续主创与整编仍须继续验收。证据 `refine-adopt-proof.json`、`refine-adopt-profiles-result.json`、`storyboard-plan-repair-intent.json`。
+
+## 618204b 正式客户端更新与第三集推进
+
+源码 `618204b` 已推送至 `integration/windows-mac-20261008`。正式客户端已重新构建并发布到同名入口，包含首节点监督器交接、Planner 原回包顺序恢复和精修采用合同继承。当前 `director-desktop-next.exe` SHA-256 为 `45238ad5697b5731d18dc9050977108d31a52654c94a1fe0c11d55ff3c5957d2`；唯一备用为 `7199ad8ea779c417d60de91e12823fa5f68915f65e37745e97c89facb4a2ca19`。上述替代前文较早的发布记录；发布目录仍只保留两份 EXE。
+
+该产物两次 Windows 原生隐藏 WebView 启动通过，验证实际嵌入前端、IPC 往返、资产协议、项目登记、媒体及保存重开；无开发服务器、无生成请求，两次进程树均清空且无超时。证据 `final-618204b-native-first/receipt.json`、`final-618204b-native-reopen/receipt.json`、`final-618204b-startup/` 及 `final-client-618204b-{build,stage,publish}.log`。此项证明客户端启动与持久化，不替代十集内容或真实出图验收。
+
+第三集原 Planner 已正式通过原节点回放：原请求字节、原 raw 字节与原 prepared 字段保持，模型提交数为零；证明 `episode3-planner-production-replay-proof.json`。05:59 第三集完成采用，共4单元、34镜、95秒，28镜为2–5秒，最长6秒、次长5.5秒，其余短于2秒。正文44行完整覆盖，逐字对白、说者、声道、声窗、资产引用与当前源版本的结构核验无错误；逐镜创作审核另行记录，不用镜长分布代替质量判断。第4–10集继续原批量流程，尚未全部完成。
+
+06:01 专属 Edge 只读检查仍为 `connected=true`、`authenticated=false`、`login_window_open`。本轮未提交图片或视频；不能将扩展连接成功等同登录成功或成图通过。
