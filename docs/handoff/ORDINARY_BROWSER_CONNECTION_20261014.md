@@ -28,4 +28,12 @@ Windows 原生 `chrome_setup::` **20/20**，其中 4 项新增普通浏览器回
 
 Windows 原生 `app_settings_engine::tests` **11/11**，runner 2.673 秒，无超时、进程树为空；核验全局设置保存重开、旧数据库保护、原媒体凭据/回执恢复以及渠道检查不自动生成。证据 `global-settings-native/`。
 
-最终产物构建、隐藏启动、保存重开与安装状态在完成后追加，不由本说明提前声明通过。
+## 最终 Windows 客户端安装
+
+产品源码提交 `8998e3ae161040393dca56eebdd8d342cc1fdf64`，已上传 `integration/windows-mac-20261008`。`update-client.ps1 -BuildOnly` 通过 SDK 资源准备、TypeScript/Vite 与 Cargo release。候选经 Windows Job Object 原生 runner 隐藏启动 5.804 秒、保存重开 2.312 秒，均无超时且进程树为空；内嵌前端、IPC、素材协议、资产删除恢复、项目归档恢复与持久化通过，生成请求/任务为 0。没有操作用户的前台 Edge 或执行真实登录。
+
+`-PublishOnly` 已更新同名 `apps/desktop/.local/client/director-desktop-next.exe`，SHA-256 `17c375316729b9d7636c8cb787eff7f02176f1e6cfa780e210e5d1039b9282da`。唯一备用仍为 `director-desktop-next-previous.exe`，保留上一轮产物 SHA-256 `e1e3803a84d84d0689e3b9a0a4ea4f14fab14c0ec3caebdd6b17a5bbda82ab8f`。两版各自 9 份 SDK 资源原字节核验通过，目录恰好两个客户端 EXE，候选已清理；私有冻结测试产物保留。
+
+证据：`client-build.log`、`startup-native-first/`、`startup-native-reopen/`、`client-startup/`、`client-publish.log`、`installed-proof.json`，均在上述私有证据目录。发布后生产全表、原 unknown 任务文件、先前已完成节点与源/资产/单元/事件仍精确一致。
+
+发布后桥接再次只读检查：连接页面仍 **0**，pending requests/commands 为 **0**。待用户完成普通 Edge 的一次性扩展安装和 Bridge 保存连接，再核验同一原浏览器的后台工作页与实际图片链路。网站风险提示的确切原因、普通 Edge 实际登录和后台生成尚未验收；本轮的工程回归与隐藏 GUI 验证不能代替这些项目。
