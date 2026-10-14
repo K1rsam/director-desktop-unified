@@ -1,5 +1,20 @@
 # 普通 Chrome／Edge 登录复用与连接入口
 
+## 2026-10-14 后台握手稳定性修复与验收边界
+
+本轮普通 Edge 持续建立匿名 WebSocket，却没有有效 hello/pong；服务约 20 秒后关闭这些连接。与此同时，旧 Chrome 控制页仍能响应心跳，Edge 独立 HTTP 健康报告持续存在但 connectionCount=0。现场支持“Edge 握手发送链没有完成”，尚不能确认是共享存储拒绝、存储操作不返回，还是网页回调中断；这些可能性不能写成已定位的真实根因。
+
+后台现在在 transport.connected 持久化成功后，直接读取原生 tab/window 身份并发送 bootstrap hello，无需等待网页收到 extension.connected。原 lease 保留，页面就绪、输入框就绪和主页面就绪均为 false，不冒充生成可用。只有原 messageId、sequence、clientId、contentEpoch 与 backgroundEpoch 的 ACK 全部匹配才确认后台握手；bootstrap-only 连接可自行应答心跳，真实网页 hello 完成后沿用原 DOM 心跳。存储写失败携带固定 code/eventType/stateBytes 给页面，并通过独立 HTTP 健康路径报告 held；8 秒诊断期限只报告超时，不解除未知写入、不重试任务、不分配新请求。
+
+复用已固定哈希的 authPreflight.js，未扩张 overlay 部署器的新文件合同。完整桥接回归 **214/214**，新增 11 项包含同请求握手/心跳、错误 ACK、存储拒绝、挂起诊断、禁止提升页面就绪，以及网页接管后的心跳保持。该组为合成回归，不代表真实多图稳定性。
+
+部署器校验 21 份 overlay，仅改变 background.js 和 authPreflight.js 两份，既有原件备份与 runtime 状态保留。部署后幂等校验再次 changed=0。当前 Edge 仍是部署前 background epoch，后台可用连接为 0；已请求一次升级加载，尚未收到完成回执。文件已部署不等于扩展已加载。
+
+原基础图仍在 recovery_paused，原会话和任务身份完整保留；直接父图衍生仍 waiting_dependency，无媒体入库。没有重新发送原基础图，没有创建更多未知控制页预约。多任务真实生成、父链运输、原图质量和断线恢复仍未验收。正式当前版和唯一备用 EXE 未变，不为仅桥接更新重新生成客户端。原七项目、十集案例源文，以及第五集 SDK unknown 原文件和全表已重新核验精确不变。本轮图片与视频新提交均为 0。
+
+私有证据：ordinary-edge-reuse-20261014/bootstrap-bridge-tests-04.log、bootstrap-integration-tests-01.log、bootstrap-deploy-20261014.json、后台 inspect 记录；私有项目、URL、token、原回包不进入 Git。
+
+
 ## 2026-10-14 普通 Edge 首次接入后的真实续测
 
 用户已在实际 ChatGPT 页保存 Bridge 设置。现场核实到独立 Edge profile，随后由它仅作为扩展传输源创建隐藏的专属控制页，输入框与主页面均 ready。原用户页 URL 和 contentEpoch 未改变，没有输入、导航或焦点操作。正式 `chrome.bind` 全局接口已把新任务绑定到这个 Edge；旧 Chrome 请求及第五集 SDK unknown 继续使用原身份。本机 setup 绿灯本身仍不能证明生成就绪。

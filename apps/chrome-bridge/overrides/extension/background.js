@@ -19,7 +19,7 @@ import {
   isExtensionReloadAlarm,
 } from './background/extensionReloadCoordinator.js';
 import { createTabController } from './background/tabController.js';
-import { checkBridgeAuth, reportBackgroundHealth } from './background/authPreflight.js';
+import { checkBridgeAuth, reportBackgroundHealth, readOnlyBootstrapHello, bootstrapAckMatches, transportFailureCode, backgroundPongEligible } from './background/authPreflight.js';
 import { createConnectionWatchdog, recoverOwnedController, confirmOwnedControllerReady } from './background/connectionWatchdog.js';
 import { tabScopedClientId } from './shared/tabClientIdentity.js';
 import './shared/buildIdentity.js';
@@ -269,6 +269,7 @@ function connectWebSocket(port, config) {
     token: String(config.token || ''),
     clientId: tabScopedClientId(contentClientId, tabId),
     contentClientId,
+    initialPage:config.page && typeof config.page==='object'?{...config.page}:{},
     reconnectTimer: null,
     ws: null,
     closed: false,
@@ -312,6 +313,7 @@ async function openConnectionOnce(state) {
   }
   let ws; try {
     state.protocolReady = false;
+    state.backgroundHandshakeReady = false;
     ws = new WebSocket(wsUrl(state.serverUrl, state.token));
     state.ws = ws;
   } catch (err) {
@@ -322,6 +324,15 @@ async function openConnectionOnce(state) {
   ws.addEventListener('open', () => {
     if(state.ws!==ws||state.closed)return;
     clearTimeout(state.reconnectTimer);state.reconnectTimer=null;
+    state.transportOpenFailure=null;
+    // A diagnostic deadline never releases a pending storage write or retries it.
+    const diagnosticTimer=setTimeout(()=>{
+      if(state.ws!==ws||state.closed||state.backgroundHandshakeReady||state.protocolReady)return;
+      state.transportOpenFailure='transport_open_timeout';
+      void reportBackgroundHealth({backgroundEpoch,bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,
+        extensionVersion:backgroundManifestVersion,recovery:{status:'held',reason:state.transportOpenFailure},connectionCount:0});
+    },8000);
+    diagnosticTimer.unref?.();
     void tabOperations.run(state.tabId, async () => {
       if(state.ws!==ws||state.closed)return;
       const connected = await backgroundState.transition(state.tabId, {
@@ -329,6 +340,8 @@ async function openConnectionOnce(state) {
       });
       if (!connected.accepted) throw new Error(`Unable to persist transport connection: ${connected.reason}`);
       const [launchMeta, runtime] = await Promise.all([state.launchMetaPromise, backgroundState.read(state.tabId)]);
+      const bootstrap=await readOnlyBootstrapHello(state,runtime,launchMeta);
+      await sendProtocolMessage(state,MessageType.TRANSPORT_HELLO,bootstrap);
       post(state.port, {
         type: 'extension.connected',
         serverUrl: state.serverUrl,
@@ -348,7 +361,12 @@ async function openConnectionOnce(state) {
           tabQueue: tabOperations.metrics(state.tabId),
         },
       });
-    }, { label: 'transport.open', priority: TabOperationPriority.OWNER_INVALIDATION, critical: true }).catch((error) => post(state.port, { type: 'extension.error', message: error.message || String(error) }));
+    }, { label: 'transport.open', priority: TabOperationPriority.OWNER_INVALIDATION, critical: true }).catch((error) => {
+      const reason=transportFailureCode(error);
+      state.transportOpenFailure=reason;
+      post(state.port,{type:'extension.error',message:error.message||String(error),code:reason,eventType:String(error.eventType||''),stateBytes:Number(error.stateBytes)||0});
+      void reportBackgroundHealth({backgroundEpoch,bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,extensionVersion:backgroundManifestVersion,recovery:{status:'held',reason},connectionCount:0});
+    }).finally(()=>clearTimeout(diagnosticTimer));
   });
   ws.addEventListener('message', (event) => {
     if(state.ws!==ws||state.closed)return;
@@ -362,6 +380,7 @@ async function openConnectionOnce(state) {
     void tabOperations.run(state.tabId, async () => {
       if(state.ws!==ws||state.closed)return;
       const hello = state.pendingHelloReceipt;
+      const bootstrapAccepted=bootstrapAckMatches(state,envelope,backgroundEpoch);
       await handleServerEnvelope({
       state,
       envelope,
@@ -372,6 +391,14 @@ async function openConnectionOnce(state) {
       scheduleReleaseDeadline,
       post,
       });
+      if(bootstrapAccepted){state.backgroundHandshakeReady=true;state.transportOpenFailure=null;}
+      if(backgroundPongEligible(state,envelope)){
+        // Bootstrap-only fallback never takes over the original DOM heartbeat.
+        const runtime=await backgroundState.read(state.tabId);
+        const launch=await readLaunchedTab(state.tabId);
+        const pong=await readOnlyBootstrapHello(state,runtime,launch);
+        await sendProtocolMessage(state,MessageType.TRANSPORT_PONG,{...pong,time:Date.now()});
+      }
       if (hello && envelope.messageType === MessageType.TRANSPORT_ACK
         && envelope.body?.accepted === true && envelope.body?.ackMessageId === hello.messageId
         && Number(envelope.body.acceptedSequence) === Number(hello.source.sequence)
@@ -431,9 +458,10 @@ const connectionWatchdog = createConnectionWatchdog({
   recoverController: async () => {
     const result=await recoverOwnedController({connections,backgroundEpoch});
     console.info('[chatgpt-bridge] owned controller reconnect', result.status, result.reason || '', result.tabId || '');
+    const failed=[...connections.values()].find(state=>!state.closed&&state.transportOpenFailure&&!state.protocolReady&&!state.backgroundHandshakeReady);
     await reportBackgroundHealth({backgroundEpoch, bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,
-      extensionVersion:backgroundManifestVersion,recovery:result,
-      connectionCount:[...connections.values()].filter(state=>!state.closed&&state.protocolReady&&state.ws?.readyState===WebSocket.OPEN).length});
+      extensionVersion:backgroundManifestVersion,recovery:failed?{status:'held',reason:failed.transportOpenFailure}:result,
+      connectionCount:[...connections.values()].filter(state=>!state.closed&&(state.protocolReady||state.backgroundHandshakeReady)&&state.ws?.readyState===WebSocket.OPEN).length});
   },
 });
 

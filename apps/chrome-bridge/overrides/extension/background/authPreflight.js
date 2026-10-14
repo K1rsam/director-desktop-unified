@@ -117,3 +117,44 @@ export async function reportBackgroundHealth({browser=chrome, backgroundEpoch, b
   }catch{return {ok:false,reason:'report_unavailable'};}
   finally{clearTimeout(timer);}
 }
+
+// Background transport can be addressable before a page is ready for generation.
+export async function readOnlyBootstrapHello(state, runtime, launch, browser = chrome) {
+  if (!Number.isInteger(state.tabId) || state.tabId <= 0 || !state.contentEpoch
+      || runtime.contentEpoch !== state.contentEpoch || runtime.tabId !== state.tabId) {
+    throw new Error('Bootstrap content identity is unproved');
+  }
+  const tab = await browser.tabs.get(state.tabId);
+  const url = new URL(tab.url || '');
+  if (tab.id !== state.tabId || url.origin !== 'https://chatgpt.com'
+      || url.username || url.password || typeof tab.incognito !== 'boolean') {
+    throw new Error('Bootstrap native tab identity is unproved');
+  }
+  const window=await browser.windows.get(tab.windowId);
+  if(window.id!==tab.windowId||typeof window.focused!=='boolean'||typeof tab.active!=='boolean')throw new Error('Bootstrap native window identity is unproved');
+  const {type, ...page} = state.initialPage || {};
+  return {...page, url:tab.url, title:tab.title||'', browserTabId:state.tabId,
+    launchToken:launch?.launchToken||'', requestedUrl:launch?.requestedUrl||'',
+    documentReadyState:'loading',pageReady:false,composerReady:false,chatMainReady:false,
+    focused:tab.active&&window.focused,visibilityState:tab.active&&window.state!=='minimized'?'visible':'hidden',session:null,tabObservation:null,
+    activeRequest:runtime.lease||null,
+    transportHealth:{kind:'connect_snapshot',observedAt:Date.now(),backgroundOnly:true}};
+}
+export function bootstrapAckMatches(state, envelope, backgroundEpoch) {
+  const hello=state.pendingHelloReceipt;
+  return Boolean(hello && hello.body?.transportHealth?.backgroundOnly===true
+    && envelope.messageType==='transport.ack' && envelope.body?.accepted===true
+    && envelope.body?.ackMessageId===hello.messageId
+    && Number(envelope.body.acceptedSequence)===Number(hello.source.sequence)
+    && hello.source.clientId===state.clientId && hello.source.contentEpoch===state.contentEpoch
+    && hello.source.backgroundEpoch===backgroundEpoch);
+}
+export function transportFailureCode(error) {
+  const code=typeof error?.code==='string'?error.code.toLowerCase():'transport_open_failed';
+  return /^[a-z0-9_]{1,96}$/.test(code)?code:'transport_open_failed';
+}
+
+export function backgroundPongEligible(state, envelope) {
+  return Boolean(!state.closed && state.backgroundHandshakeReady && !state.protocolReady
+    && envelope.messageType === 'transport.ping');
+}
