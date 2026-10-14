@@ -12,6 +12,9 @@ const STATUS: &str = "chrome-status.json";
 #[cfg(test)]
 #[path = "chrome_profile_binding_tests.rs"]
 mod profile_binding_tests;
+#[cfg(test)]
+#[path = "chrome_normal_browser_tests.rs"]
+mod normal_browser_tests;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,7 +169,7 @@ pub fn status(home: &Path, settings: &Value) -> Value {
     let configured = !s(settings,"chromeEndpoint").is_empty();
     let mut value = stored(home, STATUS);
     if value["schemaVersion"] != VERSION || value["configFingerprint"] != fingerprint(settings) {
-        value = report(if configured {"offline"} else {"unconfigured"}, if configured {"尚未检查浏览器连接。"} else {"连接旧版 Chrome 桥接后可使用网页出图。"}, installed, configured);
+        value = report(if configured {"offline"} else {"unconfigured"}, if configured {"尚未检查浏览器连接。"} else {"连接本机网页桥接，再连接已登录的 Chrome 或 Edge 扩展。"}, installed, configured);
     }
     if value["status"]=="ready" && !value["checkedAt"].as_str().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).is_some_and(|at| (0..=120).contains(&(chrono::Utc::now().timestamp()-at.timestamp()))) {
         value["status"]=json!("offline");value["message"]=json!("上次已连接，请重新检查当前浏览器状态。");
@@ -263,13 +266,13 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
                 ("waiting_browser","扩展后台已连接，正在核对原工作页的恢复状态；图片保留排队。")
             } else { ("waiting_browser","扩展后台已连接，专属工作页正在恢复；恢复后自动继续图片队列。") }
         }
-        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy {("waiting_browser","尚未收到已绑定浏览器的后台连接。请确认 Chrome 已运行且扩展已启用；图片保留排队。")}
+        else if binding.as_ref().ok().and_then(|b|b.as_ref()).is_some() && opener.is_none() && !busy {("waiting_browser","尚未收到已绑定浏览器的后台连接。请确认原 Chrome 或 Edge 已运行且扩展已连接；图片保留排队。")}
         else if browser_profiles.len()>1 && selected_binding.is_none() {("needs_selection","发现多个浏览器配置，请在软件设置绑定执行浏览器一次。")}
         else if busy && selected_binding.is_some_and(|b|profile_clients(clients).iter().any(|c|c["browserProfileId"]==b.profile_id && c["extensionBundleId"]==b.bundle_id)) {("busy","浏览器正在执行已有任务，完成后可继续。")}
         else if opener.is_none() && !usable.is_empty() {("waiting_browser","浏览器尚未提供持久身份，请重新连接扩展；隐身页面不用于新生成。")}
         else if busy {("busy","浏览器正在执行已有任务，完成后可继续。")}
-        else if !usable.is_empty() && connected {("ready","Chrome 网页已连接，可在图片资产中选择 Chrome 网页生成。")}
-        else {("waiting_browser","桥接已启动。请打开 Chrome 的 ChatGPT 页面并连接扩展。")};
+        else if !usable.is_empty() && connected {("ready","浏览器扩展已连接；每次生成前仍会核对登录及专属工作页状态。")}
+        else {("waiting_browser","本机桥接已启动，浏览器扩展尚未连接。请在已登录的 Chrome 或 Edge 的 ChatGPT 页面连接扩展。")};
     let mut value=report(state,message,component().is_some(),true);
     value["clients"]=json!(clients.len()); value["usableClients"]=json!(usable.len());
     value["pendingRequests"] = health["pendingRequests"].clone();
@@ -329,9 +332,18 @@ fn native_exe(path: &Path, name: &str) -> bool {
     if !crate::runtime_setup::safe_absolute(path) || !path.file_name().is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case(name)) { return false; }
     let mut magic=[0;2]; fs::File::open(path).and_then(|mut f|f.read_exact(&mut magic)).is_ok() && magic==*b"MZ"
 }
-fn browser_profile() -> Option<String> {
-    let root=PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Google/Chrome/User Data");
-    let extension=component()?.join("extension");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NormalBrowser { Chrome, Edge }
+impl NormalBrowser {
+    fn requested(value: Option<&str>) -> Result<Self> {
+        match value { None|Some("chrome")=>Ok(Self::Chrome),Some("edge")=>Ok(Self::Edge),_=>Err("请选择 Chrome 或 Edge；未打开其他程序。".into()) }
+    }
+    fn name(self) -> &'static str { match self {Self::Chrome=>"Chrome",Self::Edge=>"Edge"} }
+    fn executable(self) -> &'static str { match self {Self::Chrome=>"chrome.exe",Self::Edge=>"msedge.exe"} }
+    fn application(self) -> &'static str { match self {Self::Chrome=>"Google/Chrome/Application/chrome.exe",Self::Edge=>"Microsoft/Edge/Application/msedge.exe"} }
+    fn user_data(self) -> &'static str { match self {Self::Chrome=>"Google/Chrome/User Data",Self::Edge=>"Microsoft/Edge/User Data"} }
+}
+fn profile_with_extension(root: &Path, extension: &Path) -> Option<String> {
     let mut profiles=vec!["Default".to_string()];
     profiles.extend((1..=16).map(|i|format!("Profile {i}")));
     for name in profiles {
@@ -344,16 +356,29 @@ fn browser_profile() -> Option<String> {
     }
     None
 }
-pub fn open(_home: &Path) -> Result<Value> {
-    let chrome=["ProgramFiles","ProgramFiles(x86)","LOCALAPPDATA"].into_iter().filter_map(std::env::var_os)
-        .map(|root|PathBuf::from(root).join("Google/Chrome/Application/chrome.exe")).find(|p|native_exe(p,"chrome.exe")).ok_or("未找到 Chrome，请先安装 Google Chrome 浏览器。")?;
-    let mut cmd=Command::new(chrome);
-    // The old runner's scratch chrome-profile can be empty. Open the actual
-    // Chrome profile that already owns the extension; never install or copy it.
-    if let Some(profile)=browser_profile(){cmd.arg(format!("--profile-directory={profile}"));}
-    cmd.args(["--new-window","https://chatgpt.com/"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.spawn().map_err(|_|"无法打开 Chrome，请从桌面打开浏览器后连接扩展。")?;
-    Ok(json!({"opened":true,"message":"已打开 Chrome，请确认 ChatGPT 已登录并连接桥接扩展，再检查连接。"}))
+fn normal_browser_args(profile: Option<&str>) -> Result<Vec<String>> {
+    let mut args=Vec::new();
+    if let Some(profile)=profile {
+        if profile!="Default" && !(1..=16).any(|number|profile==format!("Profile {number}")) {return Err("浏览器配置名称无效，未打开。".into());}
+        args.push(format!("--profile-directory={profile}"));
+    }
+    args.push("https://chatgpt.com/".into());
+    Ok(args)
+}
+pub fn open(_home: &Path, browser: Option<&str>) -> Result<Value> {
+    let browser=NormalBrowser::requested(browser)?;
+    let executable=["ProgramFiles","ProgramFiles(x86)","LOCALAPPDATA"].into_iter().filter_map(std::env::var_os)
+        .map(|root|PathBuf::from(root).join(browser.application())).find(|p|native_exe(p,browser.executable()))
+        .ok_or_else(||format!("未找到 {}，请安装该浏览器或选择另一入口；未自动切换浏览器。",browser.name()))?;
+    let profile=std::env::var_os("LOCALAPPDATA").and_then(|local|component().and_then(|component|
+        profile_with_extension(&PathBuf::from(local).join(browser.user_data()),&component.join("extension"))));
+    // Use the normal browser's existing configuration. No automation/debugging
+    // flags, new profile, cookie copy, extension installation or login action.
+    let mut cmd=Command::new(executable);
+    cmd.args(normal_browser_args(profile.as_deref())?).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    hide(&mut cmd);
+    cmd.spawn().map_err(|_|format!("无法打开 {}，请从桌面打开后连接扩展。",browser.name()))?;
+    Ok(json!({"opened":true,"browser":browser.name().to_ascii_lowercase(),"message":format!("已打开普通 {} 的 ChatGPT 页面；请确认登录及扩展连接。尚未验证登录，也未更改执行绑定。",browser.name())}))
 }
 struct LaunchGuard(Option<std::process::Child>);
 impl Drop for LaunchGuard {fn drop(&mut self){if let Some(child)=self.0.as_mut(){let _=child.kill();let _=child.wait();}}}

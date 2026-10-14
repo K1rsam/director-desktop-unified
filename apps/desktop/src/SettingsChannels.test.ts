@@ -144,6 +144,29 @@ test('channel cards keep one connection flow and save current input before check
       } finally { view.unmount(); }
     });
 
+    await t.test('ordinary Edge and Chrome opening preserves drafts and never starts managed login or binds a browser', async () => {
+      const view = hookRenderer(), appSettings = makeSettings(), writes: any[] = [], calls: any[] = [];
+      chromeRespond = async request => { calls.push(request); return { ...chromeReport, clients: 0, usableClients: 0, status: 'waiting_browser', extensionPath: 'C:/synthetic/extension' }; };
+      const mutate = async (action: string, values: any) => { writes.push({ action, ...values }); return { ...appSettings, revision: writes.length, settings: appSettings.settings }; };
+      const element = React.createElement(SettingsPanel, { appSettings, writable: true, mutate });
+      try {
+        view.render(element); await settle(); let nodes = view.render(element);
+        input(nodes, 'BH API 服务地址').props.onChange({ target: { value: 'https://unsaved.example.test' } });
+        for (const browser of ['edge', 'chrome']) {
+          nodes = view.render(element);
+          const button = nodes.find(node => node.type === 'button' && node.props['data-browser-open'] === browser); assert.ok(button);
+          button.props.onClick(); await settle(); nodes = view.render(element);
+          assert.equal(input(nodes, 'BH API 服务地址').props.value, 'https://unsaved.example.test');
+        }
+        assert.deepEqual(writes, [{ action: 'chrome.open', browser: 'edge' }, { action: 'chrome.open', browser: 'chrome' }]);
+        assert.ok(!calls.some(request => /managed|login|bind|submit|images\./.test(request.action)));
+        const guidance = nodes.find(node => node.type === 'details' && content(node).includes('首次连接浏览器扩展')); assert.ok(guidance);
+        assert.equal(guidance.props.open, true);
+        assert.ok(content(guidance).includes('edge://extensions'));
+        assert.ok(!nodes.some(node => node.type === 'h3' && content(node).includes('推荐')));
+      } finally { view.unmount(); }
+    });
+
     await t.test('Chrome manual check waits for save and never refreshes models when the webpage is absent', async () => {
       const view = hookRenderer(), appSettings = makeSettings(), calls: string[] = [];
       chromeRespond = async input => { calls.push(input.action); return { ...chromeReport, status: 'waiting_browser', clients: 0, usableClients: 0 }; };

@@ -24,8 +24,8 @@ export function ManagedBrowserCard({ status, writable, busy, boundProfileId, err
   const ready = managedBrowserReady(status), bound = ready && status?.profileId === boundProfileId;
   const label = ready ? '已就绪' : status ? labels[status.state] || '状态待检查' : '尚未检查';
   return <section className="surface channel-provider-card" aria-label="专属 Edge">
-    <div className="section-heading compact"><h3>专属 Edge（推荐）</h3><Badge status={ready ? 'available' : status?.state === 'error' ? 'error' : 'not_configured'}>{label}</Badge></div>
-    <p className="muted">首次登录 ChatGPT 后，可在后台完成图片任务。登录信息仅保存在本机专属浏览器中。</p>
+    <div className="section-heading compact"><h3>独立配置的专属 Edge</h3><Badge status={ready ? 'available' : status?.state === 'error' ? 'error' : 'not_configured'}>{label}</Badge></div>
+    <p className="muted">可选的独立浏览器配置，需要单独登录，不继承普通 Edge 的登录。已有登录时，优先使用上方的普通浏览器连接。</p>
     {status?.message && <p className="control-hint" role="status">{status.message}</p>}
     <div className="actions">
       <Button executionAction="chrome.managed.login" variant={status?.requiresLogin ? 'primary' : 'secondary'} disabled={!writable || busy} onClick={() => onAction('chrome.managed.login')}>官方登录</Button>

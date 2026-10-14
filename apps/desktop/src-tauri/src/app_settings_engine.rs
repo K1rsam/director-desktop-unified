@@ -99,7 +99,8 @@ impl Engine {
             if !self.standard_native || !self.live_accounts {
                 return Err("Chrome 连接只由本机标准桌面显式触发。".into());
             }
-            return crate::chrome_setup::open(&self.home);
+            if !request["browser"].is_null() && !request["browser"].is_string() {return Err("浏览器选择格式无效，未打开。".into());}
+            return crate::chrome_setup::open(&self.home, request["browser"].as_str());
         }
         if action.starts_with("chrome.managed.") {
             if !self.standard_native || !self.live_accounts {
