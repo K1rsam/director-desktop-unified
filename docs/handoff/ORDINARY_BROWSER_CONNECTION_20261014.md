@@ -37,3 +37,13 @@ Windows 原生 `app_settings_engine::tests` **11/11**，runner 2.673 秒，无�
 证据：`client-build.log`、`startup-native-first/`、`startup-native-reopen/`、`client-startup/`、`client-publish.log`、`installed-proof.json`，均在上述私有证据目录。发布后生产全表、原 unknown 任务文件、先前已完成节点与源/资产/单元/事件仍精确一致。
 
 发布后桥接再次只读检查：连接页面仍 **0**，pending requests/commands 为 **0**。待用户完成普通 Edge 的一次性扩展安装和 Bridge 保存连接，再核验同一原浏览器的后台工作页与实际图片链路。网站风险提示的确切原因、普通 Edge 实际登录和后台生成尚未验收；本轮的工程回归与隐藏 GUI 验证不能代替这些项目。
+
+## 扩展安装后的实测与 setup 状态误报
+
+用户提供截图确认普通 Edge 的 Default 配置已安装并启用扩展 2.4.5；setup 页显示绿色 `Connected and ready`。只读源码核对发现，该旧组件页面仅凭服务级 `activeClient` 就显示此文字，不检查当前 setup 查看者的浏览器、网站登录、`pageReady` 或 composer。截图的 setup 绿灯不能证明普通 Edge 已连到服务。Edge 扩展“服务工作进程不活动”仅表示该时点待机，不证明安装失败。
+
+本机服务实际收到 1 个后台控制页，仍使用此前的 profile/controller 身份。新原生 inventory 在两个样本中证明该程序专属页没有 lease、其他未决命令或待回包；布局捕获显示网站错误恢复界面、没有 composer。仅在空闲证明后后台刷新同一控制页一次，得到原回执；没有重载扩展、切换用户焦点或重新提交生成。刷新后错误恢复表面消失，但 composer 仍缺失。用户的普通 Edge 真实生成能力尚未验收。证据位于私有 `ordinary-edge-reuse-20261014/` 的连接、布局、原生 inventory 与一次刷新记录，包含用户运行信息，不进入 Git。
+
+桌面端连接检查新增窄门禁：当同一正式 opener 明确报告 `pageReady`、`composerReady` 或 `chatMainReady=false` 时，返回 `waiting_browser` 并说明扩展握手与输入框就绪的区别。缺省历史字段继续保留原兼容行为，碰撞、忙态、原绑定和原请求门禁不变。这是渠道状态投影修复，没有改图片 submit、旧 prepared、原回包或后台队列。界面在等待浏览器时展开接入说明，并提示必须在实际 ChatGPT 页的 Bridge 面板保存连接；旧外部组件 `/setup` 页面本身本轮未修改。
+
+前端全组 **252/252** 通过。Windows 原生 `chrome_setup::` **21/21** 通过；新增回归以合成 HTTP 响应复现“transport ready但无输入框”，验证只做 GET、正式 profile 保留且不显示 ready。证据 `browser-page-readiness-20261014/chrome-setup-native/`，无超时、进程树为空；本轮安装状态另行追加。原稳定性案例全表及第五集 unknown 原文件再次精确不变，图片与视频提交均为 0。

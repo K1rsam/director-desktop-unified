@@ -271,6 +271,7 @@ pub fn inspect(settings: &Value, token: &str) -> Result<Value> {
         else if busy && selected_binding.is_some_and(|b|profile_clients(clients).iter().any(|c|c["browserProfileId"]==b.profile_id && c["extensionBundleId"]==b.bundle_id)) {("busy","浏览器正在执行已有任务，完成后可继续。")}
         else if opener.is_none() && !usable.is_empty() {("waiting_browser","浏览器尚未提供持久身份，请重新连接扩展；隐身页面不用于新生成。")}
         else if busy {("busy","浏览器正在执行已有任务，完成后可继续。")}
+        else if connected && opener.is_some_and(|page|page["pageReady"]==false || page["composerReady"]==false || page["chatMainReady"]==false) {("waiting_browser","浏览器扩展已连接，ChatGPT 输入框尚未就绪。本机 setup 页的连接绿灯不代表当前浏览器登录或生成已就绪；请在实际 ChatGPT 页的 Bridge 面板保存连接，并等待页面正常加载。")}
         else if !usable.is_empty() && connected {("ready","浏览器扩展已连接；每次生成前仍会核对登录及专属工作页状态。")}
         else {("waiting_browser","本机桥接已启动，浏览器扩展尚未连接。请在已登录的 Chrome 或 Edge 的 ChatGPT 页面连接扩展。")};
     let mut value=report(state,message,component().is_some(),true);
@@ -490,6 +491,22 @@ pub fn connect(home: &Path, settings: &Value, token: Option<&str>, source: Optio
         for (clients,expected) in [(json!([]),"waiting_browser"),(json!([{"id":"one","ready":true}]),"waiting_browser"),(json!([{"id":"one","ready":true},{"id":"two","ready":true}]),"waiting_browser"),(json!([{"id":"one","ready":true,"activeRequest":{"id":"existing"}}]),"busy")] {
             let (settings,server)=fixture(json!({"ok":true,"pendingRequests":0}),Some(clients));
             let result=inspect(&settings,"fixture-credential").unwrap();assert_eq!(result["status"],expected);assert!(!result.to_string().contains("fixture-credential"));server.join().unwrap();
+        }
+    }
+    #[test] fn connected_extension_with_known_missing_composer_is_not_ready_and_never_sends_commands() {
+        let profile="b84d4521-56ba-4f84-9948-090f82d639e7";
+        let base=json!({"id":"controller","url":"https://chatgpt.com/","ready":true,"transport":"extension","compatible":true,
+            "browserProfileId":profile,"browserIncognito":false,"backgroundEpoch":"epoch","extensionBundleId":"bundle","serverInstanceId":"server",
+            "launchToken":format!("bridge-director-control-{profile}"),"focused":false,"visibilityState":"hidden"});
+        for (field,value,expected) in [("pageReady",false,"waiting_browser"),("composerReady",false,"waiting_browser"),("chatMainReady",false,"waiting_browser"),("pageReady",true,"ready")] {
+            let mut page=base.clone();page[field]=json!(value);
+            let (settings,server)=fixture(json!({"ok":true,"pendingRequests":0,"pendingCommands":0}),Some(json!([page.clone()])));
+            let result=inspect(&settings,"fixture-credential").unwrap();
+            assert_eq!(result["status"],expected);
+            assert_eq!(result["clients"],1);assert_eq!(result["usableClients"],1,"transport handshake stays separate from input readiness");
+            if !value {assert!(s(&result,"message").contains("输入框尚未就绪"));}
+            assert_eq!(profiles(&[page]).len(),1,"valid profile identity is preserved");
+            server.join().unwrap(); // Fixture accepts GET only: no browser action or generation.
         }
     }
     #[test] fn unrelated_http_service_is_rejected_before_browser_or_submission_calls() {
