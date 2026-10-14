@@ -1,5 +1,7 @@
 # Chrome 原图恢复补丁
 
+2026-10-14：普通 Edge 真实续测发现 ChatGPT 的 `group/agent-activity` 进度区使用同样的辅助阅读标题，被误算为第二条助手回复。新增固定哈希 turnDom overlay，仅从 presentation-only 候选排除该区；显式原生消息身份及真实第二条助手保留。203 项桥接回归通过。真实基础图已发送一次，但随后工作页断连，原会话下载与衍生图仍未验收；部署文件不代表已加载新内容运行时。详见 [普通浏览器续测](../../docs/handoff/ORDINARY_BROWSER_CONNECTION_20261014.md)。
+
 适配已安装的 `chatgpt-browser-bridge-node` **6.4.0**。补丁用于恢复已提交的原图片任务，不重新发送提示词，不创建工作流，不改桥接持久回执、账户或数据库。
 
 覆盖文件按 manifest 校验原始字节；`.gitattributes` 对这些文件关闭行尾转换，保留上游空白。不要格式化覆盖文件或仅复制 Git 自动转换后的文本。

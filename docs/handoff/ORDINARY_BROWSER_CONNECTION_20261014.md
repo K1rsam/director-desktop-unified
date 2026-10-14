@@ -1,5 +1,21 @@
 # 普通 Chrome／Edge 登录复用与连接入口
 
+## 2026-10-14 普通 Edge 首次接入后的真实续测
+
+用户已在实际 ChatGPT 页保存 Bridge 设置。现场核实到独立 Edge profile，随后由它仅作为扩展传输源创建隐藏的专属控制页，输入框与主页面均 ready。原用户页 URL 和 contentEpoch 未改变，没有输入、导航或焦点操作。正式 `chrome.bind` 全局接口已把新任务绑定到这个 Edge；旧 Chrome 请求及第五集 SDK unknown 继续使用原身份。本机 setup 绿灯本身仍不能证明生成就绪。
+
+在单独新建的两资产手工提示词 fixture 中，发现新图片请求继承默认 2K，而网页能力只支持 native，导致发送前失败。Rust 现在仅在新 Chrome 图片快照中选择 native，保留项目尺寸设置、冻结设置和历史任务；CLI/API 不变。原两条失败/依赖阻断记录保留，并在确证 taskId、prepared、receipt 均未产生后开始独立新测试请求，没有重试已提交任务。
+
+真实基础图片请求已发送一次；网页转入原会话。前期会话 URL 切换的暂态通过原任务查询恢复，未重新发送。随后 `dom_user_boundary` 现场只读回执确认 `userCount=1`、`assistantCount=2`、`promptMatches=true`。脱敏布局显示第二个“助手”来自 `group/agent-activity` 进度区。新增逐字节固定的 turnDom overlay，仅排除该区的 presentation-only heading；显式 native message/turn 身份和真实第二条助手消息仍保留，完整提示词、当前分支、文件 ID、原图字节和复读校验均未放宽。
+
+Windows 原生后台图片队列 **45/45**（32.912 秒，Job Object 进程树为空，无超时）；桥接回归 **203/203**，包括进度区、真实第二条回复、显式身份三项新回归。组件 6.4.0 overlay 21 文件全部哈希校验，实际仅改变 turnDom 一份，原件备份、桥接状态和凭据未改。补丁已经部署到文件，但原会话的新内容运行时加载与下载尚未证明；不能将这些静态及合成结果标为真实图片通过。
+
+后续现场 Edge 原工作页与控制页断连，原生 inventory 返回 `source_or_runtime_not_idle`；一次同控制页预约的后台恢复收到 HTTP 500，创建结果未确认，已持久保留原 intent，不再次创建。没有对用户前台操作或要求重载，未部署整个扩展重载，也没有重新生成。原图仍待恢复下载，衍生图仍等待直接父图；此二图手工 fixture 只验收网页运输/父图链，不代表第二阶段 skill 的剧本设计质量已通过。第五集 SDK 原提交仍 unknown，5–10 集和整套十集验收仍未完成。
+
+此轮客户端隐藏首次启动 **5.836 秒**，保存重开 **2.335 秒**，内嵌前端、IPC、素材协议和持久化均通过，探针生成请求为零。当前同名 EXE SHA-256 `f67b2eb53495926d8036add162523793080350f4f45954cea31c0f001ef5c4e1`；唯一备用 SHA-256 `0ca8c19e0df0ab56161406eeba6e17da4fdc1ab67534c5758e3a1e25f7c7bd98`，候选已由发布脚本清理。实际图片提交一次，视频零提交；原七项目媒体、SQL 表及原稳定性案例全部表、SDK unknown 原文件继续精确一致。
+
+私有证据目录：`.local/validation/ordinary-edge-reuse-20261014/`。核心记录为 `edge-controller-bootstrap.json`、`edge-native-bind-v2-result.json`、`edge-image-original-unsubmitted-proof.json`、`edge-image-retry-report.json`、`edge-original-read-only-proof-1791971198626.json`、`edge-controller-recovery-once.json`、`native-resolution-background-tests/`、`bridge-regression-final.log`、`native-resolution-client-first-v2/`、`native-resolution-client-reopen-v2/`、`native-resolution-client-startup/` 和发布日志。源码及测试变更与私人页面、原回包、项目数据库分开提交。
+
 ## 问题和采用方案
 
 用户的普通 Edge 已有 ChatGPT 登录，但原界面把独立配置的专属 Edge 标为推荐。专属 Edge 使用应用自有 profile、自动化及 CDP 参数，不继承普通 Edge 的登录。现有 `chrome.open` 又只启动 Chrome，并强制新窗口，不能从桌面设置选择普通 Edge。这两种入口容易被误认为同一个已登录浏览器。

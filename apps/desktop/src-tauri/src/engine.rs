@@ -2963,8 +2963,13 @@ impl Engine {
                 }
                 let style = pipeline::asset_design_contract::project_visual_style(settings);
                 let presentation = pipeline::asset_design_contract::image_presentation(settings, a);
+                // The web channel returns website-native files; a saved CLI/API
+                // size is not a pixel-size option for this provider. Resolve only
+                // new snapshots, keeping the saved settings and old jobs intact.
+                let resolution = if provider == "chrome" { json!("native") }
+                    else { settings.get("imageResolution").cloned().unwrap_or(json!("2K")) };
                 let prompt = pipeline::asset_design_contract::compile_image_prompt(s(a, "prompt"), style, &presentation);
-                let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":settings.get("imageResolution").cloned().unwrap_or(json!("2K")),"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
+                let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":resolution,"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
                 snapshot["promptCompilerVersion"] = json!(pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION);
                 if let Some(binding) = r.get("backgroundChromeBinding") {
                     if provider != "chrome" { return Err("后台图片入口仅允许 Chrome".into()); }

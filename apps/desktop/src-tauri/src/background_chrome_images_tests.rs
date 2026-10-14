@@ -40,7 +40,7 @@ impl Channels for Fake {
     fn capabilities(&self,c:&ProviderConfig)->ProviderResult<Capabilities> {
         assert_eq!(c.kind,"chrome");
         Ok(serde_json::from_value(json!({"provider":"chrome","version":"offline/v1","source":"synthetic","checkedAt":now(),
-            "models":[{"id":"chatgpt-image","kind":"image","adapted":true,"ratios":["1:1","16:9"],"resolutions":["2K"],"images":8,"videos":0,"audios":0,"requiredImages":0,"raw":{}}],
+            "models":[{"id":"chatgpt-image","kind":"image","adapted":true,"ratios":["1:1","16:9"],"resolutions":["native"],"images":8,"videos":0,"audios":0,"requiredImages":0,"raw":{}}],
             "canCancel":false,"canReconcileUnknown":false,"raw":{}})).unwrap())
     }
     fn prepare(&self,c:&ProviderConfig,r:&GenerationRequest)->ProviderResult<PreparedRequest> {
@@ -121,6 +121,32 @@ impl Fixture {
         selected_step(&self.engine,&self.request,&self.store,journal).unwrap()
     }
     fn count(&self)->usize {self.fake.submits.lock().unwrap().len()}
+}
+
+#[test]
+fn background_chrome_uses_native_resolution_without_rewriting_saved_sizes_or_old_jobs() {
+    let f=Fixture::new(&[("root",None),("suit",Some("root"))]);
+    let settings_before=f.store.settings().unwrap();
+    assert_eq!(settings_before["imageResolution"],"2K");
+    let j=f.queue();
+    for binding in &j.jobs {
+        let job=f.store.job(s(binding,"jobId")).unwrap();
+        assert_eq!(job["snapshot"]["resolution"],"native");
+        assert_eq!(job["snapshot"]["frozenSettings"]["imageResolution"],"2K");
+    }
+    for _ in 0..12 {f.step(&j);}
+    assert_eq!(f.count(),2);
+    assert_eq!(f.store.settings().unwrap(),settings_before);
+    let sent=f.fake.submits.lock().unwrap();
+    assert!(sent.iter().all(|r|r.resolution=="native"));
+    assert!(sent[0].references.is_empty());
+    assert_eq!(sent[1].references.len(),1);
+    drop(sent);
+    let original=f.store.jobs().unwrap();
+    let resumed=f.queue();
+    assert_eq!(resumed.jobs.len(),2);
+    assert_eq!(f.store.jobs().unwrap(),original);
+    assert_eq!(f.count(),2);
 }
 
 #[test]

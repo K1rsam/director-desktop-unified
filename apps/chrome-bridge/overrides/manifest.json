@@ -194,6 +194,11 @@
       "path": "src/bridge/coordinator/browserClientCoordinator.js",
       "beforeSha256": "b98e2bd2671054c0726c932dca00c7c05ac25fe63bb8a581f1e03a6b04632c76",
       "afterSha256": "eed9ea6522c849d0fcf3dbeca47adf47e71de3e971055827ef7fa0069608f9b3"
+    },
+    {
+      "path": "extension/content/turnDom.js",
+      "beforeSha256": "3b831513ddb520cf5bd126887eede9126980008dcc30afe44d957ae2bee70825",
+      "afterSha256": "2a131dcc187f52933cfd3aa1c3c357ee81aa6b980dbcf7837582c8d3513519fc"
     }
   ]
 }
