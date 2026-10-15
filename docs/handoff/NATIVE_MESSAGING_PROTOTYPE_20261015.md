@@ -117,3 +117,17 @@ flowchart LR
 用户普通启动已登录的 Edge 或 Chrome，保留一个用于连接的 ChatGPT 页面。工作台分别检查 Bridge、登录页状态、网页输入就绪与恢复状态，再绑定全局浏览器配置；窗口或 tab ID 只作本次会话定位，浏览器重启后重新核验，不能当永久所有权凭据。现有 UI 已有普通浏览器全局 profile 绑定；本轮没有新增“已验收专用窗口”选项或承诺窗口级绑定已实现。
 
 后续工作页应在该配置中非活动创建，每图独立会话，默认同时生成一张，其余任务持久排队；提示词准备和已完成图片下载可并行。连接页不承载生产提示词，也不因任务结束而关闭。用户页保持原状，程序只清理有明确创建回执且已入库的工作页。出现登录失效、网页未就绪或断线时暂停派发并显示具体原因，沿保存的原会话链接和请求回执恢复，不自动重发，也不把刷新整个扩展当正常任务步骤。此方案减少登录环境和目标选择问题，但网页生成、下载、父图依赖和重开零重发仍须真实验收。
+
+## 继续稳定性测试：传输就绪不等于网页命令就绪
+
+继续只读检查时，普通 Edge 仍只有 bootstrap Native 连接，`pageReady/composerReady=false`，原 `extension.reload` 命令只有 accepted、没有原 terminal。原工作页与命令未清除，未重复升级或生成。服务已有媒体记录未找到可按原任务及源页身份直接回收的基础图，因此没有把其他历史图片当作本任务结果。
+
+源码核对定位到另一个可复现缺陷：bootstrap hello 可以先建立传输身份，但原 `serverEnvelopeRouter` 在真实 content hello 尚未处理时仍会注册、dispatch 并发出 command.accepted。它随后向尚未就绪的页面转发命令，可能留下永久 dispatched 状态。新增固定哈希 overlay `extension/background/serverEnvelopeRouter.js`：`protocolReady!==true` 或已关闭时，先返回 `CONTENT_RUNTIME_NOT_READY`，不注册新命令、不领取请求 lease、不创建 effect，不伪造取消成功；原命令和未知提交继续保留。ACK、原 outbox 与心跳仍按原协议处理。服务端 reload 协调器也在显式 `transportHealth.backgroundOnly=true` 时，派发前返回 `EXTENSION_RELOAD_CONTENT_NOT_READY`。本轮没有将旧现场命令强行改为成功、失败或可重试。
+
+最终 `node --test apps/chrome-bridge/tests/*.test.cjs` 为 327/327、零跳过。部署器核对 24 份 overlay，未更换桌面 EXE。新增定向测试覆盖 bootstrap-only 的升级、开页、读取、取消及 prompt 命令零派发，原未知记录保留，真实 content 存在后的正常派发，以及 ACK 继续处理。
+
+此外运行两轮真正隔离的 Edge / Native / Rust / loopback WebSocket 测试。每轮 64 条 FIFO 和 450018 UTF-8 bytes 大消息精确回传；原生产路由器、真实 Chrome session storage 和 Protocol5 outbox 实际处理四条 synthetic 入站命令，四条均 `CONTENT_RUNTIME_NOT_READY`、新增命令记录为零、原 synthetic maintenance 命令及 lease 保持原值。撤去 debugger 后闲置 35 秒仍为同一 worker 与默认 Native 宿主。第二轮只中断经 PID、父链及隔离 profile 证明归属的测试宿主，默认后台路径在 22292ms 后自行建立新宿主；同一 worker、原命令/lease 精确保留，无扩展重载、页面刷新或用户操作。该耗时仅是一次隔离故障测试结果，不是恢复时限承诺，也不是图片生成耗时。
+
+两轮 runner 均验证 Job Object 进程树最终为空，临时测试宿主注册已清理。私人证据位于 `.local/validation/native-messaging-20261015/edge-content-readiness-01`、`edge-content-readiness-fault-02` 与对应 `run-*` 摘要。普通浏览器和生产 storage 未被故障注入影响，原七项目、全生产表、十集源文和第五集 SDK unknown 证据再次核验一致。
+
+现场限制继续单列：目前可用的浏览器控制接口只连接普通 Chrome，明确不支持 `visible:false` 静默开页；尝试在建页前即被 capability 检查拒绝，没有退回抢焦点方式，也没有触碰用户现有页面。最终 overlay 已部署在磁盘；普通已登录 Edge 的旧页面没有新的真实 content 握手，也未证实加载本轮修复。原图入库、衍生图接续、真实多图和专用窗口完整验收仍未通过，本轮图片与视频生成提交均为零。

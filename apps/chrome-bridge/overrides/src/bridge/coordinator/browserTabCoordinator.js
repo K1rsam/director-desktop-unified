@@ -211,6 +211,11 @@ export class BrowserTabCoordinator {
       : this.hub.activeClient;
     const before = source ? { ...source } : null;
     if (!before?.id) throw new Error('No browser extension client is available for reload');
+    if (before.transportHealth?.backgroundOnly === true) {
+      const error = new Error('Browser transport is connected, but its page runtime is not ready for extension reload');
+      error.code = 'EXTENSION_RELOAD_CONTENT_NOT_READY';
+      throw error;
+    }
     if (!Number.isInteger(before.browserTabId) || before.browserTabId <= 0
       || !BROWSER_LAUNCH_TOKEN_RE.test(String(before.launchToken || ''))
       || ['browserProfileId', 'extensionBundleId', 'serverInstanceId', 'backgroundEpoch', 'contentEpoch']

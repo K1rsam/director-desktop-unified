@@ -30,6 +30,12 @@ test('owned-only command rejection remains the original rejection without any fa
   const f=fixture({commandError:true});await assert.rejects(f.controller.reloadExtension({sourceClientId:'owned-source',ownedTabsOnly:true,allowMaintenancePageBootstrap:true,timeoutMs:30000}),{code:'COMMAND_REJECTED'});
   assert.equal(f.commands.length,1);
 });
+
+test('bootstrap-only native health cannot dispatch another extension reload or allocate reconnect listeners',async()=>{
+  const f=fixture({before:{transportHealth:{kind:'connect_snapshot',backgroundOnly:true,transportKind:'native_messaging'}}});
+  await assert.rejects(f.controller.reloadExtension({sourceClientId:'owned-source',ownedTabsOnly:true}),{code:'EXTENSION_RELOAD_CONTENT_NOT_READY'});
+  assert.deepEqual(f.commands,[]);assert.equal(f.hub.listenerCount('client.ready'),0);
+});
 test('original owned page reconnect completes the existing reload without another action',async()=>{
   const f=fixture({reconnect:true}),result=await f.controller.reloadExtension({sourceClientId:'owned-source',ownedTabsOnly:true,allowMaintenancePageBootstrap:false,timeoutMs:30000});
   assert.equal(result.reconnected.id,'owned-source');assert.equal(f.commands.length,1);

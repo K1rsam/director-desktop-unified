@@ -114,11 +114,12 @@
     {
       "path": "src/bridge/coordinator/browserTabCoordinator.js",
       "beforeSha256": "91a05bc581d0035867d2722473743a48973b5836469dd09727e3756be6e64fb3",
-      "afterSha256": "a48c51660dd81699a585c1884ac8da29199dc55470e44a27a1dffd19ab361609",
+      "afterSha256": "86c4d5fb2d66de592b5355f0550d96ecb725468dffcea087d9952afc95506585",
       "previousAfterSha256s": [
         "4e547c3c9459978f2b29370603282b41b3c991680a72e90a49e4d39f08c89ae9",
         "67c52316753686dc0daad0914ec6b44ddf0d7b389b4e5b10a0fa00781096716d",
-        "4534403cf67a7857466a5589b870ac65ddc9d0c115de07b2001bfd06358e3846"
+        "4534403cf67a7857466a5589b870ac65ddc9d0c115de07b2001bfd06358e3846",
+        "a48c51660dd81699a585c1884ac8da29199dc55470e44a27a1dffd19ab361609"
       ]
     },
     {
@@ -228,6 +229,14 @@
       "path": "extension/background/stateV6Compaction.js",
       "beforeSha256": "c95ffc3741afd55643073c6a621ee6368e5c03c6f12cb85792a1fa8c31f23d91",
       "afterSha256": "fd3620a699b85d1c5cc360521f12d68341caea61ef8ec13bf2968eab66fd43c3"
+    },
+    {
+      "path": "extension/background/serverEnvelopeRouter.js",
+      "beforeSha256": "57bad8bbbcd6b646c8a3727ff2ae0a4247721dd412e5fa19f9a3736e4f7bdc35",
+      "afterSha256": "cadc301f521b4afb3c472b79bedb471e4d6a6ef107924b006629b4b361ae5307",
+      "previousAfterSha256s": [
+        "9a1ed9809aa0a621e502ea9134b28276498827637573728b4472d101c3162142"
+      ]
     }
   ]
 }
