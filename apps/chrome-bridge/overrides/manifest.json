@@ -152,7 +152,7 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "8e117c83a047a92c66b74e227f8472f660aceee032ca81d6a3b25b53c6bf902a",
+      "afterSha256": "7846ff8e0d2b8143d2dccd55b6a77989683d31de52bcad0ac1b16bcc841dbaa2",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
@@ -161,7 +161,10 @@
         "59b707cf771a5682cb20c00cd5c83d40cf3bb3b66d7bfea74eb61f069e7d6ef2",
         "3d013e568f3c120b457d408df8f2163d6516d4455f28441ec3ec30c6c6337941",
         "cbd5a9123d694fcbc222923159622c0a2815e3dd9c61cc53be58f679fd2ae705",
-        "692a7f203bf2e56602c1406f85a8552bd16e18d1563d1c8b40e15edaad1bbeca"
+        "692a7f203bf2e56602c1406f85a8552bd16e18d1563d1c8b40e15edaad1bbeca",
+        "8e117c83a047a92c66b74e227f8472f660aceee032ca81d6a3b25b53c6bf902a",
+        "d9d12eca5259e56258717dcdae21eb125c324442d0c47dcbab9278c749927092",
+        "0572ded8f38dc8fb066c2baea849b152b73e3e66f263997771b0c2e6f72bda53"
       ]
     },
     {
@@ -186,10 +189,12 @@
     {
       "path": "extension/background/authPreflight.js",
       "beforeSha256": "fb858bca7936b180e71c65ccc6921e6e989e0d35fb1c17326b881ab5eaebb5b5",
-      "afterSha256": "c3c2648a991e356d34713055b9983c979550e5991ac01d36b413a5762f30d34a",
+      "afterSha256": "fc270791843706bfa0a6e33679f1b30bafe9ca0259898279f3012e32ea95cbff",
       "previousAfterSha256s": [
         "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452",
-        "57886f37d31cbc2fc42c2597c8243122eb073086d9577aa19d7cc36e74d10ca5"
+        "57886f37d31cbc2fc42c2597c8243122eb073086d9577aa19d7cc36e74d10ca5",
+        "c3c2648a991e356d34713055b9983c979550e5991ac01d36b413a5762f30d34a",
+        "125f1a50b2f4f0442b730852c34516f01c6e9b7dcfaec7a3ddaebfaa4d7cd512"
       ]
     },
     {
@@ -201,6 +206,11 @@
       "path": "extension/content/turnDom.js",
       "beforeSha256": "3b831513ddb520cf5bd126887eede9126980008dcc30afe44d957ae2bee70825",
       "afterSha256": "2a131dcc187f52933cfd3aa1c3c357ee81aa6b980dbcf7837582c8d3513519fc"
+    },
+    {
+      "path": "extension/manifest.json",
+      "beforeSha256": "bb7834c25311d947a340efef8fdc4369832233658d7082b313d8a8c0225dd376",
+      "afterSha256": "a6226e96747a8183a82597354e7f228411b6210bd61d236dca49064113309aa6"
     }
   ]
 }

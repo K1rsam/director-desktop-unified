@@ -1,5 +1,7 @@
 # Chrome 原图恢复补丁
 
+2026-10-15：新增可试验的 Rust Native Messaging 传输，保持 ChatGPT 网页出图和原 Protocol 5/任务身份。宿主、薄适配、用户级安装与隔离浏览器三通道测试见 [原型记录](../../docs/handoff/NATIVE_MESSAGING_PROTOTYPE_20261015.md)。普通已登录浏览器加载及真实图片/父链尚未通过，不能将隔离通信测试称为出图稳定。新增权限只在原生宿主先安装后部署；旧 manifest 仍使用原通道，Native 故障不自动降级或重发。
+
 2026-10-14：普通 Edge 真实续测发现 ChatGPT 的 `group/agent-activity` 进度区使用同样的辅助阅读标题，被误算为第二条助手回复。新增固定哈希 turnDom overlay，仅从 presentation-only 候选排除该区；显式原生消息身份及真实第二条助手保留。203 项桥接回归通过。真实基础图已发送一次，但随后工作页断连，原会话下载与衍生图仍未验收；部署文件不代表已加载新内容运行时。详见 [普通浏览器续测](../../docs/handoff/ORDINARY_BROWSER_CONNECTION_20261014.md)。
 
 适配已安装的 `chatgpt-browser-bridge-node` **6.4.0**。补丁用于恢复已提交的原图片任务，不重新发送提示词，不创建工作流，不改桥接持久回执、账户或数据库。

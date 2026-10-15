@@ -19,11 +19,12 @@ import {
   isExtensionReloadAlarm,
 } from './background/extensionReloadCoordinator.js';
 import { createTabController } from './background/tabController.js';
-import { checkBridgeAuth, reportBackgroundHealth, readOnlyBootstrapHello, bootstrapAckMatches, transportFailureCode, backgroundPongEligible } from './background/authPreflight.js';
+import { checkBridgeAuth, reportBackgroundHealth, readOnlyBootstrapHello, bootstrapAckMatches, transportFailureCode, backgroundPongEligible, createNativeTransportFactory } from './background/authPreflight.js';
 import { createConnectionWatchdog, recoverOwnedController, confirmOwnedControllerReady } from './background/connectionWatchdog.js';
 import { tabScopedClientId } from './shared/tabClientIdentity.js';
 import './shared/buildIdentity.js';
 const connections = new Map();
+let nativeTransportFactory = null;
 const backgroundEpoch = createRuntimeEpoch('background');
 const backgroundManifestVersion = String(chrome.runtime?.getManifest?.()?.version || 'unknown');
 console.info('[chatgpt-bridge] Background service worker started', `version=${backgroundManifestVersion}`, `epoch=${backgroundEpoch}`);
@@ -314,7 +315,15 @@ async function openConnectionOnce(state) {
   let ws; try {
     state.protocolReady = false;
     state.backgroundHandshakeReady = false;
-    ws = new WebSocket(wsUrl(state.serverUrl, state.token));
+    const nativeEnabled=typeof chrome!=='undefined'&&chrome.runtime?.getManifest?.()?.permissions?.includes('nativeMessaging')===true;
+    if(nativeEnabled){
+      nativeTransportFactory ||= createNativeTransportFactory();
+      ws=nativeTransportFactory.connect({serverUrl:state.serverUrl,token:state.token});
+      state.transportKind='native_messaging';
+    }else{
+      ws = new WebSocket(wsUrl(state.serverUrl, state.token));
+      state.transportKind='websocket';
+    }
     state.ws = ws;
   } catch (err) {
     post(state.port, { type: 'extension.error', message: err.message || String(err) });
@@ -356,7 +365,7 @@ async function openConnectionOnce(state) {
           acknowledgedSequence: runtime.transport.ackCursor,
         },
         health: {
-          kind: 'connect_snapshot', observedAt: Date.now(),
+          kind: 'connect_snapshot', observedAt: Date.now(), transportKind: state.transportKind,
           outbox: { size: runtime.outbox.length, ...runtime.metrics },
           tabQueue: tabOperations.metrics(state.tabId),
         },
@@ -404,6 +413,7 @@ async function openConnectionOnce(state) {
         && Number(envelope.body.acceptedSequence) === Number(hello.source.sequence)
         && hello.source.clientId === state.clientId && hello.source.backgroundEpoch === backgroundEpoch
         && hello.source.contentEpoch === state.contentEpoch && !state.closed) {
+        state.reconnectAttempts = 0;
         state.pendingHelloReceipt = null;
         const launch = await readLaunchedTab(state.tabId);
         const runtime = await backgroundState.read(state.tabId);
@@ -436,20 +446,28 @@ async function openConnectionOnce(state) {
     post(state.port, { type: 'extension.status', status: 'extension disconnected', detail: `WebSocket closed${event?.code ? ` (${event.code})` : ''}; reconnecting` });
     scheduleReconnect(state,ws);
   });
-  ws.addEventListener('error', () => {
+  ws.addEventListener('error', (event) => {
     if(state.ws!==ws||state.closed)return;
-    post(state.port, { type: 'extension.status', status: 'extension websocket error', detail: 'WebSocket failed after token preflight; reconnecting' });
+    if(state.transportKind==='native_messaging'){
+      const reason=transportFailureCode(event);
+      state.transportOpenFailure=reason;
+      void reportBackgroundHealth({backgroundEpoch,bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,
+        extensionVersion:backgroundManifestVersion,recovery:{status:'held',reason},connectionCount:0});
+    }
+    post(state.port, { type: 'extension.status', status: 'extension websocket error', detail: 'Browser transport failed after token preflight; reconnecting' });
   });
 }
 function scheduleReconnect(state,expectedSocket=state.ws) {
   clearTimeout(state.reconnectTimer);
+  const delay=state.transportKind==='native_messaging'?Math.min(30000,1500*2**Math.min(state.reconnectAttempts||0,5)):1500;
+  if(state.transportKind==='native_messaging')state.reconnectAttempts=(state.reconnectAttempts||0)+1;
   state.reconnectTimer = setTimeout(() => {
     if (state.closed || !connections.has(state.port)||state.ws!==expectedSocket) return;
     const previous=state.ws;
     state.ws = null;
     try { previous?.close?.(); } catch {}
     void openConnection(state);
-  }, 1500);
+  }, delay);
 }
 const connectionWatchdog = createConnectionWatchdog({
   alarms: chrome.alarms,
