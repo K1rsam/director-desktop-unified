@@ -31,3 +31,28 @@ test('the deployed native adapter exactly matches the independently tested modul
  assert.ok(auth.includes('// BEGIN DIRECTOR NATIVE TRANSPORT ADAPTER (generated)\n'+module));
  const m=JSON.parse(fs.readFileSync(path.join(root,'overrides/extension/manifest.json'),'utf8'));assert.ok(m.permissions.includes('nativeMessaging'));
 });
+
+function backgroundStartup({native=true,failure=null}={}){
+ const code=background.slice(background.indexOf('async function ensureNativeBackgroundTransport()'),background.indexOf('function recoverBackgroundConnections()'));
+ const reports=[];let factories=0,ensures=0;
+ const ctx=vm.createContext({chrome:{runtime:{getManifest:()=>({permissions:native?['nativeMessaging']:[]})}},
+  nativeTransportFactory:null,backgroundEpoch:'synthetic-epoch',backgroundManifestVersion:'test',
+  ChatGptBridgeBuildIdentity:{bundleId:'synthetic-bundle'},
+  createNativeTransportFactory:()=>{factories++;return{ensureConnected:async()=>{ensures++;if(failure)throw failure;return{version:'director-native-transport/v2'};},connect:()=>assert.fail('startup must not open business channels')};},
+  transportFailureCode:e=>e.code||'transport_open_failed',reportBackgroundHealth:async data=>reports.push(data)});
+ vm.runInContext(code+';globalThis.ensure=ensureNativeBackgroundTransport;',ctx);
+ return{run:()=>ctx.ensure(),reports,counts:()=>({factories,ensures})};
+}
+test('native background startup validates the port without requiring a page or sending a task',async()=>{
+ const f=backgroundStartup();await f.run();await f.run();assert.deepEqual(f.counts(),{factories:1,ensures:2});
+ assert.equal(f.reports[0].recovery.status,'native_transport_ready');assert.equal(f.reports[0].connectionCount,0);
+ assert.equal(f.reports[0].pageReady,undefined);assert.equal(f.reports[0].composerReady,undefined);
+});
+test('native startup failure reports a fixed transport hold without claiming page readiness',async()=>{
+ const f=backgroundStartup({failure:Object.assign(Error('private detail'),{code:'native_ready_timeout'})});
+ await f.run();assert.equal(f.reports[0].recovery.status,'held');assert.equal(f.reports[0].recovery.reason,'native_ready_timeout');
+ assert.ok(!JSON.stringify(f.reports).includes('private detail'));
+});
+test('legacy background startup does not create a native port or claim native health',async()=>{
+ const f=backgroundStartup({native:false});assert.equal(await f.run(),null);assert.deepEqual(f.counts(),{factories:0,ensures:0});assert.equal(f.reports.length,0);
+});

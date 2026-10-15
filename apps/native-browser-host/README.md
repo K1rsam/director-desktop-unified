@@ -60,28 +60,35 @@ Config contains no token. Each Open token is used only in the authenticated
 Every stdin/stdout item is a 4-byte little-endian unsigned byte length followed
 by UTF-8 JSON. Native input and WebSocket text have a 32 MiB hard limit. Partial
 headers, partial bodies and invalid JSON fail closed. Startup emits
-`{"type":"ready","version":"director-native-transport/v1"}`.
+`{"type":"ready","version":"director-native-transport/v2"}`.
 
 Input:
 
 - `{ "type":"open", "channelId":"id", "serverUrl":"...", "token":"..." }`
-- `{ "type":"send", "channelId":"id", "data":"unchanged JSON text" }`
+- `{ "type":"send", "channelId":"id", "writeId":"write-1", "data":"unchanged JSON text" }`
 - `{ "type":"close", "channelId":"id" }`
 - `{ "type":"ping", "nonce":"caller nonce" }`
 
 Output:
 
 - `{ "type":"open", "channelId":"id" }` after a successful WS handshake.
+- `{ "type":"sent", "channelId":"id", "writeId":"write-1" }` only after
+  the corresponding `socket.send` succeeds. This is a **local transport write**
+  acknowledgment, not remote Protocol5 acceptance or a generation receipt.
+  Failed writes have no `sent` ACK and are never retried. `writeId` must be
+  `write-` followed by decimal digits, at most 64 characters in total.
 - `{ "type":"message", "channelId":"id", "data":"..." }` for text of at
   most 192 KiB. A small string whose JSON escaping exceeds Chromium's 1 MiB
   host-to-browser limit uses one chunk instead. Every native output frame is
   capped at 1 MiB.
 - Larger text is sliced from the **original UTF-8 bytes**, up to 192 KiB per
   chunk, and emitted as `{ "type":"chunk", "channelId":"id",
-  "transferId":"id:sequence", "index":0, "count":2, "byteLength":250000,
+  "transferId":"chunk-1", "index":0, "count":2, "byteLength":250000,
   "sha256":"whole-message lower-case hex SHA256", "dataBase64":"..." }`.
   A chunk may end inside a UTF-8 code point. Reassemble bytes and verify the
   entire hash before decoding. Indices are zero-based; FIFO is per channel.
+  Transfer IDs use the channel-scoped `chunk-<sequence>` spelling and do not
+  embed channel IDs, so long channel IDs cannot break adapter validation.
 - `{ "type":"close", "channelId":"id", "code":1000,
   "reason":"local_close" }`; server close reason text is never echoed.
 - `{ "type":"error", "channelId":"id or null", "code":"fixed_code" }`.
@@ -93,7 +100,15 @@ output waits at most 2 seconds and then stops transport; it never silently
 continues after dropping a frame. Channel queue overflow emits `queue_full`;
 the caller must keep uncertain application requests unchanged. A write failure
 closes the channel without retrying, because partial transmission is unknown.
-Socket reads/writes use a 50 ms timeout, connection/handshake use 2 seconds.
+The v2 adapter keeps exactly one write in flight per channel until its exact
+`sent` ACK, with a separate finite FIFO (256 messages / 32 MiB including the
+in-flight item). The host still limits its own queue to 8; normal v2 traffic
+cannot burst arbitrary unacknowledged writes into it. ACK loss/disconnect does
+not trigger native replay; the unchanged persistent Protocol5 outbox retains
+recovery ownership.
+
+The worker drains at most 8 queued commands before reading, enables TCP_NODELAY,
+and uses a 20 ms read/write timeout; connection/handshake use 2 seconds.
 stdin EOF cancels every worker (including an incomplete handshake), and the
 process exits without waiting indefinitely for a non-consuming stdout pipe.
 
@@ -102,6 +117,7 @@ Fixed error codes: `invalid_message`, `truncated_frame`, `frame_limit`,
 `channel_exists`, `channel_limit`, `server_rejected`, `token_rejected`,
 `channel_not_open`, `channel_closing`, `queue_full`, `message_limit`,
 `connect_failed`, `socket_failed`, `origin_rejected`, `handshake_failed`.
+`invalid_write` rejects a malformed v2 write identity without echoing its value.
 
 Fixed close reasons: `local_close`, `remote_close`, `send_failed`,
 `transport_failed`, `binary_rejected`, `message_limit`, `connect_failed`,
@@ -120,10 +136,10 @@ Native Windows MSVC toolchain: Cargo `1.99.0 (5f94df478 2026-08-27)`.
 
 - `cargo check`: passed.
 - Initial debug integration suite: 15 passed, 0 failed (6.24 s).
-- Final `cargo test --release ... -- --test-threads=1`: **18 passed, 0 failed**
-  (3.61 s), using actual copied GUI-subsystem executables and redirected pipes.
-- Release executable: 720384 bytes, PE subsystem 2 (Windows GUI), SHA-256
-  `b5a6260b16cb0acde5dab4625a224f5ea0a6c5d22de24afc833c916063207992`.
+- Final v2 `cargo test --release ... -- --test-threads=1`: **21 passed, 0 failed**
+  (5.38 s), using actual copied GUI-subsystem executables and redirected pipes.
+- Release executable: 718848 bytes, PE subsystem 2 (Windows GUI), SHA-256
+  `de234a0ed621f31a344c47b5b74d3225ecfdfaf7f638a85ca1e180cbe4f2bae8`.
 - `cargo clippy`: not run successfully; this machine's active toolchain does
   not have `cargo-clippy.exe` installed. No toolchain component was installed.
 
@@ -138,3 +154,10 @@ incomplete handshake. No account, browser, image or video generation was used.
 The strict-origin regression separately confirms slash-suffixed caller
 authorization, rejection of a no-slash caller argument, and the server's exact
 no-slash HTTP Origin handshake followed by a real local WebSocket roundtrip.
+The v2 suite additionally sends 64 real local WebSocket messages one per exact
+`sent` ACK and checks FIFO, validates required write identities, asserts real
+chunk IDs against the adapter alphabet, and exports a real host-output fixture
+to `target/native-v2-wire-fixture.json`. That synthetic fixture contains ready,
+open and two chunk frames for 210000 Unicode UTF-8 bytes, plus expected total
+length and SHA-256, so the adapter can consume host output without recreating
+its own assumed wire fields.

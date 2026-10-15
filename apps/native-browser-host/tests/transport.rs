@@ -31,6 +31,7 @@ struct Host {
     input: Option<ChildStdin>,
     received: Receiver<Value>,
     directory: PathBuf,
+    next_write_id: u64,
 }
 
 impl Host {
@@ -79,20 +80,33 @@ impl Host {
             input,
             received,
             directory,
+            next_write_id: 0,
         }
     }
     fn ready(&self) {
         assert_eq!(
             self.next(),
-            json!({"type":"ready","version":"director-native-transport/v1"})
+            json!({"type":"ready","version":"director-native-transport/v2"})
         );
     }
     fn next(&self) -> Value {
+        loop {
+            let event = self.next_raw();
+            if event["type"] != "sent" {
+                return event;
+            }
+        }
+    }
+    fn next_raw(&self) -> Value {
         self.received
             .recv_timeout(WAIT)
             .expect("native response deadline")
     }
-    fn send(&mut self, value: Value) {
+    fn send(&mut self, mut value: Value) {
+        if value["type"] == "send" && value.get("writeId").is_none() {
+            self.next_write_id += 1;
+            value["writeId"] = format!("write-{}", self.next_write_id).into();
+        }
         write_frame(self.input.as_mut().unwrap(), &value).unwrap();
     }
     fn open(&mut self, id: &str, port: u16) {
@@ -425,6 +439,14 @@ fn unicode_chunks_preserve_original_bytes_hash_and_order() {
             transfer = Some(chunk["transferId"].clone());
         }
         assert_eq!(chunk["transferId"], transfer.as_ref().unwrap().clone());
+        let id = chunk["transferId"].as_str().unwrap();
+        assert!(
+            id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        );
+        assert!(id.starts_with("chunk-"));
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(chunk["dataBase64"].as_str().unwrap())
             .unwrap();
@@ -678,4 +700,110 @@ fn invalid_channel_identity_is_not_echoed_in_error_output() {
         );
     }
     host.finish(true);
+}
+
+#[test]
+fn v2_sent_ack_matches_each_successful_write_and_keeps_64_message_fifo() {
+    let (listener, port) = listener();
+    let server = thread::spawn(move || {
+        let mut socket = accept(&listener);
+        for index in 0..64 {
+            assert_eq!(
+                socket.read().unwrap().to_text().unwrap(),
+                format!("fifo-{index}-资产🦉")
+            );
+        }
+        socket.send(Message::Text("received-64".into())).unwrap();
+        loop {
+            match socket.read() {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let mut host = Host::new(port);
+    host.ready();
+    host.open("write-contract", port);
+    assert_eq!(host.next_raw()["type"], "open");
+    for index in 0..64 {
+        let id = format!("write-{}", index + 1);
+        host.send(json!({"type":"send","channelId":"write-contract","writeId":id,"data":format!("fifo-{index}-资产🦉")}));
+        assert_eq!(
+            host.next_raw(),
+            json!({"type":"sent","channelId":"write-contract","writeId":id})
+        );
+    }
+    assert_eq!(host.next_raw()["data"], "received-64");
+    host.finish(true);
+    server.join().unwrap();
+}
+
+#[test]
+fn v2_requires_fixed_write_identity_without_echoing_bad_values() {
+    let mut host = Host::new(53179);
+    host.ready();
+    for id in [
+        "write-",
+        "write-1x",
+        "x-write-1",
+        "write-🦉",
+        &format!("write-{}", "1".repeat(59)),
+    ] {
+        host.send(json!({"type":"send","channelId":"fixed","writeId":id,"data":"not-sent"}));
+        assert_eq!(
+            host.next_raw(),
+            json!({"type":"error","channelId":"fixed","code":"invalid_write"})
+        );
+    }
+    write_frame(
+        host.input.as_mut().unwrap(),
+        &json!({"type":"send","channelId":"fixed","data":"missing-id"}),
+    )
+    .unwrap();
+    assert_eq!(
+        host.next_raw(),
+        json!({"type":"error","channelId":null,"code":"invalid_message"})
+    );
+    host.finish(true);
+}
+
+#[test]
+fn exports_real_host_chunk_fixture_for_adapter_contract() {
+    let (listener, port) = listener();
+    let text = "原文🦉".repeat(21000);
+    let expected_bytes = text.len();
+    let expected_sha = format!("{:x}", Sha256::digest(text.as_bytes()));
+    assert!(expected_bytes > CHUNK_BYTES);
+    let server = thread::spawn(move || {
+        let mut socket = accept(&listener);
+        socket.send(Message::Text(text.into())).unwrap();
+        loop {
+            match socket.read() {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let mut host = Host::new(port);
+    let mut events = vec![host.next_raw()];
+    assert_eq!(events[0]["version"], "director-native-transport/v2");
+    host.open("adapter-fixture", port);
+    events.push(host.next_raw());
+    assert_eq!(events[1]["type"], "open");
+    let count = expected_bytes.div_ceil(CHUNK_BYTES);
+    for index in 0..count {
+        let event = host.next_raw();
+        assert_eq!(event["type"], "chunk");
+        assert_eq!(event["index"], index);
+        assert_eq!(event["transferId"], "chunk-1");
+        assert_eq!(event["sha256"], expected_sha);
+        events.push(event);
+    }
+    let fixture = json!({"protocolVersion":"director-native-transport/v2", "expectedTextSha256":expected_sha,
+        "expectedUtf8Bytes":expected_bytes,"events":events});
+    let destination =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/native-v2-wire-fixture.json");
+    std::fs::write(destination, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+    host.finish(true);
+    server.join().unwrap();
 }

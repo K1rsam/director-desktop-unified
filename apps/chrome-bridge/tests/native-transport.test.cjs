@@ -44,7 +44,7 @@ function fixture(options = {}) {
     now = until;
   };
   const receive = message => ports.at(-1).onMessage.emit(message);
-  const ready = () => receive({ type: 'ready', version: 'director-native-transport/v1' });
+  const ready = () => receive({ type: 'ready', version: 'director-native-transport/v2' });
   const open = id => receive({ type: 'open', channelId: id });
   return { factory, ports, scheduled, connect, advance, receive, ready, open };
 }
@@ -52,7 +52,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const chunks = (id, text) => {
   const bytes = Buffer.from(text), size = 192 * 1024, hash = createHash('sha256').update(bytes).digest('hex');
   return Array.from({ length: Math.ceil(bytes.length / size) }, (_, index) => ({
-    type: 'chunk', channelId: id, transferId: 'transfer-1', index,
+    type: 'chunk', channelId: id, transferId: 'chunk-1', index,
     count: Math.ceil(bytes.length / size), byteLength: bytes.length, sha256: hash,
     dataBase64: bytes.subarray(index * size, (index + 1) * size).toString('base64'),
   }));
@@ -210,4 +210,125 @@ test('small control-character payload may arrive as one verified chunk to avoid 
   for (let i = 0; i < 20 && a.events.filter(x => x.type === 'message').length < 1; i++) await tick();
   assert.equal(a.events.find(x => x.type === 'message').data, text);
   a.socket.close(); assert.equal(f.scheduled.size, 0); f.factory.shutdown();
+});
+
+test('64-message burst sends only one write until exact sent receipts release FIFO in order', () => {
+  const f = fixture(), a = f.connect('a'); f.ready(); f.open('a');
+  const payloads = Array.from({ length: 64 }, (_, i) => JSON.stringify({ requestId: 'same-original', sequence: i, text: '诊断' }));
+  for (const payload of payloads) a.socket.send(payload);
+  const writes = () => f.ports[0].sent.filter(x => x.type === 'send');
+  assert.equal(writes().length, 1);
+  f.receive({ type: 'sent', channelId: 'a', writeId: 'write-fake' });
+  f.receive({ type: 'sent', channelId: 'other-channel', writeId: writes()[0].writeId });
+  assert.equal(writes().length, 1);
+  for (let i = 0; i < payloads.length; i++) {
+    const current = writes().at(-1); assert.equal(current.data, payloads[i]);
+    assert.match(current.writeId, /^write-\d+$/);
+    if (i) assert.ok(Number(current.writeId.slice(6)) > Number(writes()[i - 1].writeId.slice(6)));
+    f.receive({ type: 'sent', channelId: 'a', writeId: current.writeId });
+    // A duplicate acknowledgement cannot release the next in-flight write.
+    f.receive({ type: 'sent', channelId: 'a', writeId: current.writeId });
+    assert.equal(writes().length, Math.min(payloads.length, i + 2));
+  }
+  assert.deepEqual(writes().map(x => x.data), payloads);
+  f.advance(100); assert.equal(a.socket.readyState, 1);
+  a.socket.close(); assert.equal(f.scheduled.size, 0); f.factory.shutdown();
+});
+
+test('missing sent receipt times out without retransmission or transferring old pending into a new port', () => {
+  const f = fixture(), a = f.connect('a'); f.ready(); f.open('a');
+  a.socket.send('original-inflight'); a.socket.send('original-pending');
+  f.advance(100);
+  assert.equal(a.events.at(-1).reason, 'native_send_ack_timeout');
+  assert.deepEqual(f.ports[0].sent.filter(x => x.type === 'send').map(x => x.data), ['original-inflight']);
+  assert.equal(f.scheduled.size, 0);
+  f.ports[0].onDisconnect.emit();
+  const b = f.connect('b'); f.ready(); f.open('b'); b.socket.send('new-original');
+  assert.deepEqual(f.ports[1].sent.filter(x => x.type === 'send').map(x => x.data), ['new-original']);
+  f.factory.shutdown(); assert.equal(f.scheduled.size, 0);
+});
+
+test('256 pending writes include the in-flight write and queue overflow closes only its own channel', () => {
+  const f = fixture(), a = f.connect('a'), b = f.connect('b'); f.ready(); f.open('a'); f.open('b');
+  for (let i = 0; i < 256; i++) a.socket.send(String(i));
+  assert.equal(a.socket.readyState, 1);
+  a.socket.send('overflow');
+  assert.equal(a.events.at(-1).reason, 'native_send_queue_full'); assert.equal(b.socket.readyState, 1);
+  b.socket.send('unblocked-other-branch');
+  assert.deepEqual(f.ports[0].sent.filter(x => x.type === 'send').map(x => x.data), ['0', 'unblocked-other-branch']);
+  f.factory.shutdown(); assert.equal(f.scheduled.size, 0);
+});
+
+test('pending UTF8 byte budget includes the in-flight data and is bounded at 32MiB', () => {
+  const f = fixture(), a = f.connect('a'); f.ready(); f.open('a');
+  a.socket.send('甲'.repeat(5 * 1024 * 1024)); // 15 MiB, not 5 MiB.
+  a.socket.send('b'.repeat(17 * 1024 * 1024));
+  assert.equal(a.socket.readyState, 1);
+  a.socket.send('x');
+  assert.equal(a.events.at(-1).reason, 'native_send_queue_full');
+  assert.equal(f.ports[0].sent.filter(x => x.type === 'send').length, 1);
+  assert.equal(f.scheduled.size, 0); f.factory.shutdown();
+});
+
+test('old v1 hosts are rejected before any send queue may be drained', () => {
+  const f = fixture(), a = f.connect('a');
+  f.receive({ type: 'ready', version: 'director-native-transport/v1' });
+  assert.equal(a.events.at(-1).reason, 'native_version_mismatch');
+  assert.equal(f.ports[0].sent.filter(x => x.type === 'send').length, 0);
+  assert.equal(f.scheduled.size, 0);
+});
+
+const realHostFixture = path.join(__dirname, '../../native-browser-host/target/native-v2-wire-fixture.json');
+test('real Windows host v2 wire fixture crosses the adapter with exact UTF8 hash and supported transfer identity', {
+  skip: fs.existsSync(realHostFixture) ? false : 'Run Windows native-host release integration tests to create the synthetic wire fixture',
+}, async () => {
+  const wire = JSON.parse(fs.readFileSync(realHostFixture, 'utf8'));
+  assert.equal(wire.protocolVersion, 'director-native-transport/v2');
+  assert.ok(wire.events.some(e => e.type === 'ready' && e.version === wire.protocolVersion));
+  assert.ok(wire.events.some(e => e.type === 'chunk' && /^chunk-\d+$/.test(e.transferId)));
+  const f = fixture(), a = f.connect('adapter-fixture');
+  for (const message of wire.events) f.receive(message);
+  for (let i = 0; i < 40 && a.events.filter(e => e.type === 'message').length < 1; i++) await tick();
+  const received = a.events.filter(e => e.type === 'message');
+  assert.equal(received.length, 1); assert.equal(a.events.some(e => e.type === 'error'), false);
+  assert.equal(Buffer.byteLength(received[0].data), wire.expectedUtf8Bytes);
+  assert.equal(createHash('sha256').update(received[0].data).digest('hex'), wire.expectedTextSha256);
+  a.socket.close(); assert.equal(f.scheduled.size, 0); f.factory.shutdown();
+});
+
+test('ensureConnected validates native readiness without creating a channel or submitting any task', async () => {
+  const f = fixture();
+  const first = f.factory.ensureConnected(), second = f.factory.ensureConnected();
+  assert.equal(f.ports.length, 1); assert.equal(f.ports[0].sent.length, 0);
+  f.ready();
+  assert.equal((await first).version, 'director-native-transport/v2');
+  assert.equal((await second).version, 'director-native-transport/v2');
+  assert.equal((await f.factory.ensureConnected()).version, 'director-native-transport/v2');
+  assert.equal(f.ports[0].sent.length, 0); assert.equal(f.scheduled.size, 0);
+  // A later webpage may multiplex its channel over the same ready native port.
+  const a = f.connect('a'); f.open('a'); assert.equal(a.socket.readyState, 1); assert.equal(f.ports.length, 1);
+  f.factory.shutdown(); assert.equal(f.scheduled.size, 0);
+});
+
+test('ensureConnected waiters receive fixed errors for wrong readiness disconnect deadline and shutdown', async () => {
+  for (const kind of ['version', 'disconnect', 'timeout', 'shutdown']) {
+    const f = fixture(), waiting = f.factory.ensureConnected();
+    const expected = { version: 'native_version_mismatch', disconnect: 'native_host_disconnected', timeout: 'native_ready_timeout', shutdown: 'native_factory_shutdown' }[kind];
+    const checked = assert.rejects(waiting, error => error.code === expected && error.message === expected);
+    if (kind === 'version') f.receive({ type: 'ready', version: 'private-version-details' });
+    if (kind === 'disconnect') f.ports[0].onDisconnect.emit();
+    if (kind === 'timeout') f.advance(100);
+    if (kind === 'shutdown') f.factory.shutdown();
+    await checked;
+    assert.equal(f.scheduled.size, 0, kind); assert.equal(f.ports[0].sent.length, 0, kind);
+    f.factory.shutdown();
+    await assert.rejects(f.factory.ensureConnected(), error => error.code === 'native_factory_shutdown');
+  }
+});
+
+test('closing the last pending channel cannot cancel an independently awaited native startup', async () => {
+  const f = fixture(), pending = f.factory.ensureConnected(), a = f.connect('a');
+  a.socket.close(); assert.equal(f.ports[0].disconnected, false);
+  f.ready(); assert.equal((await pending).version, 'director-native-transport/v2');
+  assert.equal(f.scheduled.size, 0); f.factory.shutdown();
 });

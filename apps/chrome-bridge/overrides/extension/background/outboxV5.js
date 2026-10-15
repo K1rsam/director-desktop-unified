@@ -24,6 +24,41 @@ export function createBrowserProfileIdentity(storage, randomUUID = () => crypto.
 export function createProtocolOutbox({ backgroundEpoch, backgroundState, post, summarize }) {
   const activeFlushes = new Map();
   const retryTimers = new Map();
+  // Native `sent` only confirms a local write. Durable Protocol5 ACK remains
+  // the sole outbox removal authority; a new socket replays persisted entries.
+  const socketFlights = new WeakMap();
+  function flightsFor(ws) {
+    let flights = socketFlights.get(ws);
+    if (!flights) {
+      flights = { sent: new Map(), sending: new Set() };
+      socketFlights.set(ws, flights);
+    }
+    return flights;
+  }
+  function pruneFlights(ws, runtime) {
+    const flights = socketFlights.get(ws);
+    if (!flights || !Array.isArray(runtime?.outbox)) return;
+    const persisted = new Set(runtime.outbox.map(entry => entry.messageId));
+    const snapshotSequence = Number(runtime.transport?.outboundSequence);
+    for (const [id, sequence] of flights.sent) {
+      // A stale read must not erase a write registered after that snapshot.
+      if (!persisted.has(id) && sequence <= snapshotSequence) flights.sent.delete(id);
+    }
+  }
+  async function sendCriticalOnce(state, ws, messageId, prepare) {
+    const flights = flightsFor(ws);
+    if (flights.sent.has(messageId) || flights.sending.has(messageId)) return;
+    flights.sending.add(messageId);
+    try {
+      const envelope = await prepare();
+      if (!envelope || state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify(envelope));
+      flights.sent.set(messageId, Number(envelope.source.sequence));
+    } finally {
+      // A thrown send is not a successful write and must remain recoverable.
+      flights.sending.delete(messageId);
+    }
+  }
   const profileIdentity = createBrowserProfileIdentity(globalThis.chrome?.storage?.local);
   async function materialize(state, messageType, body, options = {}) {
     if (messageType === 'transport.hello') {
@@ -68,45 +103,58 @@ export function createProtocolOutbox({ backgroundEpoch, backgroundState, post, s
       state.pendingHelloReceipt = envelope;
     }
     const critical = options.critical === true || isCriticalMessageType(messageType);
+    let persistedRuntime;
     if (critical && options.persisted !== true) {
       const stored = await backgroundState.transition(state.tabId, {
         type: 'outbox.enqueued', envelope, contentEpoch: state.contentEpoch || '',
       });
       if (!stored.accepted) throw new Error(`Unable to persist critical extension message: ${stored.reason}`);
+      persistedRuntime = stored.state;
     }
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(envelope));
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      const ws = state.ws;
+      if (critical) {
+        pruneFlights(ws, persistedRuntime || await backgroundState.read(state.tabId));
+        await sendCriticalOnce(state, ws, envelope.messageId, () => envelope);
+      } else ws.send(JSON.stringify(envelope));
+    }
     else post(state.port, { type: 'extension.status', status: 'extension queueing', detail: JSON.stringify(summarize(body)) });
     return envelope;
   }
 
   async function replayCriticalOutbox(state) {
+    const ws = state.ws;
     const runtime = await backgroundState.read(state.tabId);
+    if (!ws || state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+    pruneFlights(ws, runtime);
     for (const persisted of runtime.outbox) {
-      if (state.ws?.readyState !== WebSocket.OPEN) return;
-      const sequenceOutcome = await backgroundState.transition(state.tabId, {
-        type: 'transport.outbound.next', contentEpoch: state.contentEpoch || runtime.contentEpoch || '',
+      if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      await sendCriticalOnce(state, ws, persisted.messageId, async () => {
+        const sequenceOutcome = await backgroundState.transition(state.tabId, {
+          type: 'transport.outbound.next', contentEpoch: state.contentEpoch || runtime.contentEpoch || '',
+        });
+        if (!sequenceOutcome.accepted) throw new Error(`Unable to resequence critical extension message: ${sequenceOutcome.reason}`);
+        const current = sequenceOutcome.state;
+        const envelope = {
+          ...persisted,
+          sentAt: Date.now(),
+          source: {
+            ...persisted.source,
+            clientId: state.clientId,
+            backgroundEpoch,
+            contentEpoch: current.contentEpoch,
+            sequence: current.transport.outboundSequence,
+          },
+        };
+        const resequenced = await backgroundState.transition(state.tabId, {
+          type: 'outbox.resequenced', envelope, contentEpoch: current.contentEpoch,
+        });
+        if (!resequenced.accepted) {
+          if (resequenced.reason === 'outbox_message_missing') return;
+          throw new Error(`Unable to persist replay sequence: ${resequenced.reason}`);
+        }
+        return envelope;
       });
-      if (!sequenceOutcome.accepted) throw new Error(`Unable to resequence critical extension message: ${sequenceOutcome.reason}`);
-      const current = sequenceOutcome.state;
-      const envelope = {
-        ...persisted,
-        sentAt: Date.now(),
-        source: {
-          ...persisted.source,
-          clientId: state.clientId,
-          backgroundEpoch,
-          contentEpoch: current.contentEpoch,
-          sequence: current.transport.outboundSequence,
-        },
-      };
-      const resequenced = await backgroundState.transition(state.tabId, {
-        type: 'outbox.resequenced', envelope, contentEpoch: current.contentEpoch,
-      });
-      if (!resequenced.accepted) {
-        if (resequenced.reason === 'outbox_message_missing') continue;
-        throw new Error(`Unable to persist replay sequence: ${resequenced.reason}`);
-      }
-      state.ws.send(JSON.stringify(envelope));
     }
   }
 

@@ -55,3 +55,33 @@ flowchart LR
 私有日志、浏览器 profile、原任务 ID、网页 URL、token、项目数据库与请求回包只保留 `.local/validation/native-messaging-20261015` 及原案例目录，不进入 Git。关键证据包含 `bridge-regression.log`、`host-regression.log`、安装计划与回执、各次隔离探针摘要、原升级 intent 和数据保护核验。
 
 浏览器平台依据：[Chrome Native Messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)、[Chrome worker 生命周期](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle)、[Edge Native Messaging](https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/native-messaging)。平台支持不等于本项目已经稳定验收。
+
+## v2：普通浏览器重载后暴露的问题与修复
+
+用户已完成 v1 重载；实际服务曾收到 hello、observer 与页面状态，随后通道断开。现场后台报告过 `queue_full`，因此不是把用户操作认作未完成，也不能用隔离 Port 成功代替普通浏览器可用。
+
+本次按真实合同补齐：
+
+- v1 发送突发消息未等待宿主写入，宿主只有八条队列。v2 要求每次发送有 `writeId`，只有实际 WebSocket write 成功才回 `sent`。适配器每通道仅一条在途，其余进入有限 FIFO（最多 256 条、含在途最多 32 MiB）；确认丢失或断线不重发、不降级。`sent` 只是本机写确认，绝不是服务采用、图片生成完成或 Protocol5 ACK。
+- 原 outbox 在每次 ACK 后重复 flush 剩余项，可能放大积压。现按具体 socket 记录已发/正在发的 messageId；同连接不重复发送，只有原 Protocol5 ACK 才删除持久记录。新连接仍恢复剩余原回执，原 body、lease、unknown 不变。
+- 宿主旧分片 ID 含冒号，而适配器拒绝该字符。统一改为通道内 `chunk-<sequence>`，用真实 Rust stdout fixture 回放验证两端合同。
+- 后台启动独立调用 `ensureConnected()`，没有网页 channel 也建立 Native Port；ready 精确匹配 v2。HTTP 健康报告只证明本机传输，不冒充网页就绪，不创建工作页或发送任务。后续 watchdog 可重建断开的端口。
+
+当前宿主为 718848 bytes，SHA-256 `de234a0ed621f31a344c47b5b74d3225ecfdfaf7f638a85ca1e180cbe4f2bae8`；已按固定计划安装，再部署三份发生变化的 overlay 文件。桌面当前版与唯一备用 EXE 未更换。
+
+新增 Windows 实测：
+
+| 检查 | 实际结果 |
+| --- | --- |
+| Rust release | 21/21，含真实 64 条发送确认及大消息 stdout fixture |
+| 桥接全组 | v2 最终 275/275、零跳过；含旧 controller 所有权丢失安全回归，真实宿主分片 fixture 回放未跳过 |
+| 隔离 Edge 两轮跨组件 | 每轮真实浏览器→Native IPC→Rust→独立 loopback WebSocket，64 条 FIFO 精确回传；其中 450018 UTF-8 bytes Unicode 消息按原值和 SHA-256 核验 |
+| 无网页后台 Port | 第二轮仅保留生产启动路径建立的端口，撤掉 debugger、闲置 35 秒后，同一 worker 与同一宿主 PID 仍存在；没有用探针另开的 Port 冒充默认启动路径 |
+| 测试收尾 | 独立临时 HKCU 测试宿主注册已删除，两轮 Job Object 均证明进程树清空；生产宿主注册未替换为测试注册 |
+| 原数据 | 原七项目、十集源文、生产全表和第五集 SDK unknown 证据重新核验一致 |
+
+上述测试均没有账户登录、图片或视频提交。私有探针、页面信息和运行证据仍只在 `.local`。
+
+仍有真实边界：普通 Edge 的旧 `bootstrap_completed` 创建记录尚在，但清空 session 后缺少可验证的页面 owner receipt。持久 tabId、窗口编号、相同 root URL 和两次 inventory 不能排除编号复用的用户页面，因此没有自动认领、导航、重建或伪造 idle。新增独立回归确认这些情形保持 held 且零副作用。需先从真实重新连接的 ChatGPT 页面恢复受认证的源，再使用现有维护恢复合同；独立 background control source 尚未实现，不以原生端口已连接冒充该能力。
+
+普通 Edge 缓存代码加载、原基础图回收与后续父子图稳定性，仍须分别实际验收；本节不宣布网页出图已通过。

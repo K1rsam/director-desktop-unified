@@ -505,10 +505,26 @@ function reportMaintenanceRecoveryFailure(error) {
   console.error('[chatgpt-bridge] maintenance recovery failed', error);
 }
 let backgroundRecovery=null;
+async function ensureNativeBackgroundTransport() {
+  if (!chrome.runtime?.getManifest?.()?.permissions?.includes('nativeMessaging')) return null;
+  let recovery;
+  try {
+    nativeTransportFactory ||= createNativeTransportFactory();
+    await nativeTransportFactory.ensureConnected();
+    recovery={status:'native_transport_ready'};
+  } catch (error) {
+    recovery={status:'held',reason:transportFailureCode(error)};
+  }
+  // Native readiness proves local transport only, never page or task readiness.
+  await reportBackgroundHealth({backgroundEpoch,bundleId:globalThis.ChatGptBridgeBuildIdentity?.bundleId,
+    extensionVersion:backgroundManifestVersion,recovery,connectionCount:0});
+  return recovery;
+}
 function recoverBackgroundConnections() {
   if(backgroundRecovery)return backgroundRecovery;
   backgroundRecovery=(async()=>{
     await connectionWatchdog.arm();
+    await ensureNativeBackgroundTransport();
     const result=await recoverPendingExtensionReload();
     if(result?.reason==='missing')await maintenanceOperations.recover();
     // A service-worker restart does not emit runtime.onStartup. Always run

@@ -70,9 +70,10 @@
     {
       "path": "extension/background/outboxV5.js",
       "beforeSha256": "8011635d8c78686f955ca763292fca73bcf85622d5691c7f582ea5e949c06081",
-      "afterSha256": "f702f0788fedbaaeb0ef59ac9e6a136afb20d87645d35b25ec2ecc211c83c840",
+      "afterSha256": "f860facfbb2b7d202990d227436db89d47fe29619cd53562a8de54e2a4288cd4",
       "previousAfterSha256s": [
-        "9d80e7a0c18efd25d12a5fd5e6f36a77328d6b2d855c9ae353604d9585ab58bf"
+        "9d80e7a0c18efd25d12a5fd5e6f36a77328d6b2d855c9ae353604d9585ab58bf",
+        "f702f0788fedbaaeb0ef59ac9e6a136afb20d87645d35b25ec2ecc211c83c840"
       ]
     },
     {
@@ -152,7 +153,7 @@
     {
       "path": "extension/background.js",
       "beforeSha256": "72afeaba15b27cfa207257af80b70d5dfe1e1ca3ff2a037e38c193984654d179",
-      "afterSha256": "7846ff8e0d2b8143d2dccd55b6a77989683d31de52bcad0ac1b16bcc841dbaa2",
+      "afterSha256": "45bd25c22b704a38fc549842efe097858d130d12071fff63a659dcf0347c5e5e",
       "previousAfterSha256s": [
         "2a4f40797abb5adf7beb7f218f7fe3de40790d00f3014426925ec48ed00da956",
         "9e87eadd0e369ab4547a9dca69defcdb48ca3c9605fe91b71742318d5918e463",
@@ -164,7 +165,8 @@
         "692a7f203bf2e56602c1406f85a8552bd16e18d1563d1c8b40e15edaad1bbeca",
         "8e117c83a047a92c66b74e227f8472f660aceee032ca81d6a3b25b53c6bf902a",
         "d9d12eca5259e56258717dcdae21eb125c324442d0c47dcbab9278c749927092",
-        "0572ded8f38dc8fb066c2baea849b152b73e3e66f263997771b0c2e6f72bda53"
+        "0572ded8f38dc8fb066c2baea849b152b73e3e66f263997771b0c2e6f72bda53",
+        "7846ff8e0d2b8143d2dccd55b6a77989683d31de52bcad0ac1b16bcc841dbaa2"
       ]
     },
     {
@@ -189,12 +191,13 @@
     {
       "path": "extension/background/authPreflight.js",
       "beforeSha256": "fb858bca7936b180e71c65ccc6921e6e989e0d35fb1c17326b881ab5eaebb5b5",
-      "afterSha256": "fc270791843706bfa0a6e33679f1b30bafe9ca0259898279f3012e32ea95cbff",
+      "afterSha256": "c4fa9fe1154fc1b19cc4c76bbc6eaa1495af980d657a16e7497fa22b53af87b0",
       "previousAfterSha256s": [
         "631fe03090e526fef1ea695ca2f2ae3b867f4bbb40ee3e1e9f7c3a8ba1f49452",
         "57886f37d31cbc2fc42c2597c8243122eb073086d9577aa19d7cc36e74d10ca5",
         "c3c2648a991e356d34713055b9983c979550e5991ac01d36b413a5762f30d34a",
-        "125f1a50b2f4f0442b730852c34516f01c6e9b7dcfaec7a3ddaebfaa4d7cd512"
+        "125f1a50b2f4f0442b730852c34516f01c6e9b7dcfaec7a3ddaebfaa4d7cd512",
+        "fc270791843706bfa0a6e33679f1b30bafe9ca0259898279f3012e32ea95cbff"
       ]
     },
     {

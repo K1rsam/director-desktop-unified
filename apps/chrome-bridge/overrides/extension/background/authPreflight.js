@@ -168,7 +168,7 @@ export function createNativeTransportFactory({
   timers = globalThis,
   crypto = globalThis.crypto,
 } = {}) {
-  const VERSION = 'director-native-transport/v1';
+  const VERSION = 'director-native-transport/v2';
   const CHUNK = 192 * 1024, MAX = 32 * 1024 * 1024;
   const encoder = new TextEncoder();
   const channels = new Map();
@@ -180,6 +180,7 @@ export function createNativeTransportFactory({
     return id;
   };
   const cancel = id => { if (id != null) timers.clearTimeout(id); };
+  const fixedError = code => Object.assign(new Error(code), { code });
   const emit = (s, type, body = {}) => {
     const event = { type, target: s.socket, ...body };
     for (const fn of [...(s.listeners.get(type) || [])]) {
@@ -197,6 +198,10 @@ export function createNativeTransportFactory({
     cancel(s.rejectTimer);
     rejected.delete(s);
     cancel(s.deadline);
+    cancel(s.writeDeadline);
+    s.pending = [];
+    s.pendingBytes = 0;
+    s.inflight = null;
     cancel(s.chunk?.deadline);
     s.chunk = null;
     if (channels.get(s.id) === s) channels.delete(s.id);
@@ -207,7 +212,7 @@ export function createNativeTransportFactory({
       cancel(current.pongDeadline);
       current.heartbeat = current.pongDeadline = null;
       current.nonce = null;
-      if (!current.ready) breakPort(current, 'native_channel_closed');
+      if (!current.ready && !current.waiters.size) breakPort(current, 'native_channel_closed');
     }
   }
   function fail(s, reason) {
@@ -221,6 +226,8 @@ export function createNativeTransportFactory({
     cancel(owner.readyDeadline);
     cancel(owner.heartbeat);
     cancel(owner.pongDeadline);
+    for (const waiter of owner.waiters) waiter.reject(fixedError(reason));
+    owner.waiters.clear();
     if (current === owner) current = null;
     owner.port.onMessage.removeListener?.(owner.onMessage);
     owner.port.onDisconnect.removeListener?.(owner.onDisconnect);
@@ -237,6 +244,13 @@ export function createNativeTransportFactory({
       sendPort(owner, { type: 'ping', nonce: owner.nonce });
     }, 20000);
   }
+  function flushWrite(s) {
+    if (s.socket.readyState !== 1 || s.inflight || !s.pending.length) return;
+    const next = s.pending[0];
+    s.inflight = next.writeId;
+    s.writeDeadline = later(() => fail(s, 'native_send_ack_timeout'), timeoutMs);
+    sendPort(s.owner, { type: 'send', channelId: s.id, writeId: next.writeId, data: next.data });
+  }
   const fixedHostReason = value => new Set([
     'native_channel_closed', 'native_host_error', 'native_host_disconnected',
     'invalid_request', 'invalid_channel', 'channel_exists', 'channel_limit',
@@ -246,7 +260,7 @@ export function createNativeTransportFactory({
     'nonce_limit', 'channel_rejected', 'server_rejected', 'token_rejected',
     'channel_not_open', 'queue_full', 'message_limit', 'connect_failed', 'socket_failed',
     'origin_rejected', 'handshake_failed', 'channel_closing', 'local_close',
-    'remote_close', 'transport_failed', 'binary_rejected',
+    'remote_close', 'transport_failed', 'binary_rejected', 'invalid_write',
   ]).has(value) ? value : 'native_host_error';
   async function receiveData(s, message) {
     if (s.socket.readyState !== 1) { if (s.socket.readyState !== 3) fail(s, 'native_channel_not_open'); return; }
@@ -294,7 +308,7 @@ export function createNativeTransportFactory({
   }
   function getPort() {
     if (current) return current;
-    const owner = { port: browser.runtime.connectNative(hostName), closed: false, ready: false };
+    const owner = { port: browser.runtime.connectNative(hostName), closed: false, ready: false, waiters: new Set() };
     current = owner;
     owner.onDisconnect = () => {
       // Read lastError to acknowledge Chrome's error; never expose its raw message.
@@ -308,6 +322,8 @@ export function createNativeTransportFactory({
         if (owner.ready || message.version !== VERSION) return breakPort(owner, 'native_version_mismatch');
         owner.ready = true;
         cancel(owner.readyDeadline);
+        for (const waiter of owner.waiters) waiter.resolve({ version: VERSION });
+        owner.waiters.clear();
         schedulePing(owner);
         return;
       }
@@ -325,6 +341,15 @@ export function createNativeTransportFactory({
         if (s.socket.readyState !== 0) return fail(s, 'native_protocol_invalid');
         cancel(s.deadline); s.socket.readyState = 1; emit(s, 'open'); return;
       }
+      if (message.type === 'sent') {
+        if (s.socket.readyState === 1 && s.inflight && message.writeId === s.inflight && s.pending[0]?.writeId === message.writeId) {
+          cancel(s.writeDeadline); s.writeDeadline = null;
+          s.pendingBytes -= s.pending.shift().bytes;
+          s.inflight = null;
+          flushWrite(s);
+        }
+        return;
+      }
       if (message.type === 'close') {
         s.inbound = s.inbound.then(() => finish(s, fixedHostReason(message.reason), message.code === 1000 ? 1000 : 1006));
         return;
@@ -340,14 +365,18 @@ export function createNativeTransportFactory({
   }
   function connect({ serverUrl, token, channelId } = {}) {
     const id = channelId ?? `channel-${++serial}`;
-    const s = { id, owner: null, listeners: new Map(), inbound: Promise.resolve(), chunk: null };
+    const s = { id, owner: null, listeners: new Map(), inbound: Promise.resolve(), chunk: null, pending: [], pendingBytes: 0, inflight: null };
     s.socket = {
       readyState: 0,
       addEventListener(type, fn) { if (typeof fn === 'function') { if (!s.listeners.has(type)) s.listeners.set(type, new Set()); s.listeners.get(type).add(fn); } },
       send(data) {
         if (s.socket.readyState !== 1) throw new Error('native_channel_not_open');
-        if (typeof data !== 'string' || encoder.encode(data).length > MAX) { fail(s, 'native_message_invalid'); return; }
-        sendPort(s.owner, { type: 'send', channelId: s.id, data });
+        if (typeof data !== 'string') { fail(s, 'native_message_invalid'); return; }
+        const bytes = encoder.encode(data).length;
+        if (s.pending.length >= 256 || bytes > MAX - s.pendingBytes) { fail(s, 'native_send_queue_full'); return; }
+        s.pending.push({ writeId: `write-${++serial}`, data, bytes });
+        s.pendingBytes += bytes;
+        flushWrite(s);
       },
       close(code = 1000) {
         const safeCode = Number.isInteger(code) && ([1000, 1002, 1006].includes(code) || (code >= 3000 && code <= 4999)) ? code : 1000;
@@ -372,6 +401,14 @@ export function createNativeTransportFactory({
   }
   return {
     connect,
+    ensureConnected() {
+      if (stopped) return Promise.reject(fixedError('native_factory_shutdown'));
+      let owner;
+      try { owner = getPort(); }
+      catch { return Promise.reject(fixedError('native_host_unavailable')); }
+      if (owner.ready) return Promise.resolve({ version: VERSION });
+      return new Promise((resolve, reject) => owner.waiters.add({ resolve, reject }));
+    },
     shutdown() {
       stopped = true;
       if (current) breakPort(current, 'native_factory_shutdown');

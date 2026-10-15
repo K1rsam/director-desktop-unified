@@ -18,14 +18,15 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 use url::Url;
 
-pub const VERSION: &str = "director-native-transport/v1";
+pub const VERSION: &str = "director-native-transport/v2";
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 pub const CHUNK_BYTES: usize = 192 * 1024;
 pub const MAX_CHANNELS: usize = 8;
 const NATIVE_OUTPUT_LIMIT: usize = 1024 * 1024;
 const OUTPUT_QUEUE: usize = 32;
 const CHANNEL_QUEUE: usize = 8;
-const IO_TIMEOUT: Duration = Duration::from_millis(50);
+const IO_TIMEOUT: Duration = Duration::from_millis(20);
+const SEND_BATCH: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,6 +138,8 @@ enum Input {
     Send {
         #[serde(rename = "channelId")]
         channel_id: String,
+        #[serde(rename = "writeId")]
+        write_id: String,
         data: String,
     },
     Close {
@@ -239,7 +242,7 @@ struct Channel {
     thread: JoinHandle<()>,
 }
 enum Command {
-    Send(String),
+    Send { write_id: String, data: String },
 }
 
 /// Run after config/origin authentication. The writer thread is intentionally
@@ -351,9 +354,17 @@ pub fn run<R: Read, W: Write + Send + 'static>(
                     },
                 );
             }
-            Input::Send { channel_id, data } => {
+            Input::Send {
+                channel_id,
+                write_id,
+                data,
+            } => {
                 if !valid_channel(&channel_id) {
                     output.error(None, "channel_rejected");
+                    continue;
+                }
+                if !valid_write(&write_id) {
+                    output.error(Some(&channel_id), "invalid_write");
                     continue;
                 }
                 let Some(channel) = channels.get(&channel_id) else {
@@ -379,7 +390,7 @@ pub fn run<R: Read, W: Write + Send + 'static>(
                     output.error(Some(&channel_id), "queue_full");
                     continue;
                 }
-                if let Err(error) = channel.sender.try_send(Command::Send(data)) {
+                if let Err(error) = channel.sender.try_send(Command::Send { write_id, data }) {
                     channel.pending.fetch_sub(bytes, Ordering::AcqRel);
                     output.error(
                         Some(&channel_id),
@@ -431,11 +442,19 @@ fn valid_channel(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c))
 }
 
+fn valid_write(value: &str) -> bool {
+    value.len() <= 64
+        && value
+            .strip_prefix("write-")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()))
+}
+
 fn connect(url: &Url, origin: &str) -> Result<WebSocket<TcpStream>, &'static str> {
     let port = url.port().ok_or("server_rejected")?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let stream =
         TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(|_| "connect_failed")?;
+    stream.set_nodelay(true).map_err(|_| "socket_failed")?;
     stream
         .set_read_timeout(Some(CONNECT_TIMEOUT))
         .map_err(|_| "socket_failed")?;
@@ -499,22 +518,33 @@ fn channel_worker(
             output.close(channel_id, 1000, "local_close");
             return;
         }
-        // One write per iteration keeps inbound frames responsive while
-        // retaining FIFO for every channel. Failed writes are never retried.
-        match input.try_recv() {
-            Ok(Command::Send(data)) => {
-                pending.fetch_sub(data.len(), Ordering::AcqRel);
-                if socket.send(Message::Text(data.into())).is_err() {
-                    output.close(channel_id, 1006, "send_failed");
+        // Drain only a finite batch, preserving inbound fairness and FIFO.
+        // `sent` acknowledges this local socket write, never remote Protocol5
+        // acceptance or generation. Failed writes have no ACK and no retry.
+        for _ in 0..SEND_BATCH {
+            if cancel.load(Ordering::Acquire) || output.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            match input.try_recv() {
+                Ok(Command::Send { write_id, data }) => {
+                    pending.fetch_sub(data.len(), Ordering::AcqRel);
+                    if socket.send(Message::Text(data.into())).is_err() {
+                        output.close(channel_id, 1006, "send_failed");
+                        return;
+                    }
+                    if !output
+                        .emit(json!({"type":"sent","channelId":channel_id,"writeId":write_id}))
+                    {
+                        return;
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let _ = socket.close(None);
+                    output.close(channel_id, 1000, "local_close");
                     return;
                 }
+                Err(TryRecvError::Empty) => break,
             }
-            Err(TryRecvError::Disconnected) => {
-                let _ = socket.close(None);
-                output.close(channel_id, 1000, "local_close");
-                return;
-            }
-            Err(TryRecvError::Empty) => {}
         }
         match socket.read() {
             Ok(Message::Text(text)) => {
@@ -572,7 +602,7 @@ fn emit_text(output: &Output, channel: &str, text: &str, sequence: u64) -> bool 
     let bytes = text.as_bytes();
     let sha256 = format!("{:x}", Sha256::digest(bytes));
     let count = bytes.len().div_ceil(CHUNK_BYTES);
-    let transfer_id = format!("{channel}:{sequence}");
+    let transfer_id = format!("chunk-{sequence}");
     for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
         if !output.emit(
             json!({"type":"chunk","channelId":channel,"transferId":transfer_id,

@@ -10,14 +10,23 @@ function fixture(t){
  fs.writeFileSync(prefs,JSON.stringify({extensions:{settings:{['a'.repeat(32)]:{path:extension},['b'.repeat(32)]:{path:path.join(root,'other-extension')}}},privateFixture:'未改变的中文配置'}));
  const binary=path.join(root,'fixture.exe');fs.writeFileSync(binary,'synthetic-not-executable');
  const install=path.join(root,'host install');
- const run=(extra=[])=>spawnSync('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',script,'-PlanOnly','-HostBinary',binary,'-ComponentDirectory',component,'-InstallRoot',install,'-EdgeUserDataRoot',edge,'-ChromeUserDataRoot',chrome,...extra],{encoding:'utf8',timeout:15000,windowsHide:true});
+ const run=(extra=[],installRoot=install)=>spawnSync('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',script,'-PlanOnly','-HostBinary',binary,'-ComponentDirectory',component,'-InstallRoot',installRoot,'-EdgeUserDataRoot',edge,'-ChromeUserDataRoot',chrome,...extra],{encoding:'utf8',timeout:15000,windowsHide:true});
  return {root,prefs,component,extension,install,run};
 }
 test('native install plan binds only the registered exact extension and leaves browser files untouched',{skip:process.platform!=='win32'},t=>{
- const f=fixture(t),before=fs.readFileSync(f.prefs),r=f.run();assert.equal(r.status,0,r.stderr);
+ const f=fixture(t),before=fs.readFileSync(f.prefs);let r=f.run(),registeredManifest,beforeManifest;
+ if(r.status!==0&&r.stderr.includes('NATIVE_INSTALL_FOREIGN_REGISTRATION')){
+  // A real pre-existing registration must stay protected. The second call is
+  // still PlanOnly and never creates or updates the registered destination.
+  const read=spawnSync('powershell.exe',['-NoProfile','-Command',"(Get-Item -LiteralPath 'HKCU:\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\app.director.browser_bridge').GetValue('')"],{encoding:'utf8',windowsHide:true,timeout:10000});
+  assert.equal(read.status,0);registeredManifest=read.stdout.trim();assert.ok(path.isAbsolute(registeredManifest));
+  beforeManifest=fs.readFileSync(registeredManifest);r=f.run([],path.dirname(registeredManifest));
+ }
+ assert.equal(r.status,0,r.stderr);
  const p=JSON.parse(r.stdout);assert.deepEqual(p.manifest.allowed_origins,['chrome-extension://'+'a'.repeat(32)+'/']);
  assert.equal(p.config.serverUrl,'http://127.0.0.1:53179');assert.equal(p.registrations.length,1);assert.equal(p.registrations[0].browser,'Edge');assert.equal(p.policiesModified,false);
  assert.deepEqual(fs.readFileSync(f.prefs),before);assert.equal(fs.existsSync(f.install),false);assert.ok(!JSON.stringify(p).includes('privateFixture'));
+ if(registeredManifest)assert.deepEqual(fs.readFileSync(registeredManifest),beforeManifest);
 });
 test('malformed browser JSON reports a fixed code without echoing profile data',{skip:process.platform!=='win32'},t=>{
  const f=fixture(t);fs.writeFileSync(f.prefs,'{"privateMarker":"synthetic-private-value",broken');const r=f.run();assert.notEqual(r.status,0);assert.match(r.stderr,/NATIVE_INSTALL_PREFERENCES_INVALID/);assert.ok(!r.stderr.includes('synthetic-private-value'));assert.equal(fs.existsSync(f.install),false);
