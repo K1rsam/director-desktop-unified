@@ -3,7 +3,7 @@ const ID='12345678-1234-4234-8234-123456789abc',PROFILE='b84d4521-56ba-4f84-9948
 const runtime={profileId:PROFILE,bundleId:'a'.repeat(32),backgroundEpoch:'background-original',serverInstanceId:'server-original',sourceClientId:'extension:tab:1',sourceTabId:1,extensionVersion:'2.4.5',contentEpoch:'content-original'};
 const sourceRecord={launchToken:'bridge-director-desktop-22345678-1234-4234-8234-123456789abc',requestedUrl:'https://chatgpt.com/',createdAt:1,serverUrl:BASE};
 function fixture(options={}){
-  let reads=0,windowReads=0;const writes=[],records={[PREFIX+'1']:sourceRecord,...options.records},tabs=[{id:1,url:'https://chatgpt.com/',incognito:false,active:false,...options.sourceTab},...(options.tabs||[])];
+  let reads=0,windowReads=0;const writes=[],records={...(options.connectionOnly?{}:{[PREFIX+'1']:sourceRecord}),...options.records},tabs=[{id:1,url:'https://chatgpt.com/',incognito:false,active:false,...options.sourceTab},...(options.tabs||[])];
   const port={sender:{tab:{id:1,incognito:false}}},connections=new Map([[port,{serverUrl:BASE,tabId:1,protocolReady:true,ws:{readyState:1}}]]);
   const context=vm.createContext({URL,URLSearchParams,TextEncoder,Uint8Array,crypto:webcrypto,Date,Math,setTimeout,console,
     chrome:{runtime:{},storage:{session:{get:async()=>{if(options.storageError)throw Error('unavailable');return {...records};},set:()=>assert.fail('readonly')},local:{set:()=>assert.fail('readonly')}},
@@ -23,6 +23,28 @@ function executionFacts(binding,change={}){return {sourceTabId:1,lease:null,ownC
   otherUnresolvedCommands:[],ownAcceptedMessageIds:[],otherPendingOutbox:[],queue:{version:'tab-operation-snapshot/v1',tabId:1,
     running:{sequence:1,label:'content:bridge.tab.open',meta:{type:'bridge.tab.open',requestId:binding.rpcRequestId}},queued:[]},...change};}
 const targetRecord={launchToken:TOKEN,requestedUrl:'https://chatgpt.com/',createdAt:2,serverUrl:BASE};
+
+test('explicit connection-only inventory reads an unowned root without acquiring or changing its ownership',async()=>{
+  const f=fixture({connectionOnly:true,lookupOptions:{sourceRole:'connection'}}),receipt=await f.lookup();
+  assert.equal(receipt.status,'confirmed_absent');assert.equal(receipt.inventory.sourceRole,'connection');
+  assert.equal(receipt.inventory.launchRecords.length,0);assert.equal(f.reads(),2);
+  const server=serverFixture(receipt,{launchToken:'',pageReady:true,composerReady:true,chatMainReady:true});
+  assert.equal((await server.ownedLaunchInventory(ID,{...runtime,sourceRole:'connection'})).status,'confirmed_absent');
+  assert.equal(server.calls[0][1].sourceRole,'connection');
+});
+
+test('connection role must be explicit and cannot reinterpret an owned page or a transport-only source',async()=>{
+  assert.equal((await fixture({connectionOnly:true}).lookup()).status,'unknown');
+  assert.equal((await fixture({lookupOptions:{sourceRole:'connection'}}).lookup()).status,'unknown');
+  const receipt=await fixture({connectionOnly:true,lookupOptions:{sourceRole:'connection'}}).lookup();
+  for(const change of [{pageReady:false},{composerReady:false},{chatMainReady:false},{transportHealth:{backgroundOnly:true}},{launchToken:sourceRecord.launchToken}]){
+    const server=serverFixture(receipt,{launchToken:'',pageReady:true,composerReady:true,chatMainReady:true,...change});
+    assert.equal((await server.ownedLaunchInventory(ID,{...runtime,sourceRole:'connection'})).status,'unknown');assert.equal(server.calls.length,0);
+  }
+  const server=serverFixture(receipt,{launchToken:'',pageReady:true,composerReady:true,chatMainReady:true});
+  delete receipt.inventory.sourceRole;receipt.inventoryCanonicalJson=JSON.stringify(receipt.inventory);receipt.inventorySha256=createHash('sha256').update(receipt.inventoryCanonicalJson).digest('hex');
+  assert.equal((await server.ownedLaunchInventory(ID,{...runtime,sourceRole:'connection'})).reason,'inventory_receipt_source_role_mismatch');
+});
 
 test('lookup contract reports exact missing capability or identity without weakening guards or enumerating',async()=>{
   for(const [options,reason] of [[{lookupOptions:{lookupRequestId:''}},'invalid_lookup_request_identity'],
@@ -74,11 +96,29 @@ test('inventory identify mode only calls the readonly lookup branch and keeps tr
 function serverFixture(result,override={}){
   const text=fs.readFileSync(path.join(__dirname,'../overrides/src/browserBridge.js'),'utf8'),start=text.indexOf('  async ownedLaunchInventory('),end=text.indexOf('  async requestForcedSnapshot(',start),method=text.slice(start,end);
   const context=vm.createContext({createHash,Date,BRIDGE_VERSION:'6.4.0'});
-  vm.runInContext(`class InventoryBridge { #serverInstanceId='server-original'; constructor(health,result){this.current=health;this.result=result;this.calls=[];} health(){return this.current;} async #sendCommand(...args){this.calls.push(args);const result=await this.result;return {commandId:result.inventoryCommandId,...result};} ${method} };this.InventoryBridge=InventoryBridge`,context);
+  vm.runInContext(`class InventoryBridge { #serverInstanceId='server-original'; constructor(health,result){this.current=health;this.result=result;this.calls=[];} health(){return this.current;} async #sendCommand(...args){this.calls.push(args);const result=await (typeof this.result==='function'?this.result(...args):this.result);return {commandId:result.inventoryCommandId,...result};} ${method} };this.InventoryBridge=InventoryBridge`,context);
   const source={id:runtime.sourceClientId,browserTabId:1,ready:true,compatible:true,browserIncognito:false,activeRequest:null,quarantined:false,focused:false,visibilityState:'hidden',
     url:'https://chatgpt.com/',launchToken:sourceRecord.launchToken,browserProfileId:PROFILE,extensionBundleId:runtime.bundleId,backgroundEpoch:runtime.backgroundEpoch,contentEpoch:runtime.contentEpoch,serverInstanceId:runtime.serverInstanceId,...override};
   return new context.InventoryBridge({clients:[source],pendingRequests:0,pendingCommands:0},result);
 }
+test('dedicated source role survives the server to content to native inventory round trip',async()=>{
+  const f=fixture({connectionOnly:true}),messages=[];
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/content/sessionCommands.js'),'utf8'),f.context);
+  const api=f.context.ChatGptSessionCommands.createSessionCommands({send:x=>messages.push(x),extensionRequest:async(type,payload)=>{
+    assert.equal(type,'bridge.tab.open');assert.equal(payload.sourceRole,'connection');
+    return f.controller.openBridgeTab(f.port,{...payload,requestId:'ext-dedicated-roundtrip'});
+  }});
+  const bridge=serverFixture(async(type,payload)=>{
+    assert.equal(type,'browser.tab.identify');
+    await api.handleBrowserTabIdentify({...payload,commandId:'roundtrip-inventory-command'});
+    assert.equal(messages.length,1);assert.equal(messages[0].type,'browser.tab.identified');
+    return messages[0];
+  },{launchToken:'',pageReady:true,composerReady:true,chatMainReady:true});
+  const out=await bridge.ownedLaunchInventory(ID,{...runtime,sourceRole:'connection'});
+  assert.equal(out.status,'confirmed_absent');assert.equal(out.inventory.sourceRole,'connection');
+  assert.equal(out.inventory.sourceExecutionProof.inventoryCommandId,'roundtrip-inventory-command');
+  assert.equal(f.reads(),2);assert.equal(bridge.calls.length,1);
+});
 test('server verifies exact runtime, complete hashed receipt and declared package before forwarding absence',async()=>{
   const receipt=await fixture().lookup(),bridge=serverFixture(receipt);
   const result=await bridge.ownedLaunchInventory(ID,runtime);

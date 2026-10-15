@@ -68,6 +68,9 @@ fn controller_root_url(value: &str) -> bool {
 pub(crate) fn profile_execution_client<'a>(clients: &'a [Value], binding: &BrowserBinding) -> Result<&'a Value> {
     if profile_collision(clients,&binding.profile_id) {return Err("Chrome 浏览器身份出现多个运行实例，已停止新提交；请核对复制的浏览器配置。".into());}
     let filtered: Vec<Value>=profile_clients(clients).into_iter().filter(|c|c["browserProfileId"]==binding.profile_id && c["extensionBundleId"]==binding.bundle_id).cloned().collect();
+    let connections:Vec<_>=clients.iter().filter(|c|connection_page(c,binding)).collect();
+    if connections.len()==1 {return Ok(connections[0]);}
+    if connections.len()>1 {return Err("专用浏览器中有多个连接首页，请只保留一个连接首页；已有工作会话不受影响。".into());}
     let controller=format!("bridge-director-control-{}",binding.profile_id);
     let controls:Vec<_>=filtered.iter().filter(|c|c["launchToken"]==controller).collect();
     if !controls.is_empty() {
@@ -82,6 +85,20 @@ pub(crate) fn profile_execution_client<'a>(clients: &'a [Value], binding: &Brows
     }
     let chosen=execution_client(&filtered).ok_or("已绑定的 Chrome 浏览器未连接或正在忙碌，请重新连接原浏览器；未改用其他浏览器。")?;
     clients.iter().find(|c|c["id"]==chosen["id"]).ok_or("Chrome 执行页面身份未确认。".into())
+}
+// A user-opened connection page is transport only: never navigate it, read its
+// conversation, send a production prompt, or claim program ownership of it.
+pub(crate) fn connection_page(c:&Value,b:&BrowserBinding)->bool {
+    c["ready"]==true && c["compatible"]!=false && c["quarantined"]!=true
+        && c["transport"]=="extension" && c["browserIncognito"]==false
+        && c["browserProfileId"]==b.profile_id && c["extensionBundleId"]==b.bundle_id
+        && c["launchToken"].as_str()==Some("") && c["url"]=="https://chatgpt.com/"
+        && c["pageReady"]==true && c["composerReady"]==true && c["chatMainReady"]==true
+        && c["transportHealth"]["backgroundOnly"]!=true && c.get("activeRequest")==Some(&Value::Null)
+        && c["focused"]==false && c["visibilityState"]=="hidden" && !client_command_busy(c)
+        && c["backgroundEpoch"].as_str().is_some_and(|v|!v.is_empty())
+        && c["contentEpoch"].as_str().is_some_and(|v|!v.is_empty())
+        && c["serverInstanceId"].as_str().is_some_and(|v|!v.is_empty())
 }
 fn profiles(clients: &[Value]) -> Vec<Value> {
     let mut groups=std::collections::BTreeMap::new();

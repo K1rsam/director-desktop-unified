@@ -400,10 +400,13 @@ export class BrowserBridge {
     const held=reason=>({version:'director-owned-launch-inventory/v1',status:'unknown',reason,requestId,complete:false});
     if(!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(requestId||''))return held('invalid_request_identity');
     const before=this.health(),source=before.clients.find(client=>client.id===expected.sourceClientId);
+    const connectionOnly=expected.sourceRole==='connection';
     const matches=client=>client && client.ready===true && client.compatible!==false && client.browserIncognito===false
       && client.activeRequest===null && !client.quarantined && client.focused===false && client.visibilityState==='hidden'
-      && client.url==='https://chatgpt.com/' && (client.launchToken===`bridge-director-control-${expected.profileId}`
+      && client.url==='https://chatgpt.com/' && (connectionOnly ? client.launchToken==='' && client.pageReady===true
+        && client.composerReady===true && client.chatMainReady===true && client.transportHealth?.backgroundOnly!==true : (client.launchToken===`bridge-director-control-${expected.profileId}`
         || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(client.launchToken||''))
+      )
       && client.browserProfileId===expected.profileId && client.extensionBundleId===expected.bundleId
       && client.backgroundEpoch===expected.backgroundEpoch && client.serverInstanceId===expected.serverInstanceId
       && typeof client.contentEpoch==='string' && client.contentEpoch.length>0 && client.contentEpoch===source?.contentEpoch
@@ -413,7 +416,7 @@ export class BrowserBridge {
     const runtime={...expected,sourceTabId:source.browserTabId,contentEpoch:source.contentEpoch};
     let result;
     try{result=await this.#sendCommand('browser.tab.identify',{mode:'owned_launch_inventory_v1',lookupRequestId:requestId,
-      launchToken:`bridge-director-desktop-${requestId}`,expectedRuntime:runtime},{sourceClientId:source.id,timeoutMs:15000});}
+      launchToken:`bridge-director-desktop-${requestId}`,expectedRuntime:runtime,...(connectionOnly?{sourceRole:'connection'}:{})},{sourceClientId:source.id,timeoutMs:15000});}
     catch{return held('inventory_command_unavailable');}
     if(result?.status==='unknown')return held(result.reason||'inventory_unknown');
     const after=this.health();
@@ -432,6 +435,7 @@ export class BrowserBridge {
     if(!Number.isSafeInteger(result.observedAt))return held('inventory_receipt_observed_at_invalid');
     if(Math.abs(Date.now()-result.observedAt)>30000)return held('inventory_receipt_stale');
     if(!result.inventory)return held('inventory_receipt_inventory_missing');
+    if(connectionOnly ? result.inventory.sourceRole!=='connection' : Object.hasOwn(result.inventory,'sourceRole'))return held('inventory_receipt_source_role_mismatch');
     if(JSON.stringify(decodedInventory)!==JSON.stringify(result.inventory))return held('inventory_receipt_canonical_value_mismatch');
     if(createHash('sha256').update(result.inventoryCanonicalJson).digest('hex')!==result.inventorySha256)return held('inventory_receipt_sha256_mismatch');
     const sourceTabs=Array.isArray(result.inventory.tabs)?result.inventory.tabs.filter(tab=>tab.id===runtime.sourceTabId):[];

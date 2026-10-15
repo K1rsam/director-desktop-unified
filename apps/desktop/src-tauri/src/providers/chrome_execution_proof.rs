@@ -57,6 +57,8 @@ pub(super) fn prove_idle(config:&ProviderConfig,client:&Client,source:&Value,bin
     let mut url=reqwest::Url::parse(&format!("http://localhost/browser/owned-launch/{}",request.request_id)).map_err(|_|held())?;
     url.query_pairs_mut().append_pair("sourceClientId",s(source,"id")).append_pair("profileId",&binding.profile_id).append_pair("bundleId",&binding.bundle_id)
         .append_pair("backgroundEpoch",s(source,"backgroundEpoch")).append_pair("serverInstanceId",s(source,"serverInstanceId"));
+    let connection_only=crate::chrome_setup::connection_page(source,binding);
+    if connection_only {url.query_pairs_mut().append_pair("sourceRole","connection");}
     let native=json_request(config,client,&format!("{}?{}",url.path(),url.query().unwrap_or("")),None,false)?;
     let raw=s(&native,"inventoryCanonicalJson");let decoded:Value=serde_json::from_str(raw).map_err(|_|held())?;
     let runtime=&native["runtime"];let inv=&native["inventory"];
@@ -71,9 +73,10 @@ pub(super) fn prove_idle(config:&ProviderConfig,client:&Client,source:&Value,bin
         || !source["browserTabId"].as_u64().is_some_and(|id|id>0) || runtime["profileId"]!=binding.profile_id || runtime["bundleId"]!=binding.bundle_id
         || runtime["backgroundEpoch"]!=source["backgroundEpoch"] || runtime["serverInstanceId"]!=source["serverInstanceId"] || runtime["contentEpoch"]!=source["contentEpoch"] || s(runtime,"contentEpoch").is_empty()
         || decoded!=*inv || native["inventorySha256"]!=hex_hash(raw.as_bytes()) || inv["sourceTabId"]!=source["browserTabId"]
+        || (if connection_only {inv["sourceRole"]!="connection"}else{inv.get("sourceRole").is_some()})
         || tabs.len()!=1 || tabs[0]["incognito"]!=false || tabs[0]["discarded"]!=false || !inventory_source_background_proven(inv,runtime,source,tabs[0]) || !execution_valid(&native,source) {return Err(held());}
     let after=clients(config,client)?;let matches:Vec<_>=after.iter().filter(|c|c["id"]==source["id"]).collect();
-    if matches.len()!=1 || after.iter().filter(|c|c["launchToken"]==source["launchToken"]).count()!=1
+    if matches.len()!=1 || !connection_only && after.iter().filter(|c|c["launchToken"]==source["launchToken"]).count()!=1
         || !same_idle_owned_source(matches[0],source,binding) || matches[0]["browserTabId"]!=source["browserTabId"] || matches[0]["contentEpoch"]!=source["contentEpoch"] || !compatible_profile_clients(&after,source,binding)
         || after.iter().filter(|c|c["browserProfileId"]==binding.profile_id).any(|c|!explicit_idle(c)) {return Err(held());}
     Ok(native)

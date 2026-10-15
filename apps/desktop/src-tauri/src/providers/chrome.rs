@@ -98,6 +98,8 @@ fn compatible_profile_clients(available:&[Value],source:&Value,binding:&crate::c
         .all(|c|same_browser_runtime(c,source,binding))
 }
 fn keep_profile_control(config:&ProviderConfig,client:&Client,source:&Value,available:&[Value],binding:&crate::chrome_setup::BrowserBinding)->ProviderResult<bool> {
+    if available.iter().any(|c|c["id"]!=source["id"] && same_browser_runtime(c,source,binding)
+        && crate::chrome_setup::connection_page(c,binding)) {return Ok(true);}
     let launch=control_launch(binding);
     let controls:Vec<_>=available.iter().filter(|c|c["launchToken"]==launch).collect();
     if controls.len()>1 || controls.iter().any(|c|!same_browser_runtime(c,source,binding) || !explicit_idle(c)) {return Ok(false);}
@@ -334,8 +336,8 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
         .map_err(|message|ProviderError::new("BROWSER_BINDING_REQUIRED",message))?;
     let mut opener=crate::chrome_setup::profile_execution_client(&available,binding)
         .map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?.clone();
-    let live_execution_required=opener["transportHealth"]["kind"]=="connect_snapshot";
-    if live_execution_required && !execution_proof::owned_root(&opener,binding) {
+    let live_execution_required=opener["transportHealth"]["kind"]=="connect_snapshot" || crate::chrome_setup::connection_page(&opener,binding);
+    if live_execution_required && !execution_proof::owned_root(&opener,binding) && !crate::chrome_setup::connection_page(&opener,binding) {
         available=execution_proof::bootstrap_control(config,&client,&opener,binding)?;
         opener=crate::chrome_setup::profile_execution_client(&available,binding).map_err(|message|ProviderError::new("BROWSER_SELECTION_REQUIRED",message))?.clone();
     }

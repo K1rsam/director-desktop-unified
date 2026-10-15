@@ -62,6 +62,14 @@ fn chrome_connect_snapshot_requires_independent_live_proof_before_intent_or_open
     let error=prepare_observed(&cfg,&r,&|_|panic!("missing live queue proof cannot persist intent")).unwrap_err();assert_eq!(error.code,"BRIDGE_BUSY");f.thread.join().unwrap();
     assert_eq!(f.requests.lock().unwrap().len(),4);assert!(f.requests.lock().unwrap().iter().all(|(route,_)|route.starts_with("GET ")));std::env::remove_var(env);
 }
+#[test]fn chrome_dedicated_home_always_requires_native_connection_role_proof_even_without_transport_snapshot(){
+    let (r,mut source,_,replies)=native_first_open_fixture();source["launchToken"]=json!("");source["transportHealth"]=Value::Null;
+    for field in ["pageReady","composerReady","chatMainReady"]{source[field]=json!(true);}
+    let f=fixture(vec![replies[0].clone(),json!({"ok":true,"clients":[source]}),json!({"ok":true,"clients":[source]}),replies[5].clone()]);
+    let env=credential();let mut cfg=config(&f.endpoint,&env);cfg.chrome_binding.as_mut().unwrap().bundle_id="a".repeat(32);
+    let error=prepare_observed(&cfg,&r,&|_|panic!("unproved connection cannot persist open intent")).unwrap_err();assert_eq!(error.code,"BRIDGE_BUSY");f.thread.join().unwrap();
+    let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),4);assert!(calls.iter().all(|(route,_)|route.starts_with("GET ")));assert!(calls[3].0.contains("sourceRole=connection"));std::env::remove_var(env);
+}
 #[test]
 fn chrome_bound_disconnected_browser_is_queue_wait_before_any_prepare_or_execution(){
     let f=fixture(vec![json!({"ok":false,"needsSelection":false,"pendingRequests":0,"pendingCommands":0}),json!({"ok":true,"clients":[]})]);

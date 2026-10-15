@@ -834,6 +834,7 @@ export function createRouter(bridge, fileStore, eventBus = null, turnManager = n
     try {
       if(!bridge.isLocalRequest(req))throw new HttpError(403,'Owned inventory is only available from localhost');
       const expected=Object.fromEntries(['sourceClientId','profileId','bundleId','backgroundEpoch','serverInstanceId'].map(key=>[key,String(req.query?.[key]||'')]));
+      if(req.query?.sourceRole==='connection')expected.sourceRole='connection';
       res.json({ok:true,...await bridge.ownedLaunchInventory(String(req.params.requestId||''),expected)});
     }catch(err){next(err);}
   });

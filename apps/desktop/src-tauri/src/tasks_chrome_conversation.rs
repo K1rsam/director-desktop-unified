@@ -48,6 +48,19 @@ pub(super) fn saved(store:&Store,job:&str)->Result<Value>{
   let reopened=Store::open(store.root.clone()).unwrap();let state=saved(&reopened,"job").unwrap();
   assert_eq!(state["recovery"],recovery);assert_eq!(state["locator"],loc);assert_eq!(state["recoveryNavigation"],nav);
  }
+ #[test]fn chrome_readonly_reader_replacement_is_bounded_preserves_old_receipts_and_never_changes_original_generation(){
+  let(_tmp,store,p,cfg,loc)=fixture();let frozen=json!(p);let observe=observer(&store,"job",&p,&cfg);
+  observe(&json!({"type":"locator","locator":loc})).unwrap();
+  let old=json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":"bridge-director-desktop-33333333-3333-4333-8333-333333333333","url":loc["url"],"submitCalled":false});observe(&old).unwrap();
+  let b=cfg.chrome_binding.as_ref().unwrap();let connection=json!({"id":"connection","ready":true,"compatible":true,"transport":"extension","browserIncognito":false,
+   "browserProfileId":b.profile_id,"extensionBundleId":b.bundle_id,"backgroundEpoch":"background","contentEpoch":"content","serverInstanceId":"server","launchToken":"","url":"https://chatgpt.com/","pageReady":true,"composerReady":true,"chatMainReady":true,"focused":false,"visibilityState":"hidden","activeRequest":null});
+  let event=json!({"type":"recovery_reader_replacement_intent","requestId":p.request.request_id,"launchToken":"bridge-director-desktop-44444444-4444-4444-8444-444444444444","previousLaunchToken":old["launchToken"],"previousRecoverySha256":crate::pipeline::digest(&old.to_string()),"url":loc["url"],"readOnly":true,"submitCalled":false,"connectionSource":connection,"nativeOriginalProof":{"requestId":p.request.request_id,"sourceClientId":"connection","inventory":{"sourceRole":"connection"}}});
+  for pointer in ["/requestId","/previousLaunchToken","/previousRecoverySha256","/url","/readOnly","/submitCalled","/connectionSource/pageReady","/nativeOriginalProof/sourceClientId","/nativeOriginalProof/inventory/sourceRole"]{
+   let mut bad=event.clone();*bad.pointer_mut(pointer).unwrap()=json!("foreign");assert!(observe(&bad).is_err(),"{pointer}");assert_eq!(saved(&store,"job").unwrap()["recovery"],old);
+  }
+  observe(&event).unwrap();let state=saved(&store,"job").unwrap();assert_eq!(state["locator"],loc);assert_eq!(state["retiredReadOnlyRecoveries"][0]["recovery"],old);assert_eq!(state["recovery"],event);assert!(state["recoveryNavigation"].is_null());assert_eq!(json!(p),frozen);
+  assert!(observe(&event).is_err());let reopened=Store::open(store.root.clone()).unwrap();assert_eq!(saved(&reopened,"job").unwrap(),state);
+ }
  #[test]fn chrome_conversation_metadata_unsent_upload_proof_is_durable_immutable_and_bound_to_original_prepared(){
   let(_tmp,store,_,cfg,_)=fixture();let base=crate::chrome_terminal::tests::upload_fixture();let mut value=base["prepared"].clone();value["wire"]["browserBinding"]=json!(cfg.chrome_binding.as_ref());
   value["capabilityVersion"]=json!("fixture");value["uploadReceipts"]=json!([]);value["preparedAt"]=json!("original");for(key,val)in [("prompt",json!("synthetic image")),("ratio",json!("16:9")),("resolution",json!("native")),("references",json!([])),("options",json!({}))]{value["request"][key]=val;}
@@ -72,6 +85,20 @@ pub(super) fn observer<'a>(store:&'a Store,job:&'a str,p:&'a PreparedRequest,cfg
    let mut same=state["locator"].clone();if same["userMessageId"].is_null()&&!same.is_null(){same["userMessageId"]=loc["userMessageId"].clone();}
    if !providers::chrome_locator_valid(cfg,p,loc)||!state["locator"].is_null()&&same!=*loc{return Err(fail());}
    if state["locator"]==*loc{return Ok(());}state["locator"]=loc.clone();
+  }else if event["type"]=="recovery_reader_replacement_intent"{
+   let binding=cfg.chrome_binding.as_ref().ok_or_else(fail)?;
+   let old=s(&state["recovery"],"launchToken");let new=s(event,"launchToken");
+   if !providers::chrome_locator_valid(cfg,p,&state["locator"])||event["requestId"]!=p.request.request_id
+    ||state["recovery"].is_null()||!state["retiredReadOnlyRecoveries"].as_array().is_none_or(Vec::is_empty)
+    ||event["previousLaunchToken"]!=old||event["previousRecoverySha256"]!=crate::pipeline::digest(&state["recovery"].to_string())
+    ||new==old||new==format!("bridge-director-desktop-{}",p.request.request_id)
+    ||!new.strip_prefix("bridge-director-desktop-").is_some_and(|id|uuid::Uuid::parse_str(id).is_ok_and(|v|v.get_version_num()==4&&v.to_string()==id))
+    ||event["url"]!=state["locator"]["url"]||event["readOnly"]!=true||event["submitCalled"]!=false
+    ||!crate::chrome_setup::connection_page(&event["connectionSource"],binding)
+    ||event["nativeOriginalProof"]["requestId"]!=p.request.request_id||event["nativeOriginalProof"]["inventory"]["sourceRole"]!="connection"
+    ||event["nativeOriginalProof"]["sourceClientId"]!=event["connectionSource"]["id"] {return Err(fail());}
+   state["retiredReadOnlyRecoveries"]=json!([{"recovery":state["recovery"],"navigation":state["recoveryNavigation"],"reason":"previous_reader_unresolved","replacementIntent":event}]);
+   state["recovery"]=event.clone();state["recoveryNavigation"]=Value::Null;
   }else if event["type"]=="recovery_navigation_intent"{
    if !providers::chrome_locator_valid(cfg,p,&state["locator"])||event["requestId"]!=p.request.request_id
     ||state["recovery"].is_null()||!state["recoveryNavigation"].is_null()

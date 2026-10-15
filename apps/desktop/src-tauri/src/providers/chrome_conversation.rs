@@ -69,7 +69,10 @@ fn settle_new_recovery(config:&ProviderConfig,client:&Client,source:&Value,root:
         // open still costs the same five transport calls as before.
         let after=clients(config,client)?;
         let owners:Vec<_>=after.iter().filter(|c|c["launchToken"]==alias).collect();
-        let controls:Vec<_>=after.iter().filter(|c|c["launchToken"]==root["launchToken"]).collect();
+        // Ordinary user chats also have an empty launch token. Bind the one
+        // connection page by its exact client identity; ownership-token
+        // uniqueness remains mandatory for program-owned controller pages.
+        let controls:Vec<_>=after.iter().filter(|c|if s(root,"launchToken").is_empty(){c["id"]==root["id"]}else{c["launchToken"]==root["launchToken"]}).collect();
         if owners.len()!=1||controls.len()!=1||!compatible_profile_clients(&after,root,binding)
             ||!recovery_bound(owners[0],source,root,binding,alias)
             ||!recovery_bound(controls[0],root,root,binding,s(root,"launchToken"))
@@ -95,20 +98,35 @@ pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRe
     let available=clients(config,client)?;let launch=format!("bridge-director-desktop-{}",p.request.request_id);
     // A still-existing original page changed by the user is not an absent page.
     if available.iter().any(|c|c["id"]==p.wire["sourceClientId"]&&c["url"]!=loc["url"]){return Err(held());}
-    let roots:Vec<_>=available.iter().filter(|c|c["launchToken"]==control_launch(binding)).collect();
-    if roots.len()!=1||!explicit_idle(roots[0])||roots[0]["focused"]!=false||roots[0]["visibilityState"]!="hidden"||!compatible_profile_clients(&available,roots[0],binding){return Err(held());}
-    let root=roots[0];let native=execution_proof::prove_idle(config,client,root,binding,&p.request)?;
+    let root=crate::chrome_setup::profile_execution_client(&available,binding).map_err(|_|held())?;
+    if !(root["launchToken"]==control_launch(binding)||crate::chrome_setup::connection_page(root,binding))
+        ||!explicit_idle(root)||root["focused"]!=false||root["visibilityState"]!="hidden"||!compatible_profile_clients(&available,root,binding){return Err(held());}
+    let native=execution_proof::prove_idle(config,client,root,binding,&p.request)?;
     let originals:Vec<_>=available.iter().filter(|c|c["launchToken"]==launch).collect();
     let original_proven= originals.is_empty()&&native["status"]=="confirmed_absent"&&native["match"].is_null()
         || originals.len()==1&&native["status"]=="matched"&&native["match"]["tabId"]==originals[0]["browserTabId"]&&native["match"]["url"]==loc["url"]&&native["match"]["connected"]==true;
     if !original_proven{return Err(held());}
-    let alias=if saved["recovery"].is_null(){format!("bridge-director-desktop-{}",uuid::Uuid::new_v4())}else{s(&saved["recovery"],"launchToken").to_owned()};
+    let mut alias=if saved["recovery"].is_null(){format!("bridge-director-desktop-{}",uuid::Uuid::new_v4())}else{s(&saved["recovery"],"launchToken").to_owned()};
     if !alias.strip_prefix("bridge-director-desktop-").is_some_and(|id|uuid::Uuid::parse_str(id).is_ok())||alias==launch{return Err(held());}
-    let owners:Vec<_>=available.iter().filter(|c|c["launchToken"]==alias).collect();
+    let mut owners:Vec<_>=available.iter().filter(|c|c["launchToken"]==alias).collect();
+    // Open at most one additional read-only view of the exact saved URL. This
+    // never retries the original generation or settles the previous reader's
+    // command; its full reservation and navigation remain immutable history.
+    let replacement_reserved=crate::chrome_setup::connection_page(root,binding) && !saved["recovery"].is_null()
+        && saved["retiredReadOnlyRecoveries"].as_array().is_none_or(Vec::is_empty)
+        && (owners.is_empty() || owners.len()==1 && owners[0]["pageReady"]==false && owners[0]["transportHealth"]["backgroundOnly"]==true);
+    if replacement_reserved {
+        let previous=alias.clone();alias=format!("bridge-director-desktop-{}",uuid::Uuid::new_v4());
+        observe(&json!({"type":"recovery_reader_replacement_intent","requestId":p.request.request_id,
+            "launchToken":alias,"url":loc["url"],"previousLaunchToken":previous,
+            "previousRecoverySha256":hex_hash(saved["recovery"].to_string().as_bytes()),
+            "connectionSource":root,"nativeOriginalProof":native,"readOnly":true,"submitCalled":false,"at":now()}))?;
+        owners=available.iter().filter(|c|c["launchToken"]==alias).collect();
+    }
     let mut opened_now=false;
     let mut source=if owners.len()==1&&!saved["recovery"].is_null() {owners[0].clone()}
-    else if owners.is_empty()&&saved["recovery"].is_null(){
-        observe(&json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":alias,"url":loc["url"],"nativeOriginalProof":native,"at":now(),"submitCalled":false}))?;
+    else if owners.is_empty()&&(saved["recovery"].is_null()||replacement_reserved){
+        if !replacement_reserved {observe(&json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":alias,"url":loc["url"],"nativeOriginalProof":native,"at":now(),"submitCalled":false}))?;}
         let opened=json_request(config,client,"/browser/tabs/open",Some(&json!({"url":loc["url"],"sourceClientId":root["id"],"active":false,"select":false,"launchToken":alias,"timeoutMs":30000,"allowSystemFallback":false})),false)?;
         if opened["ok"]!=true||opened["tabState"]["active"]!=false||opened["tabState"]["discarded"]!=false{return Err(held());}
         opened_now=true;
@@ -116,7 +134,7 @@ pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRe
     }else{return Err(held());};
     // A failed website navigation may leave the one reserved recovery page on
     // the homepage. Revisit its saved URL once; never allocate another alias.
-    if source["url"]!=loc["url"]&&!saved["recovery"].is_null(){
+    if !opened_now&&source["url"]!=loc["url"]&&!saved["recovery"].is_null(){
         if source["url"]!="https://chatgpt.com/"||source["requestedUrl"]!=loc["url"]||!saved["recoveryNavigation"].is_null()
             ||source["launchToken"]!=alias||source["focused"]!=false||source["visibilityState"]!="hidden"
             ||!explicit_idle(&source)||!same_browser_runtime(&source,root,binding){return Err(held());}

@@ -7,6 +7,18 @@ fn page(id: &str, profile: &str, epoch: &str) -> Value {
         "browserProfileId":profile,"browserIncognito":false,"backgroundEpoch":epoch,"extensionBundleId":"bundle","serverInstanceId":"server"})
 }
 fn binding() -> BrowserBinding {BrowserBinding{profile_id:PROFILE.into(),endpoint:"http://127.0.0.1:53179".into(),bundle_id:"bundle".into()}}
+fn connection(id:&str)->Value {let mut c=page(id,PROFILE,"epoch");c["launchToken"]=json!("");c["contentEpoch"]=json!("content");c["focused"]=json!(false);c["visibilityState"]=json!("hidden");c["activeRequest"]=Value::Null;
+    for key in ["pageReady","composerReady","chatMainReady"]{c[key]=json!(true);}c}
+#[test] fn chrome_connection_page_is_transport_only_and_does_not_rebind_or_rewrite_the_old_controller(){
+    let mut legacy=page("legacy-control",PROFILE,"epoch");legacy["launchToken"]=json!(format!("bridge-director-control-{PROFILE}"));legacy["pageReady"]=json!(false);legacy["focused"]=json!(false);legacy["visibilityState"]=json!("hidden");
+    let pages=vec![legacy.clone(),connection("dedicated")];let before=json!(pages);
+    assert_eq!(profile_execution_client(&pages,&binding()).unwrap()["id"],"dedicated");assert_eq!(json!(pages),before);
+}
+#[test] fn chrome_connection_page_requires_real_ready_hidden_same_profile_and_a_unique_home(){
+    let c=connection("dedicated");assert!(connection_page(&c,&binding()));
+    for (key,value) in [("launchToken",json!("owned")),("pageReady",json!(false)),("composerReady",json!(false)),("chatMainReady",json!(false)),("focused",json!(true)),("visibilityState",json!("visible")),("url",json!("https://chatgpt.com/c/other")),("browserProfileId",json!(OTHER)),("activeRequest",json!({"requestId":"old"})),("contentEpoch",json!("")),("transportHealth",json!({"backgroundOnly":true}))]{let mut bad=c.clone();bad[key]=value;assert!(!connection_page(&bad,&binding()),"{key}");}
+    assert!(profile_execution_client(&[c,connection("second")],&binding()).is_err());
+}
 #[test] fn chrome_controller_accepts_root_queries_without_accepting_conversations_or_other_origins(){
     let mut control=page("control",PROFILE,"epoch");
     control["launchToken"]=json!(format!("bridge-director-control-{PROFILE}"));

@@ -4,7 +4,7 @@ function fixture(change=()=>{}){
  const facts={source:{id:7,windowId:10,incognito:false,url:'https://chatgpt.com/'},record:{launchToken:'bridge-director-control-'+PROFILE,serverUrl:'http://127.0.0.1:53179'},calls:[],returnedWindow:10};change(facts);
  const chrome={runtime:{},tabs:{get:async()=>({...facts.source}),create:(options,done)=>{facts.calls.push(['create',options]);done({id:31,windowId:facts.returnedWindow});},
   update:(id,options,done)=>{facts.calls.push(['update',id,options]);done({id,windowId:10});},remove:(id,done)=>{facts.calls.push(['remove',id]);done();}}};
- const port={sender:{tab:{id:7,incognito:false}}},connections=new Map([[port,{serverUrl:facts.record.serverUrl}]]);
+ const port={sender:{tab:{id:7,incognito:false}}},connections=new Map([[port,{serverUrl:facts.record?.serverUrl||'http://127.0.0.1:53179',protocolReady:facts.contentReady!==false}]]);
  const context=vm.createContext({chrome,URL,URLSearchParams,Date,console,setTimeout:fn=>{fn();return 1;}});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/tabController.js'),'utf8').replace(/^export /gm,''),context);
  const api=context.createTabController({connections,safeBridgeServerUrl:u=>u,rememberLaunchedTab:async()=>{},readLaunchedTab:async()=>facts.record,forgetLaunchedTab:async()=>{},isStableLaunchToken:()=>true});
@@ -25,6 +25,15 @@ test('server coordinator forwards exact expected URL to native owned close comma
 test('owned work page explicitly uses controller window instead of Chrome last-focused user window',async()=>{
  const f=fixture();await f.open();assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0])),['create',{url:'about:blank',active:false,windowId:10}]);
  assert.equal(f.calls.filter(c=>c[0]==='update')[0][2].active,false);
+});
+
+test('explicit connection source creates only the new work tab in the source window without owning or navigating the connection page',async()=>{
+ const f=fixture(f=>{f.record=undefined;});await f.open({connectionSource:true});
+ assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0])),['create',{url:'about:blank',active:false,windowId:10}]);
+ assert.ok(f.calls.filter(c=>['update','remove'].includes(c[0])).every(c=>c[1]===31));
+ for(const [ready,options]of [[true,{}],[false,{connectionSource:true}]]){
+  const bad=fixture(f=>{f.record=undefined;f.contentReady=ready;});await assert.rejects(bad.open(options));assert.equal(bad.calls.length,0);
+ }
 });
 test('unproved source foreground request or wrong creation window cannot submit or navigate',async()=>{
  for(const change of [f=>f.source.windowId=null,f=>f.source.incognito=true,f=>f.source.url='https://chatgpt.com/c/user',f=>f.record.launchToken='',f=>f.record.serverUrl='http://elsewhere']){

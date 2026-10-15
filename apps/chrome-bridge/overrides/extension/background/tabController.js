@@ -191,9 +191,11 @@ export function createTabController({
       if(first.sourceWindowError||second.sourceWindowError)return unknown(first.sourceWindowError||second.sourceWindowError);
       if(JSON.stringify(before)!==JSON.stringify(after) || JSON.stringify(first)!==JSON.stringify(second))return unknown('inventory_changed_during_read');
       const source=second.tabs.find(tab=>tab.id===before.sourceTabId),sourceRecord=second.launched.find(item=>item.key===LAUNCHED_TAB_PREFIX+before.sourceTabId)?.record;
-      if(!source || source.incognito || !controllerRootUrl(source.url) || !sourceRecord
-        || sourceRecord.serverUrl!==serverUrl || !(sourceRecord.launchToken===`bridge-director-control-${before.profileId}`
-          || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(sourceRecord.launchToken||'')))return unknown('source_owned_idle_root_unproved');
+      const connectionOnly=options.sourceRole==='connection';
+      if(!source || source.incognito || !controllerRootUrl(source.url)
+        || (connectionOnly ? sourceRecord!==undefined : !sourceRecord || sourceRecord.serverUrl!==serverUrl
+          || !(sourceRecord.launchToken===`bridge-director-control-${before.profileId}`
+          || /^bridge-director-desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(sourceRecord.launchToken||''))))return unknown('source_owned_idle_root_unproved');
       const execution=second.execution, own=execution?.ownCommand, queue=execution?.queue;
       const inventoryCommandId=String(options.inventoryCommandId||''),rpcRequestId=String(options.requestId||'');
       const ownAcceptedMessageIds=execution?.ownAcceptedMessageIds;
@@ -239,6 +241,7 @@ export function createTabController({
       const digest=async value=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))].map(byte=>byte.toString(16).padStart(2,'0')).join('');
       // Audit unrelated tabs by URL digest; never disclose their URLs/titles.
       const inventory={tabs:await Promise.all(second.tabs.map(async tab=>({id:tab.id,urlSha256:await digest(tab.url),incognito:tab.incognito,active:tab.active,discarded:tab.discarded,windowId:tab.windowId}))),
+        ...(connectionOnly?{sourceRole:'connection'}:{}),
         launchRecords:second.launched.map(item=>({key:item.key,recordSha256:null})),sourceTabId:before.sourceTabId,
         sourceExecutionProof,...(sourceBackgroundProof?{sourceBackgroundProof}:{})};
       for(let index=0;index<second.launched.length;index++)inventory.launchRecords[index].recordSha256=await digest(JSON.stringify(second.launched[index].record));
@@ -392,8 +395,10 @@ export function createTabController({
       const sourceId=port?.sender?.tab?.id,record=await readLaunchedTab(sourceId);
       const source=await chrome.tabs.get(sourceId);
       if(active||!source||source.id!==sourceId||!Number.isSafeInteger(source.windowId)||source.windowId<=0
-        ||source.incognito!==false||!controllerRootUrl(source.url)||record?.serverUrl!==bridgeServerUrl
-        ||!(CONTROLLER_LAUNCH_RE.test(record?.launchToken||'')||/^bridge-director-desktop-[a-f0-9-]{36}$/i.test(record?.launchToken||'')))throw Error('Owned background source window is unproved');
+        ||source.incognito!==false||!controllerRootUrl(source.url)
+        || (record ? record.serverUrl!==bridgeServerUrl || !(CONTROLLER_LAUNCH_RE.test(record?.launchToken||'')||/^bridge-director-desktop-[a-f0-9-]{36}$/i.test(record?.launchToken||''))
+          : options.connectionSource!==true || !connections.get(port)?.protocolReady
+            || safeBridgeServerUrl(connections.get(port)?.serverUrl||'')!==bridgeServerUrl))throw Error('Owned background source window is unproved');
       sourceWindowId=source.windowId;
     }
     const tab = await createTab({ url: 'about:blank', active, ...(directorOwned?{windowId:sourceWindowId}:{}) });

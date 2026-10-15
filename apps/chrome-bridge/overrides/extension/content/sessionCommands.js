@@ -178,7 +178,7 @@ async function handleBrowserTabIdentify(payload) {
     if(payload.mode==='owned_launch_inventory_v1') {
       const result=await extensionRequest('bridge.tab.open',{lookupOnly:true,lookupRequestId:payload.lookupRequestId,
         inventoryCommandId:payload.commandId,
-        launchToken:payload.launchToken,expectedRuntime:payload.expectedRuntime,
+        launchToken:payload.launchToken,expectedRuntime:payload.expectedRuntime,...(payload.sourceRole==='connection'?{sourceRole:'connection'}:{}),
         sourceDocument:{visibilityState:typeof document==='object'?document.visibilityState:'unknown',
           focused:typeof document==='object'&&typeof document.hasFocus==='function'?document.hasFocus():null,sampledAt:Date.now()}},10000);
       send({type:'browser.tab.identified',commandId:payload.commandId,...result});
@@ -198,6 +198,7 @@ async function handleBrowserTabOpen(payload) {
       active: payload.active !== false,
       launchToken: String(payload.launchToken || ''),
       bridgeServerUrl: safeLaunchBridgeServerUrl(payload.bridgeServerUrl || CONFIG.serverUrl),
+      connectionSource: !payload.sourceLaunchToken && location.href==='https://chatgpt.com/',
     }, Number(payload.timeoutMs) || 15_000);
     send({ type: 'browser.tab.opened', commandId: payload.commandId, ...result });
   } catch (err) {

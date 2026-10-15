@@ -31,11 +31,38 @@ fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Value,Value,Value
  let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":"bridge-director-desktop-22222222-2222-4222-8222-222222222222"}});
  assert!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|_|panic!("no new intent")).is_err());f.thread.join().unwrap();assert!(f.requests.lock().unwrap().iter().all(|(r,_)|r.starts_with("GET ")));std::env::remove_var(cfg.bridge_token_env.unwrap());
 }
+#[test]fn chrome_dedicated_connection_opens_one_readonly_view_without_touching_unready_old_reader_or_original_generation(){
+ let tmp=fixture(vec![]);let(c,_,_,mut root,mut native,alias)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ let mut legacy=root.clone();legacy["id"]=json!("legacy-control");legacy["pageReady"]=json!(false);
+ root["launchToken"]=json!("");for field in ["pageReady","composerReady","chatMainReady"]{root[field]=json!(true);}
+ let mut old_reader=alias.clone();old_reader["id"]=json!("old-reader");old_reader["launchToken"]=json!("bridge-director-desktop-22222222-2222-4222-8222-222222222222");old_reader["pageReady"]=json!(false);old_reader["transportHealth"]=json!({"kind":"connect_snapshot","backgroundOnly":true});
+ native["inventory"]["sourceRole"]=json!("connection");native["inventoryCanonicalJson"]=json!(native["inventory"].to_string());native["inventorySha256"]=json!(hex_hash(native["inventory"].to_string().as_bytes()));
+ let list=json!({"ok":true,"clients":[root,legacy,old_reader]});let after=json!({"ok":true,"clients":[root,legacy,old_reader,alias],"__echoRecoveryAlias":true});
+ let f=fixture(vec![list.clone(),native,list,json!({"ok":true,"client":alias,"tabState":{"active":false,"discarded":false},"__echoRecoveryAlias":true}),after]);
+ let(cfg,p,loc,_,_,_)=setup(&f.endpoint);let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":old_reader["launchToken"],"url":loc["url"]}});let frozen=json!(p);let events=Mutex::new(vec![]);
+ let out=conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|event|{events.lock().unwrap().push(event.clone());Ok(())}).unwrap();f.thread.join().unwrap();
+ assert_eq!(out["url"],loc["url"]);assert_ne!(out["launchToken"],old_reader["launchToken"]);assert_eq!(json!(p),frozen);
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),5);assert!(calls[1].0.contains("sourceRole=connection"));assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);assert!(calls[3].0.starts_with("POST /browser/tabs/open "));
+ let events=events.lock().unwrap();assert_eq!(events[0]["type"],"recovery_reader_replacement_intent");assert_eq!(events[0]["submitCalled"],false);assert_eq!(events[0]["previousRecoverySha256"],hex_hash(saved["recovery"].to_string().as_bytes()));assert_eq!(events[1]["type"],"recovery_opened");std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
 fn settling_replies(opened:Value,snapshots:Vec<Vec<Value>>)->Vec<Value>{
  let tmp=fixture(vec![]);let(c,_,_,root,native,_)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
  let list=json!({"ok":true,"clients":[root]});
  let mut replies=vec![list.clone(),native,list,json!({"ok":true,"client":opened,"tabState":{"active":false,"discarded":false},"__echoRecoveryAlias":true})];
  for snapshot in snapshots{replies.push(json!({"ok":true,"clients":snapshot,"__echoRecoveryAlias":true}));}replies
+}
+#[test]fn chrome_dedicated_readonly_recovery_keeps_unrelated_unowned_user_chats_out_of_connection_identity(){
+ let tmp=fixture(vec![]);let(c,_,_,mut root,mut native,alias)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ root["launchToken"]=json!("");for field in ["pageReady","composerReady","chatMainReady"]{root[field]=json!(true);}
+ let mut user=root.clone();user["id"]=json!("unrelated-user-chat");user["browserTabId"]=json!(33);user["url"]=json!("https://chatgpt.com/c/33333333-3333-4333-8333-333333333333");
+ native["inventory"]["sourceRole"]=json!("connection");native["inventoryCanonicalJson"]=json!(native["inventory"].to_string());native["inventorySha256"]=json!(hex_hash(native["inventory"].to_string().as_bytes()));
+ let list=json!({"ok":true,"clients":[root,user]});let after=json!({"ok":true,"clients":[root,user,alias],"__echoRecoveryAlias":true});
+ let f=fixture(vec![list.clone(),native,list,json!({"ok":true,"client":alias,"tabState":{"active":false,"discarded":false},"__echoRecoveryAlias":true}),after]);
+ let(cfg,p,loc,_,_,_)=setup(&f.endpoint);let events=Mutex::new(vec![]);
+ let out=conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&json!({"locator":loc}),&|event|{events.lock().unwrap().push(event.clone());Ok(())});f.thread.join().unwrap();
+ assert!(out.is_ok(),"unrelated unowned chat is not the dedicated connection page: {out:?}");
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),5);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);assert!(calls[3].0.starts_with("POST /browser/tabs/open "));
+ assert_eq!(events.lock().unwrap().len(),2);std::env::remove_var(cfg.bridge_token_env.unwrap());
 }
 fn settling_pages()->(Value,Value,Value){
  let tmp=fixture(vec![]);let(c,_,loc,root,_,mut page)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
