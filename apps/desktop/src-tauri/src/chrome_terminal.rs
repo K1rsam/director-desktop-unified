@@ -2,11 +2,30 @@
 use serde_json::Value;
 use crate::store::s;
 fn sha(v:&Value)->bool{v.as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_hexdigit()))}
+fn presentation_tail_valid(proof:&Value,branch:&[Value])->bool{
+    let tail=&proof["presentationTail"];
+    let (Some(current),Some(final_node))=(branch.first(),branch.get(1)) else{return false};
+    tail.is_object()&&tail["version"]==1&&tail["kind"]=="reasoning_recap"&&tail["contentValueType"]=="string"
+        &&tail["contentSha256"].as_str().is_some_and(|value|value.len()==64&&value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))
+        &&tail["hasImagePointers"]==false&&tail["hideInlineActions"]==true
+        &&tail["recipient"]=="all"&&tail.get("channel")==Some(&Value::Null)&&tail["finalRecipient"]=="all"&&tail["finalChannel"]=="final"
+        &&!s(tail,"messageId").is_empty()
+        &&current["nodeKey"]==proof["currentNode"]&&current["nodeKey"]==tail["nodeKey"]&&current["id"]==tail["messageId"]
+        &&current["role"]=="assistant"&&current["status"]=="finished_successfully"&&current["endTurn"]==false
+        &&current["parent"]==final_node["nodeKey"]&&tail["parentNodeKey"]==final_node["nodeKey"]
+        &&final_node["nodeKey"]==tail["finalNodeKey"]&&final_node["id"]==tail["finalMessageId"]
+        &&branch.get(2).is_some_and(|node|node["role"]=="user"&&node["id"]==proof["userMessageId"]&&final_node["parent"]==node["nodeKey"])
+        &&branch.iter().filter(|node|node["role"]=="assistant"&&node["endTurn"]==true).count()==1
+        &&branch.iter().enumerate().all(|(index,node)|!s(node,"nodeKey").is_empty()
+            &&if index+1==branch.len(){node.get("parent")==Some(&Value::Null)}else{node["parent"]==branch[index+1]["nodeKey"]})
+        &&branch.iter().map(|node|s(node,"nodeKey")).collect::<std::collections::BTreeSet<_>>().len()==branch.len()
+}
 pub(crate) fn proof_valid(proof:&Value,prepared:&Value,task:&str)->bool{
     let body=s(&prepared["wire"],"message").split_whitespace().collect::<Vec<_>>().join(" ");
     let hash=crate::pipeline::digest(&body);
     let Some(branch)=proof["branchIdentity"].as_array() else{return false};
-    let Some(first)=branch.first() else{return false};
+    let has_tail=proof.get("presentationTail").is_some();
+    let Some(first)=branch.get(if has_tail{1}else{0}) else{return false};
     prepared["provider"]=="chrome"&&prepared["request"]["kind"]=="image"&&prepared["request"]["model"]=="chatgpt-image"
         &&proof["source"]=="conversation-record"&&proof["version"]==1&&proof["proofVersion"]==2&&proof["status"]=="matched_no_image"
         &&proof["requestId"]==task&&prepared["request"]["requestId"]==task&&prepared["wire"]["id"]==task
@@ -15,8 +34,10 @@ pub(crate) fn proof_valid(proof:&Value,prepared:&Value,task:&str)->bool{
         &&proof["backendStatus"]=="finished_successfully"&&proof["endTurn"]==true&&proof["backendImageCount"]==0
         &&proof["bindings"].as_array().is_some_and(Vec::is_empty)&&sha(&proof["recordSha256"])&&sha(&proof["recordRecheckSha256"])&&sha(&proof["assistantTextSha256"])
         &&!s(proof,"userMessageId").is_empty()&&!s(proof,"assistantMessageId").is_empty()
-        &&first["nodeKey"]==proof["currentNode"]&&first["id"]==proof["assistantMessageId"]&&first["role"]=="assistant"&&first["endTurn"]==true&&first["status"]=="finished_successfully"
-        &&branch.iter().filter(|n|n["role"]=="assistant").count()==1&&branch.iter().filter(|n|n["role"]=="user").count()==1
+        &&(if has_tail{presentation_tail_valid(proof,branch)}else{first["nodeKey"]==proof["currentNode"]})
+        &&first["id"]==proof["assistantMessageId"]&&first["role"]=="assistant"&&first["endTurn"]==true&&first["status"]=="finished_successfully"
+        &&branch.iter().filter(|n|n["role"]=="assistant").count()==if has_tail{2}else{1}
+        &&branch.iter().filter(|n|n["role"]=="user").count()==1
         &&branch.iter().any(|n|n["role"]=="user"&&n["id"]==proof["userMessageId"])
         &&branch.iter().all(|n|["","user","assistant"].contains(&s(n,"role")))
 }
@@ -72,6 +93,43 @@ pub(crate) fn upload_not_submitted_valid(p:&Value,prepared:&Value,task:&str)->bo
     "userMessageId":"user","assistantMessageId":"assistant","currentNode":"final","branchIdentity":[{"nodeKey":"final","id":"assistant","role":"assistant","endTurn":true,"status":"finished_successfully"},{"nodeKey":"user-node","id":"user","role":"user"},{"nodeKey":"root","id":"","role":""}]}}}})
  }
  #[test]fn chrome_terminal_only_proved_no_image_and_settled_original_stops_blocking(){assert!(settled_job(&fixture()));}
+ fn presentation_fixture()->Value{
+  let mut job=fixture();let proof=&mut job["result"]["raw"]["nativeProof"];
+  let branch=proof["branchIdentity"].as_array_mut().unwrap();
+  for index in 0..branch.len(){branch[index]["parent"]=if index+1==branch.len(){Value::Null}else{branch[index+1]["nodeKey"].clone()};}
+  branch.insert(0,json!({"nodeKey":"recap","parent":"final","id":"recap-message","role":"assistant","status":"finished_successfully","endTurn":false}));
+  proof["currentNode"]=json!("recap");
+  proof["presentationTail"]=json!({"version":1,"kind":"reasoning_recap","nodeKey":"recap","messageId":"recap-message","parentNodeKey":"final",
+    "finalNodeKey":"final","finalMessageId":"assistant","contentSha256":"d".repeat(64),"contentValueType":"string","hasImagePointers":false,
+    "recipient":"all","channel":null,"hideInlineActions":true,"finalRecipient":"all","finalChannel":"final"});job
+ }
+ #[test]fn chrome_terminal_precise_presentation_tail_keeps_current_and_only_settles_no_image(){
+  let job=presentation_fixture();assert!(settled_job(&job));
+  assert_eq!(job["result"]["raw"]["nativeProof"]["currentNode"],"recap");
+  assert_eq!(job["result"]["raw"]["nativeProof"]["branchIdentity"][0]["endTurn"],false);
+  let mut image=job.clone();image["result"]["raw"]["nativeProof"]["backendImageCount"]=json!(1);assert!(!settled_job(&image));
+ }
+ #[test]fn chrome_terminal_presentation_tail_rejects_missing_unknown_changed_branch_and_incomplete_evidence(){
+  for (part,value) in [("/presentationTail",Value::Null),("/presentationTail/version",json!(2)),("/presentationTail/kind",json!("unknown")),
+    ("/presentationTail/contentValueType",json!("object")),("/presentationTail/contentSha256",json!("")),("/presentationTail/hasImagePointers",json!(true)),
+    ("/presentationTail/hideInlineActions",json!(false)),("/presentationTail/recipient",json!("tool")),("/presentationTail/channel",json!("analysis")),
+    ("/presentationTail/finalRecipient",json!("tool")),("/presentationTail/finalChannel",json!("analysis")),("/presentationTail/nodeKey",json!("other")),
+    ("/presentationTail/messageId",json!("other")),("/presentationTail/parentNodeKey",json!("other")),("/presentationTail/finalNodeKey",json!("other")),
+    ("/presentationTail/finalMessageId",json!("other")),("/branchIdentity/0/endTurn",json!(true)),("/branchIdentity/0/status",json!("in_progress")),
+    ("/branchIdentity/0/role",json!("tool")),("/branchIdentity/0/parent",json!("user-node")),("/branchIdentity/1/id",json!("other")),
+    ("/branchIdentity/1/parent",json!("missing")),("/branchIdentity/3/parent",json!("cycle")),("/currentNode",json!("final"))]{
+   let mut job=presentation_fixture();*job.pointer_mut(&format!("/result/raw/nativeProof{part}")).unwrap()=value;assert!(!settled_job(&job),"{part}");
+  }
+  let mut absent=presentation_fixture();absent["result"]["raw"]["nativeProof"].as_object_mut().unwrap().remove("presentationTail");assert!(!settled_job(&absent));
+  let mut empty_id=presentation_fixture();empty_id["result"]["raw"]["nativeProof"]["presentationTail"]["messageId"]=json!("");empty_id["result"]["raw"]["nativeProof"]["branchIdentity"][0]["id"]=json!("");assert!(!settled_job(&empty_id));
+  let mut extra=presentation_fixture();let proof=&mut extra["result"]["raw"]["nativeProof"];proof["branchIdentity"][1]["parent"]=json!("extra");
+  proof["branchIdentity"].as_array_mut().unwrap().insert(2,json!({"nodeKey":"extra","parent":"user-node","id":"","role":""}));assert!(!settled_job(&extra));
+  for role in ["assistant","tool","user"]{
+   let mut job=presentation_fixture();let proof=&mut job["result"]["raw"]["nativeProof"];
+   proof["branchIdentity"].as_array_mut().unwrap().insert(0,json!({"nodeKey":"later","parent":"recap","id":"later-message","role":role,"status":"finished_successfully","endTurn":role=="assistant"}));
+   proof["currentNode"]=json!("later");assert!(!settled_job(&job),"later {role}");
+  }
+ }
  pub(crate) fn upload_fixture()->Value{
   let mut job=fixture();let task=job["providerTaskId"].clone();let prepared=&mut job["prepared"];prepared["wire"]["sourceClientId"]=serde_json::json!("worker");prepared["wire"]["attachments"]=serde_json::json!(["file-parent"]);
   let preconditions=serde_json::json!({"requestId":task,"leaseId":"lease","ownerServerInstanceId":"server","attachments":[{"id":"file-parent"}]});

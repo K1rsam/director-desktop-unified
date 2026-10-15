@@ -31,6 +31,77 @@ fn setup(endpoint:&str)->(ProviderConfig,PreparedRequest,Value,Value,Value,Value
  let saved=json!({"locator":loc,"recovery":{"type":"recovery_intent","launchToken":"bridge-director-desktop-22222222-2222-4222-8222-222222222222"}});
  assert!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|_|panic!("no new intent")).is_err());f.thread.join().unwrap();assert!(f.requests.lock().unwrap().iter().all(|(r,_)|r.starts_with("GET ")));std::env::remove_var(cfg.bridge_token_env.unwrap());
 }
+fn settling_replies(opened:Value,snapshots:Vec<Vec<Value>>)->Vec<Value>{
+ let tmp=fixture(vec![]);let(c,_,_,root,native,_)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ let list=json!({"ok":true,"clients":[root]});
+ let mut replies=vec![list.clone(),native,list,json!({"ok":true,"client":opened,"tabState":{"active":false,"discarded":false},"__echoRecoveryAlias":true})];
+ for snapshot in snapshots{replies.push(json!({"ok":true,"clients":snapshot,"__echoRecoveryAlias":true}));}replies
+}
+fn settling_pages()->(Value,Value,Value){
+ let tmp=fixture(vec![]);let(c,_,loc,root,_,mut page)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
+ page["requestedUrl"]=loc["url"].clone();let ready=page.clone();page["url"]=json!("https://chatgpt.com/");
+ page["transportHealth"]=json!({"kind":"live","tabQueue":{"running":{"label":"content:bridge.tab.open"},"pending":0}});
+ (root,page,ready)
+}
+#[test]fn chrome_conversation_new_open_homepage_and_own_command_settle_by_get_without_second_open_or_navigation(){
+ let(root,opening,mut ready)=settling_pages();ready["contentEpoch"]=json!("conversation-document");
+ let f=fixture(settling_replies(opening.clone(),vec![vec![root.clone(),opening],vec![root,ready.clone()]]));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);
+ let frozen=json!(p);let saved=json!({"locator":loc});let frozen_saved=saved.clone();let events=Mutex::new(vec![]);
+ let result=conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|e|{events.lock().unwrap().push(e.clone());Ok(())}).unwrap();
+ f.thread.join().unwrap();assert_eq!(json!(p),frozen);assert_eq!(saved,frozen_saved);assert_eq!(result["url"],loc["url"]);assert_eq!(result["contentEpoch"],ready["contentEpoch"]);
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),6);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);
+ assert!(calls[3].0.starts_with("POST /browser/tabs/open "));assert!(calls[4..].iter().all(|(r,_)|r.starts_with("GET /browser/clients ")));
+ let events=events.lock().unwrap();assert_eq!(events.len(),2);assert_eq!(events[0]["type"],"recovery_intent");assert_eq!(events[1]["type"],"recovery_opened");assert_eq!(events[0]["launchToken"],result["launchToken"]);
+ std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
+#[test]fn chrome_conversation_new_open_target_can_wait_for_same_tab_and_controller_own_queue_to_settle(){
+ let(root,_,ready)=settling_pages();let mut busy=ready.clone();busy["transportHealth"]=json!({"kind":"live","tabQueue":{"activeCommand":{"operation":"open"}}});
+ let mut busy_root=root.clone();busy_root["transportHealth"]=busy["transportHealth"].clone();
+ let f=fixture(settling_replies(ready.clone(),vec![vec![busy_root,busy],vec![root,ready]]));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);
+ assert!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&json!({"locator":loc}),&|_|Ok(())).is_ok());f.thread.join().unwrap();
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),6);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
+#[test]fn chrome_conversation_transient_open_ack_already_settled_on_existing_final_read_adds_no_calls(){
+ for homepage in [true,false]{
+  let(root,opening,ready)=settling_pages();let mut opened=opening;if !homepage{opened["url"]=ready["url"].clone();}
+  let f=fixture(settling_replies(opened,vec![vec![root,ready]]));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);
+  assert!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&json!({"locator":loc}),&|_|Ok(())).is_ok());f.thread.join().unwrap();
+  let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),5);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);std::env::remove_var(cfg.bridge_token_env.unwrap());
+ }
+}
+#[test]fn chrome_conversation_new_open_never_ready_is_bounded_and_preserves_only_the_original_intent(){
+ let(root,opening,_)=settling_pages();let snapshots=(0..6).map(|_|vec![root.clone(),opening.clone()]).collect();
+ let f=fixture(settling_replies(opening,snapshots));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);let saved=json!({"locator":loc});let frozen=json!(p);let events=Mutex::new(vec![]);
+ let error=conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&saved,&|e|{events.lock().unwrap().push(e.clone());Ok(())}).unwrap_err();f.thread.join().unwrap();
+ assert_eq!(error.code,"CHROME_LINK_RECOVERY_HELD");let context=error.context.unwrap();assert_eq!(context["reads"],6);assert_eq!(context["submitCalled"],false);
+ assert_eq!(context["launchToken"],events.lock().unwrap()[0]["launchToken"]);assert_eq!(events.lock().unwrap().len(),1);assert_eq!(json!(p),frozen);
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),10);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);assert!(calls[4..].iter().all(|(r,_)|r.starts_with("GET /browser/clients ")));std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
+#[test]fn chrome_conversation_settle_rejects_changed_user_duplicate_and_new_runtime_immediately(){
+ for case in ["id","tab","alias","url","requested_url","profile","bundle","background","server","focused","visible","active","quarantine","release","duplicate","root_id","root_runtime","copied_runtime"]{
+  let(root,opening,ready)=settling_pages();let mut page=ready.clone();let mut control=root.clone();let mut duplicate=None;
+  match case{
+   "id"=>page["id"]=json!("foreign"),"tab"=>page["browserTabId"]=json!(23),"alias"=>page["launchToken"]=json!("user"),"url"=>page["url"]=json!("https://chatgpt.com/c/foreign"),
+   "requested_url"=>{page["url"]=json!("https://chatgpt.com/");page["requestedUrl"]=json!("https://chatgpt.com/c/foreign");},
+   "profile"=>page["browserProfileId"]=json!("other"),"bundle"=>page["extensionBundleId"]=json!("other"),"background"=>page["backgroundEpoch"]=json!("changed"),"server"=>page["serverInstanceId"]=json!("changed"),
+   "focused"=>page["focused"]=json!(true),"visible"=>page["visibilityState"]=json!("visible"),"active"=>page["activeRequest"]=json!({"requestId":"other"}),"quarantine"=>page["quarantined"]=json!(true),"release"=>page["releasePending"]=json!(true),
+   "duplicate"=>{let mut other=page.clone();other["id"]=json!("second");duplicate=Some(other);},
+   "root_id"=>control["id"]=json!("changed"),"root_runtime"=>control["backgroundEpoch"]=json!("changed"),
+   "copied_runtime"=>{let mut other=page.clone();other["id"]=json!("second");other["launchToken"]=json!("user");other["backgroundEpoch"]=json!("copied");duplicate=Some(other);},_=>unreachable!()
+  }
+  let mut snapshot=vec![control,page];if let Some(other)=duplicate{snapshot.push(other);}
+  let f=fixture(settling_replies(opening,vec![snapshot]));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);let events=Mutex::new(vec![]);
+  assert_eq!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&json!({"locator":loc}),&|e|{events.lock().unwrap().push(e.clone());Ok(())}).unwrap_err().code,"CHROME_LINK_RECOVERY_HELD","{case}");f.thread.join().unwrap();
+  let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),5,"{case}");assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1,"{case}");assert_eq!(events.lock().unwrap().len(),1,"{case}");std::env::remove_var(cfg.bridge_token_env.unwrap());
+ }
+}
+#[test]fn chrome_conversation_settle_cannot_follow_a_second_content_epoch_after_reaching_the_saved_conversation(){
+ let(root,opening,ready)=settling_pages();let mut pending=ready.clone();pending["transportHealth"]=json!({"kind":"live","tabQueue":{"pending":1}});
+ let mut changed=ready.clone();changed["contentEpoch"]=json!("new-document");
+ let f=fixture(settling_replies(opening,vec![vec![root.clone(),pending],vec![root,changed]]));let(cfg,p,loc,_,_,_)=setup(&f.endpoint);
+ assert_eq!(conversation::restore_source(&cfg,&wire::client(5).unwrap(),&p,&json!({"locator":loc}),&|_|Ok(())).unwrap_err().code,"CHROME_LINK_RECOVERY_HELD");f.thread.join().unwrap();
+ let calls=f.requests.lock().unwrap();assert_eq!(calls.len(),6);assert_eq!(calls.iter().filter(|(r,_)|r.starts_with("POST ")).count(),1);std::env::remove_var(cfg.bridge_token_env.unwrap());
+}
 #[test]fn chrome_conversation_existing_homepage_alias_navigates_once_after_durable_reservation(){
  let tmp=fixture(vec![]);let(c,_,loc,root,native,mut alias)=setup(&tmp.endpoint);std::env::remove_var(c.bridge_token_env.unwrap());tmp.thread.join().unwrap();
  alias["launchToken"]=json!("bridge-director-desktop-33333333-3333-4333-8333-333333333333");alias["requestedUrl"]=loc["url"].clone();

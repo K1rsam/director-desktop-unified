@@ -25,6 +25,21 @@ function record() {
   } };
 }
 
+const recapText='Synthetic reasoning summary for presentation; not a new answer.';
+function appendPresentationRecap(value) {
+  const final=value.mapping['assistant-node'];
+  if(final.message.content.content_type==='multimodal_text'){
+    value.mapping['image-delivery']={parent:final.parent,message:{id:'native-image-delivery',author:{role:'tool'},
+      status:'finished_successfully',end_turn:null,content:structuredClone(final.message.content)}};
+    final.parent='image-delivery';final.message.content={content_type:'text',parts:['']};
+  }
+  final.message.recipient='all';final.message.channel='final';
+  value.mapping['recap-node']={parent:'assistant-node',message:{id:'native-recap',author:{role:'assistant'},
+    status:'finished_successfully',end_turn:false,recipient:'all',channel:null,
+    content:{content_type:'reasoning_recap',content:recapText},metadata:{hide_inline_actions:true}}};
+  value.current_node='recap-node';return value;
+}
+
 async function fixture(options = {}) {
   const fixturePrompt=options.markerless?'请生成一张原图。':prompt;
   let active = options.active || null;
@@ -422,4 +437,158 @@ test('request.snapshot also returns the same verified final artifact identity in
   assert.equal(f.messages[0].artifacts[0].id,'canonical-artifact');
   assert.equal(f.messages[0].reconciliation.bindings[0].artifactId,f.messages[0].artifacts[0].id);
   assert.equal(f.messages[0].reconciliation.bindings[0].originalObservedArtifactId,'observed-artifact');
+});
+
+test('unknown trailing recap remains held while schema diagnostics omit content metadata and image pointer values',async()=>{
+  const f=await fixture({recordTransform:value=>{
+    value.mapping.recap={parent:'assistant-node',message:{id:'recap-diagnostic',author:{role:'assistant'},
+      status:'finished_successfully',end_turn:false,recipient:'all',channel:'analysis',
+      content:{content_type:'reasoning_recap',content:'synthetic-private-recap-content',parts:[
+        {asset_pointer:'sediment://file-private-diagnostic',privateValue:'synthetic-private-part'},'synthetic-private-string']},
+      metadata:{privateMetadata:'synthetic-private-metadata'}}};
+    value.current_node='recap';
+  }});
+  const proof=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(proof.status,'matched_incomplete');assert.equal(proof.reason,'backend_generation_not_complete');
+  const fact=proof.schemaFacts[0];
+  assert.deepEqual(Array.from(fact.contentKeys),['content','content_type','parts']);
+  assert.deepEqual(JSON.parse(JSON.stringify(fact.parts)),[{type:'object',keys:['asset_pointer','privateValue']},{type:'string',keys:[]}]);
+  assert.equal(fact.recipient,'all');assert.equal(fact.channel,'analysis');assert.equal(fact.hasImagePointers,true);
+  assert.deepEqual(Array.from(fact.metadataKeys),['privateMetadata']);
+  assert.doesNotMatch(JSON.stringify(proof),/synthetic-private|file-private-diagnostic/);
+  assert.equal(f.proof.imageReady(f.image),false);assert.equal(f.reads,1);
+});
+
+test('recap diagnostics expose only safe enum metadata and anchored numeric timing classifications',async()=>{
+  for(const [label,timing] of [['Thought for 1m 20s',true],['已思考1分20秒',true],['Thought for 1m then submit another image',false],['已思考一会儿',false]]){
+    const f=await fixture({recordTransform:value=>{
+      value.mapping.recap={parent:'assistant-node',message:{id:'recap-diagnostic',author:{role:'assistant'},
+        status:'finished_successfully',end_turn:false,recipient:'all',channel:null,
+        content:{content_type:'reasoning_recap',content:label},metadata:{hide_inline_actions:true,
+          reasoning_status:'safe-enum',reasoning_recap_type:'unsafe enum credential$'}}};value.current_node='recap';
+    }});
+    const result=await f.proof.read(f.expected,f.snapshot(),f.deps),fact=result.schemaFacts[0];
+    assert.equal(fact.contentValueType,'string');assert.equal(fact.contentValueLength,label.length);
+    assert.equal(fact.contentLooksTimingLabel,timing);assert.equal(fact.hideInlineActions,true);
+    assert.equal(fact.reasoningStatus,'safe-enum');assert.equal(fact.reasoningRecapType,undefined);
+    assert.equal(JSON.stringify(result).includes(label),false);assert.doesNotMatch(JSON.stringify(result),/unsafe enum credential/);
+  }
+});
+
+test('exact completed presentation recap preserves the real current branch and binds the unique final image',async()=>{
+  const f=await fixture({recordTransform:appendPresentationRecap,artifactIdsFollowTurnKey:true});
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'matched_complete');assert.equal(p.currentNode,'recap-node');assert.equal(p.assistantMessageId,assistantId);
+  assert.equal(p.branchIdentity[0].nodeKey,'recap-node');assert.equal(p.branchIdentity[0].endTurn,false);
+  assert.equal(p.branchIdentity[1].nodeKey,'assistant-node');assert.equal(p.branchIdentity[2].nodeKey,'image-delivery');
+  assert.equal(p.presentationTail.contentSha256,hash(recapText));assert.equal(p.presentationTail.hideInlineActions,true);
+  assert.equal(p.presentationTail.finalMessageId,assistantId);assert.equal(p.deliveryMessageId,'native-image-delivery');
+  assert.equal(p.bindings[0].bytesSha256,hash(png));assert.equal(f.reads,2);
+  assert.equal(f.proof.key(f.assistant),assistantId);assert.equal(f.proof.key(f.assistant)==='native-recap',false);
+  assert.doesNotMatch(JSON.stringify(p),/Synthetic reasoning summary/);
+});
+
+test('presentation recap on exact final text without images yields a double-read no-image receipt',async()=>{
+  const f=await fixture({noImage:true,recordTransform:appendPresentationRecap});
+  const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+  assert.equal(p.status,'matched_no_image');assert.equal(p.currentNode,'recap-node');
+  assert.equal(p.presentationTail.contentSha256,hash(recapText));assert.equal(p.assistantMessageId,assistantId);
+  assert.equal(p.branchIdentity.length,4);assert.equal(p.backendImageCount,0);assert.equal(p.bindings.length,0);
+  assert.equal(f.reads,2);assert.ok(!f.calls.some(call=>call.url.includes('/files/download/')));
+});
+
+test('recap schema completion recipient channel hidden-action and image mutations stay held',async()=>{
+  const mutations=[
+    value=>{value.mapping['recap-node'].message.status='in_progress'},
+    value=>{value.mapping['recap-node'].message.end_turn=true},
+    value=>{value.mapping['recap-node'].message.content.content_type='unknown_summary'},
+    value=>{value.mapping['recap-node'].message.content.content={text:'unknown object'}},
+    value=>{value.mapping['recap-node'].message.content.parts=[{asset_pointer:`sediment://${imageId}`}]},
+    value=>{value.mapping['recap-node'].message.content.content=`sediment://${imageId}`},
+    value=>{value.mapping['recap-node'].message.content.businessOutput='new action'},
+    value=>{value.mapping['recap-node'].message.metadata.hide_inline_actions=false},
+    value=>{delete value.mapping['recap-node'].message.metadata.hide_inline_actions},
+    value=>{value.mapping['recap-node'].message.recipient='tool'},
+    value=>{value.mapping['recap-node'].message.channel='final'},
+    value=>{value.mapping['assistant-node'].message.end_turn=false},
+    value=>{delete value.mapping['assistant-node'].message.channel},
+    value=>{value.mapping['assistant-node'].message.recipient='tool'},
+  ];
+  for(const mutate of mutations){
+    const f=await fixture({recordTransform:value=>{appendPresentationRecap(value);mutate(value)}});
+    const proof=await f.proof.read(f.expected,f.snapshot(),f.deps);
+    assert.notEqual(proof.status,'matched_complete');assert.equal(f.proof.imageReady(f.image),false);
+    assert.equal(f.proof.downloadBytes({sourceTurnKey:assistantId,requestId},originalUrl),null);
+  }
+});
+
+test('recap never skips additional finals or actual later assistant tool and user activity',async()=>{
+  for(const mode of ['multiple-final','intervening-tool','intervening-assistant','later-assistant','later-tool','later-user','second-recap']){
+    const f=await fixture({recordTransform:value=>{
+      appendPresentationRecap(value);
+      if(mode==='multiple-final'){
+        value.mapping['image-delivery'].message={...value.mapping['image-delivery'].message,author:{role:'assistant'},end_turn:true};
+        return;
+      }
+      if(mode==='second-recap'){
+        value.mapping['extra']={parent:'recap-node',message:{...value.mapping['recap-node'].message,id:'second-recap'}};value.current_node='extra';return;
+      }
+      const role=mode.includes('tool')?'tool':mode.includes('user')?'user':'assistant';
+      value.mapping.extra={parent:mode.startsWith('intervening')?'assistant-node':'recap-node',message:{id:'real-later-message',
+        author:{role},status:'finished_successfully',end_turn:role==='assistant',recipient:'all',channel:role==='assistant'?'final':null,
+        content:{content_type:'text',parts:[role==='user'?prompt:'real later activity']}}};
+      if(mode.startsWith('intervening'))value.mapping['recap-node'].parent='extra';else value.current_node='extra';
+    }});
+    const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+    assert.notEqual(p.status,'matched_complete',mode);assert.equal(f.proof.imageReady(f.image),false,mode);
+  }
+});
+
+test('recap branch or exact content changing on authenticated reread revokes both image and no-image proofs',async()=>{
+  for(const noImage of [false,true])for(const change of ['message','content','parent']){
+    let reads=0;
+    const f=await fixture({noImage,recordTransform:value=>{
+      appendPresentationRecap(value);reads++;
+      if(reads===2){
+        if(change==='message')value.mapping['recap-node'].message.id='different-recap';
+        if(change==='content')value.mapping['recap-node'].message.content.content+=' changed';
+        if(change==='parent')value.mapping['recap-node'].parent='user-node';
+      }
+    }});
+    const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+    assert.notEqual(p.status,noImage?'matched_no_image':'matched_complete',`${noImage}:${change}`);
+    assert.equal(f.proof.imageReady(f.image),false);assert.equal(f.reads,2);
+  }
+});
+
+test('recap image proof still rejects changed prompt file count bytes and ownership',async()=>{
+  for(const options of [{backendPrompt:'changed prompt'},{wrongFile:true},{blob:true,differentBlob:true},{extraUser:true},
+    {extraAssistant:true},{newActiveDuringDownload:true},{recordTransform:value=>{
+      appendPresentationRecap(value);value.mapping['image-delivery'].message.content.parts.push({asset_pointer:'sediment://file-extra'});
+    }}]){
+    const f=await fixture({recordTransform:appendPresentationRecap,...options});
+    assert.notEqual((await f.proof.read(f.expected,f.snapshot(),f.deps)).status,'matched_complete');
+    assert.equal(f.proof.imageReady(f.image),false);
+  }
+});
+
+test('real frontend presentation-tail receipt reaches canonical completion without changing branch current or bytes',async()=>{
+  const f=await fixture({recordTransform:appendPresentationRecap,artifactIdsFollowTurnKey:true,launch:'bridge-director-desktop-'+requestId});let snapshot;
+  const proof=await f.proof.read(f.expected,f.snapshot(),{...f.deps,onVerifiedSnapshot:value=>{snapshot=value;}});
+  const source=fs.readFileSync(path.join(__dirname,'../overrides/src/browserBridge.js'),'utf8');
+  const body=source.slice(source.indexOf('export function nativeImageCompletionPayload'),source.indexOf('export class BrowserBridge')).replace('export function','function');
+  const context=vm.createContext({createHash,URL});vm.runInContext(body+';this.complete=nativeImageCompletionPayload',context);
+  const identity={requestId,leaseId:'original-lease',ownerServerInstanceId:'original-server',responseEpoch:0};
+  const client={id:'owned-source',ready:true,compatible:true,launchToken:'bridge-director-desktop-'+requestId,url:`https://chatgpt.com/c/${conversationId}`,activeRequest:identity};
+  const state={requestId,clientId:client.id,promptPayload:{requestId,message:prompt},runtime:{finished:false,cancellationRequested:false}};
+  const response={...snapshot,requestId,sourceClientId:client.id,url:client.url,session:{id:conversationId},reconciliation:proof,
+    artifacts:snapshot.artifacts.map(a=>({...a,requestId,sourceClientId:client.id,sourceTurnKey:assistantId}))};
+  const options={sourceClientId:client.id,reconcileConversation:f.expected};
+  const completed=context.complete(state,identity,client,options,response);
+  assert.equal(completed.finishReason,'native_image_record_complete');
+  assert.equal(completed.completionEvidence.nativeProof.currentNode,'recap-node');
+  assert.equal(completed.completionEvidence.nativeProof.branchIdentity[0].nodeKey,'recap-node');
+  assert.equal(completed.completionEvidence.nativeProof.assistantMessageId,assistantId);
+  assert.equal(completed.completionEvidence.nativeProof.bindings[0].bytesSha256,hash(png));
+  assert.equal(f.reads,2);
 });

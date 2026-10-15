@@ -31,3 +31,45 @@ test('malformed native branch or binding returns a hold without throwing',()=>{
     const f=fixture();mutate(f);assert.equal(run(f),null);
   }
 });
+
+function withPresentationTail(f){
+  const p=f.response.reconciliation;
+  p.branchIdentity.forEach((node,index,branch)=>{node.parent=index+1===branch.length?null:branch[index+1].nodeKey;});
+  p.branchIdentity.unshift({nodeKey:'recap-node',parent:'final-node',id:'recap-message',role:'assistant',status:'finished_successfully',endTurn:false});
+  p.currentNode='recap-node';
+  p.presentationTail={version:1,kind:'reasoning_recap',nodeKey:'recap-node',messageId:'recap-message',parentNodeKey:'final-node',
+    finalNodeKey:'final-node',finalMessageId:'assistant',contentSha256:'d'.repeat(64),contentValueType:'string',hasImagePointers:false,
+    recipient:'all',channel:null,hideInlineActions:true,finalRecipient:'all',finalChannel:'final'};
+  return f;
+}
+test('canonical completion accepts only an explicit presentation tail while retaining its real current branch',()=>{
+  const f=withPresentationTail(fixture()),before=JSON.stringify(f.response.reconciliation);
+  const result=run(f);assert.equal(result.finishReason,'native_image_record_complete');
+  assert.equal(result.completionEvidence.nativeProof.currentNode,'recap-node');
+  assert.equal(result.completionEvidence.nativeProof.branchIdentity[0].endTurn,false);
+  assert.equal(result.completionEvidence.nativeProof.assistantMessageId,'assistant');
+  assert.equal(JSON.stringify(f.response.reconciliation),before);
+});
+test('canonical presentation tail rejects unknown shape activity ownership links or incomplete evidence',()=>{
+  const mutations=[
+    p=>{delete p.presentationTail},p=>{p.presentationTail=null},p=>{p.presentationTail.version=2},p=>{p.presentationTail.kind='unknown'},
+    p=>{p.presentationTail.contentValueType='object'},p=>{p.presentationTail.contentSha256=''},
+    p=>{p.presentationTail.hasImagePointers=true},p=>{p.presentationTail.hideInlineActions=false},
+    p=>{p.presentationTail.recipient='tool'},p=>{p.presentationTail.channel='analysis'},
+    p=>{p.presentationTail.finalRecipient='tool'},p=>{p.presentationTail.finalChannel='analysis'},
+    p=>{p.presentationTail.nodeKey='different'},p=>{p.presentationTail.messageId='different'},
+    p=>{p.presentationTail.messageId='';p.branchIdentity[0].id=''},
+    p=>{p.presentationTail.parentNodeKey='different'},p=>{p.presentationTail.finalNodeKey='different'},p=>{p.presentationTail.finalMessageId='different'},
+    p=>{p.branchIdentity[0].endTurn=true},p=>{p.branchIdentity[0].status='in_progress'},p=>{p.branchIdentity[0].role='tool'},
+    p=>{p.branchIdentity[0].parent='image-node'},p=>{p.branchIdentity[1].id='different'},
+    p=>{p.branchIdentity[2].endTurn=true;p.branchIdentity[2].role='assistant'},
+    p=>{p.currentNode='final-node'},p=>{p.branchIdentity.push({nodeKey:'duplicate',parent:null,id:'another-user',role:'user'})},
+    p=>{p.branchIdentity[2].parent='not-current-branch'},p=>{p.branchIdentity.at(-1).parent='cycle'},
+  ];
+  mutations.forEach((mutate,index)=>{const f=withPresentationTail(fixture());mutate(f.response.reconciliation);assert.equal(run(f),null,`tail mutation ${index}`);});
+  for(const role of ['assistant','tool','user']){
+    const f=withPresentationTail(fixture()),p=f.response.reconciliation;
+    p.branchIdentity.unshift({nodeKey:'real-later',parent:p.currentNode,id:'real-later-id',role,status:'finished_successfully',endTurn:role==='assistant'});
+    p.currentNode='real-later';assert.equal(run(f),null,`later ${role}`);
+  }
+});

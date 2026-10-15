@@ -206,10 +206,19 @@ export class BrowserTabCoordinator {
 
   async reloadExtension(options = {}) {
     const sourceClientId = String(options.sourceClientId || options.clientId || '');
-    const before = sourceClientId
+    const source = sourceClientId
       ? (this.hub.clients || []).find((client) => client.id === sourceClientId)
       : this.hub.activeClient;
+    const before = source ? { ...source } : null;
     if (!before?.id) throw new Error('No browser extension client is available for reload');
+    if (!Number.isInteger(before.browserTabId) || before.browserTabId <= 0
+      || !BROWSER_LAUNCH_TOKEN_RE.test(String(before.launchToken || ''))
+      || ['browserProfileId', 'extensionBundleId', 'serverInstanceId', 'backgroundEpoch', 'contentEpoch']
+        .some(key => typeof before[key] !== 'string' || !before[key])) {
+      const error = new Error('Extension reload requires the original tab profile, bundle, server and runtime epochs');
+      error.code = 'EXTENSION_RELOAD_SOURCE_IDENTITY_REQUIRED';
+      throw error;
+    }
     const expectedVersion = String(options.expectedVersion || '');
     const expectedBundleId = String(options.expectedBundleId || '');
     const timeoutMs = Math.max(2_000, Number(options.timeoutMs) || 20_000);
@@ -227,8 +236,15 @@ export class BrowserTabCoordinator {
       const check = (client) => {
         if (!client?.ready) return false;
         if (expectedVersion && String(client.extensionVersion || '') !== expectedVersion) return false;
-        if (expectedBundleId && String(client.extensionBundleId || '') !== expectedBundleId) return false;
-        return client.id === before.id || Number(client.browserTabId) === Number(before.browserTabId);
+        if (String(client.extensionBundleId || '') !== (expectedBundleId || before.extensionBundleId)) return false;
+        return client.browserTabId === before.browserTabId
+          && client.browserProfileId === before.browserProfileId
+          && client.serverInstanceId === before.serverInstanceId
+          && client.launchToken === before.launchToken
+          && typeof client.backgroundEpoch === 'string' && !!client.backgroundEpoch
+          && client.backgroundEpoch !== before.backgroundEpoch
+          && typeof client.contentEpoch === 'string' && !!client.contentEpoch
+          && client.contentEpoch !== before.contentEpoch;
       };
       const handler = (client) => {
         if (!check(client)) return;
@@ -309,9 +325,6 @@ export class BrowserTabCoordinator {
     }
 
     const accepted = first.value;
-    const ownedTabRecovery = options.reloadTabs !== false
-      && Number.isInteger(Number(before.browserTabId))
-      && BROWSER_LAUNCH_TOKEN_RE.test(String(before.launchToken || ''));
     const pageReloadArmed = accepted?.pageReload?.armed === true;
     const recoveryWakeArmed = accepted?.recoveryWake?.armed === true || accepted?.recoveryAlarm?.armed === true;
     const trampolinePlanned = accepted?.reloadTrampoline?.planned === true;
@@ -370,56 +383,16 @@ export class BrowserTabCoordinator {
       }
     }
 
-    if (!ownedTabRecovery) {
-      if (maintenanceBootstrapError) {
-        cancelWait();
-        reconnectPromise.catch(() => {});
-        const wrapped = new Error(`Extension reload was accepted, but the maintenance bootstrap failed before the tab reconnected: ${maintenanceBootstrapError?.message || maintenanceBootstrapError}`);
-        wrapped.code = 'EXTENSION_RELOAD_BOOTSTRAP_FAILED';
-        wrapped.cause = maintenanceBootstrapError;
-        throw wrapped;
-      }
-      return { accepted, reconnected: await reconnectPromise };
-    }
-
+    // Another tab cannot prove that this tab loaded a new extension runtime.
+    // Preserve the accepted operation instead of replacing or closing its page.
     cancelWait();
     reconnectPromise.catch(() => {});
-    const recoveryLaunchToken = `bridge-recovery-${makeRequestId()}`;
-    const parsedBefore = browserLaunchMetadataFromUrl(before.url || '');
-    const recoveryUrl = safeChatGptUrl(parsedBefore.requestedUrl || before.requestedUrl || before.url || 'https://chatgpt.com/');
-    const elapsedMs = Date.now() - requestedAt;
-    const replacement = await this.openSystemBrowserTab({
-      url: recoveryUrl,
-      launchToken: recoveryLaunchToken,
-      timeoutMs: Math.max(5_000, timeoutMs - elapsedMs),
-      bridgeServerUrl: reloadServerUrl,
-    });
-    if (expectedVersion && String(replacement.client?.extensionVersion || '') !== expectedVersion) {
-      throw new Error(`Replacement tab connected with extension ${replacement.client?.extensionVersion || 'unknown'}, expected ${expectedVersion}`);
-    }
-    if (expectedBundleId && String(replacement.client?.extensionBundleId || '') !== expectedBundleId) {
-      throw new Error(`Replacement tab connected from bundle ${replacement.client?.extensionBundleId || 'unknown'}, expected ${expectedBundleId}`);
-    }
-    await this.sendCommand('browser.tab.close-owned', {
-      tabId: Number(before.browserTabId),
-      expectedLaunchToken: String(before.launchToken || ''),
-      timeoutMs: 10_000,
-    }, {
-      sourceClientId: replacement.client.id,
-      timeoutMs: 10_000,
-    });
-    return {
-      accepted,
-      reconnected: replacement.client,
-      recovery: {
-        used: true,
-        reason: maintenanceBootstrapError
-          ? 'maintenance_page_failed'
-          : (pageReloadArmed || recoveryWakeArmed ? 'owned_tab_did_not_reconnect' : 'page_reload_not_armed'),
-        replacedTabId: Number(before.browserTabId),
-        replacementTabId: Number(replacement.client.browserTabId),
-        launchToken: recoveryLaunchToken,
-      },
-    };
+    const error = new Error('Extension reload was accepted, but the original tab has no verified new background and content runtime');
+    error.code = 'EXTENSION_RELOAD_RECONNECT_PENDING';
+    error.reloadAccepted = true;
+    error.accepted = accepted;
+    error.recovery = { used: Boolean(maintenanceBootstrapUrl), reason: 'original_runtime_reconnect_pending' };
+    if (maintenanceBootstrapError) error.cause = maintenanceBootstrapError;
+    throw error;
   }
 }

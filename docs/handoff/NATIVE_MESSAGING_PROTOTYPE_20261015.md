@@ -85,3 +85,35 @@ flowchart LR
 仍有真实边界：普通 Edge 的旧 `bootstrap_completed` 创建记录尚在，但清空 session 后缺少可验证的页面 owner receipt。持久 tabId、窗口编号、相同 root URL 和两次 inventory 不能排除编号复用的用户页面，因此没有自动认领、导航、重建或伪造 idle。新增独立回归确认这些情形保持 held 且零副作用。需先从真实重新连接的 ChatGPT 页面恢复受认证的源，再使用现有维护恢复合同；独立 background control source 尚未实现，不以原生端口已连接冒充该能力。
 
 普通 Edge 缓存代码加载、原基础图回收与后续父子图稳定性，仍须分别实际验收；本节不宣布网页出图已通过。
+
+## 后续实际接入、读取缺陷和保留的停点
+
+普通已登录 Edge 后来确实连接到 v2 Native 宿主，原 ChatGPT 页面达到 page/composer/chatMain ready。经另一张新建的非活动只读页取得原生清单，旧控制页缺失被证明后，既有恢复合同成功建立新的隐藏控制页；原用户页面 URL 和 content epoch 未被改写。原图片工作页的完整清单结果为 confirmed_absent。正式客户端图片专用后台入口沿原任务恢复，持久预约唯一恢复 alias，重新打开原会话，未发送原提示词。
+
+读取发现真实分支尾部是 `reasoning_recap`，其前一节点才是已完成的 final，图片 tool 输出在更早的同分支。旧代码把第一个 assistant 当 final，导致已有图片仍报 `backend_generation_not_complete`。本轮按实证结构增加精确的呈现尾证据；原 currentNode 和完整 branch 不删除、不改写，原文、单 user、原消息、文件、数量、下载哈希和二次读取校验继续执行。额外 `hide_inline_actions=true` 为失败关闭条件，现场该值未取得最终确认，不能宣称真实原图已经恢复。
+
+另一独立问题是扩展升级接口把同一 background epoch 的内容页刷新误报为 runtime 更新成功。现要求原 tab/profile/server/launch、目标 bundle，以及新的 background/content epoch；owned-only 模式由持久后台协调恢复，不抢先启动内容页刷新计时器。原成功维护命令在压缩中短时保留，防止 command.accepted 已确认后、轮询前被清理而误报 ACK 超时；不改变普通生成、查询或未知状态。
+
+一次显式 `reloadTabs=false` 的后台诊断更新实际取得新 background epoch，并成功加载新版结构诊断，证明已有认证通道能够自主加载补丁。后一次更新则 HTTP 500 超时，原恢复页被旧 standalone command 持续占用；服务 pendingCommands 为零不代表扩展原命令已结算。原命令和更新 intent 均保留，不清锁、不重复升级、不把重新创建图片任务当恢复。后续现场写操作已停在该确切阻塞，最终读取、父图下载、衍生图及多任务稳定性尚未验收。
+
+用户最新建议作为接入方向：由用户普通启动专门用于网页出图的浏览器并登录，工作台验证 Bridge 与网页就绪后绑定该浏览器配置；后续在该浏览器创建受控工作标签页，保留连接页。普通浏览器模式优先，独立自动化 profile 不作默认入口。该方向减少登录环境和用户操作干扰，但不替代本轮已发现的读取、维护确认与未知状态恢复修复；窗口级引导和完整真实制作仍需单独验收。
+
+私人进度记录更新于 `.local/validation/native-messaging-20261015/checkpoint-v2.json`。本轮没有新的图片或视频生成提交，原七项目、十集源与第五集 SDK unknown 证据再次核对不变。`6d145fe` 已推送 v2 传输修复；后续源码修复与实际加载结果分开记录，不以磁盘部署冒充 runtime 已采用。
+
+## 恢复补丁收尾与 Windows 客户端验证
+
+最终冻结源码执行 `node --test apps/chrome-bridge/tests/*.test.cjs`：321/321，零失败、零跳过。Rust 定向验证分别为 `cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib providers::chrome::`（60/60）、同命令过滤 `chrome_terminal::`（6/6）、过滤 `background_chrome_images`（45/45）。这些验证覆盖会话身份、原请求恢复、精确 recap 呈现尾、维护回执保留和后台任务保护，不是网页出图质量或连续批量生成验收。
+
+执行 `cargo build --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --features desktop,custom-protocol --bin director-desktop-next` 成功，使用 `apps/desktop/scripts/update-client.ps1 -BuildOnly -CandidatePath <Cargo release EXE>` 准备 SHA 绑定 SDK 资源的独立候选。候选在隔离 home 中两次隐藏运行 `--unvirtualized-desktop --verify-startup <absolute report>`，首次真实 WebView/IPC/SQLite/媒体、项目归档恢复删除、资产删除恢复及单元编辑入口通过；第二次 `saveReopenVerified=true`，原资产及媒体身份保留，两次 `generationRequestsSent=0`、`generationJobs=0`。
+
+随后用同一更新脚本 `-PublishOnly -CandidatePath <prepared candidate EXE>` 轮换固定入口。当前客户端 SHA-256 为 `4a3dc492d2ab22c7e093e56cf613fca0f97c9e00bbe6efdde1aef2311cd16eb5`，唯一备用为上一当前版 `f67b2eb53495926d8036add162523793080350f4f45954cea31c0f001ef5c4e1`；准备候选由脚本按哈希清理。宿主 v2 没有再次修改。
+
+最终 `apply-overrides.cjs` 检查 23 份固定哈希文件，仅部署 3 份剩余差异，未写桥接状态、凭据或原任务。已有服务进程与扩展 worker 没有为加载补丁而强制重启。最终源码的磁盘部署已完成，普通浏览器实际加载和原 standalone command 结算仍未完成；保留原升级 intent，不重复发升级、不清除命令或 journal。最终只读复查仍为 Native 连接存在、页面未就绪；这不能标记为图片制作通过。
+
+复核原生产库全部表、原七项目、十集锁定源文及第五集 SDK unknown 证据精确一致。原基础图、衍生图、多任务稳定性以及第五至十集验收仍待继续，禁止以新请求绕过旧未知提交。
+
+## 专用普通浏览器的建议合同
+
+用户普通启动已登录的 Edge 或 Chrome，保留一个用于连接的 ChatGPT 页面。工作台分别检查 Bridge、登录页状态、网页输入就绪与恢复状态，再绑定全局浏览器配置；窗口或 tab ID 只作本次会话定位，浏览器重启后重新核验，不能当永久所有权凭据。现有 UI 已有普通浏览器全局 profile 绑定；本轮没有新增“已验收专用窗口”选项或承诺窗口级绑定已实现。
+
+后续工作页应在该配置中非活动创建，每图独立会话，默认同时生成一张，其余任务持久排队；提示词准备和已完成图片下载可并行。连接页不承载生产提示词，也不因任务结束而关闭。用户页保持原状，程序只清理有明确创建回执且已入库的工作页。出现登录失效、网页未就绪或断线时暂停派发并显示具体原因，沿保存的原会话链接和请求回执恢复，不自动重发，也不把刷新整个扩展当正常任务步骤。此方案减少登录环境和目标选择问题，但网页生成、下载、父图依赖和重开零重发仍须真实验收。

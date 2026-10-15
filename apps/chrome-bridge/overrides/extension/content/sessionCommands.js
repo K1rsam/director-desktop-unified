@@ -256,9 +256,12 @@ async function handleExtensionReload(payload) {
       token: CONFIG.token,
     })
     : { staged: false, reason: reloadTabs ? 'staging_unavailable' : 'tabs_not_reloaded' };
-  const pageReload = reloadTabs
+  // Owned maintenance has a durable background recovery plan. A page-owned
+  // timer can otherwise refresh this document before the ACK barrier restarts
+  // the worker, leaving the old extension runtime running.
+  const pageReload = reloadTabs && payload.ownedTabsOnly !== true
     ? await armPageOwnedReload(Number(payload.pageReloadDelayMs) || 2_500)
-    : { armed: false, reason: 'tabs_not_reloaded' };
+    : { armed: false, reason: reloadTabs ? 'owned_background_recovery' : 'tabs_not_reloaded' };
   let scheduled;
   try {
     // Arm the page-owned fallback before asking the service worker to restart.

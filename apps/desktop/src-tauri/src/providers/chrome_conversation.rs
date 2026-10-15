@@ -40,6 +40,54 @@ pub(super) fn pin(config:&ProviderConfig,p:&PreparedRequest,source:&Value,proof:
     }
     Ok(Value::Null)
 }
+// An open response is a connection snapshot, not proof that navigation and its
+// own tab command have settled. Only the same newly reserved hidden tab may be
+// observed again; this helper cannot open, navigate, or submit anything.
+const RECOVERY_SETTLE_READS:usize=6;
+fn recovery_bound(value:&Value,anchor:&Value,root:&Value,binding:&crate::chrome_setup::BrowserBinding,alias:&str)->bool{
+    value["id"]==anchor["id"]&&!s(anchor,"id").is_empty()
+        &&anchor["browserTabId"].as_u64().is_some_and(|id|id>0)&&value["browserTabId"]==anchor["browserTabId"]
+        &&value["launchToken"]==alias&&same_browser_runtime(value,root,binding)
+        &&value["focused"]==false&&value["visibilityState"]=="hidden"
+        &&value.get("activeRequest")==Some(&Value::Null)&&value["quarantined"]!=true&&value["compatible"]!=false
+        &&value["releasePending"]!=true&&value["releaseState"]!="pending"&&!s(value,"contentEpoch").is_empty()
+}
+fn recovery_transition(value:&Value,target:&Value)->bool{
+    value["url"]=="https://chatgpt.com/"&&value["requestedUrl"]==*target
+        ||value["url"]==*target&&crate::chrome_setup::client_command_busy(value)
+}
+fn settle_new_recovery(config:&ProviderConfig,client:&Client,source:&Value,root:&Value,binding:&crate::chrome_setup::BrowserBinding,alias:&str,target:&Value)->ProviderResult<Value>{
+    let held=|reads|{
+        let mut error=ProviderError::new("CHROME_LINK_RECOVERY_HELD","原会话恢复页尚未稳定，保留同一预约等待查询；未重新提交");
+        error.context=Some(json!({"phase":"recovery_page_settle","launchToken":alias,"sourceClientId":source["id"],"browserTabId":source["browserTabId"],"reads":reads,"submitCalled":false,"additionalOpenCalled":false}));error
+    };
+    if !recovery_bound(source,source,root,binding,alias)
+        ||!(source["url"]==*target&&explicit_idle(source)||recovery_transition(source,target)){return Err(held(0));}
+    let mut target_epoch=if source["url"]==*target{Some(source["contentEpoch"].clone())}else{None};
+    for read in 1..=RECOVERY_SETTLE_READS{
+        // The first read replaces the existing final verification, so a stable
+        // open still costs the same five transport calls as before.
+        let after=clients(config,client)?;
+        let owners:Vec<_>=after.iter().filter(|c|c["launchToken"]==alias).collect();
+        let controls:Vec<_>=after.iter().filter(|c|c["launchToken"]==root["launchToken"]).collect();
+        if owners.len()!=1||controls.len()!=1||!compatible_profile_clients(&after,root,binding)
+            ||!recovery_bound(owners[0],source,root,binding,alias)
+            ||!recovery_bound(controls[0],root,root,binding,s(root,"launchToken"))
+            ||controls[0]["url"]!=root["url"]||controls[0]["contentEpoch"]!=root["contentEpoch"]{return Err(held(read));}
+        let latest=owners[0];let control=controls[0];
+        if latest["url"]==*target{
+            if target_epoch.as_ref().is_some_and(|epoch|latest["contentEpoch"]!=*epoch){return Err(held(read));}
+            if target_epoch.is_none(){target_epoch=Some(latest["contentEpoch"].clone());}
+            if explicit_idle(latest)&&explicit_idle(control){return Ok(latest.clone());}
+        }else if target_epoch.is_some(){return Err(held(read));}
+        let source_wait=recovery_transition(latest,target);
+        let control_wait=control["url"]==root["url"]&&crate::chrome_setup::client_command_busy(control);
+        if !(source_wait||latest["url"]==*target&&explicit_idle(latest)&&control_wait)
+            ||!(explicit_idle(control)||control_wait){return Err(held(read));}
+        if read<RECOVERY_SETTLE_READS{std::thread::sleep(std::time::Duration::from_millis(250));}
+    }
+    Err(held(RECOVERY_SETTLE_READS))
+}
 pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRequest,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<Value>{
     let held=||ProviderError::new("CHROME_LINK_RECOVERY_HELD","原工作页丢失，保存的会话与后台恢复预约尚未完整核对；未重新提交");
     let loc=&saved["locator"];if !locator_valid(config,p,loc){return Err(held());}
@@ -57,11 +105,13 @@ pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRe
     let alias=if saved["recovery"].is_null(){format!("bridge-director-desktop-{}",uuid::Uuid::new_v4())}else{s(&saved["recovery"],"launchToken").to_owned()};
     if !alias.strip_prefix("bridge-director-desktop-").is_some_and(|id|uuid::Uuid::parse_str(id).is_ok())||alias==launch{return Err(held());}
     let owners:Vec<_>=available.iter().filter(|c|c["launchToken"]==alias).collect();
+    let mut opened_now=false;
     let mut source=if owners.len()==1&&!saved["recovery"].is_null() {owners[0].clone()}
     else if owners.is_empty()&&saved["recovery"].is_null(){
         observe(&json!({"type":"recovery_intent","requestId":p.request.request_id,"launchToken":alias,"url":loc["url"],"nativeOriginalProof":native,"at":now(),"submitCalled":false}))?;
         let opened=json_request(config,client,"/browser/tabs/open",Some(&json!({"url":loc["url"],"sourceClientId":root["id"],"active":false,"select":false,"launchToken":alias,"timeoutMs":30000,"allowSystemFallback":false})),false)?;
         if opened["ok"]!=true||opened["tabState"]["active"]!=false||opened["tabState"]["discarded"]!=false{return Err(held());}
+        opened_now=true;
         opened["client"].clone()
     }else{return Err(held());};
     // A failed website navigation may leave the one reserved recovery page on
@@ -82,9 +132,12 @@ pub(super) fn restore_source(config:&ProviderConfig,client:&Client,p:&PreparedRe
             ||navigated["client"]["browserTabId"]!=source["browserTabId"]{return Err(held());}
         source=navigated["client"].clone();
     }
-    if source["url"]!=loc["url"]||source["launchToken"]!=alias||source["focused"]!=false||source["visibilityState"]!="hidden"||!explicit_idle(&source)||!same_browser_runtime(&source,root,binding){return Err(held());}
-    let after=clients(config,client)?;let verified:Vec<_>=after.iter().filter(|c|c["launchToken"]==alias).collect();
-    if verified.len()!=1||!same_idle_owned_source(verified[0],&source,binding)||verified[0]["contentEpoch"]!=source["contentEpoch"]{return Err(held());}
+    if opened_now{source=settle_new_recovery(config,client,&source,root,binding,&alias,&loc["url"])?;}
+    else{
+        if source["url"]!=loc["url"]||source["launchToken"]!=alias||source["focused"]!=false||source["visibilityState"]!="hidden"||!explicit_idle(&source)||!same_browser_runtime(&source,root,binding){return Err(held());}
+        let after=clients(config,client)?;let verified:Vec<_>=after.iter().filter(|c|c["launchToken"]==alias).collect();
+        if verified.len()!=1||!same_idle_owned_source(verified[0],&source,binding)||verified[0]["contentEpoch"]!=source["contentEpoch"]{return Err(held());}
+    }
     observe(&json!({"type":"recovery_opened","requestId":p.request.request_id,"launchToken":alias,"client":source,"url":loc["url"],"at":now(),"submitCalled":false}))?;
     Ok(source)
 }

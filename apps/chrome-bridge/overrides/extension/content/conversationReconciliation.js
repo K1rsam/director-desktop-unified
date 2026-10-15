@@ -134,6 +134,27 @@
     for(const [key,v] of Object.entries(value)){if(key==='parts'||key==='content'||key==='image')if(v&&typeof v==='object'){if(Array.isArray(v))for(const p of v)imagePointers(p,output,depth+1);else imagePointers(v,output,depth+1);}}
     return output;
   }
+  async function presentationTailFor(outputs) {
+    const node=outputs[0],message=node?.message,finalNode=outputs[1],final=finalNode?.message;
+    const content=message?.content;
+    // This exact provider presentation schema is not a generic permission to
+    // ignore unfinished assistants. hide_inline_actions is an additional
+    // fail-closed guard; its live value still requires runtime acceptance.
+    if(message?.author?.role!=='assistant'||!message.id||message.status!=='finished_successfully'||message.end_turn!==false
+      ||message.recipient!=='all'||message.channel!==null||message.metadata?.hide_inline_actions!==true
+      ||!content||content.content_type!=='reasoning_recap'||Object.keys(content).sort().join(',')!=='content,content_type'
+      ||typeof content.content!=='string'||imagePointers(content).size
+      ||/(?:sediment:\/\/|\/backend-api\/(?:estuary\/content|files\/download)|data:image\/)/i.test(content.content)
+      ||final?.author?.role!=='assistant'||!final.id||final.status!=='finished_successfully'||final.end_turn!==true
+      ||final.recipient!=='all'||final.channel!=='final'||node.parent!==finalNode.nodeKey
+      ||final.content?.content_type!=='text'||!Array.isArray(final.content.parts)||!final.content.parts.length
+      ||!final.content.parts.every(part=>typeof part==='string')
+      ||outputs.filter(output=>output.message?.author?.role==='assistant'&&output.message.end_turn===true).length!==1)return null;
+    const contentSha256=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(content.content)))].map(value=>value.toString(16).padStart(2,'0')).join('');
+    return {version:1,kind:'reasoning_recap',nodeKey:node.nodeKey,messageId:message.id,parentNodeKey:node.parent,
+      finalNodeKey:finalNode.nodeKey,finalMessageId:final.id,contentSha256,contentValueType:'string',hasImagePointers:false,
+      recipient:'all',channel:null,hideInlineActions:true,finalRecipient:'all',finalChannel:'final'};
+  }
   async function nativeBoundary(record, expected, snapshot, facts) {
     const fail = reason => result(expected,'mismatch',reason);
     if(!/^[a-f0-9]{64}$/.test(expected.promptSha256||'')||!Number.isInteger(expected.imageCount)||expected.imageCount<1||expected.imageCount>4)return fail('invalid_expectation');
@@ -149,25 +170,47 @@
     // A fresh, submitted conversation can have its exact user turn before the
     // assistant node exists. It cannot yield image adoption or byte bindings.
     if(facts.assistantCount===0)return result(expected,'matched_incomplete','assistant_not_created',locator);
-    const userIndex=branch.indexOf(users[0]);const outputs=branch.slice(0,userIndex);const assistant=outputs.find(n=>n.message?.author?.role==='assistant')?.message;
-    const schemaFacts=outputs.map(n=>({role:n.message?.author?.role,contentType:n.message?.content?.content_type,status:n.message?.status,endTurn:n.message?.end_turn}));
+    const userIndex=branch.indexOf(users[0]);const outputs=branch.slice(0,userIndex);
+    // Structural diagnostics deliberately exclude content, metadata values,
+    // pointers and credentials. Unknown recap schemas remain held until their
+    // exact presentation-only contract has independent evidence.
+    const schemaFacts=outputs.map(n=>{
+      const message=n.message||{},content=message.content;
+      const objectKeys=value=>value&&typeof value==='object'&&!Array.isArray(value)?Object.keys(value).sort():[];
+      const safeEnum=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]{1,50}$/.test(value)?value:undefined;
+      const label=typeof content?.content==='string'?normalize(content.content):'';
+      const timingLabel=label.length<=100&&(/^(?:Thought for|Thinking for) \d+(?:\.\d+)?\s*(?:hours?|h|minutes?|mins?|m|seconds?|secs?|s)(?:\s*\d+(?:\.\d+)?\s*(?:hours?|h|minutes?|mins?|m|seconds?|secs?|s)){0,2}$/i.test(label)
+        ||/^(?:已)?思考(?:了)?\s*\d+(?:\.\d+)?\s*(?:小时|分钟|分|秒)(?:\s*\d+(?:\.\d+)?\s*(?:小时|分钟|分|秒)){0,2}$/.test(label));
+      return {role:message.author?.role,contentType:content?.content_type,status:message.status,endTurn:message.end_turn,
+        contentKeys:objectKeys(content),parts:Array.isArray(content?.parts)?content.parts.map(part=>({type:typeof part,keys:objectKeys(part)})):null,
+        contentValueType:typeof content?.content,contentValueKeys:objectKeys(content?.content),
+        contentValueLength:typeof content?.content==='string'?content.content.length:null,contentLooksTimingLabel:timingLabel,
+        hideInlineActions:message.metadata?.hide_inline_actions===true,reasoningStatus:safeEnum(message.metadata?.reasoning_status),reasoningRecapType:safeEnum(message.metadata?.reasoning_recap_type),
+        recipient:message.recipient,channel:message.channel,metadataKeys:objectKeys(message.metadata),hasImagePointers:imagePointers(content).size>0};
+    });
+    const recapHead=outputs[0]?.message?.content?.content_type==='reasoning_recap';
+    if(!recapHead&&outputs.some(node=>node.message?.content?.content_type==='reasoning_recap'))return result(expected,'matched_incomplete','backend_current_node_not_final',{schemaFacts,...locator});
+    const presentationTail=recapHead?await presentationTailFor(outputs):null;
+    const assistant=(presentationTail?outputs[1]:outputs.find(n=>n.message?.author?.role==='assistant'))?.message;
+    if(recapHead&&!presentationTail)return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts,...locator});
     if(!assistant?.id||assistant.status!=='finished_successfully'||assistant.end_turn!==true||(assistant.recipient&&assistant.recipient!=='all')||(assistant.channel&&assistant.channel!=='final'))return result(expected,'matched_incomplete','backend_generation_not_complete',{schemaFacts,...locator});
-    if(outputs[0]?.message?.id!==assistant.id)return result(expected,'matched_incomplete','backend_current_node_not_final',{schemaFacts});
+    if(outputs[presentationTail?1:0]?.message?.id!==assistant.id)return result(expected,'matched_incomplete','backend_current_node_not_final',{schemaFacts});
     // Intermediate render attempts are history, not additional delivered images.
     // Select only the newest image-bearing output, then corroborate its exact
     // file IDs with the unique DOM image and an authenticated branch reread.
     // Never fall back to an older match or select a subset of a multi-image output.
     const imageOutputs=outputs.filter(n=>['assistant','tool'].includes(n.message?.author?.role)).map(n=>({node:n,pointers:imagePointers(n.message.content)})).filter(o=>o.pointers.size);
     const delivery=imageOutputs[0];const pointers=delivery?.pointers || new Set();
-    if(!delivery && outputs.length===1 && assistant.content?.content_type==='text'
+    if(!delivery && outputs.length===(presentationTail?2:1) && assistant.content?.content_type==='text'
       && Array.isArray(assistant.content.parts) && assistant.content.parts.length>0 && assistant.content.parts.every(p=>typeof p==='string')
       && typeof snapshot.answer==='string' && await digest(snapshot.answer)===await digest(assistant.content.parts.join('\n'))){
       return result(expected,'no_image_candidate','final_text_without_image',{...locator,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:true,currentNode:record.current_node,backendImageCount:0,
+        ...(presentationTail?{presentationTail}:{}),
         assistantTextSha256:await digest(snapshot.answer),branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id||'',role:n.message?.author?.role||'',status:n.message?.status||'',endTurn:n.message?.end_turn}))});
     }
     if(delivery && delivery.node.message.status!=='finished_successfully')return result(expected,'matched_incomplete','backend_image_not_complete',{schemaFacts});
     if(pointers.size!==expected.imageCount)return result(expected,'mismatch','backend_image_identity',{schemaFacts,backendImageCount:pointers.size});
-    return {userMessageId:user.id,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:assistant.end_turn,pointers:[...pointers],schemaFacts,currentNode:record.current_node,deliveryNode:delivery?.node.nodeKey,deliveryMessageId:delivery?.node.message.id,branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id || '',role:n.message?.author?.role || '',status:n.message?.status || '',endTurn:n.message?.end_turn}))};
+    return {userMessageId:user.id,assistantMessageId:assistant.id,backendStatus:assistant.status,endTurn:assistant.end_turn,pointers:[...pointers],schemaFacts,currentNode:record.current_node,...(presentationTail?{presentationTail}:{}),deliveryNode:delivery?.node.nodeKey,deliveryMessageId:delivery?.node.message.id,branchIdentity:branch.map(n=>({nodeKey:n.nodeKey,parent:n.parent,id:n.message?.id || '',role:n.message?.author?.role || '',status:n.message?.status || '',endTurn:n.message?.end_turn}))};
   }
   async function evaluate(record,expected,snapshot,facts){
     const boundary=await nativeBoundary(record,expected,snapshot,facts);if(boundary.status)return boundary;

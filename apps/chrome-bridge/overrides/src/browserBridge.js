@@ -38,7 +38,24 @@ export function nativeImageCompletionPayload(state, identity, client, options, r
   const hash = value => createHash('sha256').update(value).digest('hex');
   const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
   const branch = proof?.branchIdentity;
-  const finalNode = branch?.[0];
+  const hasPresentationTail = proof && Object.hasOwn(proof, 'presentationTail');
+  const finalNode = branch?.[hasPresentationTail ? 1 : 0];
+  const presentationTailValid = () => {
+    const tail = proof.presentationTail, current = branch[0];
+    return tail && typeof tail === 'object' && !Array.isArray(tail)
+      && tail.version === 1 && tail.kind === 'reasoning_recap' && tail.contentValueType === 'string'
+      && sha(tail.contentSha256) && tail.hasImagePointers === false && tail.hideInlineActions === true
+      && tail.recipient === 'all' && tail.channel === null && tail.finalRecipient === 'all' && tail.finalChannel === 'final'
+      && typeof tail.messageId === 'string' && tail.messageId
+      && current.nodeKey === proof.currentNode && current.nodeKey === tail.nodeKey && current.id === tail.messageId
+      && current.role === 'assistant' && current.status === 'finished_successfully' && current.endTurn === false
+      && current.parent === finalNode.nodeKey && tail.parentNodeKey === finalNode.nodeKey
+      && finalNode.nodeKey === tail.finalNodeKey && finalNode.id === tail.finalMessageId
+      && branch.filter(node => node.role === 'assistant' && node.endTurn === true).length === 1
+      && branch.every((node, index) => typeof node.nodeKey === 'string' && node.nodeKey
+        && (index === branch.length - 1 ? node.parent === null : node.parent === branch[index + 1].nodeKey))
+      && new Set(branch.map(node => node.nodeKey)).size === branch.length;
+  };
   if (!state || state.runtime?.finished || state.runtime?.cancellationRequested
     || expected?.mode !== 'image_record_v1' || expected.imageCount !== 1
     || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id || '')
@@ -56,7 +73,8 @@ export function nativeImageCompletionPayload(state, identity, client, options, r
     || proof.conversationId !== expected.conversationId || proof.backendStatus !== 'finished_successfully' || proof.endTurn !== true
     || !proof.userMessageId || !proof.assistantMessageId || !proof.currentNode || !Array.isArray(branch) || !finalNode
     || branch.some(node => !node || typeof node !== 'object')
-    || finalNode?.nodeKey !== proof.currentNode || finalNode.id !== proof.assistantMessageId
+    || (hasPresentationTail ? !presentationTailValid() : finalNode?.nodeKey !== proof.currentNode)
+    || finalNode.id !== proof.assistantMessageId
     || finalNode.role !== 'assistant' || finalNode.status !== 'finished_successfully' || finalNode.endTurn !== true
     || branch.filter(node => node.role === 'user').length !== 1
     || !branch.some(node => node.role === 'user' && node.id === proof.userMessageId)
