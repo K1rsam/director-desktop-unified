@@ -1,0 +1,640 @@
+// Assistant-turn artifact discovery and metadata normalization.
+// Loaded as a classic MV3 content script before content.js.
+(() => {
+  'use strict';
+
+  function createArtifactDom(deps = {}) {
+    const {
+      DOM_PARSER,
+      actionSelectorHint,
+      diagnostic,
+      guessMime,
+      guessNameFromUrl,
+      isUsableButton,
+      isVisible,
+      normalizeText,
+      simpleHash,
+      visibleText,
+    } = deps;
+
+    if (typeof isUsableButton !== 'function') {
+      throw new TypeError('ChatGptArtifactDom requires isUsableButton(deps)');
+    }
+
+    const turnDom = globalThis.ChatGptTurnDom.createTurnDom();
+    const imageDiagnosticStates = new Map();
+    const MAX_IMAGE_DIAGNOSTIC_STATES = 512;
+
+    function reportImageDiagnostic(name, identity, state, details) {
+      if (typeof diagnostic !== 'function') return;
+      const key = `${name}:${identity}`;
+      if (imageDiagnosticStates.get(key) === state) return;
+      imageDiagnosticStates.set(key, state);
+      while (imageDiagnosticStates.size > MAX_IMAGE_DIAGNOSTIC_STATES) {
+        imageDiagnosticStates.delete(imageDiagnosticStates.keys().next().value);
+      }
+      diagnostic(name, details);
+    }
+
+function isZipLikeLabel(text = '') {
+  return /\.zip(?:\b|$)|application\/zip|zip archive|архив zip/i.test(String(text || ''));
+}
+
+function hasStrictArtifactIntent(text = '') {
+  const value = String(text || '');
+  return isZipLikeLabel(value) || /download|скачать|export|artifact|canvas|sandbox:|archive file|download file|save (?:file|artifact|archive)|сохранить (?:файл|архив)|выгрузить (?:файл|архив)/i.test(value);
+}
+
+function looksLikeThinkingProgressText(text = '') {
+  const value = String(text || '');
+  return /thinking|think|reasoning|thought|думаю|размыш|inspect|list|read|scan|upload|prepare|analyz|смотрю|читаю|провер|анализ/i.test(value);
+}
+
+function collectArtifactsForAssistantNode(node, meta = {}) {
+  const scopes = [];
+  const addScope = (scope) => {
+    if (!scope || scopes.includes(scope)) return;
+    scopes.push(scope);
+  };
+  addScope(node);
+  const containingTurn = turnDom.owner(node);
+  addScope(containingTurn);
+  for (const scope of turnDom.generatedImageScopes?.(containingTurn || node) || []) addScope(scope);
+  const effectiveMeta = {
+    ...meta,
+    turnKey: meta.turnKey || turnDom.key(containingTurn || node),
+  };
+  // Output files can be children of the final Markdown node or sibling tool
+  // result blocks, but the scan must remain inside the owning assistant turn.
+  return mergeArtifacts(...scopes.map((scope) => collectArtifactsFromNode(scope, effectiveMeta)));
+}
+
+function artifactPhaseRank(phase = '') {
+  return ({ FAILED: 4, READY: 3, GENERATING: 2, UPLOADING: 1 }[String(phase || '').toUpperCase()] || 0);
+}
+
+function mergeArtifactRecords(left, right) {
+  if (!left) return right;
+  if (!right) return left;
+  const preferred = artifactPhaseRank(right.phase) >= artifactPhaseRank(left.phase) ? right : left;
+  const fallback = preferred === right ? left : right;
+  return {
+    ...fallback,
+    ...preferred,
+    url: preferred.url || fallback.url || '',
+    downloadUrl: preferred.downloadUrl || fallback.downloadUrl || '',
+    src: preferred.src || fallback.src || '',
+    selectorHint: preferred.selectorHint || fallback.selectorHint || '',
+    actionLabel: preferred.actionLabel || fallback.actionLabel || '',
+    downloadable: Boolean(preferred.downloadable || fallback.downloadable),
+    downloadActionPresent: Boolean(preferred.downloadActionPresent || fallback.downloadActionPresent),
+    rawAttributes: { ...(fallback.rawAttributes || {}), ...(preferred.rawAttributes || {}) },
+  };
+}
+
+function mergeArtifacts(...lists) {
+  const byKey = new Map();
+  for (const artifact of lists.flat().filter(Boolean)) {
+    const key = artifact.id || artifact.downloadUrl || artifact.url || artifact.src || [artifact.kind, artifact.name, artifact.blockStart, artifact.blockEnd, artifact.actionLabel].filter(Boolean).join('|');
+    if (!key) continue;
+    byKey.set(key, mergeArtifactRecords(byKey.get(key), artifact));
+  }
+  return [...byKey.values()];
+}
+
+function queryAllWithSelf(root, selector) {
+  if (!root?.querySelectorAll) return [];
+  const result = [];
+  try {
+    if (root.matches?.(selector)) result.push(root);
+    result.push(...Array.from(root.querySelectorAll(selector)));
+  } catch {
+    // Ignore selector incompatibilities in older Chromium builds.
+  }
+  return result;
+}
+
+function elementDescriptor(element) {
+  if (!element) return '';
+  const own = [
+    visibleText(element),
+    element.getAttribute?.('aria-label'),
+    element.getAttribute?.('title'),
+    element.getAttribute?.('data-testid'),
+    element.getAttribute?.('download'),
+    element.getAttribute?.('href'),
+    element.getAttribute?.('class'),
+    element.getAttribute?.('data-state'),
+    element.getAttribute?.('aria-busy'),
+  ];
+  const descendants = Array.from(element.querySelectorAll?.('[aria-label], [title], [data-testid], [data-state], [aria-busy], a[href], [download]') || [])
+    .slice(0, 24)
+    .flatMap((child) => [child.getAttribute('aria-label'), child.getAttribute('title'), child.getAttribute('data-testid'), child.getAttribute('data-state'), child.getAttribute('aria-busy'), child.getAttribute('download'), child.getAttribute('href')]);
+  return normalizeText([...own, ...descendants].filter(Boolean).join(' '));
+}
+
+function artifactActionSignal(element) {
+  if (!element) return '';
+  return normalizeText([
+    visibleText(element),
+    element.getAttribute?.('aria-label'),
+    element.getAttribute?.('title'),
+    element.getAttribute?.('data-testid'),
+    element.getAttribute?.('download'),
+    element.getAttribute?.('href'),
+    element.getAttribute?.('data-state'),
+    element.getAttribute?.('aria-busy'),
+  ].filter(Boolean).join(' '));
+}
+
+function isBrowserOnlyArtifactUrl(url = '') {
+  const value = String(url || '');
+  return /^sandbox:/i.test(value) || /^filesystem:/i.test(value) || /\/mnt\/data\//i.test(value);
+}
+
+function isCurrentPageNavigationUrl(url = '') {
+  const value = String(url || '').trim();
+  if (!value || /^(?:blob|data|sandbox|filesystem):/i.test(value)) return false;
+  try {
+    const currentHref = String(globalThis.location?.href || '');
+    if (!currentHref) return false;
+    const current = new URL(currentHref);
+    const candidate = new URL(value, current);
+    return candidate.origin === current.origin
+      && candidate.pathname === current.pathname
+      && candidate.search === current.search;
+  } catch {
+    return false;
+  }
+}
+
+function hasIntrinsicArtifactEvidence(element) {
+  if (!element) return false;
+  const href = element.href || element.getAttribute?.('href') || '';
+  const download = element.getAttribute?.('download') || '';
+  const signal = artifactActionSignal(element);
+  const directNames = typeof DOM_PARSER.extractFileLikeNames === 'function'
+    ? DOM_PARSER.extractFileLikeNames(signal)
+    : [DOM_PARSER.extractFileLikeName(signal)].filter(Boolean);
+  const stableArtifactContainer = element.closest?.('[data-testid*="artifact" i], [data-testid*="file" i]');
+  return Boolean(
+    download
+    || stableArtifactContainer
+    || directNames.length
+    || hasStrictArtifactIntent(signal)
+    || isBrowserOnlyArtifactUrl(href)
+    || /\/(?:download|files?|artifacts?)(?:\/|\?|$)/i.test(href)
+  );
+}
+
+function isExcludedArtifactAction(element) {
+  if (!element) return true;
+  const signal = artifactActionSignal(element);
+  if (/copy|копировать|citation|цитирование кода|share|поделиться|regenerate|повторить ответ/i.test(signal)) return true;
+  if (element.closest?.('[data-testid="webpage-citation-pill"], [data-testid="copy-turn-action-button"], [data-testid*="turn-action" i], [role="group"][aria-label*="action" i]')) return true;
+  // Reasoning rows can mention filenames and archives in prose while exposing
+  // unrelated controls such as "Respond now". Ambient reasoning text is not
+  // artifact identity; accept controls in that subtree only when the control
+  // itself or a stable file/artifact container supplies materializable evidence.
+  if (element.closest?.('[data-testid^="cot-v5-"]') && !hasIntrinsicArtifactEvidence(element)) return true;
+  return false;
+}
+
+function artifactBlockElement(element, root) {
+  if (!element) return null;
+  const stable = element.closest?.('[data-start][data-end], [data-testid*="artifact" i], [data-testid*="file" i]');
+  if (stable && (!root?.contains || root.contains(stable))) return stable;
+  const semantic = element.closest?.('p, li, figure');
+  if (semantic && (!root?.contains || root.contains(semantic))) return semantic;
+  return element.parentElement && (!root?.contains || root.contains(element.parentElement)) ? element.parentElement : element;
+}
+
+function artifactLocatorMeta(element, root) {
+  const block = artifactBlockElement(element, root);
+  const actions = block ? queryAllWithSelf(block, 'button, [role="button"], a[href]') : [];
+  return {
+    blockStart: block?.getAttribute?.('data-start') || '',
+    blockEnd: block?.getAttribute?.('data-end') || '',
+    blockTestId: block?.getAttribute?.('data-testid') || '',
+    blockText: normalizeText(visibleText(block)).slice(0, 500),
+    actionOrdinal: Math.max(0, actions.indexOf(element)),
+    actionTag: element?.tagName?.toLowerCase?.() || '',
+    actionRole: element?.getAttribute?.('role') || '',
+    actionTestId: element?.getAttribute?.('data-testid') || '',
+    actionAriaLabel: element?.getAttribute?.('aria-label') || '',
+  };
+}
+
+function artifactFileName(element, root, url = '') {
+  const namesFrom = (value) => {
+    if (!value) return [];
+    if (typeof DOM_PARSER.extractFileLikeNames === 'function') return DOM_PARSER.extractFileLikeNames(value);
+    const one = DOM_PARSER.extractFileLikeName(value);
+    return one ? [one] : [];
+  };
+  const directSignals = [
+    element?.getAttribute?.('download'),
+    element?.getAttribute?.('aria-label'),
+    element?.getAttribute?.('title'),
+    visibleText(element),
+    guessNameFromUrl(url),
+  ].filter(Boolean);
+  for (const signal of directSignals) {
+    const direct = namesFrom(signal);
+    if (direct.length === 1) return direct[0];
+    const directZip = direct.find((name) => /\.zip$/i.test(name));
+    if (directZip) return directZip;
+  }
+
+  const block = artifactBlockElement(element, root);
+  const nearby = [];
+  if (element?.previousElementSibling) nearby.push(element.previousElementSibling);
+  if (element?.nextElementSibling) nearby.push(element.nextElementSibling);
+  const parentChildren = Array.from(element?.parentElement?.children || []);
+  const ownIndex = parentChildren.indexOf(element);
+  if (ownIndex >= 0) {
+    for (const distance of [1, 2]) {
+      if (parentChildren[ownIndex - distance]) nearby.push(parentChildren[ownIndex - distance]);
+      if (parentChildren[ownIndex + distance]) nearby.push(parentChildren[ownIndex + distance]);
+    }
+  }
+  for (const candidateNode of nearby) {
+    const candidates = namesFrom(visibleText(candidateNode));
+    if (candidates.length === 1) return candidates[0];
+  }
+
+  const blockCandidates = namesFrom(visibleText(block));
+  if (blockCandidates.length === 1) return blockCandidates[0];
+  if (blockCandidates.length > 1) {
+    const actionSignal = artifactActionSignal(element);
+    const zipCandidate = blockCandidates.find((name) => /\.zip$/i.test(name));
+    if (zipCandidate && /zip|archive|архив|bundle|download|скачать/i.test(actionSignal)) return zipCandidate;
+  }
+  return guessNameFromUrl(url) || '';
+}
+
+function generatedImageEvidence(image, src = '') {
+  if (!image) return { generated: false, signal: '', container: null };
+  const container = image.closest?.([
+    '[data-testid*="generated-image" i]',
+    '[data-testid*="imagegen" i]',
+    '[data-testid*="image-gen" i]',
+    '[data-testid*="image-generation" i]',
+    '[class*="imagegen-image" i]',
+  ].join(', ')) || null;
+  const signal = normalizeText([
+    image.getAttribute?.('alt'),
+    image.getAttribute?.('aria-label'),
+    image.getAttribute?.('title'),
+    image.getAttribute?.('data-testid'),
+    image.getAttribute?.('class'),
+    container?.getAttribute?.('data-testid'),
+    container?.getAttribute?.('aria-label'),
+    container?.getAttribute?.('title'),
+  ].filter(Boolean).join(' '));
+  const explicit = Boolean(container)
+    || /generated[\s_-]*image|image[\s_-]*(?:gen|generation)|imagegen|dall[\s_-]*e/i.test(signal);
+  const estuary = /\/backend-api\/estuary\/content(?:\/|\?|$)/i.test(String(src || ''));
+  return { generated: explicit || estuary, signal, container, estuary };
+}
+
+function generatedImageReady(image, evidence = {}) {
+  if (globalThis.ChatGptImageRecordProof?.imageReady(image)) return true;
+  if (!image || !isVisible(image)) return false;
+  if (image.getAttribute?.('aria-busy') === 'true') return false;
+  const busyRoot = image.closest?.('[aria-busy="true"], [role="progressbar"], [data-state="loading"], [data-state="running"], [data-state="generating"], [data-state="pending"]');
+  if (busyRoot && busyRoot !== evidence.container) return false;
+  if (evidence.container?.matches?.('[aria-busy="true"], [data-state="loading"], [data-state="running"], [data-state="generating"], [data-state="pending"]')) return false;
+  // Historical multi-image turns leave unselected Estuary images lazy. Their
+  // signed source is already materializable even though Chromium has not loaded
+  // the <img>, so publishing must not depend on image.complete/naturalWidth.
+  if (!evidence.estuary && typeof image.complete === 'boolean' && !image.complete) return false;
+  if (!evidence.estuary && typeof image.naturalWidth === 'number' && image.naturalWidth === 0 && image.complete) return false;
+  const rect = image.getBoundingClientRect?.() || { width: 0, height: 0 };
+  return Math.max(Number(rect.width) || 0, Number(rect.height) || 0) >= 40;
+}
+
+function generatedImageSourceKey(src = '') {
+  if (!/\/backend-api\/estuary\/content(?:\/|\?|$)/i.test(String(src || ''))) return '';
+  try {
+    const parsed = new URL(String(src), globalThis.location?.href || 'https://chatgpt.com/');
+    const contentId = parsed.searchParams.get('id') || parsed.searchParams.get('file_id') || parsed.pathname.match(/\/content\/([^/?#]+)/i)?.[1] || '';
+    return contentId ? `estuary:${contentId}` : '';
+  } catch {
+    return '';
+  }
+}
+
+function generatedImageSource(image) {
+  const native = globalThis.ChatGptImageRecordProof?.imageSource(image); if (native) return native;
+  const direct = image?.currentSrc
+    || image?.getAttribute?.('src')
+    || image?.getAttribute?.('data-src')
+    || image?.src
+    || '';
+  if (direct) return String(direct);
+  const srcset = image?.getAttribute?.('srcset') || image?.getAttribute?.('data-srcset') || '';
+  return String(srcset).split(',')[0]?.trim().split(/\s+/)[0] || '';
+}
+
+function generatedImageMime(image, src = '') {
+  const native = globalThis.ChatGptImageRecordProof?.imageMetadata(image); if (native) return native.mime;
+  const declared = [
+    image?.getAttribute?.('data-mime'),
+    image?.getAttribute?.('data-mime-type'),
+    image?.getAttribute?.('type'),
+  ].find((value) => /^image\//i.test(String(value || '')));
+  if (declared) return String(declared);
+  const guessed = guessMime('', src);
+  return /^image\//i.test(String(guessed || '')) ? guessed : 'image/*';
+}
+
+function generatedImageSize(image) {
+  const native = globalThis.ChatGptImageRecordProof?.imageMetadata(image); if (native) return native.size;
+  const value = Number(image?.getAttribute?.('data-size') || image?.getAttribute?.('data-file-size') || 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function artifactState(element, root, extra = {}) {
+  const block = artifactBlockElement(element, root);
+  const busy = element?.getAttribute?.('aria-busy') === 'true' || block?.getAttribute?.('aria-busy') === 'true';
+  const progressVisible = Boolean(block?.querySelector?.('[role="progressbar"], [aria-busy="true"]'));
+  const disabled = Boolean(element?.disabled || element?.getAttribute?.('aria-disabled') === 'true');
+  const state = [element?.getAttribute?.('data-state'), block?.getAttribute?.('data-state')].filter(Boolean).join(' ');
+  const text = normalizeText(`${artifactActionSignal(element)} ${visibleText(block)}`);
+  const phase = DOM_PARSER.classifyArtifactPhase({
+    state,
+    text,
+    busy,
+    progressVisible,
+    disabled,
+    failed: Boolean(extra.failed),
+    downloadable: Boolean(extra.downloadable),
+    downloadActionPresent: Boolean(extra.downloadActionPresent),
+    href: extra.href || '',
+  });
+  return { phase, state, busy, progressVisible, disabled, text };
+}
+
+function collectArtifactsFromNode(node, meta = {}) {
+  const artifacts = [];
+  if (!node?.querySelectorAll) return artifacts;
+
+  const push = (artifact) => {
+    const url = artifact.downloadUrl || artifact.url || artifact.src || '';
+    const locator = artifact.locator || artifactLocatorMeta(artifact.element || null, node);
+    const selectorHint = artifact.selectorHint || actionSelectorHint(artifact.element || null);
+    const fileName = artifact.fileName || artifactFileName(artifact.element || null, node, url);
+    const name = normalizeText(fileName || artifact.name || artifact.title || artifact.text || guessNameFromUrl(url) || artifact.kind || 'artifact');
+    const stateInfo = artifact.stateInfo || artifactState(artifact.element || null, node, {
+      downloadable: artifact.downloadable,
+      downloadActionPresent: artifact.downloadActionPresent,
+      href: url,
+      failed: artifact.failed,
+    });
+    const sourceTurnKey = artifact.sourceTurnKey || meta.turnKey || '';
+    const structuralOrdinal = artifact.stableKey ? '' : (artifact.groupOrdinal ?? locator.actionOrdinal);
+    const identity = artifact.stableKey
+      ? [sourceTurnKey, artifact.stableKey].join('|')
+      : [sourceTurnKey, name, locator.blockStart, locator.blockEnd, locator.blockTestId, structuralOrdinal, url && !name ? url : ''].join('|');
+    const id = artifact.id || `artifact_${simpleHash(identity)}`;
+    const { element, locator: ignoredLocator, stateInfo: ignoredState, ...publicArtifact } = artifact;
+    const record = {
+      id,
+      name,
+      fileName: name,
+      extension: name.includes('.') ? name.split('.').pop().toLowerCase() : '',
+      mime: artifact.mime || guessMime(name, url),
+      sourceTurnKey: artifact.sourceTurnKey || meta.turnKey || '',
+      sourceTurnIndex: artifact.sourceTurnIndex ?? meta.turnIndex ?? -1,
+      sourceCandidateIndex: artifact.sourceCandidateIndex ?? meta.candidateIndex ?? 0,
+      selectorHint,
+      phase: artifact.phase || stateInfo.phase,
+      state: artifact.state || stateInfo.state || '',
+      progressText: artifact.progressText || (stateInfo.phase === 'GENERATING' ? stateInfo.text.slice(0, 300) : ''),
+      errorText: artifact.errorText || (stateInfo.phase === 'FAILED' ? stateInfo.text.slice(0, 300) : ''),
+      downloadable: Boolean(artifact.downloadable || url || artifact.downloadActionPresent),
+      downloadActionPresent: Boolean(artifact.downloadActionPresent),
+      urlMayExpire: Boolean(url && (/^blob:|^data:|^sandbox:|token=|signature=/i.test(url))),
+      blockStart: locator.blockStart,
+      blockEnd: locator.blockEnd,
+      blockTestId: locator.blockTestId,
+      blockText: locator.blockText,
+      actionOrdinal: locator.actionOrdinal,
+      actionTag: locator.actionTag,
+      actionRole: locator.actionRole,
+      actionTestId: locator.actionTestId,
+      actionAriaLabel: locator.actionAriaLabel,
+      rawAttributes: {
+        href: artifact.element?.getAttribute?.('href') || '',
+        download: artifact.element?.getAttribute?.('download') || '',
+        ariaLabel: artifact.element?.getAttribute?.('aria-label') || '',
+        testId: artifact.element?.getAttribute?.('data-testid') || '',
+        state: artifact.element?.getAttribute?.('data-state') || '',
+        busy: artifact.element?.getAttribute?.('aria-busy') || '',
+      },
+      ...publicArtifact,
+    };
+    const existingIndex = artifacts.findIndex((item) => item.id === id);
+    if (existingIndex >= 0) {
+      artifacts[existingIndex] = mergeArtifactRecords(artifacts[existingIndex], record);
+      return artifacts[existingIndex];
+    }
+    artifacts.push(record);
+    return record;
+  };
+
+  for (const anchor of queryAllWithSelf(node, 'a[href]')) {
+    if (!isVisible(anchor) || isExcludedArtifactAction(anchor)) continue;
+    const rawHref = anchor.getAttribute('href') || '';
+    const href = anchor.href || rawHref;
+    const download = anchor.getAttribute('download') || '';
+    const stableArtifactContainer = anchor.closest?.('[data-testid*="artifact" i], [data-testid*="file" i], [download]');
+    if ((!rawHref || isCurrentPageNavigationUrl(href))
+      && !download
+      && !stableArtifactContainer
+      && !isBrowserOnlyArtifactUrl(rawHref)) continue;
+    if (isCurrentPageNavigationUrl(href)) continue;
+    const text = visibleText(anchor);
+    const descriptor = elementDescriptor(anchor);
+    const fileName = artifactFileName(anchor, node, href);
+    const inFileCard = Boolean(anchor.closest?.('[data-testid*="file" i], [data-testid*="artifact" i], [download]'));
+    const looksDownload = Boolean(
+      download
+      || href.startsWith('blob:')
+      || href.startsWith('data:')
+      || isBrowserOnlyArtifactUrl(href)
+      || /\/(?:download|files?|artifacts?)(?:\/|\?|$)/i.test(href)
+      || hasStrictArtifactIntent(`${download} ${text} ${descriptor}`)
+      || (inFileCard && fileName)
+    );
+    if (!looksDownload) continue;
+    push({
+      kind: isBrowserOnlyArtifactUrl(href) ? 'action' : 'file',
+      url: href,
+      downloadUrl: href,
+      name: fileName || download || text || guessNameFromUrl(href),
+      text,
+      actionLabel: text || download || descriptor,
+      downloadable: true,
+      downloadActionPresent: true,
+      element: anchor,
+    });
+  }
+
+  // Lazy historical outputs can expose currentSrc/srcset/data-src before React
+  // writes a literal src attribute, so the selector itself must not require it.
+  const imageCandidates = queryAllWithSelf(node, 'img');
+  let generatedImageOrdinal = 0;
+  let generatedContainerOrdinal = 0;
+  const generatedContainerOrdinals = new WeakMap();
+  for (const image of imageCandidates) {
+    const src = generatedImageSource(image);
+    if (!src || /^data:image\/svg/i.test(src) || image.getAttribute?.('aria-hidden') === 'true') continue;
+    const evidence = generatedImageEvidence(image, src);
+    if (!evidence.generated) continue;
+    const alt = normalizeText(image.getAttribute('alt') || image.getAttribute('aria-label') || '');
+    const ready = generatedImageReady(image, evidence);
+    const sourceKind = /\/backend-api\/estuary\/content(?:\/|\?|$)/i.test(src) ? 'estuary' : 'generated-image-ui';
+    const sourceIdentity = generatedImageSourceKey(src) || `source:${simpleHash(src)}`;
+    const diagnosticIdentity = `${meta.turnKey || ''}|${sourceIdentity}`;
+    reportImageDiagnostic('image.candidate.observed', diagnosticIdentity, [ready, Boolean(evidence.signal), sourceKind].join('|'), {
+      sourceTurnKey: meta.turnKey || '',
+      ordinal: generatedImageOrdinal,
+      ready,
+      hasExplicitSignal: Boolean(evidence.signal),
+      sourceKind,
+    });
+    if (!ready) continue;
+    const rect = image.getBoundingClientRect?.() || { width: 0, height: 0 };
+    const stableContainer = evidence.container || image.closest?.('[id^="image-"]') || null;
+    // ChatGPT renders the selected output both full-size and in its picker, and
+    // may reuse container ids across picker entries. Estuary content identity
+    // distinguishes real variants while collapsing those presentation copies.
+    let stableKey = generatedImageSourceKey(src) || (/^blob:/.test(src) ? src : '') || stableContainer?.getAttribute?.('id') || '';
+    if (!stableKey && stableContainer) {
+      if (!generatedContainerOrdinals.has(stableContainer)) {
+        generatedContainerOrdinals.set(stableContainer, generatedContainerOrdinal++);
+      }
+      const containerSignal = stableContainer.getAttribute?.('data-testid') || 'generated-image-container';
+      stableKey = `${containerSignal}:${generatedContainerOrdinals.get(stableContainer)}`;
+    }
+    if (!stableKey) stableKey = `generated-image-${generatedImageOrdinal}`;
+    const artifact = push({
+      kind: 'image',
+      src,
+      url: src,
+      downloadUrl: src,
+      name: DOM_PARSER.extractFileLikeName(alt) || alt || guessNameFromUrl(src) || 'generated-image',
+      mime: generatedImageMime(image, src),
+      size: generatedImageSize(image),
+      width: Math.round(Number(image.naturalWidth) || Number(image.getAttribute?.('width')) || Number(rect.width) || 0),
+      height: Math.round(Number(image.naturalHeight) || Number(image.getAttribute?.('height')) || Number(rect.height) || 0),
+      stableKey,
+      groupOrdinal: generatedImageOrdinal,
+      downloadable: true,
+      downloadActionPresent: false,
+      generatedImage: true,
+      element: image,
+    });
+    if (artifact) {
+      reportImageDiagnostic('image.artifact.registered', artifact.id, [
+        artifact.name,
+        artifact.mime,
+        artifact.size || 0,
+        artifact.sourceTurnKey || meta.turnKey || '',
+      ].join('|'), {
+        artifactId: artifact.id,
+        name: artifact.name,
+        mime: artifact.mime,
+        size: artifact.size || 0,
+        sourceTurnKey: artifact.sourceTurnKey || meta.turnKey || '',
+        ordinal: generatedImageOrdinal,
+      });
+    }
+    generatedImageOrdinal += 1;
+  }
+
+  const actionElements = queryAllWithSelf(node, 'button, [role="button"], a[href]');
+  for (const action of actionElements) {
+    if (!isVisible(action) || isExcludedArtifactAction(action)) continue;
+    const label = artifactActionSignal(action);
+    const actionHref = action.href || action.getAttribute?.('href') || '';
+    const rawHref = action.getAttribute?.('href') || '';
+    const actionTag = action.tagName?.toLowerCase?.() || '';
+    const stableArtifactContainer = action.closest?.('[data-testid*="artifact" i], [data-testid*="file" i], [download]');
+    // While Markdown is streaming, ChatGPT briefly mounts an inline <a href="">
+    // whose label grows token by token before replacing it with the real file button.
+    // That placeholder resolves to the current conversation URL and cannot be
+    // materialized. Treating it as READY creates a chain of stale artifact IDs.
+    if (actionTag === 'a'
+      && (!rawHref || isCurrentPageNavigationUrl(actionHref))
+      && !action.getAttribute?.('download')
+      && !stableArtifactContainer
+      && !isBrowserOnlyArtifactUrl(rawHref)) continue;
+    const fileName = artifactFileName(action, node, isCurrentPageNavigationUrl(actionHref) ? '' : actionHref);
+    const strictIntent = hasStrictArtifactIntent(label);
+    if (!strictIntent && !fileName) continue;
+    if (!fileName && looksLikeThinkingProgressText(label)) continue;
+    const stateInfo = artifactState(action, node, { downloadActionPresent: true, downloadable: isUsableButton(action) });
+    push({
+      kind: /canvas/i.test(label) ? 'canvas' : 'action',
+      name: fileName || label || 'artifact action',
+      text: label,
+      actionLabel: label || fileName,
+      phase: stateInfo.phase,
+      downloadable: stateInfo.phase === 'READY' && isUsableButton(action),
+      downloadActionPresent: true,
+      stateInfo,
+      element: action,
+    });
+  }
+
+  const stateElements = queryAllWithSelf(node, '[aria-busy="true"], [role="progressbar"], [data-state]');
+  for (const element of stateElements) {
+    if (!isVisible(element) || isExcludedArtifactAction(element)) continue;
+    const lifecycleObserved = DOM_PARSER.isArtifactLifecycleStateDescriptor({
+      ariaBusy: element.getAttribute?.('aria-busy') || '',
+      role: element.getAttribute?.('role') || '',
+      dataState: element.getAttribute?.('data-state') || '',
+      testId: element.getAttribute?.('data-testid') || '',
+      className: element.getAttribute?.('class') || '',
+      tagName: element.tagName || '',
+      ownText: visibleText(element),
+    });
+    if (!lifecycleObserved) continue;
+    const fileName = artifactFileName(element, node, '');
+    if (!fileName) continue;
+    const stateInfo = artifactState(element, node, {});
+    if (!['GENERATING', 'FAILED'].includes(stateInfo.phase)) continue;
+    push({
+      kind: 'file',
+      name: fileName,
+      text: stateInfo.text,
+      phase: stateInfo.phase,
+      downloadable: false,
+      downloadActionPresent: false,
+      lifecycleObserved: true,
+      stateInfo,
+      element,
+    });
+  }
+
+  return artifacts;
+}
+
+
+    return Object.freeze({
+      collectArtifactsForAssistantNode,
+      queryAllWithSelf,
+      isBrowserOnlyArtifactUrl,
+      isCurrentPageNavigationUrl,
+      isExcludedArtifactAction,
+      artifactLocatorMeta,
+      artifactFileName,
+      collectArtifactsFromNode,
+    });
+  }
+
+  globalThis.ChatGptArtifactDom = Object.freeze({ createArtifactDom });
+})();

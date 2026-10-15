@@ -15,7 +15,7 @@
     {
       "path": "extension/content/conversationReconciliation.js",
       "beforeSha256": "f82342b48c333aa8d86e6296716543d85b0abaffeb561b0db02518d55083a892",
-      "afterSha256": "efdcedae7a870209b8ed5dbb40398ffc6ee9a9df1e9bca03a35f11d79e1a4d96",
+      "afterSha256": "c0deb2684f238f20e394cd5fc1cf654f220ef9179bd5fc8849d5a9f634faace0",
       "previousAfterSha256": "09810908e5f758eee8e0bc1db965649c166a6d6c07545bba6ded7889191165be",
       "previousAfterSha256s": [
         "340994c84a7dcdc8ea3485f13950d9f267dab797a46ef1b7cf6799df704d6695",
@@ -31,7 +31,8 @@
         "7fa17ee5cae8f0f96a6bd835c550798858625a4c9cb2548826e169e77955ebe3",
         "4369ea901773230654d014f2f3f17e3375ac9bcf2f2e6e45a9d33ddb6c3debbb",
         "6d5a2ac0e1783cb1889a8f67ea1cf0e1193157ece5022e556dbd7b6e2617bcca",
-        "c37a54c8a009ea8a2f17a07f16fa8b9a6e0d41eb8a93a8fa060e073aad141291"
+        "c37a54c8a009ea8a2f17a07f16fa8b9a6e0d41eb8a93a8fa060e073aad141291",
+        "efdcedae7a870209b8ed5dbb40398ffc6ee9a9df1e9bca03a35f11d79e1a4d96"
       ]
     },
     {
@@ -84,7 +85,7 @@
     {
       "path": "extension/background/tabController.js",
       "beforeSha256": "e15ac5bb213847882e3e960dc77fdd268d646d208a6bd0dfe722b484d2e45b98",
-      "afterSha256": "c992f783fb5dac9cc4294c8d20b75efab1e9f2bf0879565a5c9e714b00e779e0",
+      "afterSha256": "0c7b20888d909a939e56423d42e0764880905dc584adeaebd5387a75570cdb04",
       "previousAfterSha256s": [
         "b6b4c753e8320d4aeb51ccba086813969cdffcb1ff359dee6722f401c83a6ebb",
         "db568da46fddeccd02c7e61f6db69349ca22270fc9333b6b21c349db4555ec6f",
@@ -97,7 +98,8 @@
         "a89220f69bb3adca7a28ce007e9602ecc81e0ef0d2a0895e546377c280b736f6",
         "eaadda5a36035e58b6d4166c8cd893a522728eba1425aaa1cdf0bb35f7ce1ccf",
         "c5e4582364b1a4b166a1b352a0adb40872403f37042370170699beb97fa4e684",
-        "936a995ef9a4ff58310f4ff2b887c13e13f9080342d3188e1a6e5ecf53a06ad0"
+        "936a995ef9a4ff58310f4ff2b887c13e13f9080342d3188e1a6e5ecf53a06ad0",
+        "c992f783fb5dac9cc4294c8d20b75efab1e9f2bf0879565a5c9e714b00e779e0"
       ]
     },
     {
@@ -127,7 +129,11 @@
     {
       "path": "src/bridge/hub/clientMessageRouter.js",
       "beforeSha256": "3d60e5809c0c4a697c76c42964c4ec912c3472dad7496bea40b2017e11da0d10",
-      "afterSha256": "357a8bd76d59452d3940035b294343c3880fc96764c3d80cbf9ff86f36184f19"
+      "afterSha256": "357a8bd76d59452d3940035b294343c3880fc96764c3d80cbf9ff86f36184f19",
+      "previousAfterSha256s": [
+        "357a8bd76d59452d3940035b294343c3880fc96764c3d80cbf9ff86f36184f19",
+        "62c6c6d9fb65aa37278b4b175cb07204198e715e3ff473b28b1bba14acc2892c"
+      ]
     },
     {
       "path": "src/bridge/hub/clientProjection.js",
@@ -180,7 +186,9 @@
         "8e117c83a047a92c66b74e227f8472f660aceee032ca81d6a3b25b53c6bf902a",
         "d9d12eca5259e56258717dcdae21eb125c324442d0c47dcbab9278c749927092",
         "0572ded8f38dc8fb066c2baea849b152b73e3e66f263997771b0c2e6f72bda53",
-        "7846ff8e0d2b8143d2dccd55b6a77989683d31de52bcad0ac1b16bcc841dbaa2"
+        "7846ff8e0d2b8143d2dccd55b6a77989683d31de52bcad0ac1b16bcc841dbaa2",
+        "45bd25c22b704a38fc549842efe097858d130d12071fff63a659dcf0347c5e5e",
+        "06e9114fc64a99a477f6a1b3ef281287660d5172835c4520b6ee22778163cfb9"
       ]
     },
     {
@@ -211,7 +219,9 @@
         "57886f37d31cbc2fc42c2597c8243122eb073086d9577aa19d7cc36e74d10ca5",
         "c3c2648a991e356d34713055b9983c979550e5991ac01d36b413a5762f30d34a",
         "125f1a50b2f4f0442b730852c34516f01c6e9b7dcfaec7a3ddaebfaa4d7cd512",
-        "fc270791843706bfa0a6e33679f1b30bafe9ca0259898279f3012e32ea95cbff"
+        "fc270791843706bfa0a6e33679f1b30bafe9ca0259898279f3012e32ea95cbff",
+        "c4fa9fe1154fc1b19cc4c76bbc6eaa1495af980d657a16e7497fa22b53af87b0",
+        "33f6160d5d432e73d67899a03cf5f9a0bdb93daf82acbe57dafcc54218a5e131"
       ]
     },
     {
@@ -222,7 +232,10 @@
     {
       "path": "extension/content/turnDom.js",
       "beforeSha256": "3b831513ddb520cf5bd126887eede9126980008dcc30afe44d957ae2bee70825",
-      "afterSha256": "2a131dcc187f52933cfd3aa1c3c357ee81aa6b980dbcf7837582c8d3513519fc"
+      "afterSha256": "1ad827a559a51ead690931f1e28d2487958224e5399078d0e2af63bb19d324b4",
+      "previousAfterSha256s": [
+        "2a131dcc187f52933cfd3aa1c3c357ee81aa6b980dbcf7837582c8d3513519fc"
+      ]
     },
     {
       "path": "extension/manifest.json",
@@ -240,6 +253,22 @@
       "afterSha256": "cadc301f521b4afb3c472b79bedb471e4d6a6ef107924b006629b4b361ae5307",
       "previousAfterSha256s": [
         "9a1ed9809aa0a621e502ea9134b28276498827637573728b4472d101c3162142"
+      ]
+    },
+    {
+      "path": "extension/content/artifactDom.js",
+      "beforeSha256": "1eee7d8c3c83cae2320a00e59fdc2714499d6e843deb26f9b25feb47eb906f15",
+      "afterSha256": "e7088c22528f22fa1c4e7d4558871eaa079b275d9e7e7ed51aff676aaea8fc61",
+      "previousAfterSha256s": [
+        "1eee7d8c3c83cae2320a00e59fdc2714499d6e843deb26f9b25feb47eb906f15"
+      ]
+    },
+    {
+      "path": "src/browserExtensionHub.js",
+      "beforeSha256": "88042e9f613af87b59f557578dd3260b4b4af4bb0ad283e80ef75e7b47f28b95",
+      "afterSha256": "19faeb1522ecf6dcfc39a8fbf4c20a40c97155e6c5421e0130e010862d675d3e",
+      "previousAfterSha256s": [
+        "88042e9f613af87b59f557578dd3260b4b4af4bb0ad283e80ef75e7b47f28b95"
       ]
     }
   ]

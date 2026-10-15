@@ -89,6 +89,26 @@
       return null;
     }
 
+    function generatedImageScopes(node) {
+      const turn=owner(node)||node;
+      if (!turn || role(turn)!=='assistant') return node?[node]:[];
+      const scopes=[turn],turns=getTurnNodes();
+      const users=turns.filter(n=>role(n)==='user'),assistants=turns.filter(n=>role(n)==='assistant');
+      // The presentation renderer can put its image tool result between the
+      // user bubble and the final answer, outside the final answer's wrapper.
+      // Expand only a unique fresh conversation, never a multi-turn history.
+      if (users.length!==1 || assistants.length!==1 || assistants[0]!==turn) return scopes;
+      const following=globalThis.Node?.DOCUMENT_POSITION_FOLLOWING||4;
+      const galleries=Array.from(document.querySelectorAll('[data-testid="generated-image-gallery"]')).filter(gallery=>{
+        if (excluded(gallery)||turn.contains?.(gallery)||users[0].contains?.(gallery)) return false;
+        const afterUser=users[0].compareDocumentPosition?.(gallery)||0;
+        const beforeAnswer=gallery.compareDocumentPosition?.(turn)||0;
+        return !(afterUser&1) && !(beforeAnswer&1) && Boolean(afterUser&following) && Boolean(beforeAnswer&following);
+      });
+      // Multiple external galleries are ambiguous even if one has matching IDs.
+      return galleries.length===1?[...scopes,galleries[0]]:scopes;
+    }
+
     function key(node) {
       if (!node || excluded(node)) return '';
       const turn = owner(node) || node;
@@ -125,6 +145,7 @@
       getAssistantNodes: () => getTurnNodes().filter((node) => role(node) === 'assistant'),
       getFinalAssistantNode,
       getTurnNodes,
+      generatedImageScopes,
       key,
       role,
       owner,

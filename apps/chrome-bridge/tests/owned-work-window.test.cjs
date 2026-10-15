@@ -3,7 +3,7 @@ const PROFILE='b84d4521-56ba-4f84-9948-090f82d639e7',REQUEST='c6a483f1-ad60-4e7c
 function fixture(change=()=>{}){
  const facts={source:{id:7,windowId:10,incognito:false,url:'https://chatgpt.com/'},record:{launchToken:'bridge-director-control-'+PROFILE,serverUrl:'http://127.0.0.1:53179'},calls:[],returnedWindow:10};change(facts);
  const chrome={runtime:{},tabs:{get:async()=>({...facts.source}),create:(options,done)=>{facts.calls.push(['create',options]);done({id:31,windowId:facts.returnedWindow});},
-  update:(id,options,done)=>{facts.calls.push(['update',id,options]);done({id,windowId:10});},remove:(id,done)=>{facts.calls.push(['remove',id]);done();}}};
+  update:(id,options,done)=>{facts.calls.push(['update',id,options]);done({id,windowId:10,active:false,autoDiscardable:false,discarded:false,...facts.updatedState});},remove:(id,done)=>{facts.calls.push(['remove',id]);done();}}};
  const port={sender:{tab:{id:7,incognito:false}}},connections=new Map([[port,{serverUrl:facts.record?.serverUrl||'http://127.0.0.1:53179',protocolReady:facts.contentReady!==false}]]);
  const context=vm.createContext({chrome,URL,URLSearchParams,Date,console,setTimeout:fn=>{fn();return 1;}});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../overrides/extension/background/tabController.js'),'utf8').replace(/^export /gm,''),context);
@@ -25,6 +25,10 @@ test('server coordinator forwards exact expected URL to native owned close comma
 test('owned work page explicitly uses controller window instead of Chrome last-focused user window',async()=>{
  const f=fixture();await f.open();assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0])),['create',{url:'about:blank',active:false,windowId:10}]);
  assert.equal(f.calls.filter(c=>c[0]==='update')[0][2].active,false);
+});
+test('work-page creation returns native tab state and never invents missing discarded facts',async()=>{
+ const out=await fixture().open();assert.deepEqual(JSON.parse(JSON.stringify(out.tabState)),{active:false,autoDiscardable:false,discarded:false});
+ const missing=await fixture(f=>{f.updatedState={discarded:undefined};}).open();assert.equal(Object.hasOwn(missing.tabState,'discarded'),false);
 });
 
 test('explicit connection source creates only the new work tab in the source window without owning or navigating the connection page',async()=>{

@@ -210,6 +210,33 @@ fn frames_roundtrip_unicode_and_fragmented_input() {
 }
 
 #[test]
+fn native_socket_answers_control_ping_without_page_or_extension_javascript() {
+    let (listener, port) = listener();
+    let server = thread::spawn(move || {
+        let mut socket = accept(&listener);
+        socket.send(Message::Ping(b"exact-native-nonce".to_vec().into())).unwrap();
+        match socket.read().unwrap() {
+            Message::Pong(bytes) => assert_eq!(bytes.as_ref(), b"exact-native-nonce"),
+            other => panic!("expected socket pong, got {other:?}"),
+        }
+        socket.send(Message::Text("native-heartbeat-confirmed".into())).unwrap();
+        while let Ok(message) = socket.read() {
+            if matches!(message, Message::Close(_)) { break; }
+        }
+    });
+    let mut host = Host::new(port);
+    host.ready();
+    host.open("native-heartbeat", port);
+    assert_eq!(host.next()["type"], "open");
+    // No stdin send/ping and no browser callback are required for control pong.
+    let event = host.next();
+    assert_eq!(event["type"], "message");
+    assert_eq!(event["data"], "native-heartbeat-confirmed");
+    host.finish(true);
+    server.join().unwrap();
+}
+
+#[test]
 fn frames_reject_partial_header_body_invalid_utf8_and_limit_before_allocation() {
     assert_eq!(
         read_frame(&mut Cursor::new(vec![1, 0])),

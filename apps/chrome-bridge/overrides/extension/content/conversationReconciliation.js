@@ -105,6 +105,7 @@
   };
   const nativeKeys = new WeakMap(), nativeImages = new WeakMap(), nativeDownloads = new Map();
   const rawImageSource = image => image.currentSrc || image.src || image.getAttribute?.('src') || '';
+  const assistantImages = (dom,node) => [...new Set((dom.generatedImageScopes?.(node)||[node]).flatMap(scope=>[...scope.querySelectorAll('img')]))];
   // The presentation-only user bubble now contains a Show more button. Read
   // its one dedicated plaintext body; control labels are not submitted text.
   // Ambiguous structure falls back to the original strict whole-turn check.
@@ -292,11 +293,11 @@
       if(location.href!==page.href)return unavailable('page_conversation_changed');
       const boundary=await nativeBoundary(record,expected,snapshot,facts);
       if(boundary.status==='no_image_candidate'){
-        if(expected.mode!=='image_record_v1'||(snapshot.artifacts||[]).length||assistants[0].querySelectorAll('img').length)return unavailable('no_image_dom_ambiguous');
+        if(expected.mode!=='image_record_v1'||(snapshot.artifacts||[]).length||assistantImages(dom,assistants[0]).length)return unavailable('no_image_dom_ambiguous');
         const reread=await fetch(endpoint,{...options,...(authHeaders?{headers:authHeaders}:{})});if(!reread.ok)return unavailable('record_recheck_http');
         const again=await boundedRecord(reread);if(!again)return unavailable('record_limit');
         const finalSnapshot=deps.readLatestAssistantSnapshot?.()||snapshot;
-        if((finalSnapshot.artifacts||[]).length||assistants[0].querySelectorAll('img').length)return unavailable('no_image_branch_changed');
+        if((finalSnapshot.artifacts||[]).length||assistantImages(dom,assistants[0]).length)return unavailable('no_image_branch_changed');
         const reBoundary=await nativeBoundary(JSON.parse(new TextDecoder().decode(again)),expected,finalSnapshot,facts);
         if(JSON.stringify(reBoundary)!==JSON.stringify(boundary)||!sameIdentity()||location.href!==page.href
           ||await digest(userPromptText(users[0]))!==expected.promptSha256||dom.getTurnNodes().some((n,i)=>n!==turns[i])||dom.getTurnNodes().length!==turns.length)return unavailable('no_image_branch_changed');
@@ -306,7 +307,7 @@
       }
       if(boundary.status)return {...boundary,recordSha256,checkedAt:Date.now()};
       if(!boundary.status){
-        const generatedImages=[...assistants[0].querySelectorAll('img')].filter(img=>img.closest?.('[data-testid="generated-image-gallery"]'));
+        const generatedImages=assistantImages(dom,assistants[0]).filter(img=>img.closest?.('[data-testid="generated-image-gallery"]'));
         if(boundary.pointers.length===1&&generatedImages.length===1&&expected.imageCount===1){
           const image=generatedImages[0],raw=rawImageSource(image),nativeId=boundary.pointers[0];
           const isBlob=/^blob:https:\/\/chatgpt\.com\//.test(raw);
@@ -339,7 +340,7 @@
             const reBoundary=await nativeBoundary(JSON.parse(new TextDecoder().decode(reBytes)),expected,snapshot,facts);
             if(reBoundary.status||JSON.stringify(reBoundary)!==JSON.stringify(boundary))return unavailable('native_branch_changed');
             if(!sameIdentity()||location.href!==page.href||rawImageSource(image)!==raw||!image.isConnected)return unavailable('image_changed_during_download');
-            const stillCurrent=()=>sameIdentity() && users[0].isConnected && assistants[0].isConnected && normalize(userPromptText(users[0]))===normalize(facts.userText) && normalize(assistants[0].innerText||assistants[0].textContent)===facts.assistantText && dom.getTurnNodes().length===turns.length && dom.getTurnNodes().every((n,i)=>n===turns[i]);
+            const stillCurrent=()=>sameIdentity() && users[0].isConnected && assistants[0].isConnected && assistantImages(dom,assistants[0]).includes(image) && normalize(userPromptText(users[0]))===normalize(facts.userText) && normalize(assistants[0].innerText||assistants[0].textContent)===facts.assistantText && dom.getTurnNodes().length===turns.length && dom.getTurnNodes().every((n,i)=>n===turns[i]);
             if(!stillCurrent())return unavailable('dom_changed_during_proof');
             const binding={image,raw,url:page.href,originalUrl,...native,recordSha256,recordRecheckSha256:await byteDigest(reBytes),requestId:expected.requestId,assistantMessageId:boundary.assistantMessageId,proofSource:nativeOnly?'native_record_download':directNative?'dom_native_url_download':'dom_blob_bytes_equal',trustedForBackground:Boolean(strongIdentity)&&expected.mode!=='image_record_probe',valid:stillCurrent};
             nativeImages.set(image,binding);nativeDownloads.set(nativeId,binding);while(nativeDownloads.size>4)nativeDownloads.delete(nativeDownloads.keys().next().value);
@@ -353,7 +354,7 @@
         const currentSnapshot=deps.readLatestAssistantSnapshot?.(1);if(!currentSnapshot)return unavailable('snapshot_unavailable');
         const confirmed=await evaluate(record,expected,currentSnapshot,facts);if(confirmed.status!=='matched_complete'||JSON.stringify(confirmed.bindings)!==JSON.stringify(proof.bindings))return unavailable('image_changed_during_proof');
         if(!requestMatches())return unavailable('active_request_identity');
-        const ids=[...new Set([...assistants[0].querySelectorAll('img')].map(img=>fileId(imageSource(img)||img.currentSrc||img.src)).filter(Boolean))];
+        const ids=[...new Set(assistantImages(dom,assistants[0]).map(img=>fileId(imageSource(img)||img.currentSrc||img.src)).filter(Boolean))];
         if(ids.length!==proof.bindings.length||proof.bindings.some(b=>!ids.includes(b.imageFileId)))return unavailable('dom_pointer_changed');
         nativeKeys.set(users[0],{id:proof.userMessageId,url:page.href,fingerprint:domFingerprint(users[0])});
         nativeKeys.set(assistants[0],{id:proof.assistantMessageId,url:page.href,fingerprint:domFingerprint(assistants[0])});
@@ -383,7 +384,7 @@
       }
       const bindings=proof.bindings?.map(binding=>{const native=nativeDownloads.get(binding.imageFileId);return native && validImageBinding(native.image,native)?{...binding,bytesSha256:native.sha256,size:native.size,mime:native.mime,proofSource:native.proofSource,recordSha256:native.recordSha256,recordRecheckSha256:native.recordRecheckSha256}:binding;});
       const proofSource=bindings?.every(b=>b.proofSource==='native_record_download')?'native_record_download':bindings?.every(b=>b.proofSource==='dom_blob_bytes_equal')?'dom_blob_bytes_equal':bindings?.every(b=>b.proofSource==='dom_native_url_download')?'dom_native_url_download':'dom_native_url';
-      const galleryImageFacts=expected.mode==='image_record_probe' ? [...assistants[0]?.querySelectorAll('img') || []].map(img=>({gallery:Boolean(img.closest?.('[data-testid="generated-image-gallery"]')),connected:img.isConnected,width:Number(img.naturalWidth||0),height:Number(img.naturalHeight||0),sourceKind:rawImageSource(img).startsWith('blob:')?'blob':fileId(rawImageSource(img))?'native':rawImageSource(img)?'other':'empty',fileId:fileId(rawImageSource(img))})) : undefined;
+      const galleryImageFacts=expected.mode==='image_record_probe' ? assistantImages(dom,assistants[0]).map(img=>({gallery:Boolean(img.closest?.('[data-testid="generated-image-gallery"]')),connected:img.isConnected,width:Number(img.naturalWidth||0),height:Number(img.naturalHeight||0),sourceKind:rawImageSource(img).startsWith('blob:')?'blob':fileId(rawImageSource(img))?'native':rawImageSource(img)?'other':'empty',fileId:fileId(rawImageSource(img))})) : undefined;
       if(verifiedSnapshot)deps.onVerifiedSnapshot?.(verifiedSnapshot);
       return {...proof,...(bindings?{bindings}:{}),...(galleryImageFacts?{galleryImageFacts}:{}),proofSource,reason:proof.status==='matched_complete'&&proofSource==='native_record_download'?'exact_single_user_native_download':proof.status==='matched_complete'&&proofSource==='dom_blob_bytes_equal'?'exact_single_user_blob_bytes':proof.reason,checkedAt:Date.now()};
     }catch{return unavailable(controller.signal.aborted?'timeout_or_cancelled_'+readStage:'record_unavailable_'+readStage);}finally{clearTimeout(timer);deps.signal?.removeEventListener('abort',cancel);}

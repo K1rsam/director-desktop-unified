@@ -54,7 +54,9 @@ async function fixture(options = {}) {
     user.querySelectorAll=selector=>selector==='div.whitespace-pre-wrap'?(options.multiplePromptBodies?[body,{...body}]:[body]):[];
     if(options.changeBodyDuringDownload)options.onBody=()=>{body.textContent='changed source text';};
   }
-  const assistant = { isConnected: true, innerText: options.reply||'', querySelectorAll: () => options.noImage?[]:[image] };
+  let galleryAttached=true;
+  const assistant = { isConnected: true, innerText: options.reply||'', querySelectorAll: () => options.noImage||options.siblingGallery?[]:[image] };
+  const gallery={querySelectorAll:()=>galleryAttached?[image]:[]};
   const turns = [user, ...(options.noAssistant ? [] : [assistant]), ...(options.extraUser ? [user] : []), ...(options.extraAssistant ? [assistant] : [])];
   let reads = 0;
   const context = vm.createContext({ URL, AbortController, TextEncoder, TextDecoder, Uint8Array, Response, crypto: webcrypto,
@@ -69,7 +71,7 @@ async function fixture(options = {}) {
         if(options.domWaitMutation==='page')context.location.href='https://chatgpt.com/c/different';
       }
       return options.domNeverReady||domReads<=(options.domReadyAfterReads||0)?[]:turns;
-    }, role: node => node === user ? 'user' : 'assistant' }) },
+    }, generatedImageScopes:node=>options.siblingGallery&&galleryAttached?[node,gallery]:[node], role: node => node === user ? 'user' : 'assistant' }) },
     fetch: async (url, init) => {
       calls.push({ url, init });
       assert.equal(init.method || 'GET', 'GET', 'recovery cannot submit prompts or create jobs');
@@ -90,6 +92,7 @@ async function fixture(options = {}) {
       if (url.endsWith('/api/auth/session')) return Response.json({ accessToken: 'synthetic-token-never-persisted' });
       if (url.includes(`/backend-api/files/download/${imageId}`)) return Response.json({ download_url: options.wrongFile ? originalUrl.replace(imageId, 'file-other') : originalUrl });
       if (url === originalUrl || url === image.src && options.blob) {
+        if(options.removeGalleryDuringDownload)galleryAttached=false;
         options.onBody?.();
         if (options.newActiveDuringDownload) active = { requestId: 'other-request' };
         if (options.newLaunchDuringDownload) launch = 'different-owned-tab';
@@ -114,6 +117,14 @@ async function fixture(options = {}) {
   const deps = { getActiveRequest: () => active, getBrowserLaunchToken: () => launch, getContentEpoch: () => contentEpoch, readLatestAssistantSnapshot: snapshot, onBound: () => options.onBound?.({user,assistant,image}) };
   return { context, proof, expected, deps, snapshot, calls, observed, messages, user, assistant, image, domDelays, get domReads(){return domReads;},get reads() { return reads; } };
 }
+
+test('a sibling tool gallery recovers original bytes with the same branch and request checks',async()=>{
+ const f=await fixture({siblingGallery:true});const p=await f.proof.read(f.expected,f.snapshot(),f.deps);
+ assert.equal(p.status,'matched_complete');assert.equal(p.bindings[0].bytesSha256,hash(png));assert.equal(f.reads,2);
+ assert.ok(f.calls.every(c=>c.init.method==='GET'));
+ const bad=await fixture({siblingGallery:true,removeGalleryDuringDownload:true});const held=await bad.proof.read(bad.expected,bad.snapshot(),bad.deps);
+ assert.notEqual(held.status,'matched_complete');assert.equal(bad.proof.imageReady(bad.image),false);
+});
 
 test('verified final text without an image is a stable terminal receipt, never an image result',async()=>{
   const f=await fixture({noImage:true,reply:'由于我这边发生了错误，我未能生成图片。'});

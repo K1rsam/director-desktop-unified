@@ -403,18 +403,20 @@ export function createTabController({
     }
     const tab = await createTab({ url: 'about:blank', active, ...(directorOwned?{windowId:sourceWindowId}:{}) });
     if (!Number.isInteger(tab?.id)) throw new Error('Chrome did not return a tab id for the new ChatGPT tab');
+    let updated;
     try {
       // Persist ownership before navigation so a fast content connection cannot
       // announce without its one-time launch identity.
       await rememberLaunchedTab(tab.id, { launchToken, requestedUrl, createdAt: Date.now(), serverUrl: bridgeServerUrl });
       if(directorOwned&&tab.windowId!==sourceWindowId)throw Error('Chrome returned a different owned work window');
-      await updateTab(tab.id, { url: requestedUrl, active, ...(directorOwned ? { autoDiscardable: false } : {}) });
+      updated=await updateTab(tab.id, { url: requestedUrl, active, ...(directorOwned ? { autoDiscardable: false } : {}) });
     } catch (error) {
       await forgetLaunchedTab(tab.id);
       await removeTab(tab.id).catch(() => {});
       throw error;
     }
-    return { tabId: tab.id, launchToken, requestedUrl, bridgeServerUrl, active, openerTabId: port?.sender?.tab?.id ?? null };
+    return { tabId: tab.id, launchToken, requestedUrl, bridgeServerUrl, active, openerTabId: port?.sender?.tab?.id ?? null,
+      tabState:controllerTabState(updated) };
   }
 
   async function closeOwnBridgeTab(port, options = {}) {
