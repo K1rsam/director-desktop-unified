@@ -11,7 +11,7 @@ export async function recoverSavedImage(page, receipt, { timeoutMs = 30000, poll
       || originalBytesVerified !== true) throw new Error('A stable, previously verified result is required');
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000 || pollMs < 1) throw new Error('Invalid bounded recovery timing');
   // The caller binds an owned page. Do not navigate away from any active generation.
-  const active = await page.evaluate(`!!document.querySelector('[data-testid="stop-button"],button[aria-label*="Stop generating"],button[aria-label*="停止生成"]')`);
+  const active = await page.evaluate(`!!document.querySelector('[data-testid="stop-button"],button[aria-label*="Stop generating"],button[aria-label*="停止生成"],button[aria-label="停止"],button[aria-label="Stop"]')`);
   if (active !== false) throw new Error('Active or unverified page; no navigation');
   const attempts = [];
   for (let attempt = 0; attempt < 2; attempt += 1) {

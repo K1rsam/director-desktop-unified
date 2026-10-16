@@ -44,6 +44,8 @@ node <本目录绝对路径>/recover-saved-image.mjs <checkout> <receipt.json> <
 
 该命令不关闭或重启用户浏览器，不允许拿未知任务构造已完成 receipt。测试代码与合成 fixture 不证明任何真实生成或上游可用性。
 
+后续三图测试发现新网页使用确切“停止”按钮；恢复候选已补齐拦截，`recover-modern-stop.test.mjs` 使用相应 DOM fixture 验证零导航。该测试需要上述 `OPENCLI_CHECKOUT` 的 jsdom 依赖。三图真实结果见 `multi-image-acceptance.json`；实际轮播顺序为 A/C/B，不能按输出顺序直接绑定资产。
+
 ## 运行约束
 
 实际试验使用用户授权的已登录普通 Edge、后台自有工作页和串行派发，没有切换到 API、Codex 生图或视频。原始失败/未知提交记录保留，未重新发送。单个请求保存成功不能直接标记 `APPROVED`，参考图字节也不能充当生成结果。

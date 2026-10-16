@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "web-image-multi-request-acceptance/v1",
+  "at": "2026-10-16T07:22:03.490Z",
+  "sourceCommit": "b9213a15d63df578612ddaedc4e3b5c3428d5305",
+  "requestCount": 1,
+  "requestedImages": 3,
+  "generatedIndependentImages": 3,
+  "downloadedOfficialOriginals": 3,
+  "uniqueOutputHashes": 3,
+  "visuallyAccepted": 3,
+  "carouselVirtualizesToOneMountedImage": true,
+  "actualGalleryPromptOrder": [
+    "A",
+    "C",
+    "B"
+  ],
+  "parallelOfficialDownloads": true,
+  "officialDownloadDurationMs": 2675,
+  "providerServerParallelismVerified": false,
+  "newSubmissionDuringCollection": false,
+  "repeatedPromptSubmissions": 0,
+  "videoSubmissions": 0,
+  "productionIntegrated": false,
+  "observerWasReplacedWithoutResubmission": true,
+  "images": [
+    {
+      "index": 1,
+      "promptKey": "A",
+      "asset": "角色-红色陶瓷狐狸",
+      "width": 1672,
+      "height": 941,
+      "bytes": 1766508,
+      "sha256": "b25d3a73fd52e100cae377ee59c10668f817f4d98b306812ef2c8ade6dacbf55",
+      "officialOriginalMatched": true
+    },
+    {
+      "index": 2,
+      "promptKey": "C",
+      "asset": "道具-黄色复古台灯",
+      "width": 1672,
+      "height": 941,
+      "bytes": 1569989,
+      "sha256": "1f46143a3005c004cd61b66a8b4d613428c10ab5dae6d496dfbc6bc54a7861df",
+      "officialOriginalMatched": true
+    },
+    {
+      "index": 3,
+      "promptKey": "B",
+      "asset": "道具-钴蓝机械热气球",
+      "width": 1672,
+      "height": 941,
+      "bytes": 1876575,
+      "sha256": "a8372af544f6926574e59aaa80cb06a1212c996a5c62021dd9f3d25d080fbfae",
+      "officialOriginalMatched": true
+    }
+  ],
+  "evidenceSha256": {
+    "originalAttempt": "e4f4f3fb04ea0c3525d624ba25788f7ccbd4d89815303674ec761c6aff2457dc",
+    "collection": "880cd665afbc6aace319d2ce9a1712b1c2ea3ea1f3dff432eed81960a71158c9",
+    "visualReview": "cafffa9ecb930521b2d1254efe292dbfa3b3a0d5d40adde7e3b36a736ecc1bf0",
+    "observerReplacement": "fb73ec2062c0a578fde6d4170f8c646220fc11fce72f76aaed3229275b2922bc"
+  }
+}
