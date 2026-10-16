@@ -1,0 +1,28 @@
+{
+  "profile": "director-opencli-pending-document/v3",
+  "patches": [
+    {
+      "path": "clis/chatgpt/utils.js",
+      "before": "46b1f9c27180cd5d47d5e52ac45fb72695f0e2114d4dd622588010cc909cb60e",
+      "after": "3363cc8020bbaa24576272626741da0a6cc050216b20af0612f6ad0a2ee207e7",
+      "afterLfNormalized": "a3b0628688f2172197943050d219c5d993d694b127134fc57bad7b2dfb21fdad",
+      "patchReplayAfter": "ac6a398ec1f40c1a111a26190429077ab09c9d77a83efcf75726b9d68a235e75"
+    },
+    {
+      "path": "clis/chatgpt/image.js",
+      "before": "1de5f37c1f81011d07732fdba2e953e19aad00ccb1aa1de1c3ae2338a15254dd",
+      "after": "4b05568c30f8dcd69ffd29037ee87b5575652417b6a7d5e1ff6e4598978af367",
+      "afterLfNormalized": "81a9e18e3ffa0478af398816f8734ef4db494c036058d320b3e2a92b45fb2043",
+      "patchReplayAfter": "4b05568c30f8dcd69ffd29037ee87b5575652417b6a7d5e1ff6e4598978af367"
+    }
+  ],
+  "defaultUpstreamBehaviorPreserved": "Navigation/export/gallery flags opt-in; role textbox upload selector always extended",
+  "scope": "isolated_candidate_only",
+  "uploadSelectorFix": "Current role=textbox composer, scoped attachment detection",
+  "generatedGalleryGate": "Only explicit generated-image-gallery can finish an image task",
+  "patchReplay": {
+    "applies": true,
+    "lfNormalizedExact": true,
+    "note": "Windows original checkout contains CRLF; added lines in live trial were LF. git apply preserves original CRLF. Raw hashes differ only by line endings in utils.js."
+  }
+}

@@ -1,0 +1,85 @@
+diff --git a/clis/chatgpt/image.js b/clis/chatgpt/image.js
+index 00998c3..f07c9d3 100644
+--- a/clis/chatgpt/image.js
++++ b/clis/chatgpt/image.js
+@@ -135,7 +135,7 @@ export const imageCommand = cli({
+         }
+ 
+         const urls = await waitForChatGPTImages(page, beforeUrls, timeout, convUrl);
+-        const link = convUrl;
++        const link = process.env.OPENCLI_CHATGPT_PRESERVE_PENDING_DOCUMENT === '1' ? await currentChatGPTLink(page) : convUrl;
+ 
+         if (!urls.length) {
+             throw new EmptyResultError('chatgpt image', `No generated images were detected before timeout. Open ${link} and verify whether ChatGPT finished generating the image.`);
+diff --git a/clis/chatgpt/utils.js b/clis/chatgpt/utils.js
+index 3263b67..335f1a0 100644
+--- a/clis/chatgpt/utils.js
++++ b/clis/chatgpt/utils.js
+@@ -2375,7 +2375,7 @@ async function waitForChatGPTUploadPreview(page, fileNames) {
+         const ready = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
+             (() => {
+                 const names = ${namesJson};
+-                const composer = document.querySelector('[aria-label="Chat with ChatGPT"], [placeholder="Ask anything"], #prompt-textarea');
++                const composer = document.querySelector('[contenteditable="true"][role="textbox"], [aria-label="Chat with ChatGPT"], [placeholder="Ask anything"], #prompt-textarea');
+                 if (!composer) return false;
+                 let root = composer;
+                 for (let i = 0; i < 6 && root.parentElement; i += 1) root = root.parentElement;
+@@ -2630,6 +2630,7 @@ export async function getChatGPTVisibleImageUrls(page) {
+                 if (!src) continue;
+                 if (isDecorative(img, src)) continue;
+                 if (isUserUploadPreview(img)) continue;
++                if (${process.env.OPENCLI_CHATGPT_REQUIRE_GENERATED_GALLERY === '1'} && !img.closest('[data-testid="generated-image-gallery"]')) continue;
+                 if (width < 128 && height < 128) continue;
+                 addUrl(src);
+             }
+@@ -2639,6 +2640,7 @@ export async function getChatGPTVisibleImageUrls(page) {
+             // background images as generated-image candidates too.
+             for (const el of Array.from(document.querySelectorAll('[style*="background-image"], [style*="background"]'))) {
+                 if (!(el instanceof HTMLElement) || !isVisible(el) || isDecorative(el)) continue;
++                if (${process.env.OPENCLI_CHATGPT_REQUIRE_GENERATED_GALLERY === '1'} && !el.closest('[data-testid="generated-image-gallery"]')) continue;
+                 const rect = el.getBoundingClientRect();
+                 if (rect.width < 128 && rect.height < 128) continue;
+                 const backgroundImage = window.getComputedStyle(el).backgroundImage || '';
+@@ -2656,6 +2658,7 @@ export async function getChatGPTVisibleImageUrls(page) {
+             // it decides whether a deadline reports TIMEOUT or EMPTY_RESULT.
+             for (const canvas of Array.from(document.querySelectorAll('canvas'))) {
+                 if (!(canvas instanceof HTMLCanvasElement) || !isVisible(canvas) || isDecorative(canvas)) continue;
++                if (${process.env.OPENCLI_CHATGPT_REQUIRE_GENERATED_GALLERY === '1'} && !canvas.closest('[data-testid="generated-image-gallery"]')) continue;
+                 const width = canvas.width || canvas.getBoundingClientRect().width || 0;
+                 const height = canvas.height || canvas.getBoundingClientRect().height || 0;
+                 if (width < 128 && height < 128) continue;
+@@ -2695,6 +2698,7 @@ export async function getChatGPTVisibleImageUrls(page) {
+  */
+ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, convUrl) {
+     const beforeSet = new Set(beforeUrls);
++    const preservePendingDocument = process.env.OPENCLI_CHATGPT_PRESERVE_PENDING_DOCUMENT === "1";
+     const pollIntervalSeconds = 3;
+     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds / pollIntervalSeconds));
+     let lastUrls = [];
+@@ -2705,7 +2709,7 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
+         await page.sleep(i === 0 ? 3 : pollIntervalSeconds);
+ 
+         let currentUrl = '';
+-        if (convUrl && convUrl.includes('/c/')) {
++        if (!preservePendingDocument && convUrl && convUrl.includes('/c/')) {
+             currentUrl = unwrapEvaluateResult(await page.evaluate('window.location.href').catch(() => ''));
+             if (currentUrl && !isSameChatGPTConversation(currentUrl, convUrl)) {
+                 await page.goto(convUrl);
+@@ -2717,7 +2721,7 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
+         stillRendering = generating;
+         if (generating) continue;
+ 
+-        if (convUrl && convUrl.includes('/c/') && i > 0 && i % 5 === 0) {
++        if (!preservePendingDocument && convUrl && convUrl.includes('/c/') && i > 0 && i % 5 === 0) {
+             const onConversation = !currentUrl || isSameChatGPTConversation(currentUrl, convUrl);
+             if (onConversation) {
+                 await page.goto(convUrl);
+@@ -3393,7 +3397,7 @@ export async function getChatGPTImageAssets(page, urls) {
+                 }
+ 
+                 // Fallback: draw img to canvas
+-                if (!dataUrl && img && img instanceof HTMLImageElement) {
++                if (!dataUrl && img && img instanceof HTMLImageElement && !${process.env.OPENCLI_CHATGPT_REQUIRE_ORIGINAL_FETCH === '1'}) {
+                     try {
+                         const canvas = document.createElement('canvas');
+                         canvas.width = img.naturalWidth || img.width || 512;

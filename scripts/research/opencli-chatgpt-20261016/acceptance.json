@@ -1,0 +1,157 @@
+{
+  "schemaVersion": "isolated-web-image-acceptance/v1",
+  "at": "2026-10-16T04:01:49.077Z",
+  "source": {
+    "repository": "https://github.com/jackwener/OpenCLI",
+    "commit": "b9213a15d63df578612ddaedc4e3b5c3428d5305",
+    "cliVersion": "1.8.8",
+    "extensionVersion": "1.0.24"
+  },
+  "status": "small_sample_usable_long_batch_not_accepted",
+  "confirmedGeneratedImages": 5,
+  "originalBytesVerified": 5,
+  "unknownOriginalTrialsPreserved": 2,
+  "finalProfileFreshRequestsPassed": 2,
+  "finalProfileFreshRequestsTested": 2,
+  "videoSubmissions": 0,
+  "foregroundInputAutomationUsed": false,
+  "concurrencyTested": 1,
+  "originalFailedCandidateRetained": true,
+  "productionIntegrated": false,
+  "desktopExeReplaced": false,
+  "offline": {
+    "upstreamChatgptTests": 159,
+    "specializedTests": 10,
+    "patchReplayLfNormalizedExact": true
+  },
+  "idle": {
+    "secondsWithoutBrowserCommands": 124,
+    "readAndOriginalBytesMatch": true,
+    "frozenOrMinimizedNotProven": true
+  },
+  "samples": [
+    {
+      "round": "owl",
+      "adaptation": "director-opencli-pending-document/v1",
+      "parentRound": null,
+      "width": 1672,
+      "height": 941,
+      "bytes": 1713043,
+      "imageSha256": "f46d9c2cdb52aa95865ddf0b0873e8673615f6fedcfd8903d5fd52285da594d6",
+      "officialOriginalBytesMatched": true,
+      "visuallyReviewed": true,
+      "durationSeconds": 82,
+      "durationScope": "complete_round",
+      "journalSha256": "f16a15b073bd9544a329ad2165f88d63c285d8ac5d2bbd7c553a33992d8387c1",
+      "originalVerificationSha256": "d7436a623dfa3aeec842ab26c2c1a1f4254dab5342b9aa0a91e156bd9807be4d",
+      "savedLinkReadAttempts": [
+        {
+          "matched": true,
+          "noSubmission": true,
+          "durationSeconds": 5
+        }
+      ]
+    },
+    {
+      "round": "island",
+      "adaptation": "director-opencli-pending-document/v1",
+      "parentRound": null,
+      "width": 1672,
+      "height": 940,
+      "bytes": 2786659,
+      "imageSha256": "2e337049959edc5eb703c3faba9ee973bfb6bf6881e325dc684f882c3a68934e",
+      "officialOriginalBytesMatched": true,
+      "visuallyReviewed": true,
+      "durationSeconds": 69,
+      "durationScope": "complete_round",
+      "journalSha256": "ca76306ff165d3b9a9b53aeca7d495c243c21213980cfb87087e4c84932869e0",
+      "originalVerificationSha256": "1a2fd68842caf19f0e3fdd4e37f0a479ac135985ee5be6f600b9ffe05cab3376",
+      "savedLinkReadAttempts": [
+        {
+          "matched": true,
+          "noSubmission": true,
+          "durationSeconds": 5
+        }
+      ]
+    },
+    {
+      "round": "owl-apron",
+      "adaptation": "director-opencli-pending-document/v3",
+      "parentRound": "owl",
+      "width": 1672,
+      "height": 941,
+      "bytes": 1738094,
+      "imageSha256": "358bbd08db99d159fb0d9fd14633e7c3fd4ffe84864d715083e257f86d38803c",
+      "officialOriginalBytesMatched": true,
+      "visuallyReviewed": true,
+      "durationSeconds": 6,
+      "durationScope": "recovery_download_only",
+      "journalSha256": "b8f2395a1ee04e5269dd87dcf8c7f7adcfb95bc8912a07e81200f648a30fab8e",
+      "originalVerificationSha256": "c4531b283cc5e6f189901cb362960c6dcd66923ce6654152fc62e39e7f9abddc",
+      "savedLinkReadAttempts": [
+        {
+          "matched": false,
+          "noSubmission": true,
+          "durationSeconds": 33
+        },
+        {
+          "matched": true,
+          "noSubmission": true,
+          "durationSeconds": 5
+        }
+      ]
+    },
+    {
+      "round": "owl-watering-can",
+      "adaptation": "director-opencli-pending-document/v3",
+      "parentRound": "owl-apron",
+      "width": 1672,
+      "height": 941,
+      "bytes": 1753673,
+      "imageSha256": "46426798f881d1578baac4f49a7bad1e3bb7e0f7b3a56db57991056f179a26e3",
+      "officialOriginalBytesMatched": true,
+      "visuallyReviewed": true,
+      "durationSeconds": 92,
+      "durationScope": "complete_round",
+      "journalSha256": "fd5882a9842e4685170312c8e034edc44142bb208920fe11c5f32d047624c46e",
+      "originalVerificationSha256": "3bfd97027305bfecd52299e18dd20b817b09a5e889f22adb8ff076c452382a1e",
+      "savedLinkReadAttempts": [
+        {
+          "matched": true,
+          "noSubmission": true,
+          "durationSeconds": 5
+        }
+      ]
+    },
+    {
+      "round": "teapot",
+      "adaptation": "director-opencli-pending-document/v3",
+      "parentRound": null,
+      "width": 1672,
+      "height": 941,
+      "bytes": 1662041,
+      "imageSha256": "39a64168addd27b40d0c91b5eaa53700d32027e7157fa3d4f0c0a83725c3bc46",
+      "officialOriginalBytesMatched": true,
+      "visuallyReviewed": true,
+      "durationSeconds": 60,
+      "durationScope": "complete_round",
+      "journalSha256": "63b3af7970016d16ec568561ba33acdd1a12419cdbed626c7517ea700768c02f",
+      "originalVerificationSha256": "990bb484921a85ccd275b9ac515ca31a18e79fff2f39591ddad2b27fd01e333f",
+      "savedLinkReadAttempts": [
+        {
+          "matched": true,
+          "noSubmission": true,
+          "durationSeconds": 7
+        }
+      ]
+    }
+  ],
+  "unaccepted": [
+    "long_batch",
+    "browser_restart",
+    "minimized_or_sleeping_page",
+    "interrupted_download",
+    "desktop_queue_and_asset_adoption",
+    "fault_injected_live_automatic_read_retry"
+  ]
+}
