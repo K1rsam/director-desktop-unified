@@ -2,6 +2,7 @@
 //! The caller persists its submit intent BEFORE `submit`, and the receipt immediately after.
 mod bh;
 mod chrome;
+pub mod opencli;
 mod dreamina;
 mod cli_observation;
 mod wire;
@@ -66,6 +67,8 @@ pub struct ProviderConfig {
     pub bridge_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_binding: Option<crate::chrome_setup::BrowserBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_transport: Option<Value>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     /// Reserved for a future reviewed registry. It does not bypass built-in wire adaptation.
@@ -245,7 +248,8 @@ impl ProviderError {
 }
 pub type PrepareObserver<'a> = dyn Fn(&Value) -> ProviderResult<()> + 'a;
 pub fn prepare_observed(config:&ProviderConfig,request:&GenerationRequest,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
-    if config.kind=="chrome" {validate_request(request)?;chrome::prepare_observed(config,request,observer)}
+    if opencli::enabled(config) {validate_request(request)?;opencli::prepare(config,request)}
+    else if config.kind=="chrome" {validate_request(request)?;chrome::prepare_observed(config,request,observer)}
     else {prepare(config,request)}
 }
 pub fn recover_chrome_prepare(config:&ProviderConfig,request:&GenerationRequest,proof:&Value,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
@@ -254,12 +258,14 @@ pub fn recover_chrome_prepare(config:&ProviderConfig,request:&GenerationRequest,
     chrome::recover_prepare(config,request,proof,observer)
 }
 pub fn refresh_chrome_unsubmitted_prepared(config:&ProviderConfig,prepared:&PreparedRequest)->ProviderResult<PreparedRequest>{
+    if opencli::enabled(config) {validate_request(&prepared.request)?;return Ok(prepared.clone());}
     if config.kind!="chrome"||prepared.provider!="chrome"||prepared.request.kind!="image"{return Err(ProviderError::new("CHROME_PREPARE_SCOPE","仅允许核验原 Chrome 未提交图片准备"));}
     validate_request(&prepared.request)?;
     chrome::refresh_unsubmitted_prepared(config,prepared)
 }
 
 pub fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
+    if opencli::enabled(config) {return opencli::capabilities(config);}
     match config.kind.as_str() {
         "bh" | "binghuo" => bh::capabilities(config),
         "dreamina" => dreamina::capabilities(config),
@@ -272,7 +278,8 @@ pub fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabilities> {
 }
 /// The task layer proves durable download completion before calling this adapter.
 pub fn release_completed_tab(config: &ProviderConfig, prepared: &PreparedRequest, result: &QueryResult) -> ProviderResult<Value> {
-    if config.kind == "chrome" { chrome::release_completed_tab(config, prepared, result) }
+    if opencli::enabled(config) {opencli::invoke(config,"cleanup",Some(&prepared.request))}
+    else if config.kind == "chrome" { chrome::release_completed_tab(config, prepared, result) }
     else { Ok(json!({"status":"not_applicable"})) }
 }
 /// Current official CLI account identity and credit balance, with no raw UID or OAuth tokens.
@@ -340,6 +347,7 @@ pub fn prepare(
     match config.kind.as_str() {
         "bh" | "binghuo" => bh::prepare(config, request),
         "dreamina" => dreamina::prepare(config, request),
+        "chrome" if opencli::enabled(config) => opencli::prepare(config,request),
         "chrome" => chrome::prepare(config, request),
         _ => Err(ProviderError::new(
             "UNKNOWN_PROVIDER",
@@ -368,6 +376,7 @@ pub fn submit(
     match config.kind.as_str() {
         "bh" | "binghuo" => bh::submit(config, prepared),
         "dreamina" => dreamina::submit(config, prepared),
+        "chrome" if opencli::enabled(config) => opencli::submit(config,prepared),
         "chrome" => chrome::submit(config, prepared),
         _ => Err(ProviderError::new(
             "UNKNOWN_PROVIDER",
@@ -380,6 +389,7 @@ pub fn query(config: &ProviderConfig, task_id: &str) -> ProviderResult<QueryResu
     match config.kind.as_str() {
         "bh" | "binghuo" => bh::query(config, task_id),
         "dreamina" => dreamina::query(config, task_id),
+        "chrome" if opencli::enabled(config) => Err(ProviderError::new("ORIGINAL_REQUEST_REQUIRED","必须携带原冻结请求查询网页任务")),
         "chrome" => chrome::query(config, task_id),
         _ => Err(ProviderError::new(
             "UNKNOWN_PROVIDER",
@@ -413,6 +423,7 @@ pub fn query_prepared(
     task_id: &str,
 ) -> ProviderResult<QueryResult> {
     valid_id(task_id)?;
+    if opencli::enabled(config) {return opencli::query(config,prepared,task_id);}
     if config.kind == "chrome" {
         chrome::query_with_prepared(config, task_id, Some(prepared))
     } else if config.kind == "dreamina" {
@@ -424,9 +435,10 @@ pub fn query_prepared(
 pub(crate) fn chrome_locator_valid(config:&ProviderConfig,p:&PreparedRequest,loc:&Value)->bool{chrome::conversation::locator_valid(config,p,loc)}
 pub fn query_saved(config:&ProviderConfig,p:&PreparedRequest,id:&str,saved:&Value,observe:&PrepareObserver<'_>)->ProviderResult<QueryResult>{
     valid_id(id)?;
-    if config.kind=="chrome"{chrome::query_with_saved(config,id,p,saved,observe)}else{query_prepared(config,p,id)}
+    if opencli::enabled(config){opencli::query(config,p,id)}else if config.kind=="chrome"{chrome::query_with_saved(config,id,p,saved,observe)}else{query_prepared(config,p,id)}
 }
 pub fn reconcile_unknown(config: &ProviderConfig, request_id: &str) -> ProviderResult<QueryResult> {
+    if opencli::enabled(config) {return opencli::reconcile(config,request_id);}
     // Chrome uses a caller-controlled request ID, so GET is safe even after an uncertain POST.
     if config.kind == "chrome" {
         return query(config, request_id);
@@ -441,6 +453,7 @@ pub fn download(
     url: &str,
     target: &Path,
 ) -> ProviderResult<DownloadReceipt> {
+    if opencli::enabled(config) {return opencli::download(config,url,target);}
     if config.kind == "chrome" {
         chrome::download(config, url, target)
     } else if config.kind == "dreamina" {

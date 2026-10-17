@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "node ../../sdk-bridge/scripts/package-readiness.mjs && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "node ../../sdk-bridge/scripts/package-readiness.mjs && npm run build",
+    "beforeBuildCommand": "node ../../sdk-bridge/scripts/package-readiness.mjs && node ../../web-image-bridge/package-runtime.mjs && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -30,7 +30,8 @@
   "bundle": {
     "active": true,
     "resources": {
-      "resources/sdk-readiness/": "sdk-readiness/"
+      "resources/sdk-readiness/": "sdk-readiness/",
+      "resources/opencli/": "opencli/"
     },
     "targets": [
       "nsis",

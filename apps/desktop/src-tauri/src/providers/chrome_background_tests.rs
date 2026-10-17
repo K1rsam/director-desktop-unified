@@ -9,7 +9,7 @@ fn tab(id: &str, url: &str) -> Value {
 }
 fn config(endpoint: &str, env: &str) -> ProviderConfig {
     ProviderConfig { kind:"chrome".into(),endpoint:Some(endpoint.trim_end_matches("/v1").into()),
-        bridge_token_env:Some(env.into()),chrome_binding:Some(crate::chrome_setup::BrowserBinding{profile_id:"b84d4521-56ba-4f84-9948-090f82d639e7".into(),bundle_id:"one-extension".into(),endpoint:endpoint.trim_end_matches("/v1").trim_end_matches('/').into()}),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![] }
+        browser_transport:None,bridge_token_env:Some(env.into()),chrome_binding:Some(crate::chrome_setup::BrowserBinding{profile_id:"b84d4521-56ba-4f84-9948-090f82d639e7".into(),bundle_id:"one-extension".into(),endpoint:endpoint.trim_end_matches("/v1").trim_end_matches('/').into()}),credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![] }
 }
 fn request() -> GenerationRequest {
     GenerationRequest {request_id:"offline-task".into(),kind:"image".into(),model:"chatgpt-image".into(),

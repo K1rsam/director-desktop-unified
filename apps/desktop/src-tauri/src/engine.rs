@@ -590,6 +590,7 @@ impl Engine {
         self.config_for_identity(s(&store.project()?,"id"),provider,settings)
     }
     fn config_for_identity(&self, pid:&str, provider: &str, settings: &Value) -> Result<(ProviderConfig, String)> {
+        if provider=="chrome" && settings["chromeTransport"]=="opencli" {return crate::providers::opencli::config(&self.home,settings).map_err(|e|e.message);}
         if provider == "dreamina" && self.live_accounts {
             let config = self.dreamina_config_with_settings(settings)?;
             let account = self.dreamina_sessions.snapshot(&config)?;
@@ -746,6 +747,7 @@ impl Engine {
             return Ok(());
         }
         let settings=self.effective_settings(store)?;
+        if provider=="chrome" && settings["chromeTransport"]=="opencli" {return Ok(());}
         if settings[crate::app_settings::SCOPE].is_object() && ["bh","chrome"].contains(&provider) {
             crate::app_settings::credential(&settings,s(&store.project()?,"id"),provider).map(|_|())
         } else {require_account(store, provider)}
@@ -2816,7 +2818,9 @@ impl Engine {
             if !settings[crate::app_settings::SCOPE].is_object() && ["dreamina","bh","chrome"].contains(&provider) && store.settings()?[&key] != settings[&key] {
                 return Err("图片制作期间账户身份已变化，请恢复原账户或发起新制作".into());
             }
-            if settings[crate::app_settings::SCOPE].is_object() && ["bh","chrome"].contains(&provider) {
+            if provider=="chrome" && settings["chromeTransport"]=="opencli" {
+                if s(settings,"opencliProfileId").is_empty()||s(settings,"opencliAccountKey").is_empty(){return Err("请在软件设置连接 OpenCLI 网页出图".into());}
+            } else if settings[crate::app_settings::SCOPE].is_object() && ["bh","chrome"].contains(&provider) {
                 crate::app_settings::credential(settings,s(&store.project()?,"id"),provider)?;
             } else if ["dreamina", "bh", "chrome"].contains(&provider) && s(settings, &format!("{provider}AccountId")).trim().is_empty() {
                 return Err("冻结图片设置缺少稳定账户标签，请在新制作请求中选择账户".into());

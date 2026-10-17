@@ -3475,7 +3475,7 @@ mod tests {
             credential_env: None,
             cli_path: Some(path),
             bridge_token_env: None,
-            chrome_binding: None,
+            chrome_binding: None,browser_transport:None,
             timeout_seconds: 1,
             adapted_models: vec![],
         };
@@ -4469,7 +4469,7 @@ mod tests {
             credential_env: Some("PATH".into()),
             cli_path: Some(PathBuf::from("C:\\PrivateProject\\dreamina.exe")),
             bridge_token_env: None,
-            chrome_binding: None,
+            chrome_binding: None,browser_transport:None,
             timeout_seconds: 60,
             adapted_models: vec![],
         };
@@ -5118,7 +5118,7 @@ mod tests {
             credential_env: None,
             cli_path: Some(path),
             bridge_token_env: None,
-            chrome_binding: None,
+            chrome_binding: None,browser_transport:None,
             timeout_seconds: 20,
             adapted_models: vec![],
         };
@@ -5189,7 +5189,7 @@ mod tests {
             credential_env: None,
             cli_path: Some(path),
             bridge_token_env: None,
-            chrome_binding: None,
+            chrome_binding: None,browser_transport:None,
             timeout_seconds: 20,
             adapted_models: vec![],
         };

@@ -231,7 +231,12 @@ impl Store {
     pub fn verified_source_reparse_migration(&self) -> Result<Option<Value>> {
         let mut connection=self.conn()?;
         let tx=connection.transaction().map_err(|e|e.to_string())?;
-        let source:Value=parse(tx.query_row("SELECT data FROM sources ORDER BY version DESC LIMIT 1",[],|r|r.get(0)).map_err(|e|e.to_string())?)?;
+        let source:Option<String>=tx.query_row("SELECT data FROM sources ORDER BY version DESC LIMIT 1",[],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        // A project containing only manually entered image prompts has no
+        // source migration to prove. Missing rows are valid here; malformed
+        // saved sources and mismatched migration receipts still fail below.
+        let Some(source)=source else{return Ok(None);};
+        let source:Value=parse(source)?;
         let version=source["version"].as_i64().ok_or("来源版本缺失")?;
         let raw:Option<String>=tx.query_row("SELECT value FROM metadata WHERE key=?1",[format!("source-reparse-migration:{version}")],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let Some(raw)=raw else{return Ok(None);};

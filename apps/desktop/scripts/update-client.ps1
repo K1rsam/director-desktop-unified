@@ -113,6 +113,8 @@ try {
         try {
             & node (Join-Path $repositoryRoot 'sdk-bridge\scripts\package-readiness.mjs')
             if ($LASTEXITCODE -ne 0) { throw 'SDK 只读资源准备失败，当前版与备用版未更改。' }
+            & node (Join-Path $repositoryRoot 'web-image-bridge\package-runtime.mjs')
+            if ($LASTEXITCODE -ne 0) { throw 'OpenCLI 网页组件准备失败，当前版与备用版未更改。' }
             & npm run build
             if ($LASTEXITCODE -ne 0) { throw '界面构建失败，当前版与备用版未更改。' }
             $cargo = Get-Command cargo -ErrorAction SilentlyContinue
@@ -149,6 +151,21 @@ try {
             }
             [System.IO.File]::Copy((Get-NativeIoPath (Join-Path $SdkResourceDirectory 'manifest.json')), (Get-NativeIoPath (Join-Path $stageSdk 'manifest.json')))
             $null = Get-VerifiedSdkManifest $stageSdk
+            $opencliSource = Join-Path $projectRoot 'src-tauri\resources\opencli'
+            if (Test-Path -LiteralPath (Join-Path $opencliSource 'runtime-manifest.json') -PathType Leaf) {
+                $opencliManifest = Get-Content -Raw -LiteralPath (Join-Path $opencliSource 'runtime-manifest.json') | ConvertFrom-Json
+                if ($opencliManifest.version -ne 'director-opencli-runtime/v1') { throw 'OpenCLI 组件清单版本无效。' }
+                $opencliStage = Join-Path $resourceStage 'opencli'
+                foreach ($file in $opencliManifest.files) {
+                    $sourceFile = [IO.Path]::GetFullPath((Join-Path $opencliSource $file.path))
+                    $targetFile = [IO.Path]::GetFullPath((Join-Path $opencliStage $file.path))
+                    if (-not $sourceFile.StartsWith([IO.Path]::GetFullPath($opencliSource) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or -not $targetFile.StartsWith([IO.Path]::GetFullPath($opencliStage) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'OpenCLI 资源路径越界。' }
+                    if ((Get-ClientHash $sourceFile) -ne $file.sha256) { throw 'OpenCLI 资源字节校验失败。' }
+                    $null = [IO.Directory]::CreateDirectory((Get-NativeIoPath (Split-Path -Parent $targetFile)))
+                    [IO.File]::Copy((Get-NativeIoPath $sourceFile), (Get-NativeIoPath $targetFile))
+                }
+                [IO.File]::Copy((Join-Path $opencliSource 'runtime-manifest.json'), (Join-Path $opencliStage 'runtime-manifest.json'))
+            }
             [System.IO.Directory]::Move($resourceStage, $resourceRoot)
         } finally {
             if (Test-Path -LiteralPath $resourceStage) {

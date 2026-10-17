@@ -1148,7 +1148,7 @@ mod tests {
             let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"turn":turn}),json!({"ok":true,"clients":[source]}),json!({"ok":true,"result":response})]);
             let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
             std::env::set_var(&env,"synthetic-not-a-real-credential");
-            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,browser_transport:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
             let result=query(&config,id).unwrap();
             std::env::remove_var(env);
             fixture.thread.join().unwrap();
@@ -1185,7 +1185,7 @@ mod tests {
             let fixture=super::super::wire_tests::fixture(vec![json!({"ok":true,"clients":[source]})]);
             let env=format!("DIRECTOR_CHROME_TEST_{}",uuid::Uuid::new_v4().simple());
             std::env::set_var(&env,"synthetic-not-a-real-credential");
-            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
+            let config=ProviderConfig{kind:"chrome".into(),endpoint:Some(fixture.endpoint.trim_end_matches("/v1").into()),bridge_token_env:Some(env.clone()),chrome_binding:None,browser_transport:None,credential_env:None,cli_path:None,timeout_seconds:5,adapted_models:vec![]};
             assert_eq!(original_client_for(&config,&wire::client(5).unwrap(),id,true,original).is_ok(),allowed);
             std::env::remove_var(env);
             fixture.thread.join().unwrap();

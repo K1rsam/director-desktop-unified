@@ -1,0 +1,199 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const { MockWebSocket } = vi.hoisted(() => {
+    class MockWebSocket {
+        static OPEN = 1;
+        static lastInstance;
+        readyState = 1;
+        handlers = new Map();
+        constructor(_url) {
+            MockWebSocket.lastInstance = this;
+            queueMicrotask(() => this.emit('open'));
+        }
+        on(event, handler) {
+            const handlers = this.handlers.get(event) ?? [];
+            handlers.push(handler);
+            this.handlers.set(event, handlers);
+        }
+        send(_message) { }
+        close() {
+            this.readyState = 3;
+        }
+        emit(event, ...args) {
+            for (const handler of this.handlers.get(event) ?? []) {
+                handler(...args);
+            }
+        }
+    }
+    return { MockWebSocket };
+});
+vi.mock('ws', () => ({
+    WebSocket: MockWebSocket,
+}));
+import { CDPBridge, CDP_REQUEST_BODY_CAPTURE_LIMIT } from './cdp.js';
+describe('CDPBridge cookies', () => {
+    beforeEach(() => {
+        vi.unstubAllEnvs();
+    });
+    it('filters cookies by actual domain match instead of substring match', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        vi.spyOn(bridge, 'send').mockResolvedValue({
+            cookies: [
+                { name: 'good', value: '1', domain: '.example.com' },
+                { name: 'exact', value: '2', domain: 'example.com' },
+                { name: 'child', value: '4', domain: 'account.example.com' },
+                { name: 'bad', value: '3', domain: 'notexample.com' },
+            ],
+        });
+        const page = await bridge.connect();
+        const cookies = await page.getCookies({ domain: 'example.com' });
+        expect(bridge.send).toHaveBeenCalledWith('Storage.getCookies', {});
+        expect(cookies).toEqual([
+            { name: 'good', value: '1', domain: '.example.com' },
+            { name: 'exact', value: '2', domain: 'example.com' },
+            { name: 'child', value: '4', domain: 'account.example.com' },
+        ]);
+    });
+    it.each([{}, { cookies: null }, { cookies: [null] }])('rejects malformed cookie responses %j', async (result) => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        vi.spyOn(bridge, 'send').mockResolvedValue(result);
+        const page = await bridge.connect();
+        await expect(page.getCookies({ domain: 'example.com' })).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+        await bridge.close();
+    });
+    it('matches Chrome domain filtering rather than URL applicability', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        vi.spyOn(bridge, 'send').mockResolvedValue({ cookies: [
+                { name: 'parent', value: '1', domain: '.example.com' },
+                { name: 'exact', value: '2', domain: 'account.example.com' },
+                { name: 'child', value: '3', domain: 'secure.account.example.com' },
+            ] });
+        const page = await bridge.connect();
+        expect((await page.getCookies({ domain: 'account.example.com' })).map(c => c.name)).toEqual(['exact', 'child']);
+        await bridge.close();
+    });
+    it('retains URL/path scoping for URL cookie queries', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        vi.spyOn(bridge, 'send').mockResolvedValue({ cookies: [] });
+        const page = await bridge.connect();
+        await page.getCookies({ url: 'https://example.com/account' });
+        expect(bridge.send).toHaveBeenCalledWith('Network.getCookies', { urls: ['https://example.com/account'] });
+        await bridge.close();
+    });
+    it('exposes native input helpers on direct CDP pages', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        const send = vi.spyOn(bridge, 'send').mockResolvedValue({});
+        const page = await bridge.connect();
+        send.mockClear();
+        expect(page.nativeType).toBeTypeOf('function');
+        expect(page.nativeKeyPress).toBeTypeOf('function');
+        expect(page.nativeClick).toBeTypeOf('function');
+        expect(page.handleJavaScriptDialog).toBeTypeOf('function');
+        expect(page.cdp).toBeTypeOf('function');
+        await page.nativeType('hello');
+        await page.nativeKeyPress('a', ['Ctrl']);
+        await page.nativeClick(10, 20);
+        await page.handleJavaScriptDialog(true, 'ok');
+        await page.cdp('Page.getLayoutMetrics', {});
+        expect(send.mock.calls).toEqual([
+            ['Input.insertText', { text: 'hello' }],
+            ['Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', modifiers: 2 }],
+            ['Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', modifiers: 2 }],
+            ['Input.dispatchMouseEvent', { type: 'mouseMoved', x: 10, y: 20 }],
+            ['Input.dispatchMouseEvent', { type: 'mousePressed', x: 10, y: 20, button: 'left', clickCount: 1 }],
+            ['Input.dispatchMouseEvent', { type: 'mouseReleased', x: 10, y: 20, button: 'left', clickCount: 1 }],
+            ['Page.handleJavaScriptDialog', { accept: true, promptText: 'ok' }],
+            ['Page.getLayoutMetrics', {}],
+        ]);
+    });
+    it('captures request headers and bounded post data on direct CDP pages', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        const fullBody = 'x'.repeat(CDP_REQUEST_BODY_CAPTURE_LIMIT + 5);
+        vi.spyOn(bridge, 'send').mockImplementation(async (method) => {
+            if (method === 'Network.getRequestPostData')
+                return { postData: fullBody };
+            return {};
+        });
+        const page = await bridge.connect();
+        await page.startNetworkCapture?.();
+        MockWebSocket.lastInstance?.emit('message', Buffer.from(JSON.stringify({
+            method: 'Network.requestWillBeSent',
+            params: {
+                requestId: 'request-1',
+                request: {
+                    method: 'POST',
+                    url: 'https://example.test/rsc-action/actions/pagination',
+                    headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+                    hasPostData: true,
+                },
+            },
+        })));
+        const entries = await page.readNetworkCapture?.();
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({
+            method: 'POST',
+            requestHeaders: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+            requestBodyKind: 'string',
+            requestBodyFullSize: fullBody.length,
+            requestBodyTruncated: true,
+        });
+        expect(String(entries[0].requestBodyPreview)).toHaveLength(CDP_REQUEST_BODY_CAPTURE_LIMIT);
+    });
+});
+describe('CDPBridge init script', () => {
+    const tempDirs = [];
+    afterEach(() => {
+        vi.unstubAllEnvs();
+        for (const dir of tempDirs.splice(0))
+            rmSync(dir, { recursive: true, force: true });
+    });
+    beforeEach(() => {
+        vi.unstubAllEnvs();
+    });
+    const initScripts = (calls) => calls
+        .filter(([method]) => method === 'Page.addScriptToEvaluateOnNewDocument')
+        .map(([, params]) => params.source);
+    it('registers OPENCLI_CDP_INIT_SCRIPT after the stealth script', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const dir = mkdtempSync(join(tmpdir(), 'opencli-init-'));
+        tempDirs.push(dir);
+        const file = join(dir, 'init.js');
+        writeFileSync(file, 'window.__opencliInit = 1;');
+        vi.stubEnv('OPENCLI_CDP_INIT_SCRIPT', file);
+        const bridge = new CDPBridge();
+        const send = vi.spyOn(bridge, 'send').mockResolvedValue({});
+        await bridge.connect();
+        const sources = initScripts(send.mock.calls);
+        expect(sources).toHaveLength(2);
+        expect(sources[1]).toBe('window.__opencliInit = 1;');
+        await bridge.close();
+    });
+    it.skipIf(process.platform === 'win32')('rejects a FIFO before opening a CDP connection', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'opencli-init-'));
+        tempDirs.push(dir);
+        const file = join(dir, 'init.pipe');
+        execFileSync('mkfifo', [file]);
+        vi.stubEnv('OPENCLI_CDP_INIT_SCRIPT', file);
+        const previousSocket = MockWebSocket.lastInstance;
+        await expect(new CDPBridge().connect({ cdpEndpoint: 'ws://127.0.0.1:9222' }))
+            .rejects.toThrow('regular JavaScript file');
+        expect(MockWebSocket.lastInstance).toBe(previousSocket);
+    });
+    it('registers only the stealth script when unset', async () => {
+        vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+        const bridge = new CDPBridge();
+        const send = vi.spyOn(bridge, 'send').mockResolvedValue({});
+        await bridge.connect();
+        expect(initScripts(send.mock.calls)).toHaveLength(1);
+        await bridge.close();
+    });
+});

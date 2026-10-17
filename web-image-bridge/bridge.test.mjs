@@ -1,0 +1,10 @@
+import test from'node:test';import assert from'node:assert/strict';import{validateRequest,checkIdentity,requestHash,stableConversation,dispatch,waitForIdentity}from'./bridge.mjs';
+const request={requestId:'synthetic-request',kind:'image',model:'chatgpt-image',prompt:'synthetic',ratio:'16:9',resolution:'native',references:[],options:{}};
+test('video and other channels are rejected before any browser access',()=>{assert.throws(()=>validateRequest({...request,kind:'video'}));assert.throws(()=>validateRequest({...request,model:'api-image'}));});
+test('request id traversal and empty prompt are rejected',()=>{assert.throws(()=>validateRequest({...request,requestId:'../other'}));assert.throws(()=>validateRequest({...request,prompt:''}));});
+test('original request is immutable across recovery',()=>{checkIdentity({requestHash:requestHash(request)},request);assert.throws(()=>checkIdentity({requestHash:requestHash(request)},{...request,prompt:'changed'}));});
+test('provisional conversation cannot be reopened as a stable task',()=>{assert.equal(stableConversation('https://chatgpt.com/c/local-chatgpt%3Atest'),false);assert.equal(stableConversation('https://chatgpt.com/c/saved-id'),true);assert.equal(stableConversation('https://evil.test/c/saved-id'),false);});
+test('unknown operation cannot send a prompt',async()=>{await assert.rejects(dispatch({operation:'generate-video',config:{stateRoot:process.cwd()}}),/UNSUPPORTED_OPERATION/);});
+test('authenticated page hydration is not a logout',async()=>{let n=0;const p={evaluate:async()=>({accountKey:'original',composer:++n>1}),sleep:async()=>{}};assert.equal((await waitForIdentity(p,'original',3)).composer,true);});
+test('slow authenticated composer keeps the queue busy',async()=>{const p={evaluate:async()=>({accountKey:'original',composer:false}),sleep:async()=>{}};await assert.rejects(waitForIdentity(p,'original',2),/BRIDGE_BUSY/);});
+test('different account is held without waiting or generation',async()=>{const p={evaluate:async()=>({accountKey:'changed',composer:true}),sleep:async()=>assert.fail()};await assert.rejects(waitForIdentity(p,'original'),/ACCOUNT_CHANGED/);});

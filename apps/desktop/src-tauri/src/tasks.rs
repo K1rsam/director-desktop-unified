@@ -743,13 +743,14 @@ fn completed_browser_material(store: &Store, job: &Value) -> Result<(PreparedReq
     let frozen_request=generation_request(&job["snapshot"]).map_err(|_|"prepared_identity_missing")?;
     let task=s(job,"providerTaskId");
     let proof=&job["result"]["raw"]["nativeProof"];
+    let opencli_proof=prepared.wire["transport"]=="opencli/v1" && job["result"]["raw"]["transport"]=="opencli/v1" && job["result"]["raw"]["originalIdentityVerified"]==true && job["result"]["raw"]["requestHash"]==prepared.wire["requestHash"];
     if prepared.provider!="chrome" || prepared.request.kind!="image" || prepared.request.request_id!=task
         || s(&job["result"],"taskId")!=task || s(&job["snapshot"],"requestId")!=task
-        || proof["status"]!="matched_complete" || proof["proofVersion"]!=2 || proof["requestId"]!=task
+        || !opencli_proof && (proof["status"]!="matched_complete" || proof["proofVersion"]!=2 || proof["requestId"]!=task
         || proof["promptSha256"]!=prepared.wire["metadata"]["promptSha256"]
-        || s(proof,"promptSha256").is_empty()
+        || s(proof,"promptSha256").is_empty())
         || serde_json::to_value(&prepared.request).map_err(|_|"prepared_identity_missing")?!=serde_json::to_value(&frozen_request).map_err(|_|"prepared_identity_missing")?
-        || s(proof,"conversationId").is_empty() || s(&prepared.wire,"sourceClientId").is_empty() {
+        || !opencli_proof && (s(proof,"conversationId").is_empty() || s(&prepared.wire,"sourceClientId").is_empty()) {
         return Err("completed_identity_mismatch".into());
     }
     let urls=job["result"]["resultUrls"].as_array().ok_or("completed_outputs_missing")?.iter().map(|url|url.as_str().filter(|s|!s.is_empty()).map(str::to_owned).ok_or("completed_outputs_missing")).collect::<std::result::Result<Vec<_>,_>>()?;

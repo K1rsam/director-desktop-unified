@@ -101,7 +101,7 @@ pub(crate) fn completed(store: &Store, task: &str) -> (String, ProviderConfig) {
         bridge_token_env: None,
         timeout_seconds: 5,
         adapted_models: vec![],
-        chrome_binding: None,
+        chrome_binding: None,browser_transport:None,
     };
     (key, cfg)
 }

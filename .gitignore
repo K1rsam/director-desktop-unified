@@ -16,3 +16,4 @@ __pycache__/
 *.tsbuildinfo
 apps/desktop/src-tauri/gen/
 apps/desktop/docs/verification/
+apps/desktop/src-tauri/resources/opencli/

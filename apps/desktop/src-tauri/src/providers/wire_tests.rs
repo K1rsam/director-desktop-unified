@@ -105,7 +105,7 @@ fn config(endpoint: String) -> ProviderConfig {
         credential_env: Some(env),
         cli_path: None,
         bridge_token_env: None,
-        chrome_binding: None,
+        chrome_binding: None,browser_transport:None,
         timeout_seconds: 5,
         adapted_models: vec![],
     }

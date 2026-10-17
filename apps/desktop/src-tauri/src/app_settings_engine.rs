@@ -95,6 +95,22 @@ impl Engine {
         if !allowed.contains(&action) {
             return Err("此操作不属于软件渠道设置。".into());
         }
+        let opencli_selected=app_settings::load(&self.home)?.is_some_and(|d|d["settings"]["chromeTransport"]=="opencli");
+        if ["chrome.connect","chrome.check","chrome.status"].contains(&action) && (opencli_selected || request["transport"]=="opencli") {
+            if !self.standard_native || !self.live_accounts {return Err("OpenCLI 仅允许标准桌面连接，离线验收不读取账户。".into());}
+            let doc=self.global_settings_document(request)?;
+            let mut settings=app_settings::effective_from(&doc,&json!({}));
+            if !opencli_selected {settings["opencliProfileId"]=json!("");settings["opencliAccountKey"]=json!("");}
+            let (cfg,_)=crate::providers::opencli::config(&self.home,&settings).map_err(|e|e.message)?;
+            if action!="chrome.connect" {return Ok(crate::providers::opencli::setup_status(&cfg));}
+            let _guard=self.acquire_keys(vec!["channel:chrome".into()])?;
+            let state=crate::providers::opencli::invoke(&cfg,"connect",None).map_err(|e|e.message)?;
+            let mut patch=doc["settings"].clone();
+            patch["chromeTransport"]=json!("opencli");patch["opencliProfileId"]=state["profile"].clone();patch["opencliAccountKey"]=state["accountKey"].clone();
+            patch["chromeAccountId"]=json!(format!("opencli:{}:{}",s(&state,"profile"),s(&state,"accountKey")));patch["chromeEndpoint"]=json!("http://127.0.0.1:19825");
+            let updated=app_settings::save(&self.home,&patch,doc["revision"].as_u64().ok_or("设置版本缺失")?)?;
+            return self.global_settings_view(&updated);
+        }
         if action == "chrome.open" {
             if !self.standard_native || !self.live_accounts {
                 return Err("Chrome 连接只由本机标准桌面显式触发。".into());
