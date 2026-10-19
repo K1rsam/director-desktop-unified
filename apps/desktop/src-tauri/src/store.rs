@@ -1263,7 +1263,7 @@ impl Store {
         let unknown = if has_steps { JOB_SUMMARY_UNKNOWN_COLUMN } else { "j.state='submission_unknown'" };
         let query=format!("SELECT {JOB_SUMMARY_COLUMNS},{unknown} AS summary_submission_unknown FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR ({unknown}) OR j.id IN (SELECT value FROM json_each(?1)) OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
         let mut q = c.prepare(&query).map_err(|e| e.to_string())?;
-        let rows = q.query_map([cli_ids], |row| Ok((read_job(row)?,row.get::<_,bool>(18)?))).map_err(|e| e.to_string())?;
+        let rows = q.query_map([cli_ids], |row| Ok((read_job(row)?,row.get::<_,bool>(19)?))).map_err(|e| e.to_string())?;
         rows.map(|row| {
             let (raw,unknown) = row.map_err(|e|e.to_string())?;
             let mut job = finish_job(raw)?;
@@ -1279,6 +1279,12 @@ impl Store {
     /// Read-only cross-project queue gate. Archived projects must retain unresolved
     /// browser submissions without opening/migrating their original databases.
     pub fn chrome_image_blocker(root: &Path, project_id: &str, except_job: &str) -> Result<Option<String>> {
+        Self::chrome_image_blocker_scoped(root,project_id,except_job,false)
+    }
+    /// New OpenCLI work owns a separate executor from the retired Bridge. Only
+    /// a fully bound legacy preparation can be excluded; malformed/unknown
+    /// transports and every unresolved OpenCLI request still hold this lane.
+    pub fn chrome_image_blocker_scoped(root: &Path, project_id: &str, except_job: &str, opencli: bool) -> Result<Option<String>> {
         let connection = Connection::open_with_flags(
             root.join("project.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ).map_err(|e| format!("无法核对 Chrome 原任务：{e}"))?;
@@ -1301,6 +1307,16 @@ impl Store {
             let (id,state,task,snapshot,prepared,result)=row.map_err(|e|e.to_string())?;
             let parse=|v:Option<String>|v.and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
             let candidate=json!({"kind":"image","provider":"chrome","status":state,"providerTaskId":task,"snapshot":parse(Some(snapshot)),"prepared":parse(prepared),"result":parse(result)});
+            let legacy=&candidate["prepared"];
+            let original=s(&candidate["snapshot"],"requestId");
+            let proven_legacy=opencli&&!original.is_empty()&&s(&candidate,"providerTaskId")==original
+                &&candidate["snapshot"]["providerConfig"]["browserTransport"].is_null()
+                &&legacy["provider"]=="chrome"&&legacy["request"]["kind"]=="image"
+                &&legacy["request"]["requestId"]==original&&legacy["wire"]["id"]==original
+                &&legacy["wire"]["transport"].is_null()&&!s(&legacy["wire"],"sourceClientId").is_empty()
+                &&!s(&legacy["wire"],"message").trim().is_empty()
+                &&legacy["wire"]["metadata"]["promptSha256"]==crate::pipeline::digest(&s(&legacy["wire"],"message").split_whitespace().collect::<Vec<_>>().join(" "));
+            if proven_legacy {continue;}
             if !crate::chrome_terminal::settled_job(&candidate){return Ok(Some(id));}
         }
         Ok(None)
@@ -1308,10 +1324,19 @@ impl Store {
 
     /// Waiting for another browser owner is not a state transition. Preserve FIFO
     /// timestamps and avoid one history/dirty event per queued image per tick.
-    pub fn defer_browser_queue(&self, key: &str, expected_state: &str) -> Result<()> {
+    pub fn defer_browser_queue(&self, key: &str, expected_state: &str, reason: &str) -> Result<()> {
         if !["queued", "ready"].contains(&expected_state) { return Ok(()); }
-        self.conn()?.execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2 AND state=?3 AND provider='chrome' AND kind='image'",
-            params![chrono::Utc::now().timestamp()+5,key,expected_state]).map_err(|e|e.to_string())?;
+        let mut connection=self.conn()?;
+        let tx=connection.transaction().map_err(|e|e.to_string())?;
+        if tx.execute("UPDATE jobs SET next_attempt_at=?1 WHERE id=?2 AND state=?3 AND provider='chrome' AND kind='image'",
+            params![chrono::Utc::now().timestamp()+5,key,expected_state]).map_err(|e|e.to_string())?>0 {
+            tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",params![format!("chrome_queue_wait:{key}"),reason]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn clear_browser_queue_wait(&self,key:&str)->Result<()> {
+        self.conn()?.execute("DELETE FROM metadata WHERE key=?1",[format!("chrome_queue_wait:{key}")]).map_err(|e|e.to_string())?;
         Ok(())
     }
 
@@ -1815,7 +1840,7 @@ fn source_channel_metadata_only(previous: &Value, current: &Value) -> bool {
     normalize(previous) == normalize(current)
 }
 
-const JOB_COLUMNS:&str="j.id,j.kind,j.entity_id,j.provider,j.state,j.task_id,j.account_id,j.snapshot,j.prepared,j.receipt,j.result,j.error,j.created_at,j.updated_at,j.next_attempt_at,j.query_attempts,j.download_attempts,(SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid))";
+const JOB_COLUMNS:&str="j.id,j.kind,j.entity_id,j.provider,j.state,j.task_id,j.account_id,j.snapshot,j.prepared,j.receipt,j.result,j.error,j.created_at,j.updated_at,j.next_attempt_at,j.query_attempts,j.download_attempts,(SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid)),(SELECT value FROM metadata WHERE key='chrome_queue_wait:'||j.id AND j.state IN ('queued','ready'))";
 const JOB_SUMMARY_UNKNOWN_COLUMN: &str = "j.state='submission_unknown' OR (j.kind='workflow' AND EXISTS(SELECT 1 FROM workflow_steps w JOIN jobs t ON t.id=w.text_job_id WHERE w.workflow_id=j.id AND t.kind='text' AND t.state='submission_unknown'))";
 const JOB_SUMMARY_COLUMNS: &str = r#"j.id,j.kind,j.entity_id,j.provider,j.state,j.task_id,j.account_id,
 CASE WHEN j.kind='workflow' THEN json_object('runnerVersion',json_extract(j.snapshot,'$.runnerVersion'),'stage',json_extract(j.snapshot,'$.stage'),'selection',json(COALESCE(json_extract(j.snapshot,'$.input.selection'),json_extract(j.snapshot,'$.selection'),'null')),'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),'input',json_object('source',json_object('version',json_extract(j.snapshot,'$.input.source.version'),'sha256',json_extract(j.snapshot,'$.input.source.sha256'))))
@@ -1826,12 +1851,13 @@ NULL,
 CASE WHEN j.result IS NULL THEN NULL WHEN j.kind='workflow' THEN json_object('schemaVersion',json_extract(j.result,'$.schemaVersion'),'status',json_extract(j.result,'$.status'),'blocked',json_extract(j.result,'$.blocked'),'imagePlan',(SELECT json_group_array(json_object('assetId',json_extract(item.value,'$.assetId'),'variantId',json_extract(item.value,'$.variantId'),'dependencies',json_extract(item.value,'$.dependencies'),'status',json_extract(item.value,'$.status'),'missingAdoption',json_extract(item.value,'$.missingAdoption'),'candidateCount',json_extract(item.value,'$.candidateCount'))) FROM json_each(j.result,'$.imagePlan') item))
 ELSE json_object('status',json_extract(j.result,'$.status'),'actualCost',json_extract(j.result,'$.actualCost'),'resultUrls',json_extract(j.result,'$.resultUrls')) END,
 j.error,j.created_at,j.updated_at,j.next_attempt_at,j.query_attempts,j.download_attempts,
-(SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid))"#;
+(SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid)),
+(SELECT value FROM metadata WHERE key='chrome_queue_wait:'||j.id AND j.state IN ('queued','ready'))"#;
 fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let optional = |i| row.get::<_, Option<String>>(i);
-    Ok(
-        json!({"id":row.get::<_,String>(0)?,"kind":row.get::<_,String>(1)?,"entityId":row.get::<_,String>(2)?,"provider":row.get::<_,String>(3)?,"status":row.get::<_,String>(4)?,"providerTaskId":optional(5)?,"accountId":row.get::<_,String>(6)?,"snapshot":row.get::<_,String>(7)?,"prepared":optional(8)?,"receipt":optional(9)?,"result":optional(10)?,"error":optional(11)?,"createdAt":row.get::<_,String>(12)?,"updatedAt":row.get::<_,String>(13)?,"nextAttemptAt":row.get::<_,i64>(14)?,"queryAttempts":row.get::<_,i64>(15)?,"downloadAttempts":row.get::<_,i64>(16)?,"resultMediaIds":row.get::<_,String>(17)?}),
-    )
+    let mut value = json!({"id":row.get::<_,String>(0)?,"kind":row.get::<_,String>(1)?,"entityId":row.get::<_,String>(2)?,"provider":row.get::<_,String>(3)?,"status":row.get::<_,String>(4)?,"providerTaskId":optional(5)?,"accountId":row.get::<_,String>(6)?,"snapshot":row.get::<_,String>(7)?,"prepared":optional(8)?,"receipt":optional(9)?,"result":optional(10)?,"error":optional(11)?,"createdAt":row.get::<_,String>(12)?,"updatedAt":row.get::<_,String>(13)?,"nextAttemptAt":row.get::<_,i64>(14)?,"queryAttempts":row.get::<_,i64>(15)?,"downloadAttempts":row.get::<_,i64>(16)?,"resultMediaIds":row.get::<_,String>(17)?});
+    value["queueWaitReason"]=json!(optional(18)?);
+    Ok(value)
 }
 fn finish_job(mut job: Value) -> Result<Value> {
     for key in [

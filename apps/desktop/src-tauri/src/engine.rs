@@ -1982,9 +1982,9 @@ impl Engine {
         if !["queued", "ready"].contains(&state.as_str()) { return Ok(false); }
         let result = self.chrome_image_queue_blocker(store, key);
         match result {
-            Ok(None) => Ok(true),
-            Ok(Some(_)) => {
-                store.defer_browser_queue(key, &state)?;
+            Ok(None) => {store.clear_browser_queue_wait(key)?;Ok(true)},
+            Ok(Some(reason)) => {
+                store.defer_browser_queue(key, &state, &reason)?;
                 Ok(false)
             }
             Err(error) => {
@@ -1999,12 +1999,14 @@ impl Engine {
     // An active original must finish before another task spends its proof attempt.
     fn chrome_image_queue_blocker(&self, store: &Store, key: &str) -> Result<Option<String>> {
         let current_project = s(&store.project()?, "id").to_owned();
+        let current=store.job(key)?;
+        let opencli=current["snapshot"]["providerConfig"]["browserTransport"]["transport"]=="opencli/v1";
             let registry = self.registry()?;
             for project in registry.as_array().ok_or("项目索引损坏")? {
                 let except = if s(project, "id") == current_project { key } else { "" };
-                if let Some(blocker) = Store::chrome_image_blocker(
-                    Path::new(s(project, "rootPath")), s(project, "id"), except,
-                )? { return Ok(Some(blocker)); }
+                if let Some(blocker) = Store::chrome_image_blocker_scoped(
+                    Path::new(s(project, "rootPath")), s(project, "id"), except,opencli,
+                )? { return Ok(Some(format!("等待项目「{}」中的原图片任务 {} 完成或恢复；当前图片尚未提交。", s(project,"title"), blocker))); }
             }
             Ok(None)
     }

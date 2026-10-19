@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { assetGenerationJob, generationBlocksNewJob, generationProgress, isLocalVideoPreparation, jobActive, videoPreparationLabel, workspacePollIntervalMs } from './generationState.ts';
 import type { Job } from './types.ts';
 
+test('browser queue explains the blocking original without presenting a failure', () => {
+  const reason='等待项目「旧项目」中的原图片任务 original 完成或恢复；当前图片尚未提交。';
+  assert.equal(generationProgress({id:'waiting',kind:'image',provider:'chrome',status:'queued',queueWaitReason:reason}),reason);
+  assert.doesNotMatch(generationProgress({id:'done',kind:'image',provider:'chrome',status:'downloaded',queueWaitReason:reason}),/旧项目/);
+});
+
 const job = (status: string, extra: Partial<Job> = {}): Job => ({ id: status, provider: 'dreamina', kind: 'image', assetId: 'a', status, ...extra });
 test('Chrome queued and ready images say not submitted instead of pretending to poll an original task', () => {
   for (const status of ['queued', 'ready', 'preparing']) {

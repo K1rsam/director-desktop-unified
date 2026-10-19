@@ -75,6 +75,39 @@ impl Fixture {
 }
 
 #[test]
+fn opencli_lane_excludes_only_proven_legacy_executor_and_preserves_all_originals() {
+    let f=Fixture::new();let old=f.project("legacy recovery");let new=f.project("OpenCLI request");
+    let blocker=f.job(&old,"chrome","recovery_paused");
+    let queued=f.job(&new,"chrome","queued");
+    let mut snapshot=new.job(&queued).unwrap()["snapshot"].clone();snapshot["providerConfig"]=json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1"}});
+    new.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",rusqlite::params![snapshot.to_string(),queued]).unwrap();
+    // An unidentifiable historical record remains protected.
+    old.update_job(&blocker,"recovery_paused",&json!({"providerTaskId":"original","receipt":{"original":true}})).unwrap();
+    let waiting_before=new.job(&queued).unwrap();
+    assert!(!f.engine.chrome_image_queue_ready(&new,&queued).unwrap());
+    let waiting=new.job(&queued).unwrap();
+    assert!(s(&waiting,"queueWaitReason").contains("legacy recovery") && s(&waiting,"queueWaitReason").contains(&blocker),"show the blocking project and original job");
+    assert!(waiting["error"].is_null(),"queue waiting is not a failure");
+    assert_eq!(new.job_summaries().unwrap().iter().find(|j|j["id"]==queued).unwrap()["queueWaitReason"],waiting["queueWaitReason"]);
+    assert_eq!(waiting["updatedAt"],waiting_before["updatedAt"],"queue explanation must not change FIFO priority");
+    let mut original=old.job(&blocker).unwrap()["snapshot"].clone();original["requestId"]=json!("original");
+    old.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",rusqlite::params![original.to_string(),blocker]).unwrap();
+    old.update_job(&blocker,"recovery_paused",&json!({"prepared":{"provider":"chrome","request":{"kind":"image","requestId":"original"},"wire":{"id":"original","sourceClientId":"legacy-browser","message":"synthetic legacy image","metadata":{"promptSha256":pipeline::digest("synthetic legacy image")}}}})).unwrap();
+    let before=old.job(&blocker).unwrap();
+    assert!(f.engine.chrome_image_queue_ready(&new,&queued).unwrap());
+    assert!(new.job(&queued).unwrap()["queueWaitReason"].is_null(),"clear obsolete wait reasons when the lane is ready");
+    assert_eq!(old.job(&blocker).unwrap(),before,"never settle, rebind or resend the old request");
+    let mut damaged=before["prepared"].clone();damaged["wire"]["message"]=json!("changed");
+    old.update_job(&blocker,"recovery_paused",&json!({"prepared":damaged})).unwrap();
+    assert!(!f.engine.chrome_image_queue_ready(&new,&queued).unwrap(),"unproven old driver still fails closed");
+    old.update_job(&blocker,"recovery_paused",&json!({"prepared":before["prepared"]})).unwrap();
+    let active=f.job(&new,"chrome","submission_unknown");
+    assert!(!f.engine.chrome_image_queue_ready(&new,&queued).unwrap(),"unresolved new-executor work still holds the lane");
+    assert_eq!(new.job(&active).unwrap()["status"],"submission_unknown");
+    assert_eq!(f.channels.submissions.load(Ordering::SeqCst),0);
+}
+
+#[test]
 fn chrome_queue_preserves_original_requests_and_holds_all_unresolved_states() {
     let f=Fixture::new(); let store=f.project("state coverage");
     let pending=f.job(&store,"chrome","queued");
