@@ -269,6 +269,7 @@ fn prepare_generation(
             else {channels.prepare(cfg,&request)};
         match prepared {
             Ok(p) => {
+                if recovering && providers::opencli::enabled(cfg) {chrome_prepare_recovery::execution_started(store,key,cfg,"opencli_prepare_read")?;}
                 // Uploads are a separate durable receipt class, never mistaken for generation IDs.
                 let saved: Result<bool> = (|| {
                     let mut c = store.conn()?;
@@ -312,7 +313,7 @@ fn prepare_generation(
                 }
             }
             Err(e) => {
-                if recovering && e.code!="BRIDGE_BUSY" {chrome_prepare_recovery::execution_started(store,key,cfg,"non_queue_prepare_outcome")?;}
+                if recovering && e.code!="BRIDGE_BUSY" {chrome_prepare_recovery::execution_started(store,key,cfg,if providers::opencli::enabled(cfg){"opencli_prepare_read"}else{"non_queue_prepare_outcome"})?;}
                 if cfg.kind=="chrome" {
                     store.event(key,"chrome_prepare_error",&json!({"error":e,"generationCalled":false,"sameRequestId":j["snapshot"]["requestId"],"priorError":j["error"]}))?;
                 }

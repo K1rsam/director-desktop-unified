@@ -389,7 +389,7 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         if job["nextAttemptAt"].as_i64().unwrap_or(0)>chrono::Utc::now().timestamp() {continue;}
         let known=!s(&job,"providerTaskId").is_empty();
         let (config,account)=engine.generation_config(store,&job)?;
-        let recover_prepare=!known && ["failed","recovery_paused","preparing"].contains(&state)
+        let recover_prepare=!known && ["failed","recovery_paused","preparing","auth_required"].contains(&state)
             && tasks::chrome_prepare_recovery_eligible(store,&job,&config)?;
         let generate=!known && ["queued","ready"].contains(&state);
         let refresh_marker=format!("prepared:{key}");
@@ -488,7 +488,7 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
             if !progressed {std::thread::sleep(Duration::from_millis(r.poll_interval_ms));}
             continue;
         }
-        let recoverable=jobs.iter().filter(|j|["failed","recovery_paused","preparing"].contains(&s(j,"status")))
+        let recoverable=jobs.iter().filter(|j|["failed","recovery_paused","preparing","auth_required"].contains(&s(j,"status")))
             .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::chrome_prepare_recovery_eligible(&store,j,&cfg)))
             .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
         let refreshable=jobs.iter().filter(|j|!paused_queries.contains(&format!("prepared:{}",s(j,"id"))))

@@ -54,7 +54,7 @@ pub fn invoke(c:&ProviderConfig,operation:&str,request:Option<&GenerationRequest
     let input=serde_json::to_vec(&json!({"operation":operation,"config":t,"request":request})).map_err(|e|ProviderError::new("OPENCLI_CONFIG",e.to_string()))?;
     child.stdin.take().unwrap().write_all(&input).map_err(|_|ProviderError::uncertain("网页组件请求写入中断，保留原任务。"))?;
     let mut stdout=child.stdout.take().unwrap();let reader=std::thread::spawn(move||{let mut b=vec![];stdout.by_ref().take(2*1024*1024+1).read_to_end(&mut b).map(|_|b)});
-    let deadline=Instant::now()+Duration::from_secs(if operation=="status"{20}else{90});
+    let deadline=Instant::now()+Duration::from_secs(if matches!(operation,"status"|"prepare"){20}else{90});
     loop {if child.try_wait().map_err(|_|ProviderError::new("OPENCLI_PROCESS","无法读取网页组件进程"))?.is_some(){break;}if shutting_down()||Instant::now()>deadline{let _=child.kill();let _=child.wait();let _=reader.join();return Err(if operation=="submit"{ProviderError::uncertain("网页发送中断，只能查询原任务，不会重发。")}else{ProviderError::new("OPENCLI_READ_TIMEOUT","网页读取超时，保留原任务等待恢复。")});}std::thread::sleep(Duration::from_millis(30));}
     let bytes=reader.join().ok().and_then(|r|r.ok()).filter(|b|b.len()<=2*1024*1024).ok_or_else(||ProviderError::new("OPENCLI_PACKET","网页组件回执无效"))?;
     let v:Value=serde_json::from_slice(&bytes).map_err(|_|{let _=fs::write(root.join("last-protocol-error.txt"),&bytes);if operation=="submit"{ProviderError::uncertain("网页发送回执缺失，保留原任务。")}else{ProviderError::new("OPENCLI_PACKET","网页组件回执格式无效")}})?;
@@ -70,6 +70,27 @@ pub fn prepare(c:&ProviderConfig,r:&GenerationRequest)->ProviderResult<PreparedR
     if r.kind!="image" {return Err(ProviderError::new("IMAGE_ONLY","网页渠道仅支持图片"));}
     let data=invoke(c,"prepare",Some(r))?;
     Ok(PreparedRequest{provider:"chrome".into(),request:r.clone(),capability_version:"opencli-image/v1".into(),upload_receipts:vec![],wire:json!({"transport":"opencli/v1","requestHash":data["requestHash"],"profile":data["profile"],"accountKey":data["accountKey"]}),estimated_cost:None,prepared_at:now()})
+}
+pub fn recover_prepare(c:&ProviderConfig,r:&GenerationRequest,proof:&Value)->ProviderResult<PreparedRequest>{
+    let held=||ProviderError::new("OPENCLI_PREPARE_RECOVERY_HELD","原网页准备证据不足，保留原任务，不重新提交。");
+    let digest=|v:&Value|crate::pipeline::digest(&v.to_string());
+    let audit=&proof["legacyNoSubmitAudit"];
+    if !enabled(c) || r.kind!="image" || proof["version"]!="chrome-prepare-recovery/v1"
+        || proof["noLocalSubmit"]!=true || proof["requestHash"]!=digest(&json!(r)) || !proof["intent"].is_null()
+        || audit["stateChainProven"]!=true || audit["preparedNeverCompleted"]!=true
+        || audit["configSha256"]!=digest(&json!(c)) || s(audit,"jobId").is_empty()
+        || s(audit,"snapshotSha256").len()!=64 || s(audit,"eventHistorySha256").len()!=64 {return Err(held());}
+    let root=PathBuf::from(c.browser_transport.as_ref().and_then(|t|t["stateRoot"].as_str()).unwrap_or(""));
+    if !root.is_absolute() || valid_id(&r.request_id).is_err() {return Err(held());}
+    // A canonical request journal is a possible send, even if the local job has
+    // no receipt. Recovery must never reinterpret it as a fresh preparation.
+    if root.join(&r.request_id).join("request.json").try_exists().map_err(|_|held())? {return Err(held());}
+    let active=root.join("active.json");
+    if active.try_exists().map_err(|_|held())? {
+        let owner:Value=serde_json::from_slice(&fs::read(active).map_err(|_|held())?).map_err(|_|held())?;
+        if owner["requestId"]==r.request_id {return Err(held());}
+    }
+    prepare(c,r) // Same frozen runtime/request; this operation cannot send an image.
 }
 pub fn submit(c:&ProviderConfig,p:&PreparedRequest)->ProviderResult<SubmitReceipt>{
     if p.wire["transport"]!="opencli/v1"{return Err(ProviderError::new("PROVIDER_MISMATCH","原任务不属于 OpenCLI，未迁移或重发"));}
@@ -102,6 +123,18 @@ pub fn download(c:&ProviderConfig,url:&str,target:&Path)->ProviderResult<Downloa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_routes_to_original_opencli_and_holds_any_possible_send() {
+        let t=tempfile::tempdir().unwrap();
+        let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","stateRoot":t.path(),"runner":t.path().join("missing.mjs"),"runtimeSha256":"a".repeat(64)}})).unwrap();
+        let r:GenerationRequest=serde_json::from_value(json!({"requestId":"original","kind":"image","model":"chatgpt-image","prompt":"synthetic","ratio":"16:9","resolution":"native","references":[],"options":{}})).unwrap();
+        let proof=json!({"version":"chrome-prepare-recovery/v1","noLocalSubmit":true,"requestHash":crate::pipeline::digest(&json!(r).to_string()),"intent":null,"legacyNoSubmitAudit":{"jobId":"synthetic","stateChainProven":true,"preparedNeverCompleted":true,"configSha256":crate::pipeline::digest(&json!(c).to_string()),"snapshotSha256":"a".repeat(64),"eventHistorySha256":"b".repeat(64)}});
+        let no_observe=|_:&Value|->ProviderResult<()> {panic!("OpenCLI never invokes legacy Bridge observers")};
+        assert_eq!(super::super::recover_chrome_prepare(&c,&r,&proof,&no_observe).unwrap_err().code,"OPENCLI_COMPONENT_MISMATCH","must reach frozen OpenCLI runtime validation without requesting a legacy Bridge token");
+        fs::create_dir(t.path().join("original")).unwrap();fs::write(t.path().join("original/request.json"),"{}").unwrap();
+        assert_eq!(recover_prepare(&c,&r,&proof).unwrap_err().code,"OPENCLI_PREPARE_RECOVERY_HELD");
+        let mut changed=proof;changed["requestHash"]=json!("changed");assert_eq!(recover_prepare(&c,&r,&changed).unwrap_err().code,"OPENCLI_PREPARE_RECOVERY_HELD");
+    }
     #[test] fn ready_status_matches_shared_ui_fixture(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();let v=setup_view(&c,Ok(json!({"ready":true})));let fixture:Value=serde_json::from_str(include_str!("../../../src/fixtures/web-image-status.json")).unwrap();for(key,value)in fixture.as_object().unwrap(){assert_eq!(&v[key],value,"public UI field {key}");}}
     #[test] fn setup_status_matches_frontend_contract_in_ready_waiting_and_busy_states(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();for result in [Ok(json!({"ready":true})),Err(ProviderError::new("AUTH_REQUIRED","请登录")),Err(ProviderError::new("BRIDGE_BUSY","请等待"))]{let v=setup_view(&c,result);assert_eq!(v["schemaVersion"],"chrome-setup/v1");assert_eq!(v["configured"],true);assert_eq!(v["installed"],true);assert!(v["clients"].as_u64().unwrap()>=v["usableClients"].as_u64().unwrap());assert!(v.get("version").is_none());assert!(!v.to_string().contains("accountKey"));}}
     #[test] fn legacy_snapshots_do_not_switch_transport(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome"})).unwrap();assert!(!enabled(&c));let raw=serde_json::to_value(&c).unwrap();assert!(raw.get("browserTransport").is_none());}

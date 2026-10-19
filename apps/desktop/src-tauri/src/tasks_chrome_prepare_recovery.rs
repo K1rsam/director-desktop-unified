@@ -4,6 +4,10 @@ use rusqlite::OptionalExtension;
 const HELD:&str="CHROME_PREPARE_RECOVERY_HELD: 原准备证据不足，保留原请求/错误，不重新开页或提交";
 fn hash(value:&Value)->String {crate::pipeline::digest(&value.to_string())}
 fn empty(value:&Value)->bool {value.is_null() || value==&json!({}) || value==""}
+fn budget_key(key:&str,snapshot:&Value)->String {
+    let transport=if snapshot["providerConfig"]["browserTransport"]["transport"]=="opencli/v1" {"opencli"} else {"chrome"};
+    format!("{transport}_prepare_recovery:{key}")
+}
 fn envelope(store:&Store,key:&str,cfg:&ProviderConfig,intent:&Value)->Result<Value> {
     let job=store.job(key)?;
     let request=generation_request(&job["snapshot"])?;
@@ -39,7 +43,9 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let job=store.job(key)?;
     if job["provider"]!="chrome" || job["kind"]!="image" || cfg.kind!="chrome" {return Ok(None);}
     if !unsubmitted(&job) || !job["prepared"].is_null() || !empty(&job["receipt"]) || !job["result"].is_null() {return Ok(None);}
-    if !["queued","preparing","failed","recovery_paused"].contains(&s(&job,"status")) {return Ok(None);}
+    let opencli=providers::opencli::enabled(cfg);
+    let auth_correction=opencli && job["status"]=="auth_required";
+    if !["queued","preparing","failed","recovery_paused"].contains(&s(&job,"status")) && !auth_correction {return Ok(None);}
     let has_intent:bool=store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='chrome_prepare_intent')",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
     if s(&job,"status")=="queued" && !has_intent {return Ok(None);}
     if job["snapshot"]["providerConfig"]!=json!(cfg) {return Err(HELD.into());}
@@ -51,6 +57,7 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let events=q.query_map([key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(|e|e.to_string())?
         .collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     let mut begin=false;let mut failed=false;let mut intent=None;
+    let mut original_opencli_timeout=false;let mut misrouted_recovery=false;let mut misrouted_auth=false;
     for (kind,raw) in &events {
         let value:Value=serde_json::from_str(raw).map_err(|_|HELD)?;
         if kind=="chrome_prepare_recovery_exhausted" && !saved_budget(store,key,&job["snapshot"])?
@@ -60,6 +67,13 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
                 .any(|state|value["state"]==*state || value["from"]==*state) {return Ok(None);}
         if kind=="state_claim" && value["from"]=="queued" && value["state"]=="preparing" {begin=true;}
         if kind=="state_claim" && value["from"]=="preparing" && value["state"]=="failed" && begin {failed=true;}
+        if kind=="chrome_prepare_recovery_started" {misrouted_recovery=original_opencli_timeout && value["previousState"]=="failed" && value["firstSubmitAllowed"]==false;}
+        if kind=="chrome_prepare_error" {
+            misrouted_auth=misrouted_recovery && value["generationCalled"]==false && value["sameRequestId"]==request.request_id
+                && value["error"]["code"]=="AUTH_REQUIRED" && value["error"]["authRequired"]==true
+                && value["error"]["submissionUnknown"]==false && value["error"]["message"]==ProviderError::auth().message;
+            if value["error"]["code"]=="OPENCLI_READ_TIMEOUT" && value["generationCalled"]==false && value["sameRequestId"]==request.request_id {original_opencli_timeout=true;}
+        }
         if kind=="chrome_prepare_intent" {
             let mut unsigned=value.clone();unsigned.as_object_mut().ok_or(HELD)?.remove("sha256");
             if value["sha256"]!=hash(&unsigned) || value["jobId"]!=key || value["snapshotSha256"]!=hash(&job["snapshot"])
@@ -69,6 +83,7 @@ fn proof(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
             intent=Some(value["intent"].clone());
         }
     }
+    if auth_correction && (!misrouted_auth || intent.is_some()) {return Ok(None);}
     if let Some(intent)=intent {
         return Ok(Some(json!({"version":"chrome-prepare-recovery/v1","requestHash":request_hash,"noLocalSubmit":true,"intent":intent,"legacyNoSubmitAudit":null})));
     }
@@ -87,7 +102,7 @@ pub(super) fn has_proof(store:&Store,job:&Value,cfg:&ProviderConfig)->Result<boo
     Ok(proof(store,s(job,"id"),cfg)?.is_some())
 }
 fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
-    let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+    let raw:Option<String>=store.conn()?.query_row("SELECT value FROM metadata WHERE key=?1",[budget_key(key,snapshot)],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
     let Some(raw)=raw else {return Ok(None);};
     let budget:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
     if budget["snapshotSha256"]!=hash(snapshot) || !["chrome-prepare-recovery-budget/v1","chrome-prepare-recovery-budget/v2"].contains(&s(&budget,"version"))
@@ -102,7 +117,8 @@ fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
                 || connection_wait_correction(store,key,original,Some(cutoff))?.as_ref()!=Some(correction) {return Err(HELD.into());}
             cutoff
         }else{0};
-        let raw:Option<String>=store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' AND id>?2 ORDER BY id DESC LIMIT 1",rusqlite::params![key,cutoff],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let opencli=snapshot["providerConfig"]["browserTransport"]["transport"]=="opencli/v1";
+        let raw:Option<String>=store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='chrome_prepare_execution_started' AND id>?2 AND (?3=0 OR json_extract(data,'$.reason')='opencli_prepare_read') ORDER BY id DESC LIMIT 1",rusqlite::params![key,cutoff,opencli],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(raw)=raw {let event:Value=serde_json::from_str(&raw).map_err(|_|HELD)?;
             if event["version"]!="chrome-prepare-execution-clock/v1" || event["jobId"]!=key || event["snapshotSha256"]!=hash(snapshot)
                 || event["requestId"]!=snapshot["requestId"] || event["configSha256"]!=hash(&snapshot["providerConfig"])
@@ -131,6 +147,7 @@ fn saved_budget(store:&Store,key:&str,snapshot:&Value)->Result<Option<Value>> {
 // budget and all events; any actual intent, fresh proof or remote work forbids it.
 fn connection_wait_correction(store:&Store,key:&str,budget:&Value,through:Option<i64>)->Result<Option<Value>> {
     let job=store.job(key)?;
+    if job["snapshot"]["providerConfig"]["browserTransport"]["transport"]=="opencli/v1" {return Ok(None);}
     if budget["version"]!="chrome-prepare-recovery-budget/v2" || budget.get("connectionWaitCorrection").is_some()
         || budget["attempts"].as_u64().is_none_or(|n|n==0) || !unsubmitted(&job) || !job["prepared"].is_null()
         || !empty(&job["receipt"]) || !job["result"].is_null() {return Ok(None);}
@@ -202,8 +219,8 @@ pub(crate) fn retire_exhausted_chrome_prepare(store:&Store,job:&Value,cfg:&Provi
 }
 pub(super) fn begin(store:&Store,key:&str,cfg:&ProviderConfig)->Result<Option<Value>> {
     let Some(proof)=proof(store,key,cfg)? else {return Ok(None);};
-    let metadata=format!("chrome_prepare_recovery:{key}");
     let original=store.job(key)?;
+    let metadata=budget_key(key,&original["snapshot"]);
     let budget=saved_budget(store,key,&original["snapshot"])? .unwrap_or_else(||json!({"version":"chrome-prepare-recovery-budget/v2","snapshotSha256":hash(&original["snapshot"]),"startedAt":chrono::Utc::now().timestamp(),"executionStartedAt":null,"attempts":0}));
     if budget_exhausted(&budget) {
         return Err("CHROME_PREPARE_RECOVERY_EXHAUSTED: 原页准备恢复已到有界上限，保留原任务，不开新页".into());
@@ -233,7 +250,7 @@ pub(super) fn execution_started(store:&Store,key:&str,cfg:&ProviderConfig,reason
     if budget["version"]=="chrome-prepare-recovery-budget/v2" && budget["executionStartedAt"].is_null(){budget["executionStartedAt"]=json!(chrono::Utc::now().timestamp());}
     budget["attempts"]=json!(budget["attempts"].as_u64().ok_or(HELD)?+1);
     let mut c=store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-    if tx.execute("UPDATE metadata SET value=?1 WHERE key=?2 AND value=?3",rusqlite::params![budget.to_string(),format!("chrome_prepare_recovery:{key}"),old]).map_err(|e|e.to_string())?!=1{return Err(HELD.into());}
+    if tx.execute("UPDATE metadata SET value=?1 WHERE key=?2 AND value=?3",rusqlite::params![budget.to_string(),budget_key(key,&original["snapshot"]),old]).map_err(|e|e.to_string())?!=1{return Err(HELD.into());}
     tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'chrome_prepare_execution_started',?2,?3)",rusqlite::params![key,json!({"version":"chrome-prepare-execution-clock/v1","jobId":key,"snapshotSha256":hash(&original["snapshot"]),"configSha256":hash(&json!(cfg)),"requestId":original["snapshot"]["requestId"],"attempt":budget["attempts"],"executionStartedAt":budget["executionStartedAt"],"reason":reason,"generationCalled":false}).to_string(),now()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e|e.to_string())?;Ok(())
 }
@@ -259,7 +276,7 @@ mod tests {
         fn recover_prepare(&self,c:&ProviderConfig,r:&GenerationRequest,proof:&Value,observe:&providers::PrepareObserver<'_>)->ProviderResult<PreparedRequest> {
             self.calls.fetch_add(1,Ordering::SeqCst);self.proofs.lock().unwrap().push(proof.clone());
             if self.busy {return Err(ProviderError::new("BRIDGE_BUSY","original standalone command pending"));}
-            if proof["intent"].is_null() {observe(&json!({"version":"chrome-prepare-intent/v1","mode":"legacy_first_prepare","requestId":r.request_id,"requestHash":hash(&json!(r)),"createdAt":now()}))?;}
+            if proof["intent"].is_null() && !providers::opencli::enabled(c) {observe(&json!({"version":"chrome-prepare-intent/v1","mode":"legacy_first_prepare","requestId":r.request_id,"requestHash":hash(&json!(r)),"createdAt":now()}))?;}
             Ok(PreparedRequest{provider:c.kind.clone(),request:r.clone(),capability_version:"synthetic".into(),upload_receipts:vec![],wire:json!({"sameOriginalPage":true}),estimated_cost:None,prepared_at:now()})
         }
         fn submit(&self,_:&ProviderConfig,_:&PreparedRequest)->ProviderResult<SubmitReceipt>{panic!("prepare-only restoration never submits");}
@@ -277,6 +294,46 @@ mod tests {
         let key=store.add_job("image","hero","chrome","original-account",&snapshot,"queued").unwrap();
         store.claim_job(&key,"queued","preparing").unwrap();store.claim_job_fields(&key,"preparing","failed",&json!({"error":"original safe timeout detail"})).unwrap();
         (temp,store,key,cfg)
+    }
+    #[test]
+    fn opencli_busy_wait_never_spends_prepare_attempts_or_changes_original() {
+        let (temp,store,key,mut cfg)=fixture();
+        cfg.browser_transport=Some(json!({"transport":"opencli/v1","stateRoot":temp.path(),"profile":"original","accountKey":"original"}));
+        let mut snapshot=store.job(&key).unwrap()["snapshot"].clone();snapshot["providerConfig"]=json!(cfg);
+        store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",rusqlite::params![snapshot.to_string(),key]).unwrap();
+        let fake=Fake{proofs:Mutex::new(vec![]),calls:AtomicUsize::new(0),busy:true};
+        for _ in 0..4 {
+            resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap();
+            let current=store.job(&key).unwrap();assert_eq!(current["status"],"recovery_paused");assert_eq!(current["snapshot"],snapshot);
+            let budget=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(budget["attempts"],0);assert!(budget["executionStartedAt"].is_null());
+            assert!(chrome_prepare_recovery_eligible(&store,&current,&cfg).unwrap());
+        }
+        assert_eq!(store.jobs().unwrap().len(),1);
+    }
+    #[test]
+    fn opencli_misrouted_auth_uses_its_own_budget_and_preserves_original() {
+        let (temp,store,key,mut cfg)=fixture();
+        cfg.browser_transport=Some(json!({"transport":"opencli/v1","stateRoot":temp.path(),"profile":"original","accountKey":"original"}));
+        let mut snapshot=store.job(&key).unwrap()["snapshot"].clone();snapshot["providerConfig"]=json!(cfg);
+        store.conn().unwrap().execute("UPDATE jobs SET snapshot=?1 WHERE id=?2",rusqlite::params![snapshot.to_string(),key]).unwrap();
+        store.event(&key,"chrome_prepare_error",&json!({"error":{"code":"OPENCLI_READ_TIMEOUT"},"sameRequestId":snapshot["requestId"],"generationCalled":false})).unwrap();
+        store.event(&key,"chrome_prepare_recovery_started",&json!({"previousState":"failed","firstSubmitAllowed":false})).unwrap();
+        store.claim_job(&key,"failed","preparing").unwrap();
+        store.event(&key,"chrome_prepare_error",&json!({"error":ProviderError::auth(),"sameRequestId":snapshot["requestId"],"generationCalled":false})).unwrap();
+        store.claim_job_fields(&key,"preparing","auth_required",&json!({"error":ProviderError::auth().message})).unwrap();
+        let old_budget="{\"attempts\":3,\"historicalMisroutedAdapter\":true}";
+        store.conn().unwrap().execute("INSERT INTO metadata(key,value) VALUES(?1,?2)",rusqlite::params![format!("chrome_prepare_recovery:{key}"),old_budget]).unwrap();
+        let before=store.job(&key).unwrap();
+        assert!(chrome_prepare_recovery_eligible(&store,&before,&cfg).unwrap());
+        let fake=Fake{proofs:Mutex::new(vec![]),calls:AtomicUsize::new(0),busy:false};
+        resume_chrome_prepare(&store,&key,&cfg,"original-account",&fake).unwrap();
+        let after=store.job(&key).unwrap();assert_eq!(after["status"],"ready");assert_eq!(after["snapshot"],snapshot);assert!(after["providerTaskId"].is_null());
+        let saved:String=store.conn().unwrap().query_row("SELECT value FROM metadata WHERE key=?1",[format!("chrome_prepare_recovery:{key}")],|r|r.get(0)).unwrap();assert_eq!(saved,old_budget);
+        let budget=saved_budget(&store,&key,&snapshot).unwrap().unwrap();assert_eq!(budget["attempts"],1);assert!(budget["executionStartedAt"].is_i64());
+        assert_eq!(store.jobs().unwrap().len(),1);assert_eq!(fake.calls.load(Ordering::SeqCst),1);
+        store.update_job(&key,"auth_required",&json!({"error":"真实账户需要登录"})).unwrap();
+        store.event(&key,"chrome_prepare_error",&json!({"error":{"code":"AUTH_REQUIRED","authRequired":true,"submissionUnknown":false,"message":"请在浏览器中登录 ChatGPT"},"generationCalled":false,"sameRequestId":snapshot["requestId"]})).unwrap();
+        assert!(!chrome_prepare_recovery_eligible(&store,&store.job(&key).unwrap(),&cfg).unwrap(),"genuine authentication failures never become read retries");
     }
     #[test]
     fn chrome_prepare_recovery_legacy_restores_original_job_ready_preserves_snapshot_and_error_history_zero_submit() {

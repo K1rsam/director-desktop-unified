@@ -255,6 +255,7 @@ pub fn prepare_observed(config:&ProviderConfig,request:&GenerationRequest,observ
 pub fn recover_chrome_prepare(config:&ProviderConfig,request:&GenerationRequest,proof:&Value,observer:&PrepareObserver<'_>) -> ProviderResult<PreparedRequest> {
     if config.kind!="chrome" || request.kind!="image" {return Err(ProviderError::new("CHROME_PREPARE_SCOPE","仅允许恢复原 Chrome 图片准备"));}
     validate_request(request)?;
+    if opencli::enabled(config) {return opencli::recover_prepare(config,request,proof);}
     chrome::recover_prepare(config,request,proof,observer)
 }
 pub fn refresh_chrome_unsubmitted_prepared(config:&ProviderConfig,prepared:&PreparedRequest)->ProviderResult<PreparedRequest>{

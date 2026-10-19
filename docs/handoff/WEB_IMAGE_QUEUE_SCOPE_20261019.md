@@ -30,3 +30,30 @@
 本轮没有提交任何新的图片或视频请求。真实原任务的准备、发送、原图下载入库仍待更新客户端后继续跟踪。不能用以上离线与启动证据声称图片生成成功或长期稳定性验收通过。
 
 候选准备完成后，当前客户端仍占用正式 EXE；已请求用户正常关闭。发布时使用原同名入口并只轮换一轮备用，不改变原请求冻结的运输资源。
+
+## 原任务续跑发现的恢复路由错误
+
+用户确认关闭后，核对到仍存在旧窗口，使用 computer-use 正常关闭该窗口，再成功发布上述同名版本；备用为原 `8d481ede…` 版本。
+
+图片专用后台执行器复用了用户原 jobId、requestId、资产版本及冻结快照，没有创建第二条图片任务。它解除队列阻塞后，第一次 OpenCLI prepare 读取达到 90 秒截止，随后恢复错误地进入了旧 Bridge `recover_prepare`，因为旧授权参数不适用而报出通用 AUTH_REQUIRED。事件证明两次均 generationCalled=false，没有 prepared、云端任务 ID 或生成回执。这不是原账户失效的证明。
+
+修复：
+
+- 恢复路由按冻结 transport 选择 OpenCLI；恢复只允许原请求、原组件、已完整证明未提交的准备链，存在 canonical 请求日志或本请求 active 标记时拒绝重新准备。
+- OpenCLI 与旧 Bridge 的准备恢复预算分别保存；旧的误路由预算与原错误事件完整保留，不覆盖、不删除。OpenCLI 明确返回非忙碌的读取结果后记录自己的尝试，仍限制最多三次、180 秒；纯 BRIDGE_BUSY 等待不计执行次数，也不退款或重置已发生的 OpenCLI 尝试。
+- 仅当完整原请求历史证明“OpenCLI 读取超时→误用旧恢复入口→旧入口通用授权错误”、且没有成功准备或任何提交记录时，允许从该误报恢复；真实 OpenCLI 登录失败、账户变化及未知提交保持阻塞。
+- OpenCLI prepare 只做本地校验和页面/账户读取，将 Rust 外部截止从 90 秒收紧为 20 秒；submit 仍单独保留 90 秒及结果未知保护。
+
+回归：`opencli` 11 项、`chrome_prepare_recovery` 10 项、`background_chrome_images` 45 项全部通过；这些筛选集合有重叠，不相加宣称总数。包含原误报复现、旧预算保留、原快照不变、真实授权错误不重试、canonical 原请求禁止重新准备和缺少旧 Bridge token 时仍进入正确 OpenCLI 校验路径。
+
+专用 Chrome 经只读窗口核对处于最小化状态；简单同步 DOM 可读，但账户的异步读取仍超时。没有通过激活窗口抢占用户前台，没有改绑另一个在线账户。真实图片成功与长期稳定性尚未验收。
+
+恢复路由修复的 Windows release 候选构建通过，SHA256 为 `3c3553cbad8d3e8ab0ad9b8a8619b44c24dd92654104c8c05c108e3e3ce137bf`；真实隐藏 WebView 启动通过，generationRequestsSent=0。
+
+该版实际续跑原任务时，已从旧 AUTH_REQUIRED 误报进入正确 OpenCLI 读取路径。第一次读取仍超时，后两次桥接器报告 BRIDGE_BUSY，仍无 prepared、回执、taskId 或 canonical 请求日志，原冻结快照完全一致。该次有界运行结束后没有继续启动新任务。原误路由的旧预算也完整保留。
+
+这次现场又暴露了 OpenCLI 在调用前就计次数、把纯忙碌等待也消耗掉的问题。随后将计数移动到非忙碌结果返回处，新增连续四次 BRIDGE_BUSY 仍保持 attempts=0、executionStartedAt=null、同一任务和快照不变的回归；最终 `chrome_prepare_recovery` 11 项通过。既有现场记录和已用预算不通过清理数据库来重置。
+
+最终版 Windows release SHA256：`c21aa18dc70bf6d2279a690b1c7317e70954015fdae412b4392cdcfa20d4a68f`。真实隐藏 WebView 启动与保存重开均通过，generationRequestsSent=0；本轮测试二进制重新运行 background_chrome_images 的 45 项也全部通过。已发布到原同名程序，目录仅保留 current 与 previous 两个 EXE；上一轮备用 SHA256 为 `3c3553cb…`。
+
+最终真实生成状态仍未通过：原任务已在有界恢复终点保留，冻结快照未改、无云端 ID、无 canonical 请求记录、没有新建替代图片任务、没有生成图片或视频。下一步先确认原绑定浏览器可完成只读账户核对；不能把启动或单元测试通过当作真实出图通过，也不能清理原恢复预算来继续尝试。
