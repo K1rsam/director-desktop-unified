@@ -171,6 +171,31 @@ test('channel cards keep one connection flow and save current input before check
       } finally { view.unmount(); }
     });
 
+    await t.test('selected browser is used by connect and account changes require an explicit checkbox', async () => {
+      const view=hookRenderer(), appSettings=makeSettings(), calls:any[]=[];
+      chromeRespond=async()=>({...chromeReport,browserKind:'edge'});
+      const mutate=async(action:string,values:any)=>{calls.push({action,...values});if(action==='chrome.connect'&&!values.allowAccountChange)throw Error('所选浏览器的登录账户与已保存账户不同');chromeRespond=async()=>({...chromeReport,browserKind:'chrome'});return{...appSettings,revision:1,settings:appSettings.settings};};
+      const element=React.createElement(SettingsPanel,{appSettings,writable:true,mutate});
+      const connect=(nodes:Host[])=>{const n=nodes.find(n=>n.type==='button'&&n.props['data-chrome-connect']);assert.ok(n);return n;};
+      try {
+        view.render(element);await settle();let nodes=view.render(element);
+        const select=nodes.find(n=>n.type==='select'&&n.props['aria-label']==='网页出图浏览器');assert.ok(select);assert.equal(select.props.value,'edge');
+        select.props.onChange({target:{value:'chrome'}});connect(view.render(element)).props.onClick();await settle();nodes=view.render(element);
+        assert.deepEqual(calls,[{action:'chrome.connect',transport:'opencli',browser:'chrome',allowAccountChange:false}]);
+        const confirm=input(nodes,'使用所选浏览器的当前账户');assert.equal(confirm.props.checked,false);
+        confirm.props.onChange({target:{checked:true}});connect(view.render(element)).props.onClick();await settle();nodes=view.render(element);
+        assert.deepEqual(calls.filter(c=>c.action==='chrome.connect').map(c=>[c.browser,c.allowAccountChange]),[['chrome',false],['chrome',true]]);
+        assert.ok(nodes.some(n=>n.type==='p'&&content(n).includes('本次核对的执行浏览器：Chrome')));
+        assert.ok(!nodes.some(n=>n.type==='input'&&n.props['aria-label']==='使用所选浏览器的当前账户'));
+      } finally {view.unmount();}
+    });
+
+    await t.test('network unavailable status stays visible without suggesting extension reload', async()=>{
+      const view=hookRenderer();chromeRespond=async()=>({...chromeReport,status:'network_unavailable',browserKind:'chrome',clients:0,usableClients:0,errorCode:'BROWSER_NETWORK_UNAVAILABLE',message:'浏览器网络不可用，请检查网络或浏览器代理。'});
+      const element=React.createElement(SettingsPanel,{appSettings:makeSettings(),writable:true,mutate:async()=>assert.fail('status cannot mutate settings')});
+      try {view.render(element);await settle();const nodes=view.render(element);assert.ok(nodes.some(n=>n.props.role==='status'&&content(n).includes('浏览器网络不可用')));assert.ok(!nodes.some(n=>n.type==='details'&&content(n).includes('首次安装浏览器组件')));}finally{view.unmount();}
+    });
+
     await t.test('ordinary Edge and Chrome opening preserves drafts and never starts managed login or binds a browser', async () => {
       const view = hookRenderer(), appSettings = makeSettings(), writes: any[] = [], calls: any[] = [];
       chromeRespond = async request => { calls.push(request); return { ...chromeReport, clients: 0, usableClients: 0, status: 'waiting_browser', errorCode: 'OPENCLI_BROWSER_NOT_CONNECTED', extensionPath: 'C:/synthetic/extension' }; };

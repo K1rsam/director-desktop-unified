@@ -2,6 +2,23 @@ use super::*;
 use crate::providers::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn opencli_browser_choice_is_explicit_and_does_not_replace_the_frozen_account() {
+    let config=||serde_json::from_value::<ProviderConfig>(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"old","accountKey":"original"}})).unwrap();
+    let mut c=config();
+    configure_opencli_browser_selection(&mut c,&json!({"browser":"chrome"})).unwrap();
+    assert_eq!(c.browser_transport.as_ref().unwrap()["requestedBrowser"],"chrome");
+    assert_eq!(c.browser_transport.as_ref().unwrap()["accountKey"],"original");
+    assert!(c.browser_transport.as_ref().unwrap()["allowAccountChange"].is_null());
+    configure_opencli_browser_selection(&mut c,&json!({"browser":"chrome","allowAccountChange":true})).unwrap();
+    assert_eq!(c.browser_transport.as_ref().unwrap()["allowAccountChange"],true);
+    for request in [json!({"browser":"other"}),json!({"browser":1}),json!({"allowAccountChange":true}),json!({"browser":"chrome","allowAccountChange":"true"})] {
+        let mut c=config();let before=json!(c);
+        assert!(configure_opencli_browser_selection(&mut c,&request).is_err());
+        assert_eq!(json!(c),before);
+    }
+}
+
 #[derive(Default)]
 struct MockChannels {
     catalogs: AtomicUsize,

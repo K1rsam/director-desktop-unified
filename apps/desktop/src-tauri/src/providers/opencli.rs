@@ -9,12 +9,15 @@ pub fn setup_status(c:&ProviderConfig)->Value {
 }
 fn setup_view(c:&ProviderConfig,result:ProviderResult<Value>)->Value {
     let configured=c.browser_transport.as_ref().is_some_and(|t|!s(t,"profile").is_empty()&&!s(t,"accountKey").is_empty());
+    let browser_kind=result.as_ref().ok().and_then(|v|v["browserKind"].as_str()).filter(|k|["chrome","edge"].contains(k))
+        .or_else(||c.browser_transport.as_ref().and_then(|t|t["browserKind"].as_str()).filter(|k|["chrome","edge"].contains(k))).map(str::to_owned);
     let (state,message,clients,usable,code)=match result {
         Ok(data) if data["ready"]==true && configured=>("ready","已连接，可以到第二阶段选择资产并生成图片。".to_owned(),1,1,String::new()),
         Ok(_)=>("unconfigured","浏览器已就绪，点击“连接并检查”保存连接。".to_owned(),1,0,String::new()),
-        Err(e)=>(if e.code=="BRIDGE_BUSY"{"busy"}else if e.code=="BROWSER_SELECTION_REQUIRED"{"needs_selection"}else{"waiting_browser"},e.message,0,0,e.code),
+        Err(e)=>(if e.code=="BRIDGE_BUSY"{"busy"}else if e.code=="BROWSER_SELECTION_REQUIRED"{"needs_selection"}else if e.code=="BROWSER_NETWORK_UNAVAILABLE"{"network_unavailable"}else{"waiting_browser"},e.message,0,0,e.code),
     };
     let mut value=json!({"schemaVersion":"chrome-setup/v1","installed":true,"configured":configured,"componentVersion":"OpenCLI 1.8.8 / Bridge 1.0.24","status":state,"message":message,"clients":clients,"usableClients":usable,"checkedAt":now(),"browserProfiles":[],"transport":"opencli","errorCode":code});
+    if let Some(kind)=browser_kind {value["browserKind"]=json!(kind);}
     if let Some(root)=std::env::var_os("LOCALAPPDATA") {let extension=PathBuf::from(root).join("Programs/Director-OpenCLI-Bridge/1.0.24/extension");if extension.join("manifest.json").is_file(){value["extensionPath"]=json!(extension);}}
     value
 }
@@ -58,8 +61,24 @@ pub fn invoke(c:&ProviderConfig,operation:&str,request:Option<&GenerationRequest
     loop {if child.try_wait().map_err(|_|ProviderError::new("OPENCLI_PROCESS","无法读取网页组件进程"))?.is_some(){break;}if shutting_down()||Instant::now()>deadline{let _=child.kill();let _=child.wait();let _=reader.join();return Err(if operation=="submit"{ProviderError::uncertain("网页发送中断，只能查询原任务，不会重发。")}else{ProviderError::new("OPENCLI_READ_TIMEOUT","网页读取超时，保留原任务等待恢复。")});}std::thread::sleep(Duration::from_millis(30));}
     let bytes=reader.join().ok().and_then(|r|r.ok()).filter(|b|b.len()<=2*1024*1024).ok_or_else(||ProviderError::new("OPENCLI_PACKET","网页组件回执无效"))?;
     let v:Value=serde_json::from_slice(&bytes).map_err(|_|{let _=fs::write(root.join("last-protocol-error.txt"),&bytes);if operation=="submit"{ProviderError::uncertain("网页发送回执缺失，保留原任务。")}else{ProviderError::new("OPENCLI_PACKET","网页组件回执格式无效")}})?;
-    if v["ok"]!=true {let code=v["error"]["code"].as_str().unwrap_or("OPENCLI_ERROR");let mut e=ProviderError::new(code,match code {"BRIDGE_BUSY"=>"网页正在处理任务，请稍后再检查。","BROWSER_SELECTION_REQUIRED"=>"首次连接检测到多个浏览器。请暂时只保留本次用于出图的浏览器，再点击连接；保存绑定后可同时打开其他浏览器。","AUTH_REQUIRED"=>"请在浏览器中登录 ChatGPT，再点击“连接并检查”。","ACCOUNT_CHANGED"=>"当前登录账户与已保存账户不同，请切回原账户后连接。","OPENCLI_BROWSER_NOT_CONNECTED"=>"请打开已安装组件的浏览器，登录 ChatGPT 后再连接。","LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。","OPENCLI_OWNED_PAGE_REQUIRED"=>"请先打开 ChatGPT 网页，再点击“连接并检查”。",_=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。"});e.submission_unknown=v["error"]["submissionUnknown"]==true;e.auth_required=matches!(code,"AUTH_REQUIRED"|"ACCOUNT_CHANGED");return Err(e);}
+    if v["ok"]!=true {let code=v["error"]["code"].as_str().unwrap_or("OPENCLI_ERROR");let mut e=ProviderError::new(code,connection_error_message(code));e.submission_unknown=v["error"]["submissionUnknown"]==true;e.auth_required=matches!(code,"AUTH_REQUIRED"|"ACCOUNT_CHANGED");return Err(e);}
     Ok(v["data"].clone())
+}
+fn connection_error_message(code:&str)->&'static str {
+    match code {
+        "BRIDGE_BUSY"=>"网页正在处理任务，请稍后再检查。",
+        "BROWSER_SELECTION_REQUIRED"=>"所选类型存在多个浏览器配置，请只保留本次用于出图的配置后连接；已有任务不变。",
+        "AUTH_REQUIRED"=>"请在所选浏览器中登录 ChatGPT，再点击“连接并检查”。",
+        "ACCOUNT_CHANGED"=>"所选浏览器的登录账户与已保存账户不同。如要切换，请勾选“使用所选浏览器的当前账户”后连接；已有任务仍保留原账户。",
+        "BROWSER_NETWORK_UNAVAILABLE"=>"浏览器暂时无法访问 ChatGPT，请检查网络或浏览器代理，确认网页可正常打开后再连接；无需重载扩展或重新登录。",
+        "BROWSER_CHECK_REQUIRED"=>"ChatGPT 网页需要完成网站检查，请在所选浏览器中正常完成后再连接。",
+        "CHATGPT_PAGE_LOADING"=>"ChatGPT 页面尚未加载完成，请等待网页打开后再连接。",
+        "BROWSER_KIND_MISMATCH"=>"当前浏览器类型与保存的绑定不同，请在全局设置选择正确浏览器后重新连接；已有任务保留原绑定。",
+        "OPENCLI_BROWSER_NOT_CONNECTED"=>"未找到所选浏览器的可用连接，请打开该浏览器、登录 ChatGPT 并确认已安装组件。",
+        "LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。",
+        "OPENCLI_OWNED_PAGE_REQUIRED"=>"请先在所选浏览器打开 ChatGPT 网页，再点击“连接并检查”。",
+        _=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。",
+    }
 }
 pub fn capabilities(c:&ProviderConfig)->ProviderResult<Capabilities>{
     let status=invoke(c,"status",None)?;
@@ -123,6 +142,15 @@ pub fn download(c:&ProviderConfig,url:&str,target:&Path)->ProviderResult<Downloa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn network_status_is_distinct_from_login_and_reports_the_real_browser() {
+        let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"saved","accountKey":"digest","browserKind":"edge"}})).unwrap();
+        let v=setup_view(&c,Err(ProviderError::new("BROWSER_NETWORK_UNAVAILABLE",connection_error_message("BROWSER_NETWORK_UNAVAILABLE"))));
+        assert_eq!(v["status"],"network_unavailable");assert_eq!(v["browserKind"],"edge");assert_eq!(v["errorCode"],"BROWSER_NETWORK_UNAVAILABLE");
+        assert!(!v.to_string().contains("accountKey"));assert!(v["message"].as_str().unwrap().contains("网络"));
+        let v=setup_view(&c,Ok(json!({"ready":true,"browserKind":"chrome"})));
+        assert_eq!(v["browserKind"],"chrome","observed browser takes precedence over stale display metadata");
+    }
     #[test]
     fn recovery_routes_to_original_opencli_and_holds_any_possible_send() {
         let t=tempfile::tempdir().unwrap();

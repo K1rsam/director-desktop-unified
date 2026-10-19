@@ -65,18 +65,25 @@ async function health(profile) {
   if (selected.pending) throw error('BRIDGE_BUSY');
   return selected.contextId;
 }
-async function browserIdentity(p) {
-  return p.evaluate(`(async()=>{const r=await fetch('/api/auth/session',{credentials:'include'});if(!r.ok)throw Error('AUTH_REQUIRED');const s=await r.json();const id=s.user?.id;if(typeof id!=='string'||!id)throw Error('AUTH_REQUIRED');const key=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id)))].map(b=>b.toString(16).padStart(2,'0')).join('');return{accountKey:key,composer:!!document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')};})()`);
+export async function browserIdentity(p) {
+  try {return await p.evaluate(`(async()=>{if(location.protocol==='chrome-error:')throw Error('BROWSER_NETWORK_UNAVAILABLE');if(location.origin!=='https://chatgpt.com')throw Error('CHATGPT_PAGE_LOADING');let r;try{r=await fetch('/api/auth/session',{credentials:'include',signal:AbortSignal.timeout(6000)});}catch{throw Error('BROWSER_NETWORK_UNAVAILABLE');}if(r.status===401)throw Error('AUTH_REQUIRED');if(r.status===403)throw Error('BROWSER_CHECK_REQUIRED');if(r.status===429)throw Error('BRIDGE_BUSY');if(!r.ok)throw Error('BROWSER_NETWORK_UNAVAILABLE');const s=await r.json();const id=s.user?.id;if(typeof id!=='string'||!id)throw Error('AUTH_REQUIRED');const key=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id)))].map(b=>b.toString(16).padStart(2,'0')).join('');return{accountKey:key,browserKind:/Edg\\//.test(navigator.userAgent)?'edge':/Chrome\\//.test(navigator.userAgent)?'chrome':'other',composer:!!document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')};})()`);}catch(e){throw identityError(e);}
+}
+export function identityError(e) {
+  for(const code of ['BROWSER_NETWORK_UNAVAILABLE','BROWSER_CHECK_REQUIRED','CHATGPT_PAGE_LOADING','BRIDGE_BUSY','AUTH_REQUIRED']) {
+    if(String(e.message).includes(code)) return error(code);
+  }
+  return e;
 }
 export async function waitForIdentity(p, expectedAccount = '', attempts = 15) {
-  let identity;
+  let identity, loading=false;
   for(let i=0;i<attempts;i++) {
-    try { identity=await browserIdentity(p); }
-    catch(e) {if(!String(e.message).includes('AUTH_REQUIRED'))throw e;identity=null;}
+    try { identity=await browserIdentity(p);loading=false; }
+    catch(e) {const classified=identityError(e);if(classified.code==='CHATGPT_PAGE_LOADING'){loading=true;await p.sleep(1);continue;}if(!String(e.message).includes('AUTH_REQUIRED'))throw classified;identity=null;loading=false;}
     if(identity?.accountKey && expectedAccount && identity.accountKey!==expectedAccount)throw error('ACCOUNT_CHANGED');
     if(identity?.composer)return identity;
     await p.sleep(1);
   }
+  if(loading)throw error('CHATGPT_PAGE_LOADING');
   if(identity?.accountKey)throw error('BRIDGE_BUSY'); // Authenticated page still hydrating, not logout.
   throw error('AUTH_REQUIRED');
 }
@@ -86,23 +93,36 @@ async function inspect(config, connect = false) {
   let tab = tabs.find(t => t.page && /^https:\/\/chatgpt.com(?:\/|$)/.test(t.url || ''));
   if (!tab && connect) { const page = await p.newTab('https://chatgpt.com/'); tab = { page }; await p.sleep(2); }
   if (!tab) throw error('OPENCLI_OWNED_PAGE_REQUIRED');
-  p.setActivePage(tab.page); const identity = await waitForIdentity(p,config.accountKey);
+  p.setActivePage(tab.page);
+  const expectedBrowser=config.requestedBrowser||config.browserKind;
+  if(expectedBrowser) {
+    const browser=await p.evaluate(`(/Edg\\//.test(navigator.userAgent)?'edge':/Chrome\\//.test(navigator.userAgent)?'chrome':'other')`);
+    if(browser!==expectedBrowser)throw error('BROWSER_KIND_MISMATCH');
+  }
+  const identity = await waitForIdentity(p,config.accountKey);
   if (config.accountKey && identity.accountKey !== config.accountKey) throw error('ACCOUNT_CHANGED');
   return { profile, ...identity, page: tab.page, transport: 'opencli/v1', ready: true };
 }
 export async function connectAvailable(config, probe = daemonStatus, inspectProfile = inspect) {
   const status = await probe(); if(!status)throw error('LOCAL_SERVICE_UNAVAILABLE');
   const profiles=(status.profiles||[]).filter(p=>p.extensionConnected);
-  if(!config.accountKey && profiles.length>1)throw error('BROWSER_SELECTION_REQUIRED');
+  if(config.requestedBrowser && !['chrome','edge'].includes(config.requestedBrowser))throw error('INVALID_CONFIG');
+  if(config.allowAccountChange && !config.requestedBrowser)throw error('INVALID_CONFIG');
+  if(!config.accountKey && !config.requestedBrowser && profiles.length>1)throw error('BROWSER_SELECTION_REQUIRED');
   const ordered=[...profiles].sort((a,b)=>Number(b.contextId===config.profile)-Number(a.contextId===config.profile));
   let last=error('OPENCLI_BROWSER_NOT_CONNECTED');
+  const candidates=[];
   for(const profile of ordered.slice(0,4)) {
     try {
-      const ready=await inspectProfile({...config,profile:profile.contextId},true);
-      if(config.accountKey && ready.accountKey!==config.accountKey)throw error('ACCOUNT_CHANGED');
-      return ready; // Explicit reconnect only; old jobs keep their frozen browser.
-    } catch(e) {last=e;}
+      const ready=await inspectProfile({...config,profile:profile.contextId,accountKey:config.allowAccountChange?'':config.accountKey},true);
+      if(config.requestedBrowser && ready.browserKind!==config.requestedBrowser)throw error('BROWSER_KIND_MISMATCH');
+      if(config.accountKey && ready.accountKey!==config.accountKey && !config.allowAccountChange)throw error('ACCOUNT_CHANGED');
+      if(!config.requestedBrowser || profile.contextId===config.profile)return ready;
+      candidates.push(ready);
+    } catch(e) {if(e.code!=='BROWSER_KIND_MISMATCH')last=e;}
   }
+  if(candidates.length>1)throw error('BROWSER_SELECTION_REQUIRED');
+  if(candidates.length===1)return candidates[0];
   throw last;
 }
 function paths(config, id) {

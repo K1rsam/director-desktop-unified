@@ -4,6 +4,16 @@ use crate::app_settings;
 #[path = "app_settings_engine/dreamina_refresh.rs"]
 mod dreamina_refresh;
 
+fn configure_opencli_browser_selection(config:&mut crate::providers::ProviderConfig,request:&Value)->Result<()> {
+    let browser=request.get("browser").map(|v|v.as_str().filter(|b|["chrome","edge"].contains(b)).ok_or("网页出图浏览器选择无效，原绑定未修改。")).transpose()?;
+    let allow=request.get("allowAccountChange").map(|v|v.as_bool().ok_or("账户切换确认格式无效，原绑定未修改。")).transpose()?.unwrap_or(false);
+    if allow && browser.is_none() {return Err("切换账户前必须明确选择浏览器，原绑定未修改。".into());}
+    let transport=config.browser_transport.as_mut().ok_or("网页运输配置缺失")?;
+    if let Some(browser)=browser {transport["requestedBrowser"]=json!(browser);}
+    if allow {transport["allowAccountChange"]=json!(true);}
+    Ok(())
+}
+
 impl Engine {
     pub(super) fn global_capability_cache(
         &self,
@@ -101,8 +111,9 @@ impl Engine {
             let doc=self.global_settings_document(request)?;
             let mut settings=app_settings::effective_from(&doc,&json!({}));
             if !opencli_selected {settings["opencliProfileId"]=json!("");settings["opencliAccountKey"]=json!("");}
-            let (cfg,_)=crate::providers::opencli::config(&self.home,&settings).map_err(|e|e.message)?;
+            let (mut cfg,_)=crate::providers::opencli::config(&self.home,&settings).map_err(|e|e.message)?;
             if action!="chrome.connect" {return Ok(crate::providers::opencli::setup_status(&cfg));}
+            configure_opencli_browser_selection(&mut cfg,request)?;
             let _guard=self.acquire_keys(vec!["channel:chrome".into()])?;
             let state=crate::providers::opencli::invoke(&cfg,"connect",None).map_err(|e|e.message)?;
             let mut patch=doc["settings"].clone();
