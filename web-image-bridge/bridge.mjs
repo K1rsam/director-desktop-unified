@@ -11,15 +11,22 @@ import { sendChatGPTMessage, uploadChatGPTImages } from './vendor/opencli/clis/c
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 export const requestHash = request => sha(JSON.stringify(request));
 export const stableConversation = url => /^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+$/.test(url || '');
+const imageRatios = new Set(['1:1','16:9','9:16','4:3','3:4','3:2','2:3','21:9']);
 export function validateRequest(r, verifyFiles = true) {
   if (!r || !/^[a-zA-Z0-9_-]{1,100}$/.test(r.requestId) || r.kind !== 'image' || r.model !== 'chatgpt-image'
-      || typeof r.prompt !== 'string' || !r.prompt.trim() || r.prompt.length > 80000 || !Array.isArray(r.references) || r.references.length > 10) throw new Error('INVALID_REQUEST');
+      || typeof r.prompt !== 'string' || !r.prompt.trim() || r.prompt.length > 80000 || !Array.isArray(r.references) || r.references.length > 10
+      || (r.ratio !== undefined && !imageRatios.has(r.ratio))) throw new Error('INVALID_REQUEST');
   if (!verifyFiles) return;
   for (const ref of r.references) {
     if (ref.kind !== 'image' || !path.isAbsolute(ref.path) || !/^[a-f0-9]{64}$/.test(ref.sha256)
         || fs.lstatSync(ref.path).isSymbolicLink() || fs.statSync(ref.path).size > 20 * 1024 * 1024
         || sha(fs.readFileSync(ref.path)) !== ref.sha256) throw new Error('REFERENCE_CHANGED');
   }
+}
+export function webImagePrompt(request) {
+  validateRequest(request,false);
+  const canvas = request.ratio ? `Use a ${request.ratio} aspect-ratio canvas (width:height); compose all requested views inside that single image. ` : '';
+  return 'Generate one image only. ' + canvas + request.prompt;
 }
 export function checkIdentity(saved, request) {
   if (saved.requestHash !== requestHash(request)) throw new Error('REQUEST_IDENTITY_CHANGED');
@@ -148,7 +155,7 @@ async function submit(config, request) {
   const ready = await inspect(config,true); activeOwner(loc, request.requestId);
   // Rust holds the shared OS command lease; it releases automatically after a crash.
   // Only this brief local lock is removed; active.json deliberately survives unknown work.
-  let saved = { version: 'opencli-task/v1', requestId: request.requestId, requestHash: hash, request, profile: ready.profile, accountKey: ready.accountKey, prompt: 'Generate one image only. ' + request.prompt, status: 'preparing', createdAt: new Date().toISOString(), page: null, conversationUrl: null };
+  let saved = { version: 'opencli-task/v1', requestId: request.requestId, requestHash: hash, request, profile: ready.profile, accountKey: ready.accountKey, prompt: webImagePrompt(request), status: 'preparing', createdAt: new Date().toISOString(), page: null, conversationUrl: null };
   try {
     activeOwner(loc, request.requestId);
     fs.writeFileSync(loc.file, JSON.stringify(saved), { flag: 'wx', mode: 0o600 }); atomic(loc.active, { requestId: request.requestId, profile: ready.profile });
