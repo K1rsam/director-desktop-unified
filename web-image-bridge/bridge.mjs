@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { Page } from './vendor/opencli/dist/src/browser/page.js';
+import { setDaemonCommandTimeoutSeconds } from './vendor/opencli/dist/src/browser/daemon-client.js';
 import { sendChatGPTMessage, uploadChatGPTImages } from './vendor/opencli/clis/chatgpt/utils.js';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -30,12 +32,38 @@ function error(code, unknown = false) { const e = new Error(code); e.code = code
 const activeCode = `!!document.querySelector('[data-testid="stop-button"],button[aria-label="停止"],button[aria-label="Stop"],button[aria-label*="停止生成"],button[aria-label*="Stop generating"]')`;
 const session = profile => new Page('site:chatgpt', undefined, profile, 'background', 'adapter', 'persistent');
 
+async function daemonStatus() {
+  let r;
+  try { r = await fetch('http://127.0.0.1:19825/status', { headers: { 'X-OpenCLI': '1' }, signal: AbortSignal.timeout(3000) }); }
+  catch { return null; }
+  if (!r.ok) throw error('LOCAL_SERVICE_UNAVAILABLE');
+  return r.json();
+}
+export async function ensureLocalService(probe = daemonStatus, launch = () => {
+  const script = fileURLToPath(new URL('./vendor/opencli/dist/src/daemon.js', import.meta.url));
+  const child = spawn(process.execPath, [script], { windowsHide:true, detached:true, stdio:'ignore' });
+  child.on('error',()=>{}); child.unref();
+}, pause = () => new Promise(resolve=>setTimeout(resolve,250))) {
+  if (await probe()) return;
+  launch(); // Only start an absent service. Never replace or stop an existing daemon.
+  for(let i=0;i<24;i++){await pause();if(await probe())return;}
+  throw error('LOCAL_SERVICE_UNAVAILABLE');
+}
+export function connectedProfile(s, expected = '') {
+  const profiles = (s.profiles || []).filter(p => p.extensionConnected);
+  const selected = expected ? profiles.filter(p=>p.contextId===expected) : profiles;
+  if (selected.length > 1) throw error('BROWSER_SELECTION_REQUIRED');
+  if (selected.length !== 1) throw error('OPENCLI_BROWSER_NOT_CONNECTED');
+  return selected[0];
+}
 async function health(profile) {
-  const r = await fetch('http://127.0.0.1:19825/status', { headers: { 'X-OpenCLI': '1' }, signal: AbortSignal.timeout(5000) });
-  const s = await r.json(), profiles = (s.profiles || []).filter(p => p.extensionConnected);
-  if (!r.ok || !s.extensionConnected || profiles.length !== 1 || (profile && profiles[0].contextId !== profile)) throw error('OPENCLI_BROWSER_NOT_CONNECTED');
-  if (s.pending || s.commandResultUnknown) throw error('BRIDGE_BUSY');
-  return profiles[0].contextId;
+  const s = await daemonStatus();
+  if (!s) throw error('LOCAL_SERVICE_UNAVAILABLE');
+  const selected = connectedProfile(s,profile);
+  // Global unknown is a cumulative diagnostic counter, not an active request.
+  // Frozen task journals and activeOwner retain the actual no-resend gate.
+  if (selected.pending) throw error('BRIDGE_BUSY');
+  return selected.contextId;
 }
 async function browserIdentity(p) {
   return p.evaluate(`(async()=>{const r=await fetch('/api/auth/session',{credentials:'include'});if(!r.ok)throw Error('AUTH_REQUIRED');const s=await r.json();const id=s.user?.id;if(typeof id!=='string'||!id)throw Error('AUTH_REQUIRED');const key=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id)))].map(b=>b.toString(16).padStart(2,'0')).join('');return{accountKey:key,composer:!!document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')};})()`);
@@ -53,6 +81,7 @@ export async function waitForIdentity(p, expectedAccount = '', attempts = 15) {
   throw error('AUTH_REQUIRED');
 }
 async function inspect(config, connect = false) {
+  if (connect) await ensureLocalService();
   const profile = await health(config.profile), p = session(profile), tabs = await p.tabs();
   let tab = tabs.find(t => t.page && /^https:\/\/chatgpt.com(?:\/|$)/.test(t.url || ''));
   if (!tab && connect) { const page = await p.newTab('https://chatgpt.com/'); tab = { page }; await p.sleep(2); }
@@ -60,6 +89,21 @@ async function inspect(config, connect = false) {
   p.setActivePage(tab.page); const identity = await waitForIdentity(p,config.accountKey);
   if (config.accountKey && identity.accountKey !== config.accountKey) throw error('ACCOUNT_CHANGED');
   return { profile, ...identity, page: tab.page, transport: 'opencli/v1', ready: true };
+}
+export async function connectAvailable(config, probe = daemonStatus, inspectProfile = inspect) {
+  const status = await probe(); if(!status)throw error('LOCAL_SERVICE_UNAVAILABLE');
+  const profiles=(status.profiles||[]).filter(p=>p.extensionConnected);
+  if(!config.accountKey && profiles.length>1)throw error('BROWSER_SELECTION_REQUIRED');
+  const ordered=[...profiles].sort((a,b)=>Number(b.contextId===config.profile)-Number(a.contextId===config.profile));
+  let last=error('OPENCLI_BROWSER_NOT_CONNECTED');
+  for(const profile of ordered.slice(0,4)) {
+    try {
+      const ready=await inspectProfile({...config,profile:profile.contextId},true);
+      if(config.accountKey && ready.accountKey!==config.accountKey)throw error('ACCOUNT_CHANGED');
+      return ready; // Explicit reconnect only; old jobs keep their frozen browser.
+    } catch(e) {last=e;}
+  }
+  throw last;
 }
 function paths(config, id) {
   if (!path.isAbsolute(config.stateRoot) || !/^[a-zA-Z0-9_-]{1,100}$/.test(id)) throw error('INVALID_STATE_PATH');
@@ -129,7 +173,9 @@ async function query(config, request) {
 export async function dispatch(input) {
   const { operation, config, request } = input;
   if (!config || !path.isAbsolute(config.stateRoot) || (config.profile && !/^[a-zA-Z0-9_-]{4,100}$/.test(config.profile))) throw error('INVALID_CONFIG');
-  if (operation === 'status' || operation === 'connect') return inspect(config,operation==='connect');
+  if (operation === 'status' || operation === 'connect') setDaemonCommandTimeoutSeconds(8);
+  if (operation === 'status') return inspect(config,false);
+  if (operation === 'connect') {await ensureLocalService();return connectAvailable(config);}
   if (operation === 'prepare') { validateRequest(request); const ready=await inspect(config,true); const loc=paths(config,request.requestId); activeOwner(loc,request.requestId); return { ...ready, requestHash:requestHash(request) }; }
   if (operation === 'submit') return submit(config,request);
   if (operation === 'query') return query(config,request);

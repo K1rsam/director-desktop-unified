@@ -26,6 +26,16 @@
   min-width: 0;
 }
 
+.web-image-steps { display: flex; flex-wrap: wrap; gap: 12px 32px; padding: 0; margin: 18px 0; list-style: none; counter-reset: web-step; }
+.web-image-steps li { counter-increment: web-step; display: flex; align-items: center; gap: 8px; font-size: .8rem; }
+.web-image-steps li::before { content: counter(web-step); border-radius: 50%; width: 24px; height: 24px; display: grid; place-items: center; background: var(--line); }
+.web-image-result { padding: 12px 14px; border-radius: 10px; background: rgba(105,110,160,.08); font-size: .82rem; }
+.web-image-result.ready { background: rgba(35,145,110,.10); color: #206b54; }
+.web-image-result.error { background: rgba(192,124,31,.10); color: #8a581c; }
+.web-image-browser { display: flex; align-items: center; gap: 8px; font-size: .8rem; }
+.web-image-browser select { width: auto; margin: 0; }
+.web-image-advanced { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+
 .channel-configuration > label {
   display: block;
   margin-top: 14px;

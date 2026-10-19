@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import * as React from 'react';
 import { createServer } from 'vite';
 
@@ -71,7 +72,7 @@ function readinessFixture(provider: string) {
 test('channel cards keep one connection flow and save current input before checking', async t => {
   let respond = async (_request: any): Promise<unknown> => { throw new Error('unexpected synthetic IPC'); };
   let runtimeRespond = async (input: any): Promise<unknown> => runtimeFixture(input.provider);
-  const chromeReport = { schemaVersion: 'chrome-setup/v1', installed: true, configured: true, status: 'ready', message: '网页已连接', clients: 1, usableClients: 1, componentVersion: 'synthetic' };
+  const chromeReport = { ...JSON.parse(readFileSync(new URL('./fixtures/web-image-status.json', import.meta.url), 'utf8')), componentVersion: 'synthetic' };
   let chromeRespond = async (_input: any): Promise<unknown> => chromeReport;
   t.beforeEach(() => { runtimeRespond = async input => runtimeFixture(input.provider); chromeRespond = async () => chromeReport; });
   Object.assign(globalThis, { isTauri: true, location: { search: '' }, window: { __TAURI_INTERNALS__: { invoke: async (_command: string, args: { request: any }) => args.request.action === 'runtime.status' ? runtimeRespond(args.request) : args.request.action.startsWith('chrome.') ? chromeRespond(args.request) : respond(args.request) } } });
@@ -82,6 +83,30 @@ test('channel cards keep one connection flow and save current input before check
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
     policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['files.choose', 'runtime.status', 'chrome.status', 'chrome.check', 'chrome.connect', 'chrome.open', 'chrome.bind', 'chrome.managed.status', 'chrome.managed.login', 'chrome.managed.start', 'chrome.managed.recover', 'settings.global.save', 'providers.refresh', 'textCli.login', 'dreamina.login', 'dreamina.status', 'readiness.check', 'runtime.prepare'] });
     const makeSettings = () => ({ schemaVersion: 'app-settings/v1', revision: 0, providers: structuredClone(previewWorkspace.providers), rules: [], settings: { textProvider: 'api', bhEndpoint: 'https://old.example.test', bhAccountId: 'stable-bh', chromeAccountId: 'stable-chrome', codexPath: '/synthetic/codex', textSdkNodePath: '/synthetic/node', dreaminaPath: '/synthetic/dreamina' } });
+
+    await t.test('web setup accepts the Rust public contract and keeps technical controls collapsed', async () => {
+      const view = hookRenderer();
+      try {
+        const element = React.createElement(SettingsPanel, { appSettings: makeSettings(), writable: true, mutate: async () => { throw new Error('view must not mutate'); } });
+        view.render(element); await settle(); const nodes = view.render(element);
+        const card = nodes.find(node => node.props['data-web-image-setup']); assert.ok(card);
+        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('已连接，可以到第二阶段生成图片')));
+        const visible: Host[] = []; const walk = (node: Host) => { visible.push(node); if (node.type === 'details' && !node.props.open) return; for (const child of node.children) if (typeof child !== 'string') walk(child); }; walk(card);
+        assert.deepEqual(visible.filter(node => node.type === 'button').map(content), ['打开 ChatGPT', '连接并检查']);
+        assert.ok(!visible.some(node => node.type === 'input'), 'no endpoint or token fields in normal flow');
+        assert.ok(!visible.some(node => /OpenCLI|Bridge token|专属 Edge/.test(content(node)) && !['section','details'].includes(node.type)));
+      } finally { view.unmount(); }
+    });
+
+    await t.test('an invalid status becomes a visible error instead of an endless loading message', async () => {
+      const view = hookRenderer(); chromeRespond = async () => ({ version: 'chrome-setup/v1', installed: true, status: 'ready' });
+      try {
+        const element = React.createElement(SettingsPanel, { appSettings: makeSettings(), writable: true, mutate: async () => { throw new Error('view must not mutate'); } });
+        view.render(element); await settle(); const nodes = view.render(element);
+        assert.ok(nodes.some(node => node.props.role === 'alert' && content(node).includes('连接状态读取失败')));
+        assert.ok(!nodes.some(node => node.props.role === 'status' && content(node).includes('正在读取连接状态')));
+      } finally { view.unmount(); }
+    });
 
     await t.test('one card for each channel, with no Canvas or editable program paths', async () => {
       const view = hookRenderer();
@@ -139,14 +164,16 @@ test('channel cards keep one connection flow and save current input before check
         assert.ok(!nodes.some(node => node.type === 'input' && node.props['aria-label'] === 'ChatGPT 网页 账户名称'), 'Chrome identity is discovered, not user entered');
         assert.equal(input(nodes, 'BH API 服务地址').props.value, 'https://draft-bh.example.test');
         assert.equal(input(nodes, 'BH API 凭据').props.value, 'draft-token');
-        assert.deepEqual(calls.map(item => item.action), ['chrome.status', 'chrome.connect', 'chrome.status']);
+        assert.deepEqual(calls.map(item => item.action), ['chrome.status', 'chrome.connect', 'chrome.status', 'providers.refresh']);
+        assert.equal(calls.find(item => item.action === 'chrome.connect').transport, 'opencli');
+        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('可以到第二阶段生成图片')));
         assert.ok(!calls.some(item => /generate|submit|images\./.test(item.action)));
       } finally { view.unmount(); }
     });
 
     await t.test('ordinary Edge and Chrome opening preserves drafts and never starts managed login or binds a browser', async () => {
       const view = hookRenderer(), appSettings = makeSettings(), writes: any[] = [], calls: any[] = [];
-      chromeRespond = async request => { calls.push(request); return { ...chromeReport, clients: 0, usableClients: 0, status: 'waiting_browser', extensionPath: 'C:/synthetic/extension' }; };
+      chromeRespond = async request => { calls.push(request); return { ...chromeReport, clients: 0, usableClients: 0, status: 'waiting_browser', errorCode: 'OPENCLI_BROWSER_NOT_CONNECTED', extensionPath: 'C:/synthetic/extension' }; };
       const mutate = async (action: string, values: any) => { writes.push({ action, ...values }); return { ...appSettings, revision: writes.length, settings: appSettings.settings }; };
       const element = React.createElement(SettingsPanel, { appSettings, writable: true, mutate });
       try {
@@ -154,14 +181,16 @@ test('channel cards keep one connection flow and save current input before check
         input(nodes, 'BH API 服务地址').props.onChange({ target: { value: 'https://unsaved.example.test' } });
         for (const browser of ['edge', 'chrome']) {
           nodes = view.render(element);
+          const select = nodes.find(node => node.type === 'select' && node.props['aria-label'] === '网页出图浏览器'); assert.ok(select);
+          select.props.onChange({ target: { value: browser } }); nodes = view.render(element);
           const button = nodes.find(node => node.type === 'button' && node.props['data-browser-open'] === browser); assert.ok(button);
           button.props.onClick(); await settle(); nodes = view.render(element);
           assert.equal(input(nodes, 'BH API 服务地址').props.value, 'https://unsaved.example.test');
         }
         assert.deepEqual(writes, [{ action: 'chrome.open', browser: 'edge' }, { action: 'chrome.open', browser: 'chrome' }]);
         assert.ok(!calls.some(request => /managed|login|bind|submit|images\./.test(request.action)));
-        const guidance = nodes.find(node => node.type === 'details' && content(node).includes('首次连接浏览器扩展')); assert.ok(guidance);
-        assert.equal(guidance.props.open, true);
+        const guidance = nodes.find(node => node.type === 'details' && content(node).includes('首次安装浏览器组件')); assert.ok(guidance);
+        assert.notEqual(guidance.props.open, true);
         assert.ok(content(guidance).includes('edge://extensions'));
         assert.ok(!nodes.some(node => node.type === 'h3' && content(node).includes('推荐')));
       } finally { view.unmount(); }

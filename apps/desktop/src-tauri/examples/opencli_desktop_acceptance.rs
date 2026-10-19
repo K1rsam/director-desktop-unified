@@ -3,14 +3,23 @@
 use director_core::{Engine,store::{s,atomic_json}};
 use serde_json::{json,Value};use std::{path::PathBuf,time::{Duration,Instant}};
 fn main()->Result<(),Box<dyn std::error::Error>>{
-    let args:Vec<_>=std::env::args().collect();if args.len()!=3||args[2]!="--allow-free-web-images"{return Err("usage: HOME --allow-free-web-images".into());}
+    let args:Vec<_>=std::env::args().collect();if !(3..=4).contains(&args.len())||args[2]!="--allow-free-web-images"{return Err("usage: HOME --allow-free-web-images [EXISTING_APP_HOME_FOR_SAVED_BROWSER]".into());}
     let home=PathBuf::from(&args[1]);if !home.is_absolute()||!home.to_string_lossy().contains("opencli-native-acceptance"){return Err("isolated acceptance home required".into());}
     let marker=home.join("probe.json");let engine=Engine::new_standard(home.clone())?;
     let mut probe:Value=if marker.is_file(){serde_json::from_slice(&std::fs::read(&marker)?)?}else{
         let global=engine.dispatch(json!({"action":"settings.global.get"}))?;
         let mut settings=global["settings"].clone();settings["textSdkNodePath"]=json!("C:/Program Files/nodejs/node.exe");
+        if let Some(source)=args.get(3) {
+            let source=PathBuf::from(source);if !source.is_absolute()||!source.join("director-next-home.json").is_file(){return Err("existing application home required".into());}
+            let saved:Value=serde_json::from_slice(&std::fs::read(source.join("app-settings.json"))?)?;
+            for key in ["chromeTransport","opencliProfileId","opencliAccountKey"] {settings[key]=saved["settings"][key].clone();}
+            if settings["chromeTransport"]!="opencli"{return Err("saved OpenCLI binding required".into());}
+        }
         engine.dispatch(json!({"action":"settings.global.save","expectedRevision":global["revision"],"settings":settings}))?;
         engine.dispatch(json!({"action":"chrome.connect","scope":"global","transport":"opencli"}))?;
+        let status=engine.dispatch(json!({"action":"chrome.check","scope":"global"}))?;
+        assert_eq!(status["schemaVersion"],"chrome-setup/v1");assert_eq!(status["configured"],true);assert_eq!(status["status"],"ready");
+        atomic_json(&home.join("connection-status.json"),&status)?;
         engine.dispatch(json!({"action":"providers.refresh","scope":"global","provider":"chrome"}))?;
         let project=engine.dispatch(json!({"action":"projects.create","title":"OpenCLI 网页接口验收"}))?;
         let v=json!({"version":"opencli-desktop-acceptance/v1","projectId":project["id"],"queued":false,"allowVideo":false});atomic_json(&marker,&v)?;v

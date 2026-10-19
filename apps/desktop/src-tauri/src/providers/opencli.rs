@@ -1,13 +1,22 @@
 //! Pinned OpenCLI browser transport. Keeps legacy Chrome snapshots on their original adapter.
 use super::*;
+use crate::store::s;
 use std::{io::{Read,Write},process::{Command,Stdio},time::{Duration,Instant}};
 
 pub fn enabled(c:&ProviderConfig)->bool { c.browser_transport.as_ref().is_some_and(|v|v["transport"]=="opencli/v1") }
 pub fn setup_status(c:&ProviderConfig)->Value {
-    match invoke(c,"status",None) {
-        Ok(data)=>json!({"version":"chrome-setup/v1","installed":true,"componentVersion":"OpenCLI 1.8.8 / Bridge 1.0.24","status":"ready","message":"OpenCLI 已连接已登录浏览器；新图片使用网页生成，原图核验后入库。","clients":1,"usableClients":1,"checkedAt":now(),"browserProfiles":[],"transport":"opencli","diagnostic":data}),
-        Err(e)=>json!({"version":"chrome-setup/v1","installed":true,"componentVersion":"OpenCLI 1.8.8 / Bridge 1.0.24","status":if e.code=="BRIDGE_BUSY"{"busy"}else{"waiting_browser"},"message":e.message,"clients":0,"usableClients":0,"checkedAt":now(),"browserProfiles":[],"transport":"opencli"})
-    }
+    setup_view(c,invoke(c,"status",None))
+}
+fn setup_view(c:&ProviderConfig,result:ProviderResult<Value>)->Value {
+    let configured=c.browser_transport.as_ref().is_some_and(|t|!s(t,"profile").is_empty()&&!s(t,"accountKey").is_empty());
+    let (state,message,clients,usable,code)=match result {
+        Ok(data) if data["ready"]==true && configured=>("ready","已连接，可以到第二阶段选择资产并生成图片。".to_owned(),1,1,String::new()),
+        Ok(_)=>("unconfigured","浏览器已就绪，点击“连接并检查”保存连接。".to_owned(),1,0,String::new()),
+        Err(e)=>(if e.code=="BRIDGE_BUSY"{"busy"}else if e.code=="BROWSER_SELECTION_REQUIRED"{"needs_selection"}else{"waiting_browser"},e.message,0,0,e.code),
+    };
+    let mut value=json!({"schemaVersion":"chrome-setup/v1","installed":true,"configured":configured,"componentVersion":"OpenCLI 1.8.8 / Bridge 1.0.24","status":state,"message":message,"clients":clients,"usableClients":usable,"checkedAt":now(),"browserProfiles":[],"transport":"opencli","errorCode":code});
+    if let Some(root)=std::env::var_os("LOCALAPPDATA") {let extension=PathBuf::from(root).join("Programs/Director-OpenCLI-Bridge/1.0.24/extension");if extension.join("manifest.json").is_file(){value["extensionPath"]=json!(extension);}}
+    value
 }
 pub fn config(home:&Path,settings:&Value)->ProviderResult<(ProviderConfig,String)> {
     let node= settings["textSdkNodePath"].as_str().filter(|p|!p.is_empty()).map(PathBuf::from)
@@ -45,11 +54,11 @@ pub fn invoke(c:&ProviderConfig,operation:&str,request:Option<&GenerationRequest
     let input=serde_json::to_vec(&json!({"operation":operation,"config":t,"request":request})).map_err(|e|ProviderError::new("OPENCLI_CONFIG",e.to_string()))?;
     child.stdin.take().unwrap().write_all(&input).map_err(|_|ProviderError::uncertain("网页组件请求写入中断，保留原任务。"))?;
     let mut stdout=child.stdout.take().unwrap();let reader=std::thread::spawn(move||{let mut b=vec![];stdout.by_ref().take(2*1024*1024+1).read_to_end(&mut b).map(|_|b)});
-    let deadline=Instant::now()+Duration::from_secs(90);
+    let deadline=Instant::now()+Duration::from_secs(if operation=="status"{20}else{90});
     loop {if child.try_wait().map_err(|_|ProviderError::new("OPENCLI_PROCESS","无法读取网页组件进程"))?.is_some(){break;}if shutting_down()||Instant::now()>deadline{let _=child.kill();let _=child.wait();let _=reader.join();return Err(if operation=="submit"{ProviderError::uncertain("网页发送中断，只能查询原任务，不会重发。")}else{ProviderError::new("OPENCLI_READ_TIMEOUT","网页读取超时，保留原任务等待恢复。")});}std::thread::sleep(Duration::from_millis(30));}
     let bytes=reader.join().ok().and_then(|r|r.ok()).filter(|b|b.len()<=2*1024*1024).ok_or_else(||ProviderError::new("OPENCLI_PACKET","网页组件回执无效"))?;
     let v:Value=serde_json::from_slice(&bytes).map_err(|_|{let _=fs::write(root.join("last-protocol-error.txt"),&bytes);if operation=="submit"{ProviderError::uncertain("网页发送回执缺失，保留原任务。")}else{ProviderError::new("OPENCLI_PACKET","网页组件回执格式无效")}})?;
-    if v["ok"]!=true {let code=v["error"]["code"].as_str().unwrap_or("OPENCLI_ERROR");let mut e=ProviderError::new(code,match code {"BRIDGE_BUSY"=>"网页已有任务执行中，当前图片保持排队。","AUTH_REQUIRED"|"ACCOUNT_CHANGED"=>"网页登录或账户身份已变化，请恢复绑定的账户。","OPENCLI_BROWSER_NOT_CONNECTED"=>"OpenCLI 扩展未连接，请打开已登录的专用浏览器。",_=>"网页接口未完成，原请求与回包已保留；不会重复发送。"});e.submission_unknown=v["error"]["submissionUnknown"]==true;e.auth_required=matches!(code,"AUTH_REQUIRED"|"ACCOUNT_CHANGED");return Err(e);}
+    if v["ok"]!=true {let code=v["error"]["code"].as_str().unwrap_or("OPENCLI_ERROR");let mut e=ProviderError::new(code,match code {"BRIDGE_BUSY"=>"网页正在处理任务，请稍后再检查。","BROWSER_SELECTION_REQUIRED"=>"首次连接检测到多个浏览器。请暂时只保留本次用于出图的浏览器，再点击连接；保存绑定后可同时打开其他浏览器。","AUTH_REQUIRED"=>"请在浏览器中登录 ChatGPT，再点击“连接并检查”。","ACCOUNT_CHANGED"=>"当前登录账户与已保存账户不同，请切回原账户后连接。","OPENCLI_BROWSER_NOT_CONNECTED"=>"请打开已安装组件的浏览器，登录 ChatGPT 后再连接。","LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。","OPENCLI_OWNED_PAGE_REQUIRED"=>"请先打开 ChatGPT 网页，再点击“连接并检查”。",_=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。"});e.submission_unknown=v["error"]["submissionUnknown"]==true;e.auth_required=matches!(code,"AUTH_REQUIRED"|"ACCOUNT_CHANGED");return Err(e);}
     Ok(v["data"].clone())
 }
 pub fn capabilities(c:&ProviderConfig)->ProviderResult<Capabilities>{
@@ -93,6 +102,8 @@ pub fn download(c:&ProviderConfig,url:&str,target:&Path)->ProviderResult<Downloa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn ready_status_matches_shared_ui_fixture(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();let v=setup_view(&c,Ok(json!({"ready":true})));let fixture:Value=serde_json::from_str(include_str!("../../../src/fixtures/web-image-status.json")).unwrap();for(key,value)in fixture.as_object().unwrap(){assert_eq!(&v[key],value,"public UI field {key}");}}
+    #[test] fn setup_status_matches_frontend_contract_in_ready_waiting_and_busy_states(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();for result in [Ok(json!({"ready":true})),Err(ProviderError::new("AUTH_REQUIRED","请登录")),Err(ProviderError::new("BRIDGE_BUSY","请等待"))]{let v=setup_view(&c,result);assert_eq!(v["schemaVersion"],"chrome-setup/v1");assert_eq!(v["configured"],true);assert_eq!(v["installed"],true);assert!(v["clients"].as_u64().unwrap()>=v["usableClients"].as_u64().unwrap());assert!(v.get("version").is_none());assert!(!v.to_string().contains("accountKey"));}}
     #[test] fn legacy_snapshots_do_not_switch_transport(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome"})).unwrap();assert!(!enabled(&c));let raw=serde_json::to_value(&c).unwrap();assert!(raw.get("browserTransport").is_none());}
     #[test] fn frozen_transport_roundtrips_unchanged(){let raw=json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"bound","stateRoot":"synthetic","accountKey":"original"}});let c:ProviderConfig=serde_json::from_value(raw.clone()).unwrap();assert!(enabled(&c));assert_eq!(serde_json::to_value(c).unwrap()["browserTransport"],raw["browserTransport"]);}
     #[test] fn video_is_rejected_before_invoking_any_component(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome"})).unwrap();let r:GenerationRequest=serde_json::from_value(json!({"requestId":"synthetic","kind":"video","model":"x","prompt":"x","ratio":"16:9","resolution":"native","references":[],"options":{}})).unwrap();assert_eq!(prepare(&c,&r).unwrap_err().code,"IMAGE_ONLY");}

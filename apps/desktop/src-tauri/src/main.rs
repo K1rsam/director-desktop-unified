@@ -189,6 +189,11 @@ const STARTUP_PROBE: &str = r#"
     if (!accountCard || accountCard.getAttribute('aria-label') !== '即梦生成 CLI' || !accountCard.textContent.includes('OAuth 登录')) throw new Error('OAuth account panel did not render');
     const cliCard=document.querySelector('.text-execution-settings');
     if (!cliCard || !cliCard.textContent.includes('OpenAI') || !cliCard.textContent.includes('SDK 与 CLI 共用 OpenAI 账户')) throw new Error('Unified OpenAI settings did not render');
+    const webCard=document.querySelector('[data-web-image-setup]');
+    if(!webCard || document.querySelectorAll('[data-web-image-setup]').length!==1) throw new Error('Unified web image connection card did not render');
+    const webButtons=[...webCard.querySelectorAll('button')].filter(button=>!button.closest('details:not([open])'));
+    if(webButtons.length!==2 || !webButtons.some(button=>button.textContent.includes('连接并检查')) || !webButtons.some(button=>button.textContent.includes('打开 ChatGPT'))) throw new Error('Web image setup must expose only the open and connect actions');
+    if(webCard.querySelector('.web-image-advanced')?.open || [...webCard.querySelectorAll('input')].some(input=>!input.closest('details:not([open])'))) throw new Error('Legacy connection credentials leaked into the normal setup flow');
     const software = await invoke('desktop_request',{request:{action:'settings.global.get'}});
     if(software.schemaVersion !== 'app-settings/v1') throw new Error('Software settings require an unexpected project');
     const savedSoftware = await invoke('desktop_request',{request:{action:'settings.global.save',expectedRevision:software.revision,settings:{textModel:'startup-global-model'}}});
