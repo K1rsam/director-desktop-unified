@@ -11586,7 +11586,129 @@ mod visual_fact_recovery_tests {
 // SDK is a transport branch of this executor. Jobs, workflow checkpoints, raw
 // evidence, domain callbacks and the global four-slot semaphore remain shared.
 static SDK_DISPATCH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+const SDK_PRE_DISPATCH_POLICY: &str = "sdk-pre-dispatch-queued/v1";
+const SDK_PRE_DISPATCH_HELD: &str = "SDK_PRE_DISPATCH_HELD: 原排队节点缺少完整零派发和原流程绑定证明；保留原请求及文件，不重发或追认";
+
+#[cfg(test)]
+#[path = "text_executor_sdk_predispatch_tests.rs"]
+mod sdk_predispatch_tests;
+
+fn sdk_pre_dispatch_artifacts(root: &Path, job: &str) -> Result<Value> {
+    if uuid::Uuid::parse_str(job).is_err() {return Err(SDK_PRE_DISPATCH_HELD.into());}
+    fn metadata(path:&Path)->Result<Option<std::fs::Metadata>> {
+        let meta=match std::fs::symlink_metadata(path) {
+            Ok(meta)=>meta,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+            Err(_)=>return Err(SDK_PRE_DISPATCH_HELD.into()),
+        };
+        #[cfg(windows)]
+        let reparse={use std::os::windows::fs::MetadataExt;meta.file_attributes()&0x400!=0};
+        #[cfg(not(windows))]
+        let reparse=false;
+        if meta.file_type().is_symlink()||reparse {return Err(SDK_PRE_DISPATCH_HELD.into());}
+        Ok(Some(meta))
+    }
+    // Inspect shared roots without reading an unrelated control worker/lock.
+    for parent in [root.join("text-runs"),root.join("sdk-worker")] {
+        if metadata(&parent)?.is_some_and(|meta|!meta.is_dir()) {return Err(SDK_PRE_DISPATCH_HELD.into());}
+    }
+    if metadata(&root.join("sdk-worker").join(job))?.is_some() {
+        return Err(SDK_PRE_DISPATCH_HELD.into());
+    }
+    let directory=root.join("text-runs").join(job);
+    let Some(meta)=metadata(&directory)? else {return Ok(json!([]));};
+    if !meta.is_dir(){return Err(SDK_PRE_DISPATCH_HELD.into());}
+    let mut files=Vec::new();
+    for (index,entry) in std::fs::read_dir(directory).map_err(|_|SDK_PRE_DISPATCH_HELD)?.enumerate() {
+        if index>=16 {return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let entry=entry.map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+        let name=entry.file_name().to_str().ok_or(SDK_PRE_DISPATCH_HELD)?.to_owned();
+        // Only compiled bytes (including an interrupted atomic replacement) can
+        // predate the submitting marker. Any attempt, result, or unknown file
+        // fails closed, including sdk-attempt.json.<uuid>.partial.
+        let compiled_partial=name.strip_prefix("sdk-compiled.json.")
+            .and_then(|s|s.strip_suffix(".partial"))
+            .is_some_and(|id|uuid::Uuid::parse_str(id).is_ok());
+        if name!="sdk-compiled.json"&&!compiled_partial {return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let meta=metadata(&entry.path())?.ok_or(SDK_PRE_DISPATCH_HELD)?;
+        if !meta.is_file()||meta.len()>2_097_152 {return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let (sha,bytes)=crate::store::hash_file(&entry.path()).map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+        files.push(json!({"name":name,"sha256":sha,"bytes":bytes}));
+    }
+    files.sort_by(|a,b|s(a,"name").cmp(s(b,"name")));
+    Ok(json!(files))
+}
+
 impl SavedTextExecutor {
+    fn sdk_pre_dispatch_binding(&self, request:&TextRequest, snapshot:&Value, c:&rusqlite::Connection)->Result<Value> {
+        let run=self.workflow_id.as_deref().ok_or(SDK_PRE_DISPATCH_HELD)?;
+        if snapshot.get("sdkSupervisorHandoff").is_some() {return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let parent:String=c.query_row("SELECT snapshot FROM jobs WHERE id=?1 AND kind='workflow'",[run],|row|row.get(0)).map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+        let parent_value:Value=serde_json::from_str(&parent).map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+        if parent_value.pointer("/input/settings").or_else(||parent_value.get("settings"))!=Some(&self.settings) {
+            return Err(SDK_PRE_DISPATCH_HELD.into());
+        }
+        Ok(json!({"version":SDK_PRE_DISPATCH_POLICY,"workflowId":run,"nodeKey":step_key(request),"stage":request.stage,
+            "requestSha256":crate::pipeline::digest(&snapshot.to_string()),"parentSnapshotSha256":crate::pipeline::digest(&parent),
+            "settingsSha256":crate::pipeline::digest(&self.settings.to_string()),"modelCalls":0}))
+    }
+
+    /// Bind queued ownership before any fallible compiled-file write. A future
+    /// restart can prove this preparation belongs to this exact original run.
+    fn sdk_allocate_pre_dispatch(&self,request:&TextRequest,snapshot:&Value)->Result<String> {
+        let mut c=self.store.conn()?;
+        let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let binding=self.sdk_pre_dispatch_binding(request,snapshot,&tx)?;
+        let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND provider='codex_sdk' AND snapshot=?1) OR EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?2 AND node_key=?3)",params![snapshot.to_string(),self.workflow_id,step_key(request)],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if occupied{return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let job=id();let timestamp=now();
+        tx.execute("INSERT INTO jobs(id,kind,entity_id,provider,state,account_id,snapshot,created_at,updated_at) VALUES(?1,'text',?2,'codex_sdk','queued',?3,?4,?5,?5)",params![job,format!("{}:{}:{}",request.stage,request.skill,id()),s(&snapshot["executorIdentity"],"accountFingerprint"),snapshot.to_string(),timestamp]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO workflow_steps(workflow_id,node_key,stage,request_hash,state,text_job_id,result,error,updated_at) VALUES(?1,?2,?3,?4,'queued',?5,NULL,NULL,?6)",params![self.workflow_id,step_key(request),request.stage,crate::pipeline::digest(&snapshot.to_string()),job,timestamp]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'sdk_pre_dispatch_queued',?2,?3)",params![job,binding.to_string(),timestamp]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO metadata VALUES('changed_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[timestamp]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;Ok(job)
+    }
+
+    fn sdk_pre_dispatch_evidence(&self,request:&TextRequest,snapshot:&Value,job:&str,c:&rusqlite::Connection)->Result<Value> {
+        let binding=self.sdk_pre_dispatch_binding(request,snapshot,c)?;
+        let exact:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind='text' AND provider='codex_sdk' AND state='queued' AND snapshot=?2 AND prepared IS NULL AND receipt IS NULL AND result IS NULL AND task_id IS NULL AND error IS NULL) AND (SELECT COUNT(*) FROM jobs WHERE kind='text' AND provider='codex_sdk' AND snapshot=?2)=1 AND (SELECT COUNT(*) FROM workflow_steps WHERE text_job_id=?1)=1 AND EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?3 AND node_key=?4 AND stage=?5 AND request_hash=?6 AND state='queued' AND text_job_id=?1 AND result IS NULL AND error IS NULL) AND (SELECT COUNT(*) FROM events WHERE job_id=?1)=1 AND EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='sdk_pre_dispatch_queued' AND data=?7)",params![job,snapshot.to_string(),self.workflow_id,step_key(request),request.stage,crate::pipeline::digest(&snapshot.to_string()),binding.to_string()],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if !exact{return Err(SDK_PRE_DISPATCH_HELD.into());}
+        Ok(json!({"binding":binding,"compiledArtifacts":sdk_pre_dispatch_artifacts(&self.store.root,job)?}))
+    }
+
+    /// This CAS is the dispatch boundary for both a fresh node and a strictly
+    /// proven queued preparation resume. After it commits, all crashes remain
+    /// observe-only, even if the attempt-file write or actual RPC has not run.
+    fn sdk_mark_pre_dispatch(&self,request:&TextRequest,snapshot:&Value,job:&str,prepared:&Value,original:&Value,resumed:bool)->Result<()> {
+        let mut c=self.store.conn()?;
+        let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let current=self.sdk_pre_dispatch_evidence(request,snapshot,job,&tx)?;
+        if current["binding"]!=original["binding"]||!original["compiledArtifacts"].as_array().is_some_and(|old|
+            old.iter().all(|file|current["compiledArtifacts"].as_array().is_some_and(|current|current.contains(file)))) {
+            return Err(SDK_PRE_DISPATCH_HELD.into());
+        }
+        let compiled:Value=serde_json::from_slice(&std::fs::read(self.store.root.join("text-runs").join(job).join("sdk-compiled.json")).map_err(|_|SDK_PRE_DISPATCH_HELD)?).map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+        if compiled.as_object().is_none_or(|fields|fields.len()!=4)
+            || compiled["promptSha256"]!=prepared["compiledPromptSha256"]
+            || compiled["schemaSha256"]!=prepared["compiledSchemaSha256"]
+            || crate::pipeline::digest(s(&compiled,"prompt"))!=s(prepared,"compiledPromptSha256")
+            || crate::pipeline::digest(s(&compiled,"schema"))!=s(prepared,"compiledSchemaSha256") {
+            return Err(SDK_PRE_DISPATCH_HELD.into());
+        }
+        let timestamp=now();let hash=crate::pipeline::digest(&snapshot.to_string());
+        let n=tx.execute("UPDATE jobs SET state='submitting',prepared=?1,updated_at=?2 WHERE id=?3 AND state='queued' AND snapshot=?4 AND prepared IS NULL AND receipt IS NULL AND result IS NULL AND task_id IS NULL AND error IS NULL",params![prepared.to_string(),timestamp,job,snapshot.to_string()]).map_err(|e|e.to_string())?;
+        if n!=1{return Err(SDK_PRE_DISPATCH_HELD.into());}
+        let n=tx.execute("UPDATE workflow_steps SET state='running',updated_at=?1 WHERE workflow_id=?2 AND node_key=?3 AND text_job_id=?4 AND request_hash=?5 AND state='queued' AND result IS NULL AND error IS NULL",params![timestamp,self.workflow_id,step_key(request),job,hash]).map_err(|e|e.to_string())?;
+        if n!=1{return Err(SDK_PRE_DISPATCH_HELD.into());}
+        if resumed {
+            let audit=json!({"version":"sdk-pre-dispatch-resumed/v1","workflowId":self.workflow_id,"nodeKey":step_key(request),"requestSha256":hash,
+                "queuedBindingSha256":crate::pipeline::digest(&current["binding"].to_string()),"preservedCompiledArtifacts":original["compiledArtifacts"],"originalJobReused":true,"modelCallsBeforeMarker":0});
+            tx.execute("INSERT INTO events(job_id,type,data,created_at) VALUES(?1,'sdk_pre_dispatch_resumed',?2,?3)",params![job,audit.to_string(),timestamp]).map_err(|e|e.to_string())?;
+        }
+        tx.execute("INSERT INTO metadata VALUES('changed_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[timestamp]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())
+    }
+
     fn check_sdk_unresolved_hold(&self) -> Result<()> {
         let held: bool=self.store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND provider='codex_sdk' AND state NOT IN ('completed','rejected') AND json_extract(prepared,'$.sdkDispatchStarted')=1)",[],|r|r.get(0)).map_err(|e|e.to_string())?;
         if held {
@@ -11789,6 +11911,7 @@ impl SavedTextExecutor {
         self.sdk_parent_binding()?;
         self.sdk_request_policy(request)?;
         self.sdk_checkpoint_binding(request, snapshot)?;
+        let mut queued_preparation=None;
         if let Some(job) = self.sdk_find(snapshot)? {
             if ["received", "completed", "rejected"].contains(&s(&job, "status")) {
                 let raw = self.sdk_raw(&job, snapshot)?;
@@ -11797,6 +11920,10 @@ impl SavedTextExecutor {
                 }
                 return Ok(raw);
             }
+            if job["status"]=="queued" {
+                let evidence=self.sdk_pre_dispatch_evidence(request,snapshot,s(&job,"id"),&self.store.conn()?)?;
+                queued_preparation=Some((s(&job,"id").to_owned(),evidence));
+            } else {
             // Only observe the original attempt, never execute it a second time.
             let original = FrozenAttempt::load(
                 &self
@@ -11854,18 +11981,21 @@ impl SavedTextExecutor {
                     .join("sdk-attempt.json"),
             )?;
             return self.sdk_receive(request, snapshot, s(&job, "id"), &attempt);
+            }
         }
         self.check_sdk_unresolved_hold()?;
         check_cli_unknown_hold(&self.store)?;
-        let new_node_snapshot = self.sdk_new_node_snapshot(request, snapshot).await?;
+        let new_node_snapshot = if queued_preparation.is_some(){snapshot.clone()} else {self.sdk_new_node_snapshot(request, snapshot).await?};
         let snapshot = &new_node_snapshot;
         // Reuse the domain-specific global attempt guards before allocating a
         // transport. They key budgets by source/original raw, not workflow IDs.
-        let _ = self.visual_fact_replay(request, snapshot)?;
         let hash = crate::pipeline::digest(&snapshot.to_string());
+        if queued_preparation.is_none() {
+        let _ = self.visual_fact_replay(request, snapshot)?;
         let _ = self.carrier_rejected_result(request, snapshot, &hash)?;
         let _ = self.carrier_received_result(request, snapshot, &hash)?;
         self.sdk_revision_budget(request)?;
+        }
         let config = crate::text_sdk::Config::from_frozen_identity(
             &self.settings, &snapshot["executorIdentity"], &self.store.root,
         )?;
@@ -11894,8 +12024,12 @@ impl SavedTextExecutor {
         children().check_open()?;
         self.check_sdk_unresolved_hold()?;
         let handed_off = snapshot.get("sdkSupervisorHandoff").is_some();
-        let job = if handed_off {
+        let resumed=queued_preparation.is_some();
+        let bound_preparation=!handed_off&&self.workflow_id.is_some();
+        let job = if let Some((job,_))=queued_preparation.as_ref() {job.clone()} else if handed_off {
             self.store.add_sdk_handoff_node_atomic(request, snapshot, &self.settings)?
+        } else if bound_preparation {
+            self.sdk_allocate_pre_dispatch(request,snapshot)?
         } else {
             self.store.add_job(
             "text",
@@ -11906,6 +12040,9 @@ impl SavedTextExecutor {
             "queued",
             )?
         };
+        let preparation_evidence=if let Some((_,evidence))=queued_preparation {Some(evidence)} else if bound_preparation {
+            Some(self.sdk_pre_dispatch_evidence(request,snapshot,&job,&self.store.conn()?)?)
+        } else {None};
         let dir = self.store.root.join("text-runs").join(&job);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut attempt = FrozenAttempt::prepare_sdk_for_bridge(
@@ -11917,14 +12054,18 @@ impl SavedTextExecutor {
             &inspect,
         )?;
         // Freeze exact compiled bytes alongside semantic and execution identity.
-        crate::store::atomic_json(
-            &dir.join("sdk-compiled.json"),
-            &json!({"prompt":compiled.prompt,"schema":compiled.schema,"promptSha256":crate::pipeline::digest(&compiled.prompt),"schemaSha256":crate::pipeline::digest(&compiled.schema)}),
-        )?;
+        let compiled_value=json!({"prompt":compiled.prompt,"schema":compiled.schema,"promptSha256":crate::pipeline::digest(&compiled.prompt),"schemaSha256":crate::pipeline::digest(&compiled.schema)});
+        if resumed&&dir.join("sdk-compiled.json").is_file() {
+            let existing:Value=serde_json::from_slice(&std::fs::read(dir.join("sdk-compiled.json")).map_err(|_|SDK_PRE_DISPATCH_HELD)?).map_err(|_|SDK_PRE_DISPATCH_HELD)?;
+            if existing!=compiled_value{return Err(SDK_PRE_DISPATCH_HELD.into());}
+        } else {crate::store::atomic_json(&dir.join("sdk-compiled.json"),&compiled_value)?;}
         let mut prepared = json!({"sdkRequestHash":hash,"sdkAttemptId":job,"sdkDispatchStarted":true,"sdkOriginWorkflowId":self.workflow_id,"compiledPromptSha256":crate::pipeline::digest(&compiled.prompt),"compiledSchemaSha256":crate::pipeline::digest(&compiled.schema)});
         if handed_off {
             prepared["sdkSupervisorHandoff"] = snapshot["sdkSupervisorHandoff"].clone();
         }
+        if let Some(evidence)=preparation_evidence {
+            self.sdk_mark_pre_dispatch(request,snapshot,&job,&prepared,&evidence,resumed)?;
+        } else {
         self.store
             .update_job(&job, "submitting", &json!({"prepared":prepared}))?;
         if let Some(run) = self.workflow_id.as_ref().filter(|_| !handed_off) {
@@ -11938,6 +12079,7 @@ impl SavedTextExecutor {
                 None,
                 None,
             )?;
+        }
         }
         let frozen = attempt.clone();
         attempt.begin_dispatch(Backend::CodexSdk)?;
