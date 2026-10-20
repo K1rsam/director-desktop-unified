@@ -22,12 +22,17 @@ pub(crate) fn inherit_frozen_profiles(target: &mut Value, frozen: &Value) -> Res
     creative::attach_scene_profile(&mut inherited,frozen)?;
     super::storyboard_sound_events::inherit(&mut inherited,frozen)?;
     super::asset_use_binding::inherit(&mut inherited,frozen)?;
-    for field in [creative::SCENE_PROFILE_FIELD,super::storyboard_sound_events::PROFILE_FIELD,super::asset_use_binding::FIELD] {
+    super::storyboard_scene_facts::inherit(&mut inherited,frozen)?;
+    for field in [creative::SCENE_PROFILE_FIELD,super::storyboard_sound_events::PROFILE_FIELD,super::asset_use_binding::FIELD,super::storyboard_scene_facts::PROFILE_FIELD,super::storyboard_scene_facts::PACKET_FIELD] {
         if target.get(field).is_some() && target.get(field)!=inherited.get(field) {
             return Err("精修采用不能向原冻结候选新增或变更演绎合同".into());
         }
     }
-    target.as_object_mut().unwrap().extend(inherited.as_object().unwrap().clone());
+    let mut proposed = target.clone();
+    super::storyboard_scene_facts::inherit(&mut proposed, frozen)?;
+    super::storyboard_refinement_identity::inherit(&mut proposed, frozen)?;
+    proposed.as_object_mut().unwrap().extend(inherited.as_object().unwrap().clone());
+    *target = proposed;
     Ok(())
 }
 
@@ -107,6 +112,7 @@ fn basis(input: &Value) -> Result<Basis, String> {
         serde_json::from_value(input["source"].clone()).map_err(|e| e.to_string())?;
     let source = super::upgrade_source_dialogues(&source)?;
     super::validate_source(&source)?;
+    super::storyboard_scene_facts::validate_source(input, &source)?;
     if source.diagnostics.iter().any(|item| item.blocking) {
         return Err("精修原文仍有阻塞诊断".into());
     }
@@ -141,9 +147,10 @@ fn basis(input: &Value) -> Result<Basis, String> {
         input["assets"].as_array().ok_or("精修缺少冻结资产目录")?,
         episode,
     );
+    let validation_draft = super::storyboard_refinement_identity::validation_view(input, &draft)?;
     storyboard::validate_storyboard_scope(
         &source,
-        &draft,
+        &validation_draft,
         &assets,
         &input["capabilities"],
         Some(&refs),
@@ -222,6 +229,8 @@ fn basis(input: &Value) -> Result<Basis, String> {
     }
     super::storyboard_sound_events::inherit(&mut binding, input)?;
     super::asset_use_binding::inherit(&mut binding, input)?;
+    super::storyboard_scene_facts::inherit(&mut binding, input)?;
+    if let Some(packet)=input.get(super::storyboard_refinement_identity::FIELD){binding[super::storyboard_refinement_identity::FIELD]=packet.clone();}
     let input_binding = digest(&binding.to_string());
     Ok(Basis {
         source,
@@ -388,9 +397,10 @@ fn validate_delta(input: &Value, basis: &Basis, raw: &Value) -> Result<(Value, V
     }
     let draft = storyboard::apply_finish_delta(&basis.draft, &delta)?;
     let refs: Vec<_> = basis.rows.iter().map(|row| row.id.clone()).collect();
+    let validation_draft = super::storyboard_refinement_identity::validation_view(input, &draft)?;
     storyboard::validate_storyboard_scope(
         &basis.source,
-        &draft,
+        &validation_draft,
         &basis.assets,
         &input["capabilities"],
         Some(&refs),
@@ -445,7 +455,7 @@ pub async fn run_storyboard_refinement(
         &basis.rows,
         &basis.context_rows,
     )?;
-    let mut model_draft = basis.draft.clone();
+    let mut model_draft = super::storyboard_refinement_identity::validation_view(input, &basis.draft)?;
     for unit in model_draft["units"].as_array_mut().unwrap() {
         for field in [
             "prompt",
@@ -465,7 +475,9 @@ pub async fn run_storyboard_refinement(
         "acceptedProvenance":basis.context["unitBindings"],"capacityBrief":storyboard::original::capacity_brief(&input["capabilities"],Some(&basis.draft),input.get("voiceReference"),&basis.rows)});
     stage3_pack::attach_profile(&mut payload, input)?;
     creative::attach_scene_profile(&mut payload, input)?;
+    super::storyboard_scene_facts::attach_scope(&mut payload, input, &basis.source)?;
     payload["assetSelection"] = asset_selection;
+    if let Some(packet)=input.get(super::storyboard_refinement_identity::FIELD){payload["acceptedIdentityRebinding"]=json!({"version":packet["version"],"sha256":packet["sha256"],"meaning":"Only program-owned identity metadata in the review view is rebound to current registered assets; adopted text, shot/source anchors and the original base hash are unchanged."});}
     let request = creative::prepare_request(TextRequest {
         stage: "storyboardRefine".into(),
         skill: "director-refinement".into(),
@@ -522,6 +534,7 @@ pub async fn run_storyboard_refinement(
         "model":model,"reasoning":reasoning,"rawDelta":raw,"validatedDelta":delta,"draft":draft,
         "reviewDecisions":accepted["reviewDecisions"],"productionFeedback":accepted["productionFeedback"],"feedbackVersion":FEEDBACK_VERSION,
         "engineeringValidated":true,"creativeQualityAccepted":false,"automaticAdoption":false});
+    if let Some(packet)=input.get(super::storyboard_refinement_identity::FIELD){candidate[super::storyboard_refinement_identity::FIELD]=packet.clone();}
     candidate["candidateSha256"] = json!(candidate_hash(&candidate));
     Ok(candidate)
 }
@@ -539,6 +552,7 @@ pub fn adopt_storyboard_refinement(
         return Err("精修候选身份、状态或内容指纹无效；原采用稿保持".into());
     }
     let basis = basis(current_input)?;
+    if candidate.get(super::storyboard_refinement_identity::FIELD)!=current_input.get(super::storyboard_refinement_identity::FIELD){return Err("精修素材身份重绑定回执改变，未采用".into());}
     if candidate["sourceSha256"] != basis.source.sha256
         || candidate["episodeId"] != current_input["episodeId"]
         || candidate["baseDraftHash"] != storyboard::finish_base_hash(&basis.draft)
@@ -1080,6 +1094,16 @@ pub(crate) mod tests {
         assert_eq!(calls.len(),2);
         assert_eq!(calls[1].input[creative::SCENE_PROFILE_FIELD],creative::SCENE_PROFILE);
         assert_eq!(calls[1].rule_snapshot["runtimeContract"]["sceneProfile"],creative::SCENE_PROFILE);
+        assert_eq!(calls[1].input[super::super::storyboard_scene_facts::PROFILE_FIELD],super::super::storyboard_scene_facts::PROFILE);
+        assert_eq!(calls[1].rule_snapshot["runtimeContract"]["sceneFactsProfile"],super::super::storyboard_scene_facts::PROFILE);
+        assert!(!calls[1].input[super::super::storyboard_scene_facts::PACKET_FIELD]["scenes"].as_array().unwrap().is_empty());
+        assert_eq!(serde_json::to_vec(&creative::prepare_request(calls[1].clone()).unwrap()).unwrap(),serde_json::to_vec(&calls[1]).unwrap(),"refinement scene facts and trusted contract are byte-idempotent");
+        for field in ["sourceRows","contextRows"] {assert_eq!(calls[1].input[field],first.input[field]);}
+        for field in ["primary","methods"] {assert_eq!(calls[1].rule_snapshot[field],first.rule_snapshot[field]);}
+        let mut adopted=old.clone();inherit_frozen_profiles(&mut adopted,&current).unwrap();
+        assert_eq!(adopted[super::super::storyboard_scene_facts::PACKET_FIELD],current[super::super::storyboard_scene_facts::PACKET_FIELD]);
+        let unchanged=adopted.clone();
+        assert!(inherit_frozen_profiles(&mut adopted,&old).is_err());assert_eq!(adopted,unchanged);
         assert_eq!(calls[1].input["previousDraft"],first.input["previousDraft"],"full adopted draft stays identical model material");
         run_storyboard_refinement(&old,&executor,"offline","medium").await.unwrap();
         assert_eq!(executor.calls.lock().await.len(),2,"old frozen refinement remains cache-compatible");

@@ -4535,6 +4535,8 @@ mod sdk_foundation_replay;
 mod sdk_supervisor_handoff;
 #[path = "text_executor_sdk_local_recovery.rs"]
 mod sdk_local_recovery;
+#[path = "text_executor_sdk_schema_recovery.rs"]
+mod sdk_schema_recovery;
 pub(crate) use scoped_shot_replay::{
     scoped_author_replay_audit_valid, scoped_author_replay_receipt_bound, scoped_author_replay_stage,
     STORYBOARD_AUTHOR_SHOT_REPLAY_POLICY,
@@ -4640,6 +4642,7 @@ fn is_carrier_repair(request: &TextRequest) -> bool {
 }
 
 pub(crate) const AUTHOR_ASSET_SCOPE_REJECTION: &str = "分镜引用的形象不适用于当前集场";
+pub(crate) const AUTHOR_ASSET_USE_DUPLICATE_REJECTION: &str = "单元重复引用同一资产形象";
 pub(crate) const AUTHOR_DIALOGUE_INTERVAL_REJECTION: &str =
     "发声区间越界或包含不发声演法；跨演法须分别选择连续原话区间";
 pub(crate) const AUTHOR_SOURCE_COVERAGE_REJECTION: &str =
@@ -4670,6 +4673,7 @@ pub(crate) fn author_missing_dialogue(reason: &str) -> Option<&str> {
 
 pub(crate) fn author_repairable_rejection(reason: &str) -> bool {
     [
+        AUTHOR_ASSET_USE_DUPLICATE_REJECTION,
         AUTHOR_ASSET_SCOPE_REJECTION,
         AUTHOR_DIALOGUE_INTERVAL_REJECTION,
         AUTHOR_SOURCE_COVERAGE_REJECTION,
@@ -4681,7 +4685,7 @@ pub(crate) fn author_repairable_rejection(reason: &str) -> bool {
 }
 
 pub(crate) fn planner_repairable_rejection(reason:&str) -> bool {
-    matches!(reason,"真实跨场景不能声明 continuous")
+    matches!(reason,"真实跨场景不能声明 continuous" | "事件跨入另一个真实场景")
 }
 
 fn is_author_scope_repair(request: &TextRequest) -> bool {
@@ -6188,10 +6192,18 @@ impl SavedTextExecutor {
     fn rejected_planner_result(&self, request:&TextRequest, snapshot:&Value, hash:&str) -> Result<Option<(String,Value,String)>> {
         if request.stage!="storyboardPlan" || request.skill!="episode-emotion-planner" || request.input["storyboardCreativeProfile"]!="original-production-contract/v1" {return Ok(None);}
         let Some(run)=self.workflow_id.as_deref() else{return Ok(None);};
-        let found:Option<(String,String,String,String)>=self.store.conn()?.query_row(
+        let connection=self.store.conn()?;
+        let prior:Option<(Option<String>,Option<String>)>=connection.query_row(
+            "SELECT w.error,j.error FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",
+            params![run,step_key(request)],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        let protected_origin=prior.as_ref().is_some_and(|(step,job)|step.iter().chain(job).any(|reason|planner_repairable_rejection(reason)));
+        let found:Option<(String,String,String,String)>=connection.query_row(
             "SELECT j.id,j.result,e.data,j.error FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id JOIN jobs parent ON parent.id=w.workflow_id JOIN events e ON e.id=(SELECT MAX(x.id) FROM events x WHERE x.job_id=j.id AND x.type='text_received_raw') WHERE w.workflow_id=?1 AND w.node_key=?2 AND w.stage='storyboardPlan' AND w.request_hash=?3 AND w.state='rejected' AND parent.kind='workflow' AND parent.entity_id='storyboard.run' AND j.kind='text' AND j.provider=?4 AND j.state='rejected' AND j.error=w.error AND j.snapshot=?5 AND j.result IS NOT NULL AND w.result=j.result AND json_extract(j.receipt,'$.validation')='rejected' AND json_extract(j.receipt,'$.contract')='desktop-runner/v1' AND json_extract(j.receipt,'$.migrationPolicy') IS NULL",
             params![run,step_key(request),hash,s(&self.settings,"textProvider"),snapshot.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
-        let Some((job,raw,event,reason))=found else{return Ok(None);};
+        let Some((job,raw,event,reason))=found else{
+            if protected_origin{return Err("规划原拒绝的请求、节点、回包或回执绑定变化；保留原证据，禁止重发".into());}
+            return Ok(None);
+        };
         if !planner_repairable_rejection(&reason){return Ok(None);}
         let raw:Value=serde_json::from_str(&raw).map_err(|e|e.to_string())?;
         let event:Value=serde_json::from_str(&event).map_err(|e|e.to_string())?;
@@ -6214,6 +6226,7 @@ impl SavedTextExecutor {
         let key = step_key(request);
         let c = self.store.conn()?;
         let mut repairable = vec![
+            AUTHOR_ASSET_USE_DUPLICATE_REJECTION,
             AUTHOR_ASSET_SCOPE_REJECTION,
             AUTHOR_DIALOGUE_INTERVAL_REJECTION,
             AUTHOR_SOURCE_COVERAGE_REJECTION,
@@ -10263,6 +10276,40 @@ mod carrier_continuity_key_tests {
         }
     }
 
+    #[tokio::test]
+    async fn planner_scene_rejected_raw_replays_only_bound_origin_and_never_becomes_adopted() {
+        let (_temp,exec,mut request,job,raw)=rejected_author_fixture();
+        let old_key=step_key(&request);
+        request.stage="storyboardPlan".into();request.skill="episode-emotion-planner".into();
+        request.rule_snapshot=crate::pipeline::snapshot("episode-emotion-planner",&[]).unwrap();
+        let snapshot=exec.request_snapshot(&request).unwrap();let hash=crate::pipeline::digest(&snapshot.to_string());
+        let reason="事件跨入另一个真实场景";
+        let connection=exec.store.conn().unwrap();
+        connection.execute("DELETE FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2",params![exec.workflow_id,old_key]).unwrap();
+        connection.execute("UPDATE jobs SET snapshot=?1,error=?2 WHERE id=?3",params![snapshot.to_string(),reason,job]).unwrap();
+        drop(connection);
+        exec.store.checkpoint(exec.workflow_id.as_deref().unwrap(),&step_key(&request),&request.stage,&hash,"rejected",Some(&job),Some(&raw),Some(reason)).unwrap();
+        exec.store.event(&job,"text_received_raw",&json!({"requestHash":hash,"value":raw})).unwrap();
+        let before=carrier_attempt_evidence(&exec,&request,&job);let count=exec.store.jobs().unwrap().len();
+        for _ in 0..2 {
+            assert_eq!(exec.execute(request.clone()).await.unwrap(),raw);
+            exec.reject(&request,&raw,reason).await.unwrap();
+            assert!(exec.accept(&request,&raw).await.is_err(),"original rejected planner cannot be adopted");
+            assert_eq!(carrier_attempt_evidence(&exec,&request,&job),before);
+            assert_eq!(exec.store.jobs().unwrap().len(),count);
+        }
+        assert!(exec.reject(&request,&raw,"different reason").await.is_err());
+        let mut drift=request.clone();drift.input["sourceRows"]=json!([{"id":"other-source"}]);
+        assert!(exec.execute(drift).await.is_err());
+        assert_eq!(carrier_attempt_evidence(&exec,&request,&job),before);
+        assert_eq!(exec.store.jobs().unwrap().len(),count);
+        exec.store.conn().unwrap().execute("UPDATE workflow_steps SET request_hash='tampered-request-hash' WHERE workflow_id=?1 AND node_key=?2",params![exec.workflow_id,step_key(&request)]).unwrap();
+        let corrupted=carrier_attempt_evidence(&exec,&request,&job);
+        assert!(exec.execute(request.clone()).await.unwrap_err().contains("禁止重发"));
+        assert_eq!(carrier_attempt_evidence(&exec,&request,&job),corrupted,"hash corruption is held without overwriting either original row");
+        assert_eq!(exec.store.jobs().unwrap().len(),count,"source/hash drift causes zero new API jobs or submissions");
+    }
+
     fn rejected_ordinary_finish_fixture() -> (
         tempfile::TempDir,
         SavedTextExecutor,
@@ -11811,6 +11858,7 @@ impl SavedTextExecutor {
         use crate::text_transport::{AttemptState, FrozenAttempt};
         self.sdk_handoff_job_bound(job, snapshot)?;
         self.sdk_local_recovery_bound(job)?;
+        self.sdk_schema_recovery_bound(job)?;
         let fail = || {
             "SDK_RAW_BINDING_MISMATCH: 原请求、原始文本、事件、回执或执行身份不一致；证据与预算保留"
                 .to_string()
@@ -11958,6 +12006,9 @@ impl SavedTextExecutor {
             )?;
             if self.workflow_id.as_deref().unwrap_or("standalone") != original.workflow_id {
                 return Err("SDK_EXISTING_ATTEMPT_UNRESOLVED: 新工作流不能替换原未知执行".into());
+            }
+            if let Some(value) = self.sdk_recover_schema_preparation(request, snapshot, &job, &original).await? {
+                return Ok(value);
             }
             if let Some(value) = self.sdk_recover_local_preparation(request, snapshot, &job, &original).await? {
                 return Ok(value);
@@ -12508,6 +12559,30 @@ mod sdk_core_tests {
             workflow_id: executor.workflow_id.clone(),
         }
     }
+
+    #[tokio::test]
+    async fn sdk_core_planner_scene_rejected_raw_reopens_without_dispatch_or_adoption() {
+        let (_temp,executor,mut request)=fixture("happy");
+        request.stage="storyboardPlan".into();request.skill="episode-emotion-planner".into();
+        request.rule_snapshot=crate::pipeline::snapshot("episode-emotion-planner",&[]).unwrap();
+        let raw=executor.execute(request.clone()).await.unwrap();
+        let reason="事件跨入另一个真实场景";
+        executor.reject(&request,&raw,reason).await.unwrap();
+        let before=executor.store.jobs().unwrap();let job=text_job(&executor);
+        let events=executor.store.root.join("sdk-worker").join(s(&job,"id")).join("events.ndjson");
+        let event_bytes=std::fs::read(&events).unwrap();let resumed=restart(&executor);
+        for _ in 0..2 {
+            assert_eq!(resumed.execute(request.clone()).await.unwrap(),raw);
+            resumed.reject(&request,&raw,reason).await.unwrap();
+            assert!(resumed.accept(&request,&raw).await.unwrap_err().contains("SDK_REJECTED_RESULT_IMMUTABLE"));
+            assert_eq!(resumed.store.jobs().unwrap(),before);
+            assert_eq!(calls(&resumed),1,"only the synthetic original transport; no repeated execution");
+            assert_eq!(std::fs::read(&events).unwrap(),event_bytes);
+        }
+        assert!(resumed.reject(&request,&raw,"different reason").await.is_err());
+        assert_eq!(resumed.store.jobs().unwrap(),before);
+    }
+
     #[tokio::test]
     async fn sdk_core_legacy_v2_adopted_cache_reopens_with_original_frozen_bytes() {
         use crate::text_transport::{Backend, FrozenAttempt, TextTransport};

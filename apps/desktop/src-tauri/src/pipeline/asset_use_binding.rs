@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 pub const FIELD: &str = "assetUseBindingProfile";
 pub const PROFILE: &str = "asset-use-binding/v1";
+pub(crate) const ORDER_REJECTION: &str = "素材使用顺序须从1连续且不得重复";
 const USE_PURPOSE: &str = "UNIT_USE_ANCHOR";
 const RULE: &str = "【素材身份与使用位置】本次 asset-use-binding/v1：资产身份、形象及其来源由冻结目录提供，assets.sourceRefs/sourceRefsPurpose 仅为登记身份/适用范围依据，不是当前镜头的新增动作事实。每个实际 assetRefs 只选正式 assetId、variantId、use、order 和 useShotIds；useShotIds 是该资产在本单元实际入画或声音使用的镜号，必须非空、无重复、全部属于本单元 shots，不写另一个单元镜号。不要输出资产 sourceRefs、identityEvidence、sourceRefsPurpose 或程序绑定标记；Rust 从已核对的所选镜头制作 sourceRefs 生成本地使用锚，并原样保留登记身份依据。输入旧稿里的这些派生字段仅供审阅，替换单元按本次 schema 重交实际镜号。连续人物/道具不需原文在每个容量单元重复点名，但仍依据原文、入口事实与实际连续态判断当前是否在场及持物；本场目录、身份出处、父图或 useShotIds 均不授权提前入场、未来受伤/换装、源外动作、画外人物实体化。CONTEXT_EVIDENCE_ONLY 与 MATERIAL_SOURCE_ONLY 不可选作当前实体。unit/shot.sourceRefs 的制作覆盖、contextRefs 的前情边界、原话及动作时序全部保持原规则，整编仍检查实际画面。";
 
@@ -120,22 +121,92 @@ fn usage_refs(unit: &Value, reference: &Value) -> Result<Value, String> {
 /// Input and raw are separate. The caller retains raw before deriving a copy;
 /// no old failed raw is mechanically repaired or promoted into an adopted job.
 pub(super) fn materialize(input: &Value, raw: &Value) -> Result<Value, String> {
+    materialize_with_order_gaps(input, raw, &HashSet::new())
+}
+
+// Diagnostic projection only: the original Finisher must return a fresh valid
+// delta. No reference is reordered, removed, renumbered or accepted here.
+pub(super) fn materialize_order_gap_diagnostic(input: &Value, raw: &Value, issues: &[Value]) -> Result<Value, String> {
+    if issues.is_empty() || issues.iter().any(|issue| issue["code"] != "ASSET_USE_ORDER") {
+        return Err(ORDER_REJECTION.into());
+    }
+    let units=issues.iter().filter_map(|issue|issue["unitId"].as_str().map(str::to_owned)).collect::<HashSet<_>>();
+    if units.len()!=issues.len() { return Err(ORDER_REJECTION.into()); }
+    for issue in issues {
+        let matches=raw["replacements"].as_array().into_iter().flatten()
+            .flat_map(|group|group["units"].as_array().into_iter().flatten())
+            .filter(|unit|unit["id"]==issue["unitId"]).collect::<Vec<_>>();
+        let [unit]=matches.as_slice() else {return Err(ORDER_REJECTION.into());};
+        let refs=unit["assetRefs"].as_array().ok_or(ORDER_REJECTION)?;
+        if issue["actualOrders"]!=json!(refs.iter().map(|r|r["order"].clone()).collect::<Vec<_>>())
+            || issue["referenceSelectionSha256"]!=selection_hash(refs) {return Err(ORDER_REJECTION.into());}
+    }
+    materialize_with_order_gaps(input, raw, &units)
+}
+
+fn selection_hash(refs:&[Value])->String {
+    digest(&json!(refs.iter().map(|r|json!({"assetId":r["assetId"],"variantId":r["variantId"],"use":r["use"],"useShotIds":r["useShotIds"]})).collect::<Vec<_>>()).to_string())
+}
+
+pub(super) fn order_gap_issues(input:&Value,raw:&Value,base:&Value,prior:&[Value])->Result<Vec<Value>,String>{
+    let fail=||ORDER_REJECTION.to_string();
+    if !enabled(input)? || raw["schemaVersion"]!="storyboard-delta/v2" || !input["finishRepair"].is_object(){return Err(fail());}
+    let old_units=base["units"].as_array().ok_or_else(fail)?;
+    let mut issues=Vec::new();
+    let wire=|r:&Value,with_order:bool|{let mut v=json!({"assetId":r["assetId"],"variantId":r["variantId"],"use":r["use"],"useShotIds":r["useShotIds"]});if with_order{v["order"]=r["order"].clone();}v};
+    for group in raw["replacements"].as_array().ok_or_else(fail)? {
+        for unit in group["units"].as_array().ok_or_else(fail)? {
+            let refs=unit["assetRefs"].as_array().ok_or_else(fail)?;
+            let orders=refs.iter().map(|r|r["order"].as_u64().filter(|n|*n>0).ok_or_else(fail)).collect::<Result<Vec<_>,_>>()?;
+            if orders.windows(2).any(|pair|pair[0]>=pair[1]){return Err(fail());}
+            if orders.iter().enumerate().all(|(i,n)|*n==i as u64+1){continue;}
+            let old=old_units.iter().find(|old|old["id"]==unit["id"]).ok_or_else(fail)?;
+            let old_refs=old["assetRefs"].as_array().ok_or_else(fail)?;
+            let previous_order=prior.iter().find(|issue|issue["code"]=="ASSET_USE_ORDER"&&issue["unitId"]==unit["id"]);
+            if let Some(previous)=previous_order {
+                if previous["actualOrders"]!=json!(old_refs.iter().map(|r|r["order"].clone()).collect::<Vec<_>>())
+                    || old_refs.iter().map(|r|wire(r,false)).collect::<Vec<_>>()!=refs.iter().map(|r|wire(r,false)).collect::<Vec<_>>(){return Err(fail());}
+            } else {
+                if !old_refs.iter().enumerate().all(|(i,r)|r["order"].as_u64()==Some(i as u64+1)){return Err(fail());}
+                let retained=old_refs.iter().filter(|old|refs.iter().any(|r|wire(old,true)==wire(r,true))).collect::<Vec<_>>();
+                if retained.len()!=refs.len() || retained.iter().map(|r|wire(r,true)).collect::<Vec<_>>()!=refs.iter().map(|r|wire(r,true)).collect::<Vec<_>>(){return Err(fail());}
+                let removed=old_refs.iter().filter(|old|!refs.iter().any(|r|wire(old,true)==wire(r,true))).collect::<Vec<_>>();
+                if removed.is_empty() || removed.iter().any(|removed|{
+                    removed["use"]!="audio" || !prior.iter().any(|issue|issue["code"]=="ASSET_USE_IDENTITY"&&issue["unitId"]==unit["id"]&&issue["assetId"]==removed["assetId"]&&issue["variantId"]==removed["variantId"])
+                    || !refs.iter().any(|r|r["assetId"]==removed["assetId"]&&r["variantId"]==removed["variantId"]&&r["use"]=="character"
+                        && r["useShotIds"].as_array().is_some_and(|ids|!ids.is_empty()&&removed["useShotIds"].as_array().is_some_and(|audio|!audio.is_empty()&&ids.iter().all(|id|!audio.contains(id)))))
+                }){return Err(fail());}
+            }
+            issues.push(json!({"code":"ASSET_USE_ORDER","unitId":unit["id"],"coordinate":format!("{}.assetRefs.order",unit["id"].as_str().ok_or_else(fail)?),
+                "sourceRefs":unit["sourceRefs"],"actualOrders":orders,"expectedOrders":(1..=refs.len()).collect::<Vec<_>>(),
+                "referenceSelectionSha256":selection_hash(refs),"problem":ORDER_REJECTION}));
+        }
+    }
+    if issues.is_empty(){return Err(fail());}Ok(issues)
+}
+
+fn materialize_with_order_gaps(input: &Value, raw: &Value, gaps: &HashSet<String>) -> Result<Value, String> {
     if !enabled(input)? { return Ok(raw.clone()); }
     let assets = input["assets"].as_array().ok_or("素材使用缺少冻结目录")?;
     let rows = input["sourceRows"].as_array().ok_or("素材使用缺少制作原行")?;
     let allowed: HashSet<_> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
     let mut result = raw.clone();
-    fn units(value: &mut Value, assets: &[Value], allowed: &HashSet<&str>) -> Result<(), String> {
+    fn units(value: &mut Value, assets: &[Value], allowed: &HashSet<&str>, gaps: &HashSet<String>) -> Result<(), String> {
         let Some(units) = value.get_mut("units") else { return Ok(()); };
         for unit in units.as_array_mut().ok_or("素材使用单元列表无效")? {
             if unit.get(FIELD).is_some() { return Err("模型回包不得伪造程序素材绑定标记".into()); }
             let owned = ids(unit, "sourceRefs", true)?;
             if owned.iter().any(|id| !allowed.contains(id.as_str())) { return Err("素材使用单元越出冻结制作范围".into()); }
             let refs = unit["assetRefs"].as_array().ok_or("素材使用缺少资产选择")?;
+            let diagnostic=gaps.contains(unit["id"].as_str().unwrap_or(""));
+            if diagnostic {
+                let orders=refs.iter().map(|r|r["order"].as_u64().filter(|n|*n>0).ok_or(ORDER_REJECTION)).collect::<Result<Vec<_>,_>>()?;
+                if orders.windows(2).any(|p|p[0]>=p[1]){return Err(ORDER_REJECTION.into());}
+            }
             let mut bindings = Vec::new();
             for (index, reference) in refs.iter().enumerate() {
-                if reference["order"].as_u64() != Some(index as u64 + 1) {
-                    return Err("素材使用顺序须从1连续且不得重复".into());
+                if !diagnostic && reference["order"].as_u64() != Some(index as u64 + 1) {
+                    return Err(ORDER_REJECTION.into());
                 }
                 if ["sourceRefs", "sourceRefsPurpose", "identityEvidence"].iter().any(|key| reference.get(*key).is_some()) {
                     return Err("模型回包不得重写素材身份证据或程序使用锚".into());
@@ -159,9 +230,9 @@ pub(super) fn materialize(input: &Value, raw: &Value) -> Result<Value, String> {
         }
         Ok(())
     }
-    units(&mut result, assets, &allowed)?;
+    units(&mut result, assets, &allowed, gaps)?;
     if let Some(groups) = result.get_mut("replacements") {
-        for group in groups.as_array_mut().ok_or("素材使用替换组无效")? { units(group, assets, &allowed)?; }
+        for group in groups.as_array_mut().ok_or("素材使用替换组无效")? { units(group, assets, &allowed, gaps)?; }
     }
     Ok(result)
 }
@@ -246,6 +317,45 @@ pub(crate) mod tests {
         let mut changed = reopened;
         changed["units"][0]["assetRefs"][0]["sourceRefs"] = json!(["identity-before"]);
         assert!(validate_unit(&changed["units"][0], input["assets"].as_array().unwrap()).is_err());
+    }
+
+    #[test]
+    fn post_audio_removal_gap_is_diagnostic_only_and_requires_exact_evidence(){
+        let (mut input,mut base)=fixture();
+        input["finishRepair"]=json!({"attempt":1});
+        let mut prop=input["assets"][0].clone();prop["id"]=json!("prop");
+        input["assets"].as_array_mut().unwrap().push(prop);
+        base["units"][0]["assetRefs"]=json!([
+            {"assetId":"child","variantId":"base","use":"character","order":1,"useShotIds":["S1"]},
+            {"assetId":"child","variantId":"base","use":"audio","order":2,"useShotIds":["S2"]},
+            {"assetId":"prop","variantId":"base","use":"prop","order":3,"useShotIds":["S1"]}]);
+        let mut unit=base["units"][0].clone();unit["assetRefs"].as_array_mut().unwrap().remove(1);
+        let raw=json!({"schemaVersion":"storyboard-delta/v2","replacements":[{"units":[unit]}]});
+        let before=raw.clone();
+        let prior=vec![json!({"code":"ASSET_USE_IDENTITY","unitId":"U1","assetId":"child","variantId":"base"})];
+        let issues=order_gap_issues(&input,&raw,&base,&prior).unwrap();
+        assert_eq!(issues[0]["actualOrders"],json!([1,3]));
+        assert_eq!(materialize(&input,&raw).unwrap_err(),ORDER_REJECTION);
+        let diagnostic=materialize_order_gap_diagnostic(&input,&raw,&issues).unwrap();
+        assert_eq!(diagnostic["replacements"][0]["units"][0]["assetRefs"][1]["order"],3);
+        assert_eq!(raw,before);
+        for mode in ["legacy","no-prior","wrong-identity","duplicate","zero","descending","selection-change","forged-proof","forged-anchor"] {
+            let mut input=input.clone();let mut raw=raw.clone();let mut prior=prior.clone();let mut issues=issues.clone();
+            match mode {
+                "legacy"=>{input.as_object_mut().unwrap().remove(FIELD);},
+                "no-prior"=>prior.clear(),
+                "wrong-identity"=>prior[0]["assetId"]=json!("other"),
+                "duplicate"=>raw["replacements"][0]["units"][0]["assetRefs"][1]["order"]=json!(1),
+                "zero"=>raw["replacements"][0]["units"][0]["assetRefs"][0]["order"]=json!(0),
+                "descending"=>raw["replacements"][0]["units"][0]["assetRefs"][0]["order"]=json!(4),
+                "selection-change"=>raw["replacements"][0]["units"][0]["assetRefs"][1]["assetId"]=json!("unknown"),
+                "forged-proof"=>issues[0]["referenceSelectionSha256"]=json!("wrong"),
+                _=>raw["replacements"][0]["units"][0]["assetRefs"][1]["sourceRefs"]=json!(["r1"]),
+            }
+            if matches!(mode,"forged-proof"|"forged-anchor") {
+                assert!(materialize_order_gap_diagnostic(&input,&raw,&issues).is_err(),"{mode}");
+            } else {assert!(order_gap_issues(&input,&raw,&base,&prior).is_err(),"{mode}");}
+        }
     }
 
     #[test]

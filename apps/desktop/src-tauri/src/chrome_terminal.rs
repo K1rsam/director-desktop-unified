@@ -66,7 +66,7 @@ fn no_opencli_send_markers(value:&Value,depth:usize)->bool {
     if depth>32 {return false;}
     match value {
         Value::Object(fields)=>fields.iter().all(|(key,value)|
-            !["sentAt","sendConfirmed","conversationUrl"].contains(&key.as_str())
+            !["sentAt","sendConfirmed","conversationUrl","sendIntent"].contains(&key.as_str())
                 &&no_opencli_send_markers(value,depth+1)),
         Value::Array(values)=>values.iter().all(|value|no_opencli_send_markers(value,depth+1)),
         _=>true,
@@ -80,16 +80,30 @@ fn opencli_reader_bound(job:&Value,proof:&Value)->bool {
     if !opencli_sha(frozen)||!opencli_sha(&proof["runtimeSha256"]) {return false;}
     let Some(audit)=raw.get("readerMigration") else{return proof["runtimeSha256"]==*frozen;};
     // This is the existing query-only provider audit, not a new execution
-    // identity. Its destination is also bound to this binary's pinned reader.
+    // identity. Its destination must be an exact reviewed reader generation.
     audit["schemaVersion"]=="opencli-readonly-reader-migration/v1"
         &&["query","reconcile"].contains(&s(audit,"operation"))&&audit["bridgeOperation"]=="query"
         &&audit["readOnly"]==true&&audit["resubmitted"]==false&&audit["frozenConfigUnchanged"]==true
         &&audit["fromRuntimeSha256"]==*frozen&&audit["toRuntimeSha256"]==proof["runtimeSha256"]
         &&audit["fromRuntimeSha256"]!=audit["toRuntimeSha256"]
-        &&crate::providers::opencli::read_only_reader_migration_allowed(s(audit,"fromRuntimeSha256"),s(audit,"toRuntimeSha256"))
+        &&crate::providers::opencli::read_only_reader_audit_allowed(s(audit,"fromRuntimeSha256"),s(audit,"toRuntimeSha256"))
         &&["fromRunnerSha256","toRunnerSha256","fromManifestSha256","toManifestSha256"].iter().all(|key|opencli_sha(&audit[key]))
         &&audit["frozenConfigSha256"]==crate::pipeline::digest(&config.to_string())
         &&audit["generationRequestSha256"]==crate::pipeline::digest(&job["prepared"]["request"].to_string())
+}
+
+fn opencli_owned_adapter_bound(proof:&Value)->bool {
+    let pin=s(proof,"runtimeSha256");let adapter=s(proof,"composerAdapterSha256");
+    (pin==include_str!("../../../../web-image-bridge/runtime.sha256").trim()
+        &&adapter==crate::pipeline::digest(include_str!("../../../../web-image-bridge/composer-transport.mjs")))
+        // Preserve only this exact prior owned no-click proof. Legacy unknowns
+        // have neither this protocol nor a valid absent-click proof.
+        ||(pin=="f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70"
+            &&adapter=="0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65")
+        ||(pin=="54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0"
+            &&adapter=="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b")
+        ||(pin=="afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6"
+            &&adapter=="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b")
 }
 
 fn opencli_not_submitted_valid(job:&Value,task:&str)->bool {
@@ -104,13 +118,19 @@ fn opencli_not_submitted_valid(job:&Value,task:&str)->bool {
     let Some(checks)=proof["checks"].as_array().filter(|checks|checks.len()==2) else{return false;};
     let page=s(proof,"page");let account=s(wire,"accountKey");let profile=s(wire,"profile");
     let error=s(result,"error");
+    let owned=proof["version"]=="opencli-owned-pre-send-not-submitted/v2";
+    let proof_kind=proof["version"]=="opencli-pre-send-not-submitted/v1" || (owned
+        &&wire["sendProtocol"]=="owned-composer-send/v2"&&proof["sendProtocol"]==wire["sendProtocol"]
+        &&proof["composerAdapterSha256"]==wire["composerAdapterSha256"]
+        &&opencli_owned_adapter_bound(proof)
+        &&proof["clickIntentAbsent"]==true&&proof["clickCalls"].as_u64()==Some(0));
     prepared["provider"]=="chrome"&&request==prepared["request"]&&original==request
         &&request["requestId"]==task&&request["kind"]=="image"&&request["model"]=="chatgpt-image"
         &&uuid::Uuid::parse_str(task).is_ok()
         &&wire["transport"]=="opencli/v1"&&config["kind"]=="chrome"&&frozen["transport"]=="opencli/v1"
         &&!account.trim().is_empty()&&frozen["accountKey"]==account&&!profile.trim().is_empty()&&frozen["profile"]==profile
         &&raw["transport"]=="opencli/v1"&&opencli_sha(&wire["requestHash"])&&raw["requestHash"]==wire["requestHash"]
-        &&proof["version"]=="opencli-pre-send-not-submitted/v1"&&proof["requestId"]==task&&proof["requestHash"]==wire["requestHash"]
+        &&proof_kind&&proof["requestId"]==task&&proof["requestHash"]==wire["requestHash"]
         &&opencli_reader_bound(job,proof)
         &&opencli_sha(&proof["journalBeforeSha256"])&&opencli_sha(&proof["journalAfterSha256"])
         &&proof["journalBeforeSha256"]!=proof["journalAfterSha256"]
@@ -119,7 +139,7 @@ fn opencli_not_submitted_valid(job:&Value,task:&str)->bool {
         &&checks.iter().all(|check|check["page"]==page&&check["accountKey"]==account
             &&["https://chatgpt.com/","https://chatgpt.com/new"].contains(&s(check,"url"))
             &&check["userCount"].as_u64()==Some(0)&&check["assistantCount"].as_u64()==Some(0)
-            &&check["composerEmpty"]==true&&check["generating"]==false)
+            &&(check["composerEmpty"]==true||(owned&&check["composerEmpty"].is_boolean()))&&check["generating"]==false)
         &&raw["taskSettlement"]["id"]==task&&raw["taskSettlement"]["status"]=="failed"&&raw["taskSettlement"]["reason"]=="not_submitted"
         &&(error.contains("未提交")||error.contains("未发送")||error.contains("没有提交")
             ||error.to_ascii_lowercase().contains("not_submitted")||error.to_ascii_lowercase().contains("not submitted"))

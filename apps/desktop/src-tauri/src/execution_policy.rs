@@ -25,6 +25,7 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "project.export",
     "workspace.get",
     "units.get",
+    "storyboard.refinement.continuity.preview",
     "units.versions.list",
     "units.version.restore",
     "units.save",

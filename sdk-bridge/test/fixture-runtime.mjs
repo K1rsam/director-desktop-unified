@@ -20,6 +20,9 @@ export function offlineFixture(scenario) {
       // and redirect only this synthetic child's entry point before main runs.
       // No shell/.cmd wrapper, extra subprocess, real Codex runtime, or SDK patch.
       const bootstrap = path.join(isolated, 'fake-codex-bootstrap.cjs');
+      // Node's CJS preloader rejects an extended Windows path even though fs
+      // accepts it. Convert only the script spelling; keep worker/temp paths.
+      const preload = fileURLToPath(pathToFileURL(bootstrap));
       const code = `const Module = require('node:module');
 Module.runMain = () => {
   process.argv = [process.execPath, ${JSON.stringify(script)}, 'exec', ...process.argv.slice(2)];
@@ -27,7 +30,7 @@ Module.runMain = () => {
 };
 `;
       await fs.writeFile(bootstrap, code, { mode: 0o600 });
-      return { executable: process.execPath, workingDirectory: work, env: { HOME: home, CODEX_HOME: home, TMPDIR: isolated, NODE_OPTIONS: `--require=${JSON.stringify(bootstrap)}`, DIRECTOR_FIXTURE_SCENARIO: scenario, DIRECTOR_FIXTURE_CAPTURE: path.join(directory, 'fixture-invocation.json') } };
+      return { executable: process.execPath, workingDirectory: work, env: { HOME: home, CODEX_HOME: home, TMPDIR: isolated, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, DIRECTOR_FIXTURE_SCENARIO: scenario, DIRECTOR_FIXTURE_CAPTURE: path.join(directory, 'fixture-invocation.json') } };
     },
   });
 }

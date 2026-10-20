@@ -35,6 +35,8 @@ const SOURCE_COORDINATE_REPAIR_EXECUTION: &str = "本次原整编处理程序定
 const SHOT_SOURCE_REPAIR_EXECUTION: &str = "SHOT_SOURCE_SCOPE定位同一冻结执行包内的镜头来源与其所属单元来源不一致。outsideSourceRefs及ownerUnitIds只标明原包中已有源行与单元归属，不授权新增、预演或重放下一单元动作。依原文、实际镜表和前后声画判断是否修正镜头引用、改写越界演法或在问题单元及其来源关联单元内重组；不能机械删引用、改作contextRefs或仅扩大单元sourceRefs来掩盖提前兑现。必要关联组由原整编完整处理，其余单元原样保留；全包正文、原话逐字恰好一次，时序、身份、幻想和声窗仍须通过最终强校验。";
 const PACKAGE_ASSET_SOURCE_REPAIR_EXECUTION: &str = "带outsideSourceRefs及ownerUnitIds的ASSET_SOURCE_SCOPE与同包镜头来源问题一并处理：assetId/variantId是冻结正式素材身份，越界源行属于原包已定位的另一单元，不授权添加素材或扩展原文范围。请依据实际入画、持物交接和原动作顺序协调素材来源与镜表，避免引用正确但画面仍提前挥铲、抓物或兑现；不能机械删引用、按名称换资产或扩大本单元sourceRefs掩盖问题。即使镜头问题已修而仅余素材问题，也仅继续当前原整编的剩余有界轮次；其余单元原样保留，最终仍须通过全部来源、身份、原话、时序与声窗校验。";
 const UNIT_LOCAL_SCENE_REQUIREMENTS: &str = "单元场景合同 unit-local-scene/v1：scene只描述本单元实际镜表发生的时空、声画与有依据的内部跳转。同一物理场的基础表述保持一致，但不要把工作包、事件或前一单元的完整scene头复制到所有单元；未在本单元实际出现的酒店、闪回、幻想或天气不写入本单元scene。sceneId仍是锁定制作来源坐标，不能以其简短标题覆盖合法的单元内部闪回或多空间。规划在自然事件与单元范围中区分这些内容；主创依据本单元sourceRefs、逐镜声画及已选幻想写完整场景。整编与独立精修在keep/retained前逐单元核对scene和真实镜表；若元数据污染则正式差量替换该单元及必要关联组，不能保留错误头或由程序猜改。保留原文、完整表演、原话与有依据的跨空间镜头，不通过删除源内容或一律改成单场来过关。";
+const ASSET_USE_IDENTITY_REPAIR: &str = "ASSET_USE_IDENTITY定位同一单元把同一assetId/variantId分别列为character和audio，且使用镜号不相交的冻结运输冲突；旧的一单元一形象一条引用规则不变。由本次原整编协调为一条该形象引用：本单元若实体入画，使用character且useShotIds只选实际入画镜；其余画外原话仍依dialogueParts的锁定说者、声道、区间和演法完整保留，无需为同人再加audio引用。本单元仅有声音而无该实体入画时，audio仍合法，不强造独立音频资产。不可把画外镜号拼到character使用镜号，不改原文、原话、身份、实际声画或删除应有入画来消除冲突；程序未合并或删除原引用。只替换问题单元及必要原文/幻想关联组，最终仍须通过原唯一身份、源覆盖、对白与时长强校验。";
+const ASSET_USE_ORDER_REPAIR: &str = "ASSET_USE_ORDER：第一轮已删除同人物冗余audio引用，但保留的assetRefs.order出现空档。本次是同原整编第二次且最后一次有限修订：必须明确替换问题单元，保持其id、所有正文、镜表、对白、原文、幻想及素材选择原样；仅将assetRefs按现数组相对顺序写为1到N连续整数。assetId、variantId、use、useShotIds和数组顺序不变，不增删引用，不以retainedUnitIds保留问题单元。未涉及单元原样保留；程序不会替你重编号，也不会采用仍有空档的回包。";
 
 pub(in crate::pipeline) fn uses_scene_profile(input: &Value) -> Result<bool, String> {
     match input.get(SCENE_PROFILE_FIELD) {
@@ -385,6 +387,10 @@ pub(in crate::pipeline) fn prepare_request(
     }
     let mac_pack = super::super::stage3_pack::uses_profile(&request.input)?;
     let unit_scene = uses_scene_profile(&request.input)?;
+    let scene_facts = super::super::storyboard_scene_facts::validate_request(&request.input)?;
+    if scene_facts && !unit_scene {
+        return Err("场景原文证据须与冻结单元场景合同共同使用".into());
+    }
     if request.stage == "storyboardRefine" {
         if !mac_pack || request.skill != "director-refinement" {
             return Err("导演精修必须绑定冻结生产规则的独立兼容适配".into());
@@ -392,6 +398,7 @@ pub(in crate::pipeline) fn prepare_request(
         request.rule_snapshot["runtimeContract"] =
             super::super::stage3_pack::runtime_contract("storyboardRefine", true)?;
         attach_scene_contract(&mut request.rule_snapshot["runtimeContract"], unit_scene);
+        super::super::storyboard_scene_facts::attach_contract(&mut request.rule_snapshot["runtimeContract"], scene_facts);
         attach_joint_speaker_contract(&mut request.rule_snapshot["runtimeContract"], &request.input);
         request
             .input
@@ -438,6 +445,7 @@ pub(in crate::pipeline) fn prepare_request(
     } else {
         false
     };
+    let asset_use_profile = super::super::asset_use_binding::enabled(&request.input)?;
     let author_repair = if let Some(proof) = request.input.get("authorRepair") {
         if proof["version"] != AUTHOR_SCOPE_REPAIR_PROFILE
             || request.stage != "storyboardFinish"
@@ -469,6 +477,7 @@ pub(in crate::pipeline) fn prepare_request(
                                 && issue["code"] != "SHOT_DURATION"
                                 && issue["code"] != "UNIT_DURATION"
                                 && !source_coordinate_issue(issue)
+                                && !(asset_use_profile && issue["code"]=="ASSET_USE_IDENTITY")
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
                         })
@@ -480,7 +489,6 @@ pub(in crate::pipeline) fn prepare_request(
     } else {
         false
     };
-    let asset_use_profile = super::super::asset_use_binding::enabled(&request.input)?;
     let finish_repair = if let Some(proof) = request.input.get("finishRepair") {
         if author_repair
             || proof["version"] != FINISH_SCOPE_REPAIR_PROFILE
@@ -512,7 +520,8 @@ pub(in crate::pipeline) fn prepare_request(
                             issue["code"] != "ASSET_SCENE_SCOPE"
                                 && issue["code"] != "SHOT_DURATION"
                                 && issue["code"] != "UNIT_DURATION"
-                                && !(asset_use_profile && matches!(text(issue,"code"),"SHOT_SOURCE_SCOPE" | "ASSET_SOURCE_SCOPE"))
+                                && !(asset_use_profile && matches!(text(issue,"code"),"SHOT_SOURCE_SCOPE" | "ASSET_SOURCE_SCOPE" | "ASSET_USE_IDENTITY"))
+                                && !(asset_use_profile && proof["attempt"]==2 && issue["code"]=="ASSET_USE_ORDER")
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
                         })
@@ -592,6 +601,7 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
     attach_scene_contract(&mut runtime_contract, unit_scene);
+    super::super::storyboard_scene_facts::attach_contract(&mut runtime_contract, scene_facts);
     if planner_repair {
         let content=format!("{}\n\n本次是原情绪统筹岗位的定向规划修复。previousPlan为完整未采用原回包，validationIssues由程序校验给出。保留正确的情绪、事件、来源归属、入口事实、选择及初排；只修复明确问题及其必要关联。真实集场以sourceRows和episode为准，continuous只适用于同一真实场景；跨场的时空或事件边界由本岗依据原文判断，程序不代写剧情。交完整规划并再次经过覆盖、顺序、身份及场景校验。不得重抄原文或改写源事实。最多两次定向修订，同样问题不循环。",text(&runtime_contract,"content"));
         runtime_contract["planRepairProfile"] = json!("rejected-plan-repair/v1");
@@ -674,6 +684,19 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
     }
     attach_joint_speaker_contract(&mut runtime_contract, &request.input);
+    if (author_repair || finish_repair) && request.input["validationIssues"].as_array().is_some_and(|issues|issues.iter().any(|issue|issue["code"]=="ASSET_USE_IDENTITY")) {
+        if !super::super::asset_use_binding::enabled(&request.input)? {return Err("素材用途冲突修订缺少原冻结使用绑定合同".into());}
+        let content=format!("{}\n\n{ASSET_USE_IDENTITY_REPAIR}",text(&runtime_contract,"content"));
+        runtime_contract["assetUseIdentityRepairProfile"]=json!("single-identity-reference/v1");
+        runtime_contract["content"]=json!(content);
+        runtime_contract["sha256"]=json!(digest(text(&runtime_contract,"content")));
+    }
+    if finish_repair && request.input["validationIssues"].as_array().is_some_and(|issues|issues.iter().any(|issue|issue["code"]=="ASSET_USE_ORDER")) {
+        let content=format!("{}\n\n{ASSET_USE_ORDER_REPAIR}",text(&runtime_contract,"content"));
+        runtime_contract["assetUseOrderRepairProfile"]=json!("post-audio-removal-order/v1");
+        runtime_contract["content"]=json!(content);
+        runtime_contract["sha256"]=json!(digest(text(&runtime_contract,"content")));
+    }
     request.rule_snapshot["runtimeContract"] = runtime_contract;
     if author_repair
         && request.input["validationIssues"]
@@ -1260,6 +1283,9 @@ mod tests {
             let mut input=json!({PROFILE_FIELD:PROFILE,"sourceRows":[source.rows[3]],"contextRows":[],"settings":{"fantasyMode":"off"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":2},"previousDraft":{"units":[]}});
             input["capacityBrief"]=super::super::original::capacity_brief(&input["capabilities"],Some(&input["previousDraft"]),None,&[]);
             super::super::super::stage3_pack::mark_input(&mut input).unwrap();
+            // This fixture proves the genuinely unmarked saved-workflow path.
+            // New-workflow ordinary context is tested separately below.
+            input.as_object_mut().unwrap().remove("storyboardProductionContext");
             let request=TextRequest{stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),input,schema:json!({}),rule_snapshot:super::super::super::stage3_pack::snapshot(skill,&[]).unwrap()};
             let prepared=prepare_request(request.clone()).unwrap();
             assert_eq!(prepared.rule_snapshot["runtimeContract"]["jointSpeakerProfile"],"source-dialogue-members/v1");
@@ -1270,7 +1296,45 @@ mod tests {
             let mut old=request.clone(); old.input["sourceRows"][0]["dialogue"].as_object_mut().unwrap().remove("speakers");
             let old_prepared=prepare_request(old.clone()).unwrap();
             assert!(old_prepared.rule_snapshot["runtimeContract"].get("jointSpeakerProfile").is_none());
+            assert_eq!(old_prepared.rule_snapshot["methods"],old.rule_snapshot["methods"],"the truly unmarked old method list remains byte exact");
             assert_eq!(serde_json::to_vec(&prepare_request(old).unwrap()).unwrap(),serde_json::to_vec(&old_prepared).unwrap());
+        }
+    }
+
+    #[test]
+    fn joint_ordinary_context_new_opt_in_keeps_both_contracts_and_compilers_idempotent() {
+        let source=super::super::super::prepare_source("第一集\n场景：门口\n人物：林川、周航\n林川&周航：真的来了！\n").unwrap();
+        let original=super::super::super::stage3_pack::snapshot("unit-performance-director",&["storyboard-source-context"]).unwrap()["methods"][0].clone();
+        for (stage,skill) in [("storyboardPlan","episode-emotion-planner"),("storyboardCreate","unit-performance-director"),("storyboardFinish","episode-finishing-editor"),("storyboardRefine","director-refinement")] {
+            let mut input=json!({PROFILE_FIELD:PROFILE,"sourceRows":[source.rows[3]],"contextRows":[],"settings":{"fantasyMode":"off"},"capabilities":{"minDuration":0,"maxDuration":15,"imageLimit":2},"previousDraft":{"units":[]}});
+            input["capacityBrief"]=super::super::original::capacity_brief(&input["capabilities"],Some(&input["previousDraft"]),None,&[]);
+            super::super::super::stage3_pack::mark_input(&mut input).unwrap();
+            let frozen_input=input.clone();
+            let request=TextRequest{stage:stage.into(),skill:skill.into(),model:"offline".into(),reasoning:"medium".into(),input,schema:json!({}),rule_snapshot:super::super::super::stage3_pack::snapshot(skill,&[]).unwrap()};
+            let prepared=prepare_request(request).unwrap();
+            for field in ["sourceRows","contextRows","storyboardProductionContext"] {assert_eq!(prepared.input[field],frozen_input[field],"frozen card and exact joint-speaker evidence stay intact; creative/rhythm preparation remains enabled");}
+            let methods:Vec<_>=prepared.rule_snapshot["methods"].as_array().unwrap().iter().filter(|method|method["id"]=="storyboard-source-context").collect();
+            let ordinary=["storyboardCreate","storyboardFinish"].contains(&stage);
+            assert_eq!(methods.len(),usize::from(ordinary));
+            if ordinary {assert_eq!(*methods[0],original,"new opt-in loads the original method bytes");}
+            let runtime=&prepared.rule_snapshot["runtimeContract"];
+            assert_eq!(runtime["jointSpeakerProfile"],"source-dialogue-members/v1");
+            assert_eq!(text(runtime,"content").matches(JOINT_SPEAKER_REQUIREMENTS).count(),1);
+            if ordinary {assert_eq!(runtime["storyboardProductionContext"],frozen_input["storyboardProductionContext"]);} else {assert!(runtime.get("storyboardProductionContext").is_none());}
+            assert_eq!(text(runtime,"content").matches("普通制作判断在本次原主创/整编内部完成").count(),usize::from(ordinary));
+            let canonical=serde_json::to_vec(&prepared).unwrap();
+            let direct=super::super::super::stage3_pack::prepare_request(prepared.clone()).unwrap();
+            let again=prepare_request(direct).unwrap();
+            assert_eq!(serde_json::to_vec(&again).unwrap(),canonical,"direct and creative rewrapping cannot duplicate either contract or shift the cache identity");
+            let cli=crate::text_executor::compile_codex_input(&again).unwrap();
+            let attempt=crate::text_transport::FrozenAttempt::prepare_sdk_rules_first("joint-ordinary-compile","synthetic-workflow","synthetic-node",again.clone(),&json!({"synthetic":true})).unwrap();
+            let sdk=crate::text_executor::compile_sdk_attempt_input(&attempt).unwrap();
+            for prompt in [&cli.prompt,&sdk.prompt] {
+                assert_eq!(prompt.matches("共同说者合同 source-dialogue-members/v1：").count(),1);
+                assert_eq!(prompt.matches("普通制作判断在本次原主创/整编内部完成").count(),usize::from(ordinary));
+                assert!(prompt.contains("speakers"));
+            }
+            assert_eq!(serde_json::to_vec(&again).unwrap(),canonical,"both transport compilers leave the frozen request unchanged");
         }
     }
 

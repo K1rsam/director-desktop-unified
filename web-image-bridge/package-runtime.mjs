@@ -3,9 +3,9 @@ const root=path.dirname(fileURLToPath(import.meta.url)),repo=path.dirname(root),
 for(const f of pin.files){const p=path.join(root,'vendor/opencli',f.path);if(createHash('sha256').update(fs.readFileSync(p)).digest('hex')!==f.sha256)throw Error('Pinned source changed: '+f.path);}
 const destination=process.argv[2]?path.resolve(process.argv[2]):path.join(repo,'apps/desktop/src-tauri/resources/opencli');
 fs.mkdirSync(destination,{recursive:true});if(fs.lstatSync(destination).isSymbolicLink())throw Error('Resource directory must not be a link');
-for(const file of ['bridge.mjs','vendor-source.json','package.json','package-lock.json'])fs.copyFileSync(path.join(root,file),path.join(destination,file));
+for(const file of ['bridge.mjs','composer-transport.mjs','vendor-source.json','package.json','package-lock.json'])fs.copyFileSync(path.join(root,file),path.join(destination,file));
 for(const dir of ['vendor','node_modules'])fs.cpSync(path.join(root,dir),path.join(destination,dir),{recursive:true,filter:p=>!p.endsWith('.log')});
-const runtimeSha=createHash('sha256');for(const file of ['bridge.mjs','vendor-source.json','package-lock.json'])runtimeSha.update(fs.readFileSync(path.join(root,file)));
+const runtimeSha=createHash('sha256');for(const file of ['bridge.mjs','composer-transport.mjs','vendor-source.json','package-lock.json'])runtimeSha.update(fs.readFileSync(path.join(root,file)));
 const runtimePin=runtimeSha.digest('hex')+'\n';
 fs.writeFileSync(path.join(destination,'runtime.sha256'),runtimePin);
 fs.writeFileSync(path.join(root,'runtime.sha256'),runtimePin);

@@ -78,7 +78,7 @@ pub(crate) fn storyboard_transport_rule(
             static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
             RULE.get_or_init(refinement_audit_rule).as_str()
         },
-        Some(rule) if request.stage == "storyboardFinish" && rule == finish_binding_rule() => {
+        Some(rule) if matches!(request.stage.as_str(), "storyboardFinish" | "storyboardRefine") && rule == finish_binding_rule() => {
             static RULE:std::sync::OnceLock<String>=std::sync::OnceLock::new();
             RULE.get_or_init(finish_binding_rule).as_str()
         },
@@ -1154,6 +1154,33 @@ fn compile_refinement_audit_transport(
     let after = crate::text_executor::transport_payload_characters(request, &input, old_schema);
     if before.checked_sub(after).is_none_or(|saving| saving < 2_048)
         || crate::text_executor::codex_wire_characters(request, &input, old_schema) > STORYBOARD_TRANSPORT_LIMIT {
+        return compile_refinement_binding_transport(request, original);
+    }
+    Ok(Some(CompiledStoryboardTransport { profile: THREE_ROLE_PROFILE, input, schema: old_schema.clone() }))
+}
+
+/// Compose individually insufficient metadata projections before the final
+/// capacity gate. Already fitting original/audit wires keep their exact bytes.
+/// This does not use the ID dictionary: every shot and original ID stays literal.
+fn compile_refinement_binding_transport(
+    request: &TextRequest,
+    original: Option<CompiledStoryboardTransport>,
+) -> Result<Option<CompiledStoryboardTransport>, String> {
+    let (old_input, old_schema) = original.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+    let mut input = old_input.clone();
+    input.as_object_mut().ok_or("精修输入不是对象")?.remove("losslessInputRule");
+    compact_refinement_audit(&mut input, &request.input);
+    compact_metadata_copies(&mut input, &request.input);
+    compact_finish_repetitions(&mut input, &request.input);
+    compact_finish_bindings(&mut input, &request.input);
+    if expand_finish_bindings(&input)? != request.input {
+        return Err("精修组合运输未逐值还原原文、完整现稿及身份；未派发请求".into());
+    }
+    input["losslessInputRule"] = json!(finish_binding_rule());
+    let before = crate::text_executor::transport_payload_characters(request, old_input, old_schema);
+    let after = crate::text_executor::transport_payload_characters(request, &input, old_schema);
+    if before.checked_sub(after).is_none_or(|saving| saving < 2_048)
+        || crate::text_executor::codex_wire_characters(request, &input, old_schema) > STORYBOARD_TRANSPORT_LIMIT {
         return Ok(original);
     }
     Ok(Some(CompiledStoryboardTransport { profile: THREE_ROLE_PROFILE, input, schema: old_schema.clone() }))
@@ -1667,6 +1694,106 @@ mod tests {
         assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
     }
 
+    fn refinement_binding_fixture() -> TextRequest {
+        let mut request = binding_fixture();
+        request.stage = "storyboardRefine".into();
+        request.skill = "director-refinement".into();
+        request.input.as_object_mut().unwrap().remove("finishMode");
+        request.input["capacityBrief"] = refinement_audit_fixture();
+        request.input["refinementScope"] = json!({"unitIds":[request.input["previousDraft"]["units"][0]["id"]]});
+        request.input["acceptedProvenance"] = json!([{"unitId":"unit:0","version":2,"sha256":"frozen-original"}]);
+        request.input["literalPadding"] = json!("x".repeat(150_000));
+        request
+    }
+
+    fn refinement_candidate_size(request: &TextRequest, audit: bool, bindings: bool) -> usize {
+        let old = compile_dispatch_before_metadata(request).unwrap();
+        let (input, schema) = old.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+        let mut input = input.clone();
+        input.as_object_mut().unwrap().remove("losslessInputRule");
+        if audit { compact_refinement_audit(&mut input, &request.input); }
+        if bindings {
+            compact_metadata_copies(&mut input, &request.input);
+            compact_finish_repetitions(&mut input, &request.input);
+            compact_finish_bindings(&mut input, &request.input);
+        }
+        input["losslessInputRule"] = json!(if bindings { finish_binding_rule() } else { refinement_audit_rule() });
+        crate::text_executor::codex_wire_characters(request, &input, schema)
+    }
+
+    fn tune_refinement_before_metadata(request: &mut TextRequest, target: usize) {
+        for _ in 0..3 {
+            let old = compile_dispatch_before_metadata(request).unwrap();
+            let (input, schema) = old.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+            let chars = crate::text_executor::codex_wire_characters(request, input, schema);
+            let padding = request.input["literalPadding"].as_str().unwrap().len();
+            let next = padding as isize + target as isize - chars as isize;
+            assert!(next >= 0, "fixture requires enough literal padding");
+            request.input["literalPadding"] = json!("x".repeat(next as usize));
+        }
+    }
+
+    #[test]
+    fn refinement_overflow_composes_audit_and_identity_tables_before_the_final_capacity_gate() {
+        let mut request = refinement_binding_fixture();
+        let old = compile_dispatch_before_metadata(&request).unwrap();
+        let (old_input, old_schema) = old.as_ref().map(|wire| (&wire.input, &wire.schema)).unwrap_or((&request.input, &request.schema));
+        let before = crate::text_executor::codex_wire_characters(&request, old_input, old_schema);
+        let audit_gain = before - refinement_candidate_size(&request, true, false);
+        let binding_gain = before - refinement_candidate_size(&request, false, true);
+        tune_refinement_before_metadata(&mut request, STORYBOARD_TRANSPORT_LIMIT + audit_gain.max(binding_gain) + audit_gain.min(binding_gain) / 2);
+        assert!(refinement_candidate_size(&request, true, false) > STORYBOARD_TRANSPORT_LIMIT, "audit alone is insufficient");
+        assert!(refinement_candidate_size(&request, false, true) > STORYBOARD_TRANSPORT_LIMIT, "identity tables alone are insufficient");
+        assert!(refinement_candidate_size(&request, true, true) <= STORYBOARD_TRANSPORT_LIMIT);
+        let frozen = serde_json::to_vec(&request).unwrap();
+        let wire = compile_storyboard_dispatch_transport(&request).unwrap().unwrap();
+        assert_eq!(expand_storyboard_input(&wire.input).unwrap(), request.input);
+        assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(), request.schema);
+        assert!(wire.input.get("losslessIdDictionary").is_none());
+        assert_eq!(storyboard_transport_rule(&request, &wire.input), Some(finish_binding_rule().as_str()));
+        for (actual, original) in wire.input["previousDraft"]["units"].as_array().unwrap().iter().zip(request.input["previousDraft"]["units"].as_array().unwrap()) {
+            for (field, value) in original.as_object().unwrap() {
+                if !["assetRefs", "sourceCoverage"].contains(&field.as_str()) { assert_eq!(&actual[field], value, "literal {field}"); }
+            }
+        }
+        let compiled = crate::text_executor::compile_codex_input(&request).unwrap();
+        let prompt: Value = serde_json::from_str(&compiled.prompt).unwrap();
+        assert_eq!(prompt["rules"], request.rule_snapshot);
+        assert_eq!(prompt["input"], wire.input);
+        assert_eq!(compiled.prompt.encode_utf16().count() + compiled.schema.encode_utf16().count(), refinement_candidate_size(&request, true, true));
+        assert_eq!(serde_json::to_vec(&request).unwrap(), frozen);
+        for change in ["identityIndex", "sourceIndex", "coverageIndex", "shotText", "auditValue"] {
+            let mut bad = wire.input.clone();
+            match change {
+                "identityIndex" => bad["previousDraft"]["units"][0]["assetRefs"]["$assetBindings"]["values"][0][8] = json!(usize::MAX),
+                "sourceIndex" => bad["previousDraft"]["units"][0]["assetRefs"]["$assetBindings"]["values"][0][6] = json!([-1]),
+                "coverageIndex" => bad["previousDraft"]["units"][0]["sourceCoverage"]["$sourceCoverage"]["values"][0][0] = json!(usize::MAX),
+                "shotText" => bad["previousDraft"]["units"][0]["shots"][0]["picture"] = json!("changed"),
+                _ => bad["capacityBrief"]["rhythm"]["audit"]["speech"]["lineTimings"]["$auditRows"]["values"][0][0] = json!("changed")
+            }
+            assert!(storyboard_transport_rule(&request, &bad).is_none(), "{change}");
+        }
+    }
+
+    #[test]
+    fn refinement_binding_fallback_keeps_fitting_frozen_wires_and_unresolved_oversize_exact() {
+        for target in [199_999, 400_000] {
+            let mut request = refinement_binding_fixture();
+            tune_refinement_before_metadata(&mut request, target);
+            let frozen = serde_json::to_vec(&request).unwrap();
+            let old = compile_dispatch_before_metadata(&request).unwrap();
+            let actual = compile_storyboard_dispatch_transport(&request).unwrap();
+            let bytes = |wire: &Option<CompiledStoryboardTransport>| wire.as_ref().map(|w| serde_json::to_vec(&json!([w.input, w.schema])).unwrap());
+            assert_eq!(bytes(&actual), bytes(&old), "preserve original wire at {target}");
+            assert_eq!(serde_json::to_vec(&request).unwrap(), frozen);
+        }
+        for marker in [json!({"$assetBindings":{}}), json!({"$sourceCoverage":{}}), json!({"$id":0}), json!({"losslessIdDictionary":["source data"]})] {
+            let mut request = refinement_binding_fixture();
+            request.input["ordinarySourceData"] = marker;
+            assert!(compile_storyboard_dispatch_transport(&request).unwrap().is_none());
+        }
+    }
+
     #[test]
     #[ignore = "explicit captured Refine canonical request, read-only bytes, zero model/DB calls"]
     fn refinement_captured_request_proves_full_roundtrip_and_real_envelope_capacity() {
@@ -1681,7 +1808,10 @@ mod tests {
         let cli=crate::text_executor::codex_wire_characters(&request,&wire.input,&wire.schema);
         let max=crate::text_executor::transport_payload_characters(&request,&wire.input,&wire.schema);
         assert_eq!(expand_storyboard_input(&wire.input).unwrap(),request.input);assert_eq!(expand_storyboard_schema(&wire.schema).unwrap(),request.schema);
-        for field in ["previousDraft","acceptedProvenance","refinementScope"] {assert_eq!(wire.input[field],request.input[field],"{field}");}
+        for field in ["acceptedProvenance","refinementScope"] {assert_eq!(wire.input[field],request.input[field],"{field}");}
+        for (wire_unit, unit) in wire.input["previousDraft"]["units"].as_array().unwrap().iter().zip(request.input["previousDraft"]["units"].as_array().unwrap()) {
+            for (field,value) in unit.as_object().unwrap() {if !["assetRefs","sourceCoverage"].contains(&field.as_str()){assert_eq!(&wire_unit[field],value,"literal complete draft field {field}");}}
+        }
         let compiled=crate::text_executor::compile_codex_input(&request).unwrap();let prompt:Value=serde_json::from_str(&compiled.prompt).unwrap();
         assert_eq!(prompt["rules"],request.rule_snapshot);assert_eq!(prompt["input"],wire.input);
         assert_eq!(compiled.prompt.encode_utf16().count()+compiled.schema.encode_utf16().count(),cli);

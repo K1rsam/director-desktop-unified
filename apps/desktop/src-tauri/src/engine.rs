@@ -28,6 +28,11 @@ pub mod background_chrome_images;
 pub mod task_record_maintenance;
 #[path = "unit_save_guard.rs"]
 mod unit_save_guard;
+#[path = "engine_refinement_identity.rs"]
+mod refinement_identity;
+#[cfg(test)]
+#[path = "engine_refinement_continuity_tests.rs"]
+mod refinement_continuity_tests;
 #[cfg(test)]
 #[path = "engine_backup_restore_tests.rs"]
 mod backup_restore_tests;
@@ -1549,15 +1554,27 @@ impl Engine {
                 workspace["imageQueueReport"] = report;
                 return Ok(workspace);
             }
+            "storyboard.refinement.continuity.preview" => {
+                let plan=store.preview_refinement_continuity(s(&request,"workflowId"),s(&request,"candidateSha256"))?;
+                let mut workspace=self.workspace(&store,None)?;
+                workspace["refinementContinuityReviewPreview"]=plan;
+                return Ok(workspace);
+            }
             "storyboard.refinement.adopt" => {
                 let _pipeline_lease = self.acquire_pipeline(&store)?;
                 let run = s(&request, "workflowId");
+                if let Some(review)=request.get("continuityReview") {
+                    store.adopt_refinement_continuity(run,s(&request,"candidateSha256"),review)?;
+                    return self.workspace(&store,None);
+                }
                 let old = store.job(run)?;
                 if old["entityId"] != "storyboard.refine" { return Err("请选择原导演精修记录".into()); }
                 let original = &old["snapshot"]["input"];
                 if old["snapshot"]["savedSettingsSha256"] != pipeline::digest(&store.settings()?.to_string()) { return Err("项目参数已变化，精修结果已保留，请核对后重新精修".into()); }
                 let mut current = refinement_input_with_capabilities(&store, &json!({"episodeId":original["episodeId"],"refinementScope":original["refinementScope"],"reviewNotes":original["reviewNotes"],"preserveNotes":original["preserveNotes"]}),original.get("capabilities"))?;
-                pipeline::storyboard_refinement::inherit_frozen_profiles(&mut current, original)?;
+                let mut effective_original=original.clone();
+                pipeline::storyboard_refinement_identity::attach_recovery(&mut effective_original,&old["snapshot"],&old["prepared"])?;
+                pipeline::storyboard_refinement::inherit_frozen_profiles(&mut current, &effective_original)?;
                 // Execution identity is frozen by preflight, not editable project state.
                 current["settings"] = original["settings"].clone();
                 store.publish_storyboard_refinement(run, s(&request,"candidateSha256"), &current)?;
@@ -3230,6 +3247,7 @@ impl Engine {
         // A busy project is not a failed attempt. Acquire before resume events
         // or decisions change, retaining the same frozen workflow and budget.
         let pipeline_lease = self.acquire_pipeline(&store)?;
+        refinement_identity::prepare_resume(&store,id)?;
         let rule_migration =
             workflow_resume_rule_audit(&job, &production_rules_for_snapshot(&snapshot)?)?;
         if s(request, "action") == "storyboard.decision.resolve" {
@@ -3291,6 +3309,8 @@ impl Engine {
                 let stage=s(&snapshot,"stage");let mut input=snapshot["input"].clone();
                 store.refresh_storyboard_audit_guard(&run,&snapshot)?;
                 let record=store.job(&run)?;
+                pipeline::storyboard_refinement_identity::attach_recovery(&mut input,&snapshot,&record["prepared"])?;
+                refinement_identity::verify(&store,&input)?;
                 let guard=record["prepared"].get("publicationGuard").unwrap_or(&snapshot["guard"]).clone();
                 {let mut c=store.conn()?;let tx=c.transaction().map_err(|e|e.to_string())?;crate::workflow::verify_guard(&tx,&guard)?;}
                 input["decisions"]=record["prepared"]["decisions"].clone();
@@ -5390,7 +5410,14 @@ fn revision_context_from_refinement(
         || receipt["episodeId"]!=episode || receipt["acceptedPlanContext"]!=candidate["acceptedContext"]
         || receipt["domainRequestSha256"]!=candidate["domainRequestSha256"] || receipt["ruleReceipt"]!=candidate["ruleReceipt"]
     {return Err(revision_origin_error("精修采用回执没有回绑原候选与规划"));}
-    let expected=pipeline::adopt_storyboard_refinement(&snapshot["input"],candidate)
+    let mut frozen=snapshot["input"].clone();
+    pipeline::storyboard_refinement_identity::attach_recovery(&mut frozen,snapshot,projection)?;
+    if receipt.get(pipeline::storyboard_refinement_identity::FIELD)!=candidate.get(pipeline::storyboard_refinement_identity::FIELD)
+        || (candidate.get(pipeline::storyboard_refinement_identity::FIELD).is_some()
+            && refinement_identity::packet(connection,&frozen)?.as_ref()!=candidate.get(pipeline::storyboard_refinement_identity::FIELD)) {
+        return Err(revision_origin_error("精修身份重绑定未回绑原登记来源"));
+    }
+    let expected=pipeline::adopt_storyboard_refinement(&frozen,candidate)
         .map_err(|_|revision_origin_error("精修候选不能重现原领域验证"))?;
     if receipt["deliverySha256"]!=pipeline::digest(&expected.to_string()) {
         return Err(revision_origin_error("精修采用作品与原差量不一致"));
@@ -5472,6 +5499,7 @@ fn accepted_storyboard_revision_contexts(
         }
     }
     let connection = store.conn()?;
+    crate::workflow::verify_refinement_continuity_history(&connection,input)?;
     let has_steps: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')", [], |row|row.get(0)).map_err(|e|e.to_string())?;
     if !has_steps {
         return Err(revision_origin_error("项目没有正式采用流程节点"));
@@ -5501,6 +5529,7 @@ fn accepted_storyboard_revision_contexts(
             let receipt=&prepared["refinementAdoption"];
             result=json!({"sourceSha256":result["sourceSha256"],"scope":"units","units":receipt["adoptedUnits"],
                 "fantasyRealization":receipt["fantasyRealization"],"refinementCandidate":result,"refinementAdoption":receipt});
+            if let Some(recovery)=prepared.get(pipeline::storyboard_refinement_identity::RECOVERY){result[pipeline::storyboard_refinement_identity::RECOVERY]=recovery.clone();}
         }
         if snapshot["runnerVersion"] == "desktop-runner/v1"
             && snapshot["input"]["source"]["sha256"] == source_sha
@@ -5737,6 +5766,7 @@ fn refinement_input_with_capabilities(store: &Store, request: &Value,capabilitie
     input["reviewNotes"] = json!(s(request,"reviewNotes"));
     input["preserveNotes"] = json!(s(request,"preserveNotes"));
     input["productionDirection"] = input["foundation"]["productionDirection"].clone();
+    refinement_identity::freeze(store,&mut input)?;
     Ok(input)
 }
 fn production_input(store: &Store, request: &Value) -> Result<Value> {

@@ -35,6 +35,34 @@ async function completed(bridge, message = executeCommand()) {
   return { dispatched, receipt: bridge.observe(message.attemptId) };
 }
 
+test('Windows offline namespace roots preload the synthetic runtime and preserve completed or unknown receipts across restart', { skip: process.platform !== 'win32' }, async t => {
+  for (const [scenario, state] of [['happy', 'transport_completed'], ['configuration-notice-only', 'submission_unknown']]) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'director-sdk-namespace-fixture-'));
+    const root = path.toNamespacedPath(directory);
+    const config = { stateDirectory: root, offlineFixture: offlineFixture(scenario) };
+    let bridge = new OfficialSdkBridge(config);
+    t.after(async () => { await bridge.disconnect(); await fs.rm(directory, { recursive: true, force: true }); });
+    await bridge.initialize();
+    const message = executeCommand('namespace_fixture');
+    assert.equal((await completed(bridge, message)).receipt.state, state);
+    const attempt = path.join(root, message.attemptId);
+    const capture = path.join(attempt, 'fixture-invocation.json');
+    const bytes = await fs.readFile(capture);
+    const invocation = JSON.parse(bytes);
+    const bootstrap = path.join(directory, message.attemptId, 'synthetic-runtime', 'fake-codex-bootstrap.cjs');
+    assert.equal(invocation.env.NODE_OPTIONS, `--require=${JSON.stringify(bootstrap)}`);
+    assert.equal(invocation.env.TMPDIR, path.join(attempt, 'synthetic-runtime'));
+    const receipt = await fs.readFile(path.join(attempt, 'receipt.json'));
+    await bridge.disconnect();
+    bridge = new OfficialSdkBridge(config);
+    await bridge.initialize();
+    assert.equal(bridge.observe(message.attemptId).state, state);
+    await assert.rejects(bridge.handle(message), { code: state === 'transport_completed' ? 'ATTEMPT_EXISTS' : 'WORKER_OCCUPIED' });
+    assert.deepEqual(await fs.readFile(capture), bytes);
+    assert.deepEqual(await fs.readFile(path.join(attempt, 'receipt.json')), receipt);
+  }
+});
+
 async function localPreparationFixture(t, fault = null) {
   const identity = { version: 'official-sdk-identity/v2', bridgeSha256: LEGACY_PATH_BRIDGE_SHA, accountFingerprint: 'synthetic-account', runtimePackageVersion: 'synthetic-runtime', supervisorExecutable: 'synthetic-old', supervisorSha256: 'a'.repeat(64), resourceDirectory: 'synthetic-old-resources' };
   const initial = await fixture(t, null, { nativeRuntime: { identity, async create() { throw new Error('SDK_NATIVE_IDENTITY: attempt directory'); } } });
@@ -181,6 +209,28 @@ test('genuine SDK native mode creates schema inside the dedicated attempt temp a
   const captured = JSON.parse(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'));
   const schemaPath = captured.args[captured.args.indexOf('--output-schema') + 1];
   assert(path.resolve(schemaPath).startsWith(path.resolve(temporaryDirectory) + path.sep));
+  assert.deepEqual(Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]])), previous);
+  assert.deepEqual(await fs.readdir(temporaryDirectory), []);
+});
+
+test('genuine SDK supports a Windows long namespaced schema temp and restores the worker environment', { skip: process.platform !== 'win32' }, async t => {
+  const previous = Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]]));
+  let temporaryDirectory;
+  const nativeRuntime = { identity: { runtimePackageVersion: 'offline-long-schema-contract-only' }, async create(directory) {
+    const fixture = await offlineFixture('happy').create(directory);
+    const physicalTemp = path.join(directory, 'x'.repeat(233 - directory.length - 1));
+    await fs.mkdir(physicalTemp);
+    temporaryDirectory = path.toNamespacedPath(physicalTemp);
+    return { ...fixture, temporaryDirectory };
+  } };
+  const { bridge, dir } = await fixture(t, null, { nativeRuntime });
+  const { receipt } = await completed(bridge);
+  assert.equal(receipt.state, 'transport_completed');
+  const captured = JSON.parse(await fs.readFile(path.join(dir, 'attempt_1/fixture-invocation.json'), 'utf8'));
+  const schemaPath = captured.args[captured.args.indexOf('--output-schema') + 1];
+  assert(schemaPath.startsWith(temporaryDirectory + path.sep));
+  assert(schemaPath.length > 260);
+  assert.deepEqual(captured.schema, syntheticSchema);
   assert.deepEqual(Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].map(key => [key, process.env[key]])), previous);
   assert.deepEqual(await fs.readdir(temporaryDirectory), []);
 });
@@ -353,6 +403,24 @@ test('second worker cannot own same state directory', async t => {
   const { dir } = await fixture(t, null);
   const second = new OfficialSdkBridge({ stateDirectory: dir });
   await assert.rejects(second.initialize(), { code: 'WORKER_LOCKED' });
+});
+
+test('Windows namespaced worker shares the original physical lock and reopens the same completed receipt', { skip: process.platform !== 'win32' }, async t => {
+  const { dir, bridge } = await fixture(t);
+  const { receipt } = await completed(bridge);
+  const file = path.join(dir, 'attempt_1', 'receipt.json'), before = await fs.readFile(file);
+  const capture = await fs.readFile(path.join(dir, 'attempt_1', 'fixture-invocation.json'));
+  const namespaced = new OfficialSdkBridge({ stateDirectory: path.toNamespacedPath(dir), offlineFixture: offlineFixture('happy') });
+  await assert.rejects(namespaced.initialize(), { code: 'WORKER_LOCKED' });
+  await bridge.disconnect();
+  const reopened = new OfficialSdkBridge({ stateDirectory: path.toNamespacedPath(dir), offlineFixture: offlineFixture('happy') });
+  try {
+    await reopened.initialize();
+    assert.deepEqual(reopened.observe('attempt_1'), receipt);
+    await assert.rejects(reopened.handle(executeCommand()), { code: 'ATTEMPT_EXISTS' });
+    assert.deepEqual(await fs.readFile(file), before);
+    assert.deepEqual(await fs.readFile(path.join(dir, 'attempt_1', 'fixture-invocation.json')), capture);
+  } finally { await reopened.disconnect(); }
 });
 
 function childClient(directory, scenario) {

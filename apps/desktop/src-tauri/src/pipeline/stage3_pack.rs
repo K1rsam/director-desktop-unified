@@ -13,6 +13,10 @@ pub const DIALOGUE_PROFILE: &str = "locked-utf16-reference/v1";
 pub const ORIGINAL_VERSION: &str = "production-byte-lock/20261005";
 pub const RHYTHM_PROFILE_FIELD: &str = "storyboardRhythmProfile";
 pub const RHYTHM_PROFILE: &str = "source-bound-rhythm-locator/v1";
+const PRODUCTION_CONTEXT_FIELD: &str = "storyboardProductionContext";
+const PRODUCTION_CONTEXT_PROFILE: &str = "ordinary-production-context/v1";
+const SOURCE_CONTEXT_RULE: &str = "storyboard-source-context";
+const PRODUCTION_CONTEXT_INSTRUCTIONS: &str = "普通制作判断在本次原主创/整编内部完成，不新增准备岗、审查岗、全剧目录或逐项用户确认。依同次装入的source-context-preparer规则，未登记独立资产不等于不能入画：一次性普通持物、普通设备和短暂环境对象，可在props/picture中给出源约束下的最小一致文字设计并贯穿相关镜头；没有正式ID就不伪造assetRefs，也不因缺ID一律留待补图。已登记且实际使用的实体仍选准确assetId/variantId/useShotIds，不借普通制作判断改身份、形态、作用结果或既有范围。LOC已有的固定镜面、桌、窗等部件，在原文及实际已给资料可支持其使用时可沿主LOC引用，不因倒影/取景或与部件交互就强制另造PROP；不假称已看过未提供图片，也不假定未验证的场景图包含物件。只有确需脱离配套独立辨认、持续外观一致或独特关键图面，且现有源/已给素材不能承载时，才保留准确必要资产缺口。普通姿态、机位、光源和到达拍法由当前两岗按源正常设计；原文已明确的返回/到达不能只因未详述每个路径支点就被判不可能。区分原文事实、已采用的可变调度与未给资料；在未违反明确源事实或真实锁定条件时，直接完成合理的局部调度与承接，不新增法术/能力、搬动物件或源外事件圆场。确有具体冲突且在当前授权内不能安全解决时保留unresolved，不删问题、不借假ID或假绑定冒充通过。";
 const MANIFEST: &str = include_str!("../../../../../rules/stage3/manifest.json");
 
 struct FrozenFile {
@@ -222,11 +226,37 @@ pub fn pack_sha256() -> Result<String, String> {
     ))
 }
 
+fn production_context_card() -> Result<Value, String> {
+    let rule = rule_snapshots()?.into_iter().find(|rule| rule.id == SOURCE_CONTEXT_RULE)
+        .ok_or("普通制作上下文缺少原版来源规则")?;
+    Ok(json!({"version":PRODUCTION_CONTEXT_PROFILE,"ruleId":rule.id,
+        "ruleVersion":rule.version,"ruleSha256":rule.sha256,
+        "scopeInstructionsSha256":digest(PRODUCTION_CONTEXT_INSTRUCTIONS)}))
+}
+
+fn production_context_enabled(input: &Value) -> Result<bool, String> {
+    match input.get(PRODUCTION_CONTEXT_FIELD) {
+        None | Some(Value::Null) => Ok(false),
+        Some(card) if *card == production_context_card()? => Ok(true),
+        _ => Err("普通制作上下文卡版本或规则摘要无效；原冻结请求保留，未迁移或派发".into()),
+    }
+}
+
 pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> {
     super::storyboard_sound_events::inherit(target, frozen)?;
     super::asset_coverage::inherit(target, frozen)?;
     super::asset_use_binding::inherit(target, frozen)?;
     let rhythm = uses_rhythm_profile(frozen)?;
+    let production_context = production_context_enabled(frozen)?;
+    if production_context && !uses_profile(frozen)? {
+        return Err("普通制作上下文缺少冻结的原版第三阶段规则包".into());
+    }
+    if production_context {
+        target[PRODUCTION_CONTEXT_FIELD] = frozen[PRODUCTION_CONTEXT_FIELD].clone();
+    } else if let Some(target) = target.as_object_mut() {
+        // Reprojecting an old workflow cannot inherit a fresh caller's card.
+        target.remove(PRODUCTION_CONTEXT_FIELD);
+    }
     if uses_profile(frozen)? {
         let hash = pack_sha256()?;
         if frozen
@@ -245,6 +275,7 @@ pub fn attach_profile(target: &mut Value, frozen: &Value) -> Result<(), String> 
 }
 
 pub fn mark_input(input: &mut Value) -> Result<(), String> {
+    production_context_enabled(input)?;
     if input
         .get("storyboardCreativeProfile")
         .is_some_and(|profile| profile != "original-production-contract/v1")
@@ -257,6 +288,9 @@ pub fn mark_input(input: &mut Value) -> Result<(), String> {
     // Only newly constructed workflows opt into the mechanical locator. Saved
     // runs without this marker retain their exact old requests and caches.
     input[RHYTHM_PROFILE_FIELD] = json!(RHYTHM_PROFILE);
+    // Only this genuinely new-workflow boundary opts into the ordinary
+    // production method. Saved workflows without the card retain their rules.
+    input[PRODUCTION_CONTEXT_FIELD] = production_context_card()?;
     Ok(())
 }
 
@@ -345,6 +379,10 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         return Err("素材核对合同缺少冻结的第三阶段规则包".into());
     }
     let rhythm = uses_rhythm_profile(&request.input)?;
+    let production_context = production_context_enabled(&request.input)?;
+    if production_context && !uses_profile(&request.input)? {
+        return Err("普通制作上下文缺少冻结的原版第三阶段规则包".into());
+    }
     if !uses_profile(&request.input)? {
         return Ok(request);
     }
@@ -357,7 +395,7 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         return Err("冻结规则包身份发生变化；原回包和请求保留".into());
     }
     request.input["storyboardRulePackSha256"] = json!(expected);
-    let methods: Vec<String> = request.rule_snapshot["methods"]
+    let mut methods: Vec<String> = request.rule_snapshot["methods"]
         .as_array()
         .ok_or("缺少实际规则方法清单")?
         .iter()
@@ -368,6 +406,11 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
                 .ok_or("方法身份无效")
         })
         .collect::<Result<_, _>>()?;
+    let ordinary_role = production_context
+        && ["storyboardCreate", "storyboardFinish"].contains(&request.stage.as_str());
+    if ordinary_role && !methods.iter().any(|id| id == SOURCE_CONTEXT_RULE) {
+        methods.push(SOURCE_CONTEXT_RULE.into());
+    }
     let runtime = request.rule_snapshot.get("runtimeContract").cloned();
     request.rule_snapshot = snapshot(
         &request.skill,
@@ -377,6 +420,17 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
         request.rule_snapshot["runtimeContract"] = runtime;
     }
     super::asset_coverage::storyboard_request(&mut request)?;
+    if ordinary_role {
+        let runtime = request.rule_snapshot.get_mut("runtimeContract")
+            .filter(|value| value.is_object()).ok_or("普通制作判断缺少可信运行合同")?;
+        let previous = runtime["content"].as_str().ok_or("普通制作运行合同缺少正文")?;
+        if !previous.contains(PRODUCTION_CONTEXT_INSTRUCTIONS) {
+            let content = format!("{previous}\n\n{PRODUCTION_CONTEXT_INSTRUCTIONS}");
+            runtime["sha256"] = json!(digest(&content));
+            runtime["content"] = json!(content);
+        }
+        runtime[PRODUCTION_CONTEXT_FIELD] = request.input[PRODUCTION_CONTEXT_FIELD].clone();
+    }
     super::storyboard_sound_events::prepare_request(&mut request)?;
     if rhythm {
         super::storyboard::original::rhythm::attach(&mut request)?;
@@ -384,6 +438,10 @@ pub(super) fn prepare_request(mut request: TextRequest) -> Result<TextRequest, S
     super::asset_use_binding::prepare_request(&mut request)?;
     Ok(request)
 }
+
+#[cfg(test)]
+#[path = "stage3_production_context_tests.rs"]
+mod production_context_tests;
 
 #[cfg(test)]
 mod tests {

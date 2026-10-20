@@ -42,6 +42,33 @@ test('Windows Rust forward-slash state roots accept Node backslash attempt paths
   }
 });
 
+test('Windows SDK schema temp survives MAX_PATH inside the original owned attempt', { skip: process.platform !== 'win32' }, async t => {
+  const { root, identity, config } = await fixture(t);
+  const id = 'long-path-attempt';
+  const suffix = path.join(id, 'native-runtime', 'tmp');
+  // The real failure had a 233-character tmp parent and a 260-character
+  // mkdtemp template. The extended spelling must also work beyond that edge.
+  for (const parentLength of [233, 280]) {
+    const padding = 'x'.repeat(parentLength - root.length - suffix.length - 2);
+    const worker = path.join(root, padding), directory = path.join(worker, id);
+    await fs.mkdir(directory, { recursive: true });
+    const namespacedDirectory = path.toNamespacedPath(directory);
+    const result = await nativeRuntime(config, path.toNamespacedPath(worker)).create(namespacedDirectory, frozenRecord(identity, id));
+    const plan = JSON.parse(await fs.readFile(result.env.DIRECTOR_SDK_RUNTIME_PLAN));
+    assert.equal(plan.tempDirectory.length, parentLength + 4);
+    assert.equal(plan.tempDirectory, path.join(namespacedDirectory, 'native-runtime', 'tmp'));
+    assert.equal(result.temporaryDirectory, path.toNamespacedPath(plan.tempDirectory));
+    for (const key of ['TEMP', 'TMP', 'TMPDIR']) assert.equal(result.env[key], result.temporaryDirectory);
+    const schemaRoot = await fs.mkdtemp(path.join(result.temporaryDirectory, 'codex-output-schema-'));
+    const schema = path.join(schemaRoot, 'schema.json');
+    await fs.writeFile(schema, '{"type":"object"}');
+    assert.equal(await fs.realpath(path.dirname(schemaRoot)), await fs.realpath(plan.tempDirectory));
+    assert.equal(await fs.readFile(schema, 'utf8'), '{"type":"object"}');
+    assert.equal(result.workingDirectory, plan.workingDirectory);
+    assert.equal(path.dirname(await fs.realpath(plan.workingDirectory)), path.dirname(await fs.realpath(plan.tempDirectory)));
+  }
+});
+
 test('native runtime rejects parent traversal, nested/sibling directories and linked attempts before writing', async t => {
   const { root, identity, config } = await fixture(t);
   const directory = path.join(root, 'attempt'); await fs.mkdir(directory);
@@ -54,6 +81,10 @@ test('native runtime rejects parent traversal, nested/sibling directories and li
   await assert.rejects(runtime.create(link, frozenRecord(identity, 'linked')), /must not be linked/);
   await fs.mkdir(path.join(target, 'attempt'));
   await assert.rejects(nativeRuntime(config, link).create(path.join(link, 'attempt'), frozenRecord(identity, 'attempt')), /must not be linked/);
+  if (process.platform === 'win32') {
+    await assert.rejects(nativeRuntime(config, path.toNamespacedPath(link)).create(path.toNamespacedPath(path.join(link, 'attempt')), frozenRecord(identity, 'attempt')), /must not be linked/);
+    await assert.rejects(nativeRuntime(config, path.toNamespacedPath(root)).create(path.toNamespacedPath(link), frozenRecord(identity, 'linked')), /must not be linked/);
+  }
   await assert.rejects(runtime.create(directory, frozenRecord(identity, 'different-attempt')), /attempt directory identity changed/);
   assert.deepEqual(await fs.readdir(directory), []);
   assert.deepEqual(await fs.readdir(path.join(target, 'attempt')), []);

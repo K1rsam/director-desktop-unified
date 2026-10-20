@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 struct Runtime { runner: PathBuf, pin: String }
 
 fn runtime(root: &Path, marker: &str) -> Runtime {
+    runtime_with_owned_adapter(root, marker, false)
+}
+
+fn runtime_with_owned_adapter(root: &Path, marker: &str, owned: bool) -> Runtime {
     fs::create_dir_all(root).unwrap();
     let vendor_bytes = format!("synthetic vendor {marker}").into_bytes();
     let vendor = json!({"commit":"synthetic-pinned-source","files":[{"path":"reader.js","sha256":hex_hash(&vendor_bytes)}]}).to_string();
@@ -15,8 +19,11 @@ fn runtime(root: &Path, marker: &str) -> Runtime {
         ("package.json".to_owned(), b"{\"private\":true}".to_vec()),
         ("vendor/opencli/reader.js".to_owned(), vendor_bytes),
     ]);
+    if owned { files.insert("composer-transport.mjs".to_owned(), format!("// synthetic owned adapter {marker}").into_bytes()); }
     let mut aggregate = Sha256::new();
-    for name in ["bridge.mjs", "vendor-source.json", "package-lock.json"] { aggregate.update(&files[name]); }
+    let names: Vec<&str> = if owned { vec!["bridge.mjs", "composer-transport.mjs", "vendor-source.json", "package-lock.json"] }
+        else { vec!["bridge.mjs", "vendor-source.json", "package-lock.json"] };
+    for name in names { aggregate.update(&files[name]); }
     let pin = format!("{:x}", aggregate.finalize());
     files.insert("runtime.sha256".to_owned(), format!("{pin}\n").into_bytes());
     for (name, bytes) in &files {
@@ -49,13 +56,78 @@ fn response(request: &GenerationRequest) -> Value {
 #[test]
 fn reader_policy_allows_only_the_reviewed_old_and_current_pin_pairs() {
     assert_eq!(READ_ONLY_READER_MIGRATIONS, &[
-        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"),
-        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"),
+        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
     ]);
     for (from,to) in READ_ONLY_READER_MIGRATIONS {assert!(read_only_reader_migration_allowed(from,to));}
     assert!(!read_only_reader_migration_allowed(&"f".repeat(64),COMPILED_RUNTIME_PIN.trim()));
     assert!(!read_only_reader_migration_allowed(READ_ONLY_READER_MIGRATIONS[0].0,&"f".repeat(64)));
     assert_eq!(reader_policy().compiled_pin, COMPILED_RUNTIME_PIN.trim());
+}
+
+#[test]
+fn reader_saved_historical_audits_do_not_allow_executing_a_historical_reader() {
+    let prior="f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70";
+    for source in ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+        "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+        "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"] {
+        assert!(read_only_reader_audit_allowed(source,prior));
+        assert!(!read_only_reader_migration_allowed(source,prior));
+        assert!(!reader_policy().migrations.iter().any(|(old,new)|*old==source&&*new==prior));
+    }
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),prior));
+    assert!(!read_only_reader_audit_allowed(prior,prior));
+    let previous="54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0";
+    for source in ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+        "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+        "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",prior] {
+        assert!(read_only_reader_audit_allowed(source,previous));
+        assert!(!read_only_reader_migration_allowed(source,previous));
+        assert!(!reader_policy().migrations.iter().any(|(old,new)|*old==source&&*new==previous));
+    }
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),previous));
+    assert!(!read_only_reader_audit_allowed(previous,previous));
+    let terminal_reader="afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6";
+    for source in ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+        "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+        "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",prior,previous] {
+        assert!(read_only_reader_audit_allowed(source,terminal_reader));
+        assert!(!read_only_reader_migration_allowed(source,terminal_reader));
+        assert!(!reader_policy().migrations.iter().any(|(old,new)|*old==source&&*new==terminal_reader));
+    }
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),terminal_reader));
+    assert!(!read_only_reader_audit_allowed(terminal_reader,terminal_reader));
+}
+
+#[test]
+fn reader_owned_adapter_is_in_the_v1_manifest_and_aggregate_without_weakening_legacy_readers() {
+    let temp = tempfile::tempdir().unwrap();
+    let legacy = runtime(&temp.path().join("legacy"), "legacy");
+    assert!(verify_reader(&legacy.runner, &legacy.pin).is_ok());
+    let owned = runtime_with_owned_adapter(&temp.path().join("owned"), "owned", true);
+    assert!(verify_reader(&owned.runner, &owned.pin).is_ok());
+    for fault in ["missing-file", "missing-manifest-entry", "changed-adapter-with-updated-manifest"] {
+        let reader = runtime_with_owned_adapter(&temp.path().join(fault), fault, true);
+        let root = reader.runner.parent().unwrap();
+        let manifest_path = root.join("runtime-manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        match fault {
+            "missing-file" => fs::remove_file(root.join("composer-transport.mjs")).unwrap(),
+            "missing-manifest-entry" => manifest["files"].as_array_mut().unwrap().retain(|f| f["path"] != "composer-transport.mjs"),
+            "changed-adapter-with-updated-manifest" => {
+                let changed = b"changed owned adapter";
+                fs::write(root.join("composer-transport.mjs"), changed).unwrap();
+                manifest["files"].as_array_mut().unwrap().iter_mut().find(|f| f["path"] == "composer-transport.mjs").unwrap()["sha256"] = json!(hex_hash(changed));
+            },
+            _ => unreachable!(),
+        }
+        fs::write(manifest_path, manifest.to_string()).unwrap();
+        assert_eq!(verify_reader(&reader.runner, &reader.pin).err().unwrap().code, "OPENCLI_COMPONENT_MISMATCH", "{fault}");
+    }
 }
 
 #[test]

@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { Page } from './vendor/opencli/dist/src/browser/page.js';
 import { setDaemonCommandTimeoutSeconds } from './vendor/opencli/dist/src/browser/daemon-client.js';
-import { sendChatGPTMessage, uploadChatGPTImages } from './vendor/opencli/clis/chatgpt/utils.js';
+import { uploadChatGPTImages } from './vendor/opencli/clis/chatgpt/utils.js';
+import { OWNED_SEND_PROTOCOL, composerAdapterSha256, logicalComposerText, prepareOwnedComposer, clickOwnedComposer, observeOwnedSubmission } from './composer-transport.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 export const requestHash = request => sha(JSON.stringify(request));
@@ -81,12 +82,94 @@ function emptyCheckValid(check, saved) {
   return check.page===saved.page && ['https://chatgpt.com/','https://chatgpt.com/new'].includes(check.url)
     && check.accountKey===saved.accountKey && check.userCount===0 && check.assistantCount===0 && check.composerEmpty===true && check.generating===false;
 }
+function ownedTerminalJournal(saved, proof) {
+  if (!preSendJournal(saved) || saved.status!=='not_submitted' || Object.hasOwn(saved,'sendIntent')
+      || saved.ownedSend?.version!==OWNED_SEND_PROTOCOL || saved.ownedSend.token!==saved.requestId
+      || saved.ownedSend.adapterSha256!==proof.composerAdapterSha256) return false;
+  // This exception only reads an already-saved, strictly proven old terminal.
+  // ownedPreSendJournal remains current-only, so old unknowns cannot be settled.
+  return (proof.runtimeSha256===fs.readFileSync(new URL('./runtime.sha256',import.meta.url),'utf8').trim()
+      && proof.composerAdapterSha256===composerAdapterSha256)
+    || (proof.runtimeSha256==='f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70'
+      && proof.composerAdapterSha256==='0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65')
+    || (['54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0','afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6'].includes(proof.runtimeSha256)
+      && proof.composerAdapterSha256==='5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b');
+}
+export function ownedNewPagePreflight(observed, expected) {
+  const held=reason=>({ok:false,reason});
+  if(expected?.newPageVerified!==true || !expected.page || observed.page!==expected.page
+      || (observed.ownerToken!=null&&observed.ownerToken!==expected.requestId))return held('not_owned_new_page');
+  if(!['https://chatgpt.com/','https://chatgpt.com/new'].includes(observed.url))return held('not_new_conversation_url');
+  if(observed.userCount!==0||observed.assistantCount!==0)return held('existing_conversation');
+  if(observed.generating!==false)return held('page_generating');
+  if(observed.visibleComposers!==1)return held('composer_not_unique');
+  if(observed.embeddedChips!==0)return held('embedded_content_requires_review');
+  if(!expected.accountKey||observed.accountKey!==expected.accountKey)return held('account_changed');
+  if(observed.logical?.ok!==true||typeof observed.logical.text!=='string')return held('logical_text_unrecognized');
+  if(observed.logical.text==='')return{ok:true,mode:'empty'};
+  if(typeof expected.prompt==='string'&&expected.prompt&&observed.logical.text===expected.prompt)return{ok:true,mode:'exact_prompt_draft'};
+  return held('different_draft');
+}
+export function ownedNewPagePreflightCode() {
+  return `(()=>{const logicalComposerText=${logicalComposerText.toString()};const visible=n=>n instanceof HTMLElement&&n.getClientRects().length>0&&!n.closest('[hidden],[aria-hidden="true"]')&&getComputedStyle(n).display!=='none'&&getComputedStyle(n).visibility!=='hidden';const nodes=[...new Set([...document.querySelectorAll('#prompt-textarea,[data-testid="prompt-textarea"],[contenteditable="true"][role="textbox"]')])].filter(visible);const c=nodes.length===1?nodes[0]:null;return{url:location.href,userCount:document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message').length,assistantCount:document.querySelectorAll('[data-message-author-role=assistant]').length,generating:${activeCode},visibleComposers:nodes.length,embeddedChips:c?c.querySelectorAll('[contenteditable="false"]').length:null,ownerToken:c?c.getAttribute('data-director-owned-composer'):null,logical:c?logicalComposerText(c):{ok:false}};})()`;
+}
+export async function verifyOwnedNewPagePreflight(page,saved,loc,newPageVerified,identity=browserIdentity) {
+  const expected={newPageVerified,page:saved.page,requestId:saved.requestId,accountKey:saved.accountKey,prompt:saved.prompt};
+  for(let i=0;i<15;i++) {
+    const observed={...await page.evaluate(ownedNewPagePreflightCode()),page:page.getActivePage()};
+    if(observed.visibleComposers===1)observed.accountKey=(await identity(page)).accountKey;
+    const validation=ownedNewPagePreflight(observed,expected);
+    saved.preSendValidation={version:'owned-new-page-preflight/v1',page:observed.page,newPageVerified,url:observed.url,
+      userCount:observed.userCount,assistantCount:observed.assistantCount,generating:observed.generating,visibleComposers:observed.visibleComposers,embeddedChips:observed.embeddedChips,
+      accountVerified:observed.accountKey===expected.accountKey,logicalRecognized:observed.logical?.ok===true,
+      logicalUtf16:typeof observed.logical?.text==='string'?observed.logical.text.length:null,
+      logicalSha256:typeof observed.logical?.text==='string'?sha(observed.logical.text):null,expectedPromptSha256:sha(saved.prompt),...validation};
+    atomic(loc.file,saved);
+    if(validation.ok)return validation;
+    if(!newPageVerified||observed.visibleComposers!==0)throw error('EMPTY_PREFLIGHT',true);
+    if(i<14)await page.sleep(1);
+  }
+  throw error('EMPTY_PREFLIGHT',true);
+}
+function noOwnedProofSendMarkers(value, depth=0) {
+  if(depth>32)return false;
+  if(Array.isArray(value))return value.every(item=>noOwnedProofSendMarkers(item,depth+1));
+  if(value&&typeof value==='object')return Object.entries(value).every(([key,item])=>!['sentAt','sendConfirmed','sendIntent','conversationUrl'].includes(key)&&noOwnedProofSendMarkers(item,depth+1));
+  return true;
+}
 function notSubmittedResult(request,saved,loc) {
   const proof={...saved.notSubmittedProof,journalAfterSha256:sha(fs.readFileSync(loc.file))};
+  if (proof.version==='opencli-owned-pre-send-not-submitted/v2') {
+    if (!ownedTerminalJournal(saved,proof) || saved.requestId!==request.requestId || requestHash(saved.request)!==saved.requestHash || proof.requestId!==request.requestId || proof.requestHash!==saved.requestHash
+        || proof.sendProtocol!==OWNED_SEND_PROTOCOL || proof.clickIntentAbsent!==true || !noOwnedProofSendMarkers(proof)
+        || proof.sendMarkerAbsent!==true || proof.sendConfirmedAbsent!==true || proof.conversationUrlAbsent!==true
+        || proof.clickCalls!==0 || !/^[a-f0-9]{64}$/.test(proof.runtimeSha256||'') || !/^[a-f0-9]{64}$/.test(proof.journalBeforeSha256||'')
+        || proof.journalBeforeSha256===proof.journalAfterSha256 || proof.checks?.length!==2 || !proof.checks.every(c=>ownedCheckValid(c,saved))) throw error('OWNED_NO_CLICK_UNPROVEN');
+    return {taskId:request.requestId,status:'failed',resultUrls:[],error:'未提交：提示词或发送按钮准备未通过，已核实本程序没有调用发送；原记录保留。',raw:{transport:'opencli/v1',requestHash:saved.requestHash,opencliNotSubmitted:proof,taskSettlement:{id:request.requestId,status:'failed',reason:'not_submitted'}}};
+  }
   if (!preSendJournal(saved) || saved.status!=='not_submitted' || saved.requestId!==request.requestId || requestHash(saved.request)!==saved.requestHash || proof.requestId!==request.requestId || proof.requestHash!==saved.requestHash
       || proof.version!=='opencli-pre-send-not-submitted/v1' || !/^[a-f0-9]{64}$/.test(proof.runtimeSha256||'') || !/^[a-f0-9]{64}$/.test(proof.journalBeforeSha256||'') || proof.journalBeforeSha256===proof.journalAfterSha256
       || proof.sendMarkerAbsent!==true || proof.sendConfirmedAbsent!==true || proof.conversationUrlAbsent!==true || proof.checks?.length!==2 || !proof.checks.every(c=>emptyCheckValid(c,saved))) throw error('PRE_SEND_SETTLEMENT_UNPROVEN');
   return {taskId:request.requestId,status:'failed',resultUrls:[],error:'参考图片准备在发送提示词前中断，已核实未提交生成；可继续制作，原记录保留。',raw:{transport:'opencli/v1',requestHash:saved.requestHash,opencliNotSubmitted:proof,taskSettlement:{id:request.requestId,status:'failed',reason:'not_submitted'}}};
+}
+export function ownedPreSendJournal(saved) {
+  return preSendJournal(saved) && saved.ownedSend?.version===OWNED_SEND_PROTOCOL
+    && saved.ownedSend.adapterSha256===composerAdapterSha256 && saved.ownedSend.token===saved.requestId
+    && !Object.hasOwn(saved,'sendIntent');
+}
+const ownedCheckValid=(check,saved)=>check.page===saved.page && ['https://chatgpt.com/','https://chatgpt.com/new'].includes(check.url)
+  && check.accountKey===saved.accountKey && check.userCount===0 && check.assistantCount===0 && typeof check.composerEmpty==='boolean' && check.generating===false;
+export async function settleOwnedPreSendFailure(config,request,saved,loc,page,check=emptyCheck) {
+  if (!ownedPreSendJournal(saved) || !['preparing','submission_unknown'].includes(saved.status)) return null;
+  const before=fs.readFileSync(loc.file);checkIdentity(saved,request);
+  if(saved.requestId!==request.requestId||requestHash(saved.request)!==saved.requestHash)throw error('REQUEST_IDENTITY_CHANGED');
+  const checks=[await check(page,saved.page),await check(page,saved.page)];
+  if(!checks.every(c=>ownedCheckValid(c,saved))||!fs.readFileSync(loc.file).equals(before))return null;
+  const beforeSha=sha(before),archive=path.join(path.dirname(loc.file),`owned-pre-send-${beforeSha}.json`);
+  if(fs.existsSync(archive)){if(!fs.readFileSync(archive).equals(before))throw error('PRE_SEND_ARCHIVE_CHANGED');}else fs.writeFileSync(archive,before,{flag:'wx',mode:0o600});
+  saved.status='not_submitted';saved.settledAt=new Date().toISOString();
+  saved.notSubmittedProof={version:'opencli-owned-pre-send-not-submitted/v2',sendProtocol:OWNED_SEND_PROTOCOL,composerAdapterSha256,requestId:request.requestId,requestHash:saved.requestHash,runtimeSha256:config.runtimeSha256,journalBeforeSha256:beforeSha,journalBeforeArchive:path.basename(archive),sendMarkerAbsent:true,sendConfirmedAbsent:true,conversationUrlAbsent:true,clickIntentAbsent:true,clickCalls:0,page:saved.page,checks};
+  atomic(loc.file,saved);return notSubmittedResult(request,saved,loc);
 }
 export async function settlePreSendFailure(config,request,saved,loc,page,check=emptyCheck) {
   if (!preSendJournal(saved) || !['preparing','submission_unknown'].includes(saved.status)) return null;
@@ -205,7 +288,7 @@ function paths(config, id) {
   return { root, dir, file: path.join(dir, 'request.json'), active: path.join(root, 'active.json') };
 }
 function read(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-function activeOwner(loc, requestId) {
+export function activeOwner(loc, requestId) {
   if (!fs.existsSync(loc.active)) return;
   const active = read(loc.active);
   if (active.requestId === requestId) return;
@@ -224,22 +307,30 @@ async function submit(config, request) {
   const ready = await inspect(config,true); activeOwner(loc, request.requestId);
   // Rust holds the shared OS command lease; it releases automatically after a crash.
   // Only this brief local lock is removed; active.json deliberately survives unknown work.
-  let saved = { version: 'opencli-task/v1', requestId: request.requestId, requestHash: hash, request, profile: ready.profile, accountKey: ready.accountKey, prompt: webImagePrompt(request), status: 'preparing', createdAt: new Date().toISOString(), page: null, conversationUrl: null };
+  let saved = { version: 'opencli-task/v1', requestId: request.requestId, requestHash: hash, request, profile: ready.profile, accountKey: ready.accountKey, prompt: webImagePrompt(request), status: 'preparing', createdAt: new Date().toISOString(), page: null, conversationUrl: null, ownedSend:{version:OWNED_SEND_PROTOCOL,adapterSha256:composerAdapterSha256,token:request.requestId} };
+  let p;
   try {
     activeOwner(loc, request.requestId);
     fs.writeFileSync(loc.file, JSON.stringify(saved), { flag: 'wx', mode: 0o600 }); atomic(loc.active, { requestId: request.requestId, profile: ready.profile });
-    const p = session(ready.profile); saved.page = await p.newTab('https://chatgpt.com/new'); atomic(loc.file, saved); if (!saved.page) throw error('TAB_OPEN_UNKNOWN', true);
-    p.setActivePage(saved.page); let blank = false;
-    for (let i = 0; i < 15; i++) { blank = await p.evaluate(`(()=>{const c=document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea');return !!c&&!(c.innerText||'').trim()&&document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message').length===0;})()`); if (blank) break; await p.sleep(1); }
-    if (!blank || await p.evaluate(activeCode)) throw error('EMPTY_PREFLIGHT', true);
+    p = session(ready.profile); const priorPages=new Set((await p.tabs()).map(tab=>tab.page));
+    saved.page = await p.newTab('https://chatgpt.com/new'); atomic(loc.file, saved); if (!saved.page) throw error('TAB_OPEN_UNKNOWN', true);
+    p.setActivePage(saved.page);await verifyOwnedNewPagePreflight(p,saved,loc,!priorPages.has(saved.page));
     if (request.references.length) { const refs = [...request.references].sort((a,b) => a.order - b.order); const upload = await uploadChatGPTImages({setFileInput:()=>attachReferenceFiles(p,refs,request.requestId),evaluate:p.evaluate.bind(p),sleep:p.sleep.bind(p)},refs.map(r => r.path)); if (!upload?.ok) throw error('REFERENCE_UPLOAD_UNCONFIRMED', true); }
-    saved.status = 'send_dispatching'; saved.sentAt = new Date().toISOString(); atomic(loc.file, saved);
-    const sent = await sendChatGPTMessage(p, saved.prompt); if (!sent) throw error('SUBMISSION_UNKNOWN', true);
-    saved.status = 'processing'; saved.sendConfirmed = true;
-    const url = await p.evaluate('location.href'); if (stableConversation(url)) saved.conversationUrl = url;
+    await submitOwnedComposer(p,saved,loc);
     atomic(loc.file, saved); return { taskId: request.requestId, status: 'processing', resultUrls: [], raw: { transport: 'opencli/v1', requestHash: hash } };
-  } catch (e) { if (fs.existsSync(loc.file)) { saved.status = 'submission_unknown'; saved.error = e.code || 'OPENCLI_INTERRUPTED'; atomic(loc.file, saved); } throw error(e.code || 'SUBMISSION_UNKNOWN', true); }
+  } catch (e) { if (fs.existsSync(loc.file)) { saved.status = 'submission_unknown'; saved.error = e.code || 'OPENCLI_INTERRUPTED'; atomic(loc.file, saved);
+      if(p&&ownedPreSendJournal(saved)){try{const settled=await settleOwnedPreSendFailure(config,request,saved,loc,p);if(settled)return settled;}catch{/* No proof means the original task stays held. */}}
+    } throw error(e.code || 'SUBMISSION_UNKNOWN', true); }
   finally { /* Durable request and active owner remain for original-result recovery. */ }
+}
+export async function submitOwnedComposer(page,saved,loc) {
+  const gate=await prepareOwnedComposer(page,saved.prompt,saved.requestId);
+  saved.status='send_dispatching';saved.sentAt=new Date().toISOString();
+  saved.sendIntent={version:'owned-click-intent/v1',token:gate.token,promptSha256:gate.promptSha256,requestId:saved.requestId,requestHash:saved.requestHash,page:saved.page};
+  atomic(loc.file,saved);
+  await clickOwnedComposer(page,saved.prompt,gate,saved.sendIntent);
+  const observed=await observeOwnedSubmission(page,saved.prompt);
+  saved.status='processing';saved.sendConfirmed=true;saved.conversationUrl=observed.conversationUrl;
 }
 async function query(config, request) {
   validateRequest(request,false); const loc = paths(config, request.requestId);
@@ -248,7 +339,8 @@ async function query(config, request) {
   if (saved.status === 'downloaded') return { taskId: request.requestId, status: 'succeeded', resultUrls: saved.resultUrls, raw: saved.proof };
   if (saved.status === 'not_submitted') return notSubmittedResult(request,saved,loc);
   await health(config.profile); const p = session(saved.profile); p.setActivePage(saved.page);
-  if (preSendJournal(saved)) { const settled=await settlePreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
+  if (ownedPreSendJournal(saved)) { const settled=await settleOwnedPreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
+  else if (preSendJournal(saved)) { const settled=await settlePreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
   let url;
   try { url = await p.evaluate('location.href'); } catch { if (!stableConversation(saved.conversationUrl)) throw error('ORIGINAL_PAGE_UNAVAILABLE'); const page = await p.newTab(saved.conversationUrl); saved.page = page; p.setActivePage(page); atomic(loc.file, saved); await p.sleep(1); url = await p.evaluate('location.href'); }
   if (stableConversation(url)) { if (saved.conversationUrl && saved.conversationUrl !== url) throw error('CONVERSATION_CHANGED'); saved.conversationUrl = url; atomic(loc.file, saved); }
@@ -274,7 +366,7 @@ export async function dispatch(input) {
   if (operation === 'status' || operation === 'connect') setDaemonCommandTimeoutSeconds(8);
   if (operation === 'status') return inspect(config,false);
   if (operation === 'connect') {await ensureLocalService();return connectAvailable(config);}
-  if (operation === 'prepare') { validateRequest(request); const ready=await inspect(config,true); const loc=paths(config,request.requestId); activeOwner(loc,request.requestId); return { ...ready, requestHash:requestHash(request) }; }
+  if (operation === 'prepare') { validateRequest(request); const ready=await inspect(config,true); const loc=paths(config,request.requestId); activeOwner(loc,request.requestId); return { ...ready, requestHash:requestHash(request), sendProtocol:OWNED_SEND_PROTOCOL, composerAdapterSha256 }; }
   if (operation === 'submit') return submit(config,request);
   if (operation === 'query') return query(config,request);
   if (operation === 'cleanup') {

@@ -8,6 +8,11 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 #[path = "workflow_retry_progress.rs"]
 mod retry_progress;
+#[path = "workflow_refinement_continuity.rs"]
+pub(crate) mod refinement_continuity;
+pub(crate) fn verify_refinement_continuity_history(c: &Connection, input: &Value) -> Result<()> {
+    refinement_continuity::verify_history_for_input(c, input)
+}
 
 fn has_steps(store: &Store) -> Result<bool> {
     store.conn()?.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_steps')",[],|r|r.get(0)).map_err(|e|e.to_string())
@@ -1647,12 +1652,13 @@ impl Store {
                 .map(|row| parse(row.map_err(|e| e.to_string())?))
                 .collect::<Result<Vec<_>>>()?;
             drop(query);
-            let receipt = json!({"version":"storyboard-refinement-adoption/v1","workflowId":adoption.run,
+            let mut receipt = json!({"version":"storyboard-refinement-adoption/v1","workflowId":adoption.run,
                 "candidateSha256":adoption.expected_candidate_sha,"sourceSha256":candidate["sourceSha256"],"episodeId":episode,
                 "domainRequestSha256":candidate["domainRequestSha256"],"deliverySha256":delivery_sha,
                 "acceptedPlanContext":candidate["acceptedContext"],"adoptedUnits":adopted_units,
                 "unitBindings":adopted_units.iter().map(|unit|json!({"unitId":unit["id"],"unitVersion":unit["version"],"unitSha256":crate::pipeline::digest(&unit.to_string())})).collect::<Vec<_>>(),
                 "fantasyRealization":candidate["draft"]["fantasyRealization"],"ruleReceipt":candidate["ruleReceipt"],"adoptedAt":now()});
+            if let Some(packet)=candidate.get(crate::pipeline::storyboard_refinement_identity::FIELD){receipt[crate::pipeline::storyboard_refinement_identity::FIELD]=packet.clone();}
             prepared["refinementAdoption"] = receipt.clone();
             let changed=tx.execute("UPDATE jobs SET prepared=?1,updated_at=?2 WHERE id=?3 AND kind='workflow' AND entity_id='storyboard.refine' AND state='completed' AND result=?4",
                 params![prepared.to_string(),now(),adoption.run,candidate_raw]).map_err(|e|e.to_string())?;

@@ -3,17 +3,23 @@
 use super::*;
 
 struct Fixture {
-    temp: tempfile::TempDir,
+    _temp: tempfile::TempDir,
+    attempt_directory: PathBuf,
     plan: RuntimePlan,
     record: Value,
     prompt: String,
 }
 impl Fixture {
     fn new(recovery: bool) -> Self {
+        Self::with_padding(recovery, "")
+    }
+    fn with_padding(recovery: bool, padding: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let runtime = temp.path().join("sdk-worker/attempt-synthetic/native-runtime");
+        let attempt_directory = temp.path().join(padding).join("sdk-worker/attempt-synthetic");
+        let runtime = attempt_directory.join("native-runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         let mut plan = super::tests::plan(&runtime);
+        plan.identity.resource_directory = Some(node_path_argument(&std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../sdk-bridge")).unwrap()).unwrap().to_string_lossy().into_owned());
         let actual_sha = crate::store::hash_file(&std::env::current_exe().unwrap()).unwrap().0;
         plan.identity.supervisor_sha256 = Some(actual_sha.clone());
         plan.identity.runtime_sha256 = Some(actual_sha.clone());
@@ -57,9 +63,39 @@ impl Fixture {
             record["state"] = json!("dispatching"); record["error"] = Value::Null;
             record["preDispatchRecovery"] = json!({"proof":proof,"effectiveIdentity":effective});
         }
-        Self { temp, plan, record, prompt: compiled.prompt }
+        Self { _temp: temp, attempt_directory, plan, record, prompt: compiled.prompt }
     }
-    fn attempt_dir(&self) -> PathBuf { self.temp.path().join("sdk-worker/attempt-synthetic") }
+    fn attempt_dir(&self) -> PathBuf { self.attempt_directory.clone() }
+    fn schema_recovery() -> Self {
+        let mut f=Self::with_padding(false,&"x".repeat(190));let dir=f.attempt_dir();let runtime=dir.join("native-runtime");
+        let schema=std::fs::read(runtime.join("tmp/schema.json")).unwrap();std::fs::remove_file(runtime.join("tmp/schema.json")).unwrap();
+        std::fs::write(runtime.join("work/.director-text-root"),"director SDK text execution\n").unwrap();
+        std::fs::write(runtime.join("runtime-plan.json"),serde_json::to_string(&f.plan).unwrap()).unwrap();
+        let template=node_path_argument(&node_state_path_argument(&runtime.join("tmp").join("codex-output-schema-XXXXXX")).unwrap()).unwrap();
+        f.record["state"]=json!("submission_unknown");f.record["error"]=json!({"code":"ENOENT","message":format!("ENOENT: no such file or directory, mkdtemp '{}'",template.to_string_lossy())});
+        let original=seal(&f.record);std::fs::write(dir.join("receipt.json"),&original).unwrap();
+        let mut public=json!({"attemptId":f.plan.attempt_id,"semanticRequestHash":f.plan.semantic_request_hash,"executionFingerprint":f.plan.execution_fingerprint,
+            "attemptEnvelopeHash":f.record["attempt"]["attemptEnvelopeHash"],"compiledPromptSha256":f.plan.compiled_prompt_sha256,"compiledSchemaSha256":f.plan.compiled_schema_sha256,
+            "state":"dispatching","error":null,"threadId":null,"turnId":null,"lastSequence":0,"rawResult":null,"usage":null});
+        let ack=json!({"attemptId":f.plan.attempt_id,"requestId":"schema_1","protocolVersion":PROTOCOL,"ok":true,"result":public});
+        public["state"]=f.record["state"].clone();public["error"]=f.record["error"].clone();public["requestId"]=json!("schema_1");public["protocolVersion"]=json!(PROTOCOL);
+        let events=json!([{"id":1,"type":"sdk_dispatch_receipt","data":ack},{"id":2,"type":"sdk_observation","data":public},
+            {"id":3,"type":"sdk_process_tree","data":{"processTreeStopProven":true,"activeProcesses":0,"totalProcesses":2}},
+            {"id":4,"type":"sdk_stderr","data":{"bytes":0,"retainedBytes":0,"truncated":false}}]);
+        let mut attempt:FrozenAttempt=serde_json::from_value(f.record["attempt"].clone()).unwrap();attempt.begin_dispatch(Backend::CodexSdk).unwrap();
+        attempt.state=crate::text_transport::AttemptState::SubmissionUnknown;attempt.last_sequence=1;
+        let evidence=schema_preparation_evidence(dir.parent().unwrap().parent().unwrap(),&attempt,&events).unwrap();let effective=json!(f.plan.identity);
+        let proof=json!({"version":"sdk-schema-preparation-recovery/v1","attemptId":attempt.attempt_id,"attemptEnvelopeHash":attempt.attempt_envelope_hash,
+            "controllerSha256":schema_controller_sha256(),"originalReceiptSha256":evidence["originalReceiptSha256"],"originalReceiptSeal":evidence["originalReceiptSeal"],
+            "runtimeInventorySha256":evidence["runtimeInventorySha256"],"evidenceSha256":digest(&evidence.to_string()),"effectiveIdentitySha256":digest(&effective.to_string()),
+            "sdkEvents":0,"processTreeStopProven":true,"beforeOfficialRuntimeSpawn":true});
+        std::fs::write(dir.join("schema-preparation-original.json"),original).unwrap();std::fs::write(dir.join("schema-preparation-evidence.json"),evidence.to_string()).unwrap();
+        std::fs::write(dir.join("schema-preparation-recovery.json"),proof.to_string()).unwrap();
+        f.record["state"]=json!("dispatching");f.record["error"]=Value::Null;f.record["schemaPreparationRecovery"]=json!({"proof":proof,"effectiveIdentity":effective});
+        let new=dir.join("native-runtime-schema-recovery");std::fs::create_dir_all(new.join("tmp")).unwrap();std::fs::create_dir(new.join("work")).unwrap();
+        std::fs::write(new.join("tmp/schema.json"),schema).unwrap();std::fs::write(new.join("work/.director-text-root"),"director SDK text execution\n").unwrap();
+        f.plan.working_directory=canonical(&new.join("work")).unwrap();f.plan.temp_directory=canonical(&new.join("tmp")).unwrap();f
+    }
     fn repair() -> Self {
         let mut f=Self::new(true);let effective=json!(f.plan.identity);
         let mut prior=effective.clone();prior["bridgeSha256"]=json!(WRAPPER_FAILED_BRIDGE_SHA);prior["supervisorSha256"]=json!(WRAPPER_FAILED_SUPERVISOR_SHA);
@@ -88,6 +124,51 @@ impl Fixture {
             Ok(0)
         })
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_schema_wrapper_accepts_one_bound_recovery_and_rejects_changed_archive_proof_or_runtime() {
+    let mut f=Fixture::schema_recovery();let dir=f.attempt_dir();let mut launches=0;
+    let paths=["schema-preparation-original.json","schema-preparation-evidence.json","schema-preparation-recovery.json","native-runtime/runtime-plan.json"];
+    let original:Vec<_>=paths.iter().map(|p|std::fs::read(dir.join(p)).unwrap()).collect();let saved=f.record.clone();
+    assert_eq!(f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches).unwrap(),0);assert_eq!(launches,1);
+    for fault in ["archive","evidence","intent","runtime","controller","identity","request"] {
+        match fault {
+            "archive"=>std::fs::write(dir.join(paths[0]),"{}").unwrap(),"evidence"=>std::fs::write(dir.join(paths[1]),"{}").unwrap(),
+            "intent"=>std::fs::write(dir.join(paths[2]),"{}").unwrap(),"runtime"=>std::fs::write(dir.join(paths[3]),"{}").unwrap(),
+            "controller"=>f.record["schemaPreparationRecovery"]["proof"]["controllerSha256"]=json!("f".repeat(64)),
+            "identity"=>f.record["schemaPreparationRecovery"]["effectiveIdentity"]["accountFingerprint"]=json!("f".repeat(64)),
+            "request"=>f.record["attempt"]["request"]["model"]=json!("other"),_=>unreachable!(),
+        }
+        assert!(f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches).is_err(),"{fault}");assert_eq!(launches,1,"{fault}");
+        f.record=saved.clone();for (p,b) in paths.iter().zip(&original){std::fs::write(dir.join(p),b).unwrap();}
+    }
+    for (p,b) in paths.iter().zip(original){assert_eq!(std::fs::read(dir.join(p)).unwrap(),b);}
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_native_wrapper_full_validation_accepts_owned_long_namespaced_schema_and_rejects_escape() {
+    let mut f = Fixture::with_padding(false, &"x".repeat(190));
+    f.plan.working_directory = canonical(&f.plan.working_directory).unwrap();
+    f.plan.temp_directory = canonical(&f.plan.temp_directory).unwrap();
+    let schema = canonical(&f.plan.temp_directory.join("schema.json")).unwrap();
+    assert!(schema.to_string_lossy().starts_with(r"\\?\"));
+    assert!(f.plan.temp_directory.join("schema.json").to_string_lossy().len() > 260);
+    let mut args = super::tests::args(&f.plan);
+    args[10] = schema.to_string_lossy().into_owned();
+    let original_attempt = f.record["attempt"].clone();
+    let mut launches = 0;
+    assert_eq!(f.run(&args, f.prompt.as_bytes(), &mut launches).unwrap(), 0);
+    assert_eq!(launches, 1);
+    assert_eq!(f.record["attempt"], original_attempt);
+
+    let outside = f.attempt_dir().join("foreign-schema.json");
+    std::fs::copy(&schema, &outside).unwrap();
+    args[10] = canonical(&outside).unwrap().to_string_lossy().into_owned();
+    assert!(f.run(&args, f.prompt.as_bytes(), &mut launches).is_err());
+    assert_eq!(launches, 1, "a namespaced spelling must not bypass containment");
 }
 
 #[cfg(windows)]

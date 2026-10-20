@@ -6,6 +6,9 @@ use crate::text_transport::FrozenAttempt;
 const POLICY: &str = "sdk-new-node-supervisor-handoff/v1";
 const FIRST_NODE_POLICY: &str = "sdk-first-node-supervisor-handoff/v1";
 const LOCAL_RECOVERY_POLICY: &str = "sdk-new-node-local-recovery-handoff/v1";
+const REJECTED_PLAN_POLICY: &str = "sdk-rejected-plan-repair-handoff/v1";
+#[path = "text_executor_sdk_rejected_plan_handoff.rs"]
+mod rejected_plan;
 const FIELD: &str = "sdkSupervisorHandoff";
 const HELD: &str =
     "SDK_SUPERVISOR_HANDOFF_HELD: 新节点交接证据不足或原节点已存在；保留原请求、回包和预算，不重发";
@@ -41,7 +44,7 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
-    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY || proof["policy"] == FIRST_NODE_POLICY)
+    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY || proof["policy"] == FIRST_NODE_POLICY || proof["policy"] == REJECTED_PLAN_POLICY)
         && proof["sha256"] == hash(&unsigned)
         && proof["workflowId"] == run
         && proof["nodeKey"] == key
@@ -68,6 +71,10 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
         })
         && if proof["policy"] == FIRST_NODE_POLICY {
             proof["predecessor"] == first_node_evidence(run)
+        } else if proof["policy"] == REJECTED_PLAN_POLICY {
+            request.stage == "storyboardPlan" && request.skill == "episode-emotion-planner"
+                && request.input["planRepair"]["version"] == "rejected-plan-repair/v1"
+                && proof["predecessor"].as_object().is_some_and(|p|p.len()==16)
         } else { proof["predecessor"].as_object().is_some_and(|p| p.len() == 14) }
 }
 
@@ -154,7 +161,7 @@ fn predecessor(
         "rawEventId":event_id,"rawEventDataSha256":crate::pipeline::digest(&event_data)}),
     ))
 }
-fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value) -> Result<bool> {
+fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value, snapshot: &Value) -> Result<bool> {
     if proof["policy"] == FIRST_NODE_POLICY {
         // The absence proof is checked before reservation. After reservation,
         // bind the original first step, allowing later steps without re-sending.
@@ -162,6 +169,9 @@ fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value) -> 
             "SELECT EXISTS(SELECT 1 FROM workflow_steps first WHERE first.workflow_id=?1 AND first.node_key=?2 AND NOT EXISTS(SELECT 1 FROM workflow_steps older WHERE older.workflow_id=first.workflow_id AND older.rowid<first.rowid))",
             params![s(proof,"workflowId"),s(proof,"nodeKey")], |r| r.get(0),
         ).map_err(|e|e.to_string());
+    }
+    if proof["policy"] == REJECTED_PLAN_POLICY {
+        return Ok(rejected_plan::predecessor(store,c,s(proof,"workflowId"),snapshot)? == proof["predecessor"]);
     }
     Ok(predecessor(
         store,
@@ -264,6 +274,10 @@ impl SavedTextExecutor {
     fn sdk_handoff_predecessor(&self, original: &Value, local_recovery: bool) -> Result<(&'static str, Value)> {
         let run=self.workflow_id.as_deref().ok_or(HELD)?;
         let c=self.store.conn()?;
+        if original["input"].get("planRepair").is_some() {
+            if local_recovery { return Err(HELD.into()); }
+            return Ok((REJECTED_PLAN_POLICY,rejected_plan::predecessor(&self.store,&c,run,original)?));
+        }
         let previous_key: Option<String> = c.query_row("SELECT w.node_key FROM workflow_steps w JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.state='accepted' AND j.kind='text' AND j.provider='codex_sdk' AND j.state='completed' ORDER BY w.updated_at DESC,w.rowid DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let Some(previous_key)=previous_key else {
             if local_recovery { return Err(HELD.into()); }
@@ -323,7 +337,7 @@ impl SavedTextExecutor {
             || prepared[FIELD] != saved[FIELD]
             || !proof_valid(&saved, &self.settings, run, &step_key(request))
             || !parent_bound(&c, &saved[FIELD], &self.settings)?
-            || !predecessor_bound(&self.store, &c, &saved[FIELD])?
+            || !predecessor_bound(&self.store, &c, &saved[FIELD], &saved)?
             || created.as_deref() != Some(saved[FIELD].to_string().as_str())
         {
             return Err(HELD.into());
@@ -449,7 +463,7 @@ impl Store {
         }
         if proof["policy"]==FIRST_NODE_POLICY {
             first_node_absent(self,&tx,run)?;
-        } else if !predecessor_bound(self,&tx,proof)? { return Err(HELD.into()); }
+        } else if !predecessor_bound(self,&tx,proof,snapshot)? { return Err(HELD.into()); }
         if proof["policy"] == LOCAL_RECOVERY_POLICY {
             let prior = executor.sdk_job(s(&proof["predecessor"],"jobId"))?;
             executor.sdk_raw(&prior,&prior["snapshot"])?;
@@ -478,6 +492,7 @@ mod tests {
     use super::*;
     use crate::text_transport::{AttemptState, Backend};
     use sha2::{Digest, Sha256};
+    include!("text_executor_sdk_rejected_plan_handoff_tests.rs");
 
     fn resource_names() -> [&'static str; 9] {
         [

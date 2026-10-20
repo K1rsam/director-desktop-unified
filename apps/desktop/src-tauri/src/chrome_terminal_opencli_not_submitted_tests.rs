@@ -23,6 +23,62 @@ fn fixture() -> Value {
                 "taskSettlement":{"id":id,"status":"failed","reason":"not_submitted"}}}})
 }
 
+fn owned_fixture() -> Value {
+    let mut job=fixture();
+    let adapter=crate::pipeline::digest(include_str!("../../../../web-image-bridge/composer-transport.mjs"));
+    job["prepared"]["wire"]["sendProtocol"]=json!("owned-composer-send/v2");
+    job["prepared"]["wire"]["composerAdapterSha256"]=json!(adapter);
+    let proof=&mut job["result"]["raw"]["opencliNotSubmitted"];
+    proof["version"]=json!("opencli-owned-pre-send-not-submitted/v2");
+    proof["sendProtocol"]=json!("owned-composer-send/v2");proof["composerAdapterSha256"]=json!(adapter);
+    proof["clickIntentAbsent"]=json!(true);proof["clickCalls"]=json!(0);
+    for check in proof["checks"].as_array_mut().unwrap(){check["composerEmpty"]=json!(false);}
+    job
+}
+
+#[test]
+fn opencli_owned_prior_exact_no_click_terminal_survives_upgrade_but_never_converts_an_unknown() {
+    for (prior,adapter) in [
+        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70","0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65"),
+        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
+        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
+    ] {
+    let mut job=owned_fixture();
+    job["snapshot"]["providerConfig"]["browserTransport"]["runtimeSha256"]=json!(prior);
+    job["prepared"]["wire"]["composerAdapterSha256"]=json!(adapter);
+    job["result"]["raw"]["opencliNotSubmitted"]["runtimeSha256"]=json!(prior);
+    job["result"]["raw"]["opencliNotSubmitted"]["composerAdapterSha256"]=json!(adapter);
+    assert!(settled_job(&job));
+    for (pointer,value) in [
+        ("/status",json!("submission_unknown")),("/result/status",json!("unknown")),
+        ("/prepared/wire/sendProtocol",json!("legacy")),
+        ("/result/raw/opencliNotSubmitted/clickIntentAbsent",json!(false)),
+        ("/result/raw/opencliNotSubmitted/clickCalls",json!(1)),
+        ("/result/raw/opencliNotSubmitted/composerAdapterSha256",json!("0".repeat(64))),
+        ("/snapshot/providerConfig/browserTransport/runtimeSha256",json!("0".repeat(64))),
+    ] {let mut changed=job.clone();*changed.pointer_mut(pointer).unwrap()=value;assert!(!settled_job(&changed),"{pointer}");}
+    for key in ["sentAt","sendConfirmed","sendIntent","conversationUrl"] {
+        let mut changed=job.clone();changed["result"]["raw"][key]=Value::Null;assert!(!settled_job(&changed),"{key}");
+    }
+    }
+}
+
+#[test]
+fn opencli_owned_no_click_partial_composer_requires_frozen_protocol_and_exact_adapter() {
+    let original=owned_fixture();assert!(settled_job(&original));
+    for (pointer,value) in [
+        ("/prepared/wire/sendProtocol",json!("legacy")),
+        ("/prepared/wire/composerAdapterSha256",json!("0".repeat(64))),
+        ("/result/raw/opencliNotSubmitted/composerAdapterSha256",json!("0".repeat(64))),
+        ("/result/raw/opencliNotSubmitted/clickIntentAbsent",json!(false)),
+        ("/result/raw/opencliNotSubmitted/clickCalls",json!(1)),
+        ("/result/raw/opencliNotSubmitted/checks/0/userCount",json!(1)),
+        ("/result/raw/opencliNotSubmitted/checks/1/accountKey",json!("other")),
+    ] {let mut job=original.clone();*job.pointer_mut(pointer).unwrap()=value;assert!(!settled_job(&job),"{pointer}");}
+    let mut legacy=original.clone();legacy["result"]["raw"]["opencliNotSubmitted"]["version"]=json!("opencli-pre-send-not-submitted/v1");assert!(!settled_job(&legacy));
+    for key in ["sentAt","sendConfirmed","conversationUrl","sendIntent"] {let mut job=original.clone();job["result"]["raw"][key]=Value::Null;assert!(!settled_job(&job),"{key}");}
+}
+
 fn migrated_fixture() -> Value {
     let mut job = fixture();
     let from = "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2";
@@ -35,6 +91,19 @@ fn migrated_fixture() -> Value {
         "frozenConfigSha256":crate::pipeline::digest(&job["snapshot"]["providerConfig"].to_string()),
         "generationRequestSha256":crate::pipeline::digest(&job["prepared"]["request"].to_string())});
     job
+}
+
+#[test]
+fn opencli_saved_historical_reader_audit_retains_terminal_proof_without_new_migration_permission() {
+    for prior in ["f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70","54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0","afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6"] {
+    let mut job=migrated_fixture();
+    job["result"]["raw"]["readerMigration"]["toRuntimeSha256"]=json!(prior);
+    job["result"]["raw"]["opencliNotSubmitted"]["runtimeSha256"]=json!(prior);
+    assert!(settled_job(&job));
+    let mut unknown=job.clone();unknown["status"]=json!("submission_unknown");assert!(!settled_job(&unknown));
+    let mut send=job.clone();send["result"]["raw"]["sentAt"]=json!(0);assert!(!settled_job(&send));
+    let mut changed=job;changed["result"]["raw"]["readerMigration"]["bridgeOperation"]=json!("submit");assert!(!settled_job(&changed));
+    }
 }
 
 #[test]

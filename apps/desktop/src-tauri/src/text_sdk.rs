@@ -32,6 +32,9 @@ pub(crate) use passive::historical_receipt;
 #[path = "text_sdk_local_recovery.rs"]
 mod local_recovery;
 pub(crate) use local_recovery::{local_preparation_evidence, local_recovery_identity_bound, recovered_receipt_bound, LOCAL_PATH_BRIDGE_SHA};
+#[path = "text_sdk_schema_recovery.rs"]
+mod schema_recovery;
+pub(crate) use schema_recovery::{schema_preparation_evidence, schema_recovery_identity_bound, schema_recovered_receipt_bound, schema_recovery_record_bound};
 #[path = "text_sdk_wrapper_repair.rs"]
 mod wrapper_repair;
 pub(crate) use wrapper_repair::{wrapper_preparation_evidence, repaired_receipt_bound, wrapper_repair_record_bound, WRAPPER_FAILED_BRIDGE_SHA, WRAPPER_FAILED_SUPERVISOR_SHA};
@@ -43,6 +46,14 @@ pub(crate) async fn prepare_local_recovery_handoff(settings: &Value) -> Result<S
 pub(crate) fn verify_local_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
     native::verify_local_recovery_bytes(old, new, hashes)
 }
+pub(crate) async fn prepare_schema_recovery_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    native::prepare_schema_recovery_handoff(settings).await
+}
+pub(crate) fn verify_schema_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    native::verify_schema_recovery_bytes(old,new,hashes)
+}
+const SCHEMA_CONTROLLER: &str = include_str!("../../../../sdk-bridge/src/schema-preparation-controller.mjs");
+pub(crate) fn schema_controller_sha256() -> String {digest(SCHEMA_CONTROLLER)}
 pub use native::{enable_native_execution, native_execution_enabled, run_runtime_wrapper};
 const FRAME_LIMIT: usize = 1_048_576;
 const EVENT_LIMIT: usize = 2048;
@@ -277,6 +288,41 @@ pub(crate) fn node_path_argument(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Node's script loader needs ordinary paths, while fs.mkdtemp in the pinned
+/// SDK needs extended Windows data paths at MAX_PATH. Preserve the same physical
+/// worker directory without canonicalizing through a caller-supplied symlink.
+/// The unchanged bridge still owns its lock, attempt checks and frozen plan.
+pub(crate) fn node_state_path_argument(path: &Path) -> Result<PathBuf> {
+    let regular = node_path_argument(path)?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut parts = regular.components();
+        let mut extended = match parts.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) => PathBuf::from(format!(r"\\?\{}:\", char::from(drive))),
+                Prefix::UNC(server, share) => {
+                    let mut value = std::ffi::OsString::from(r"\\?\UNC\");
+                    value.push(server);
+                    value.push("\\");
+                    value.push(share);
+                    PathBuf::from(value)
+                }
+                _ => return Err("SDK_PATH_IDENTITY: worker 数据路径不是磁盘或UNC路径".into()),
+            },
+            _ => return Err("SDK_PATH_IDENTITY: worker 数据路径缺少卷标".into()),
+        };
+        for part in parts {
+            if let Component::Normal(value) = part {
+                extended.push(value);
+            }
+        }
+        Ok(extended)
+    }
+    #[cfg(not(windows))]
+    Ok(regular)
+}
+
 #[cfg(windows)]
 pub(crate) fn node_system_root() -> Result<PathBuf> {
     let root = std::env::var_os("SystemRoot")
@@ -474,15 +520,31 @@ struct Worker {
 }
 impl Worker {
     async fn spawn(config: &Config) -> Result<Self> {
+        Self::spawn_entry(config,false).await
+    }
+    async fn spawn_entry(config: &Config, schema_recovery: bool) -> Result<Self> {
         config.verify()?;
         std::fs::create_dir_all(&config.state).map_err(|e| e.to_string())?;
+        let entry = if schema_recovery {
+            use std::io::Write;
+            let metadata=std::fs::symlink_metadata(&config.state).map_err(|e|e.to_string())?;
+            if !metadata.is_dir() || metadata.is_symlink() {return Err("SDK_SCHEMA_CONTROLLER_DIRECTORY".into());}
+            let file=config.state.join(format!("schema-controller-{}.mjs",schema_controller_sha256()));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+                Ok(mut handle)=>{handle.write_all(SCHEMA_CONTROLLER.as_bytes()).map_err(|e|e.to_string())?;handle.sync_all().map_err(|e|e.to_string())?;},
+                Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e.to_string()),
+            }
+            let m=std::fs::symlink_metadata(&file).map_err(|e|e.to_string())?;
+            if !m.is_file() || m.is_symlink() || crate::store::hash_file(&file)?.0!=schema_controller_sha256() {return Err("SDK_SCHEMA_CONTROLLER_CHANGED".into());}
+            file
+        } else {config.bridge.clone()};
         // No inherited NODE_OPTIONS, HOME, credential, proxy, PATH or config variables.
         let mut command = tokio::process::Command::new(&config.node);
         command
             .arg("--max-old-space-size=192")
-            .arg(node_path_argument(&config.bridge)?)
+            .arg(node_path_argument(&entry)?)
             .arg("--state-dir")
-            .arg(node_path_argument(&config.state)?)
+            .arg(node_state_path_argument(&config.state)?)
             .env_clear()
             .current_dir(&config.state)
             .stdin(Stdio::piped())
@@ -724,9 +786,14 @@ impl OfficialSdkTransport {
     pub(crate) async fn recover_local_preparation(&self, attempt: &FrozenAttempt, proof: &Value) -> Result<Observation> {
         self.execute_method(attempt, Some(proof)).await
     }
+    pub(crate) async fn recover_schema_preparation(&self, attempt: &FrozenAttempt, proof: &Value, evidence: &Value) -> Result<Observation> {
+        self.execute_method(attempt,Some(&json!({"proof":proof,"evidence":evidence}))).await
+    }
     async fn execute_method(&self, attempt: &FrozenAttempt, recovery: Option<&Value>) -> Result<Observation> {
         attempt.validate_identity()?;
-        if attempt.backend != Backend::CodexSdk || if recovery.is_some() { !local_recovery_identity_bound(&attempt.runtime_identity, &self.config.identity) } else { attempt.runtime_identity != self.config.identity }
+        let schema_recovery=recovery.is_some_and(|r|r["proof"]["version"]==schema_recovery::SCHEMA_RECOVERY_VERSION);
+        if attempt.backend != Backend::CodexSdk || if schema_recovery { !schema_recovery_identity_bound(&attempt.runtime_identity,&self.config.identity) }
+            else if recovery.is_some() { !local_recovery_identity_bound(&attempt.runtime_identity, &self.config.identity) } else { attempt.runtime_identity != self.config.identity }
         {
             return Err("SDK_ATTEMPT_IDENTITY".into());
         }
@@ -739,9 +806,14 @@ impl OfficialSdkTransport {
             *active = Some(attempt.attempt_id.clone());
         }
         let mut worker = self.worker.lock().await;
-        self.connect(&mut worker).await?;
+        if schema_recovery {
+            if worker.is_some(){return Err("SDK_SCHEMA_CONTROLLER_ALREADY_CONNECTED".into());}
+            *worker=Some(Worker::spawn_entry(&self.config,true).await?);
+        } else {self.connect(&mut worker).await?;}
         let worker = worker.as_mut().unwrap();
-        let (method, params) = if let Some(proof) = recovery {
+        let (method, params) = if schema_recovery {
+            ("recover-schema-preparation",recovery.unwrap().clone())
+        } else if let Some(proof) = recovery {
             (if proof["version"] == "sdk-wrapper-preparation-repair/v1" {"repair-wrapper-preparation"} else {"recover-local-preparation"}, json!({"proof":proof}))
         } else {
             ("execute", json!({"attempt":attempt,"compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,
@@ -997,6 +1069,9 @@ mod tests {
                 node_path_argument(Path::new(regular)).unwrap(),
                 Path::new(regular)
             );
+            assert_eq!(node_state_path_argument(Path::new(regular)).unwrap(), Path::new(verbatim));
+            assert_eq!(node_state_path_argument(Path::new(verbatim)).unwrap(), Path::new(verbatim));
+            assert_eq!(node_state_path_argument(Path::new(&regular.replace('\\', "/"))).unwrap(), Path::new(verbatim));
         }
         for invalid in [
             r"relative.mjs",
@@ -1005,6 +1080,7 @@ mod tests {
             r"\\?\GLOBALROOT\Device\sdk",
         ] {
             assert!(node_path_argument(Path::new(invalid)).is_err(), "{invalid}");
+            assert!(node_state_path_argument(Path::new(invalid)).is_err(), "{invalid}");
         }
     }
 

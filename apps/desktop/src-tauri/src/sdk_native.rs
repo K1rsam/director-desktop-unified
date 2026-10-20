@@ -103,7 +103,9 @@ pub(super) async fn resolve(settings: &Value) -> Result<Value> {
     }
     let (node, node_sha, node_version, resources) =
         crate::readiness_sdk::native_components(settings, &native.resources).await?;
-    let inspected = crate::text_cli::readiness_status(settings).await;
+    // Execution needs one fresh account/catalog inspection. Settings' separate
+    // local --version fallback is useful to users but duplicates this preflight.
+    let inspected = crate::text_cli::status(settings,true).await;
     crate::text_cli::validate_selection(&inspected, model, reasoning)?;
     if inspected["loggedIn"] != true || !inspected["account"].is_object() {
         return Err("SDK_ACCOUNT_NOT_VERIFIED".into());
@@ -267,6 +269,21 @@ pub(super) fn verify_local_recovery_bytes(old: &Value, new: &Value, hashes: &Val
     let bridge = digest(&format!("{}{}{}", std::fs::read_to_string(root.join("src/main.mjs")).map_err(|e|e.to_string())?,std::fs::read_to_string(root.join("src/bridge.mjs")).map_err(|e|e.to_string())?,std::fs::read_to_string(root.join("src/native-runtime.mjs")).map_err(|e|e.to_string())?));
     if bridge != compiled_native_bridge_sha() || hashes["node_modules/@openai/codex-sdk/dist/index.js"] != SDK_IMPLEMENTATION_SHA { return Err("SDK_LOCAL_RECOVERY_PACKAGE_CHANGED".into()); }
     Ok(())
+}
+pub(super) async fn prepare_schema_recovery_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    let old=identity(settings)?;let resolved=resolve(settings).await?;let new=identity(&resolved)?;
+    let hashes=handoff_resource_hashes(Path::new(s(&new,"resourceDirectory")))?;
+    verify_schema_recovery_bytes(&old,&new,&hashes)?;
+    Ok(SupervisorHandoff{identity:new,resource_hashes:hashes})
+}
+pub(super) fn verify_schema_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    if !schema_recovery_identity_bound(old,new) || handoff_resource_hashes(Path::new(s(old,"resourceDirectory")))?!=*hashes
+        || handoff_resource_hashes(Path::new(s(new,"resourceDirectory")))?!=*hashes {return Err("SDK_SCHEMA_RECOVERY_IDENTITY_CHANGED".into());}
+    for identity in [old,new] {
+        for (field,sha) in [("nodeExecutable","nodeSha256"),("runtimeExecutable","runtimeSha256"),("supervisorExecutable","supervisorSha256")] {
+            if crate::store::hash_file(Path::new(s(identity,field)))?.0!=s(identity,sha) {return Err("SDK_SCHEMA_RECOVERY_BYTES_CHANGED".into());}
+        }
+    }Ok(())
 }
 pub(super) async fn add_readiness(settings: &Value, result: &mut Value) {
     let inspected = crate::text_cli::readiness_status(settings).await;
@@ -512,7 +529,7 @@ fn run_runtime_wrapper_plan(
     }
     let root = canonical(file.parent().unwrap())?;
     if file.file_name().and_then(|s| s.to_str()) != Some("runtime-plan.json")
-        || ![Some("native-runtime"), Some("native-runtime-wrapper-repair")].contains(&root.file_name().and_then(|s| s.to_str()))
+        || ![Some("native-runtime"), Some("native-runtime-wrapper-repair"),Some(schema_recovery::SCHEMA_RECOVERY_ROOT)].contains(&root.file_name().and_then(|s| s.to_str()))
         || root
             .parent()
             .and_then(Path::file_name)
@@ -533,6 +550,7 @@ fn run_runtime_wrapper_plan(
     )?)
     .map_err(|_| "SDK_WRAPPER_RECEIPT_INVALID")?;
     if record.get("wrapperPreparationRepair").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some("native-runtime-wrapper-repair"))
+        || record.get("schemaPreparationRecovery").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some(schema_recovery::SCHEMA_RECOVERY_ROOT))
         || record["state"] != "dispatching"
         || record["attempt"]["attemptId"] != plan.attempt_id
         || !wrapper_runtime_identity_bound(&record, &plan, root.parent().unwrap())?
@@ -580,6 +598,9 @@ fn run_runtime_wrapper_plan(
 }
 fn wrapper_runtime_identity_bound(record: &Value, plan: &RuntimePlan, attempt_root: &Path) -> Result<bool> {
     let effective = serde_json::to_value(&plan.identity).map_err(|e| e.to_string())?;
+    if record.get("schemaPreparationRecovery").is_some() {
+        return schema_recovery_record_bound(attempt_root,record,&effective);
+    }
     let Some(recovery) = record.get("preDispatchRecovery") else {
         return Ok(record["attempt"]["runtimeIdentity"] == effective);
     };

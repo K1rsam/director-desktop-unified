@@ -10,9 +10,11 @@ pub(crate) mod foundation_wire;
 mod scene_edits;
 mod source;
 mod storyboard;
+pub(crate) mod storyboard_scene_facts;
 pub(crate) mod storyboard_sound_events;
 pub mod stage3_pack;
 pub(crate) mod storyboard_refinement;
+pub(crate) mod storyboard_refinement_identity;
 pub use storyboard_refinement::{run_storyboard_refinement, adopt_storyboard_refinement};
 pub(crate) mod storyboard_dependencies;
 mod storyboard_transport;
@@ -30,6 +32,15 @@ pub use source::*;
 use std::collections::{HashMap, HashSet};
 pub(crate) use storyboard::{finish_base_hash, finish_base_input_projection, validate_episode_delivery, CONTEXT_INPUT_PROFILE_FIELD, CONTEXT_INPUT_PROFILE};
 pub(crate) use storyboard::planner_source_order_replay_result;
+pub(crate) use storyboard::validate_planner_repair_request_bound;
+#[cfg(test)]
+pub(crate) fn planner_request_for_handoff_test(mut request: TextRequest, reason: Option<&str>, raw: &Value) -> Result<TextRequest,String> {
+    if let Some(reason)=reason {
+        let rows:Vec<SourceRow>=serde_json::from_value(request.input["sourceRows"].clone()).map_err(|e|e.to_string())?;
+        request.input["validationIssues"]=storyboard::planner_validation_issues(reason,raw,&rows);
+    }
+    storyboard::creative::prepare_request(request)
+}
 #[cfg(test)]
 pub(crate) fn scope_repair_delta_schema_for_test(full: &Value, base: &Value) -> Value {
     storyboard::finish_delta_schema(full, base)

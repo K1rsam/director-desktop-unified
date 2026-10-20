@@ -6,6 +6,8 @@ pub(super) mod asset_cards;
 pub(super) mod creative;
 #[path = "storyboard_original.rs"]
 pub(super) mod original;
+#[path = "storyboard_asset_use_repair.rs"]
+mod asset_use_repair;
 
 /// Explicit new-workflow opt-in. Recovery reads the existing frozen marker;
 /// this helper is never called while reconstructing a saved role request.
@@ -16,7 +18,10 @@ pub fn freeze_scene_input_profile(input: &mut Value) -> Result<(), String> {
     {
         return Err("单元场景合同须绑定第三阶段冻结创作合同".into());
     }
-    input[creative::SCENE_PROFILE_FIELD] = json!(creative::SCENE_PROFILE);
+    let mut frozen = input.clone();
+    super::storyboard_scene_facts::freeze_new(&mut frozen)?;
+    frozen[creative::SCENE_PROFILE_FIELD] = json!(creative::SCENE_PROFILE);
+    *input = frozen;
     Ok(())
 }
 
@@ -469,6 +474,7 @@ fn finish_request(
     input["workPackages"] = json!(owners);
     input["sourceRows"] = json!(source_rows);
     input["contextRows"] = json!(context_rows);
+    super::storyboard_scene_facts::merge_scopes(&mut input, &scopes.iter().map(|scope| &scope.input).collect::<Vec<_>>())?;
     if super::stage3_pack::uses_profile(&input)? {
         let (cards, selection) = asset_cards::project_for_scope(
             &input,
@@ -775,6 +781,79 @@ fn validate_emotion(contract: &Value) -> Result<(), String> {
         || strings(contract, "retain")?.is_empty()
     {
         return Err("完整情绪契约缺少主体、当拍基调、观众回报、变化、落点或保留项".into());
+    }
+    Ok(())
+}
+
+/// Source coordinates are feedback for the original planner, never a rewritten
+/// plan. Keep existing repair requests byte-for-byte unchanged for older errors.
+pub(super) fn planner_validation_issues(reason: &str, raw: &Value, rows: &[SourceRow]) -> Value {
+    let mut issue = json!({"code":"PLAN_EVENT_BOUNDARY","problem":reason});
+    if reason == "事件跨入另一个真实场景" {
+        let mut groups: Vec<Value> = Vec::new();
+        for row in rows {
+            let scene = json!(row.scene_id);
+            if groups.last().is_none_or(|group| group["sceneId"] != scene) {
+                groups.push(json!({"sceneId":scene,"sourceRefs":[]}));
+            }
+            groups.last_mut().unwrap()["sourceRefs"].as_array_mut().unwrap().push(json!(row.id));
+        }
+        let mismatches: Vec<_> = raw["events"].as_array().into_iter().flatten().filter_map(|event| {
+            let refs = strings(event,"sourceRefs").ok()?;
+            let wrong: Vec<_> = refs.iter().filter(|id| rows.iter().any(|row|
+                &row.id == *id && row.scene_id.as_deref() != Some(text(event,"sceneId")))).collect();
+            (!wrong.is_empty()).then(|| json!({"eventId":event["id"],"declaredSceneId":event["sceneId"],"mismatchedSourceRefs":wrong}))
+        }).collect();
+        issue["evidenceRole"] = json!("LOCKED_SOURCE_COORDINATES_ONLY");
+        issue["lockedSceneGroups"] = json!(groups);
+        issue["mismatchedEvents"] = json!(mismatches);
+        issue["requiredRepair"] = json!("每个事件只引用其sceneId对应的真实源场正文。由原情绪统筹修订越场事件及关联工作包、初排归属；完整保留原文覆盖与源序，不改变sourceRows、场次身份或范围。锁定场组只是坐标反馈，不是已修订或已采用的计划。");
+    }
+    json!([issue])
+}
+
+/// Proof-only reconstruction of the already authorized finite planner repair.
+/// It does not normalize/adopt a rejected plan or dispatch a model request.
+pub(crate) fn validate_planner_repair_request_bound(
+    source: &LockedSource, origin: &TextRequest, origin_raw: &Value, origin_reason: &str,
+    previous: &TextRequest, previous_raw: &Value, previous_reason: &str, current: &TextRequest,
+) -> Result<(), String> {
+    const HELD: &str = "SDK_PLAN_REPAIR_LINEAGE_HELD: 原拒绝规划、源范围或有限修订绑定不完整";
+    validate_source(source)?;
+    if origin.stage != "storyboardPlan" || origin.skill != "episode-emotion-planner"
+        || origin.input.get("planRepair").is_some()
+        || origin.input["storyboardCreativeProfile"] != "original-production-contract/v1" {
+        return Err(HELD.into());
+    }
+    let episode = source.episodes.iter().find(|episode| origin.input["episode"]["id"] == episode.id).ok_or(HELD)?;
+    let rows: Vec<_> = source.rows.iter().filter(|row| row.kind == "body" && row.episode_id.as_deref() == Some(&episode.id)).cloned().collect();
+    let context: Vec<SourceRow> = serde_json::from_value(origin.input["contextRows"].clone()).map_err(|_|HELD)?;
+    if json!(rows) != origin.input["sourceRows"] || json!(episode) != origin.input["episode"]
+        || context.iter().any(|row| !source.rows.iter().any(|locked| json!(row) == json!(locked))) {
+        return Err(HELD.into());
+    }
+    let scenes: Vec<_> = source.scenes.iter().filter(|scene| scene.episode_id == episode.id).cloned().collect();
+    for (raw, reason) in [(origin_raw,origin_reason),(previous_raw,previous_reason)] {
+        if !crate::text_executor::planner_repairable_rejection(reason)
+            || materialize_validated_plan(&mut raw.clone(),&rows,&context,&scenes).err().as_deref() != Some(reason) {
+            return Err(HELD.into());
+        }
+    }
+    let make = |prior: &TextRequest, raw: &Value, reason: &str, attempt: u64| -> Result<TextRequest,String> {
+        let mut repair = origin.clone();
+        repair.input["previousPlan"] = raw.clone();
+        repair.input["validationIssues"] = planner_validation_issues(reason,raw,&rows);
+        repair.input["planRepair"] = json!({"version":"rejected-plan-repair/v1","attempt":attempt,"maximumAttempts":2,
+            "sourceSha256":source.sha256,"originDomainRequestSha256":digest(&serde_json::to_string(origin).map_err(|_|HELD)?),
+            "originalPlanSha256":digest(&origin_raw.to_string()),"previousRequestSha256":digest(&serde_json::to_string(prior).map_err(|_|HELD)?),"previousPlanSha256":digest(&raw.to_string())});
+        creative::prepare_request(repair)
+    };
+    let attempt = current.input["planRepair"]["attempt"].as_u64().filter(|attempt|(1..=2).contains(attempt)).ok_or(HELD)?;
+    let same = |left: &TextRequest,right: &TextRequest| serde_json::to_value(left).ok() == serde_json::to_value(right).ok();
+    if (attempt == 1 && (!same(previous,origin) || previous_raw != origin_raw || previous_reason != origin_reason))
+        || (attempt == 2 && (origin_reason == previous_reason || !same(previous,&make(origin,origin_raw,origin_reason,1)?)))
+        || !same(current,&make(previous,previous_raw,previous_reason,attempt)?) {
+        return Err(HELD.into());
     }
     Ok(())
 }
@@ -1278,6 +1357,7 @@ fn validate_storyboard_scope_with_issues(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -1290,11 +1370,21 @@ fn validate_storyboard_repair_scope(
     assets: &[Value],
     caps: &Value,
     expected_refs: Option<&[String]>,
-    mut scope_issues: Option<&mut Vec<Value>>,
+    scope_issues: Option<&mut Vec<Value>>,
     defer_scene_coordinate: bool,
     defer_zero_duration: bool,
     defer_shot_source: bool,
+    defer_asset_use_identity: bool,
 ) -> Result<(), String> {
+    validate_storyboard_repair_scope_with_order(source,draft,assets,caps,expected_refs,scope_issues,
+        defer_scene_coordinate,defer_zero_duration,defer_shot_source,defer_asset_use_identity,None)
+}
+
+fn validate_storyboard_repair_scope_with_order(
+    source:&LockedSource,draft:&Value,assets:&[Value],caps:&Value,expected_refs:Option<&[String]>,
+    mut scope_issues:Option<&mut Vec<Value>>,defer_scene_coordinate:bool,defer_zero_duration:bool,
+    defer_shot_source:bool,defer_asset_use_identity:bool,order_issues:Option<&[Value]>,
+) -> Result<(),String> {
     validate_source(source)?;
     let (min, max, image_limit) = capabilities(&json!({"capabilities":caps}))?;
     let units = draft
@@ -1411,6 +1501,7 @@ fn validate_storyboard_repair_scope(
         let mut orders = HashSet::new();
         let mut asset_identities = HashSet::new();
         let mut image_identities = HashSet::new();
+        let duplicate_issues=if defer_asset_use_identity {asset_use_repair::unit_issues(unit)?}else{Vec::new()};
         for reference in references {
             let aid = text(reference, "assetId");
             let vid = text(reference, "variantId");
@@ -1419,7 +1510,11 @@ fn validate_storyboard_repair_scope(
                 .find(|a| text(a, "id") == aid && text(a, "variantId") == vid)
                 .ok_or("分镜引用未知资产/形象，不能按同名匹配")?;
             if !asset_identities.insert((aid, vid)) {
-                return Err("单元重复引用同一资产形象".into());
+                let issue=duplicate_issues.iter().find(|issue|issue["assetId"]==aid&&issue["variantId"]==vid);
+                match (scope_issues.as_deref_mut(),issue) {
+                    (Some(issues),Some(issue))=>issues.push(issue.clone()),
+                    _=>return Err(crate::text_executor::AUTHOR_ASSET_USE_DUPLICATE_REJECTION.into()),
+                }
             }
             let order = reference
                 .get("order")
@@ -1532,7 +1627,10 @@ fn validate_storyboard_repair_scope(
             return Err(format!("单元 {uid} 需要 {} 张图片，超出渠道 {image_limit} 张上限；须修订单元，不能自动删图",image_identities.len()));
         }
         if !orders.is_empty() && (1..=orders.len() as u64).any(|o| !orders.contains(&o)) {
-            return Err("素材顺序存在空档".into());
+            let actual=json!(references.iter().map(|r|r["order"].clone()).collect::<Vec<_>>());
+            if !order_issues.is_some_and(|issues|issues.iter().any(|issue|issue["code"]=="ASSET_USE_ORDER"&&issue["unitId"]==unit["id"]&&issue["actualOrders"]==actual)) {
+                return Err("素材顺序存在空档".into());
+            }
         }
         let shots = unit
             .get("shots")
@@ -2279,6 +2377,7 @@ pub async fn run_storyboard(
             .map_err(|e| format!("原文结构无效：{e}"))?;
     let source = upgrade_source_dialogues(&source)?;
     validate_source(&source)?;
+    super::storyboard_scene_facts::validate_source(input, &source)?;
     if source.diagnostics.iter().any(|d| d.blocking) {
         return Err("原文仍有未定集场范围，不能创作假定来源的分镜".into());
     }
@@ -2437,6 +2536,7 @@ pub async fn run_storyboard(
             creative::mark_input(&mut plan_input, creative_enabled);
             creative::attach_carrier_profile(&mut plan_input, input)?;
             creative::attach_scene_profile(&mut plan_input, input)?;
+            super::storyboard_scene_facts::attach_scope(&mut plan_input, input, &source)?;
             attach_repetition_transport_profile(&mut plan_input, input)?;
             super::stage3_pack::attach_profile(&mut plan_input, input)?;
             if !continuity_revision.is_null(){plan_input["continuityRevision"]=continuity_revision.clone();}
@@ -2472,7 +2572,7 @@ pub async fn run_storyboard(
                         attempt+=1; last_problem=reason.clone();
                         plan_input=base_plan_input.clone();
                         plan_input["previousPlan"]=raw.clone();
-                        plan_input["validationIssues"]=json!([{"code":"PLAN_EVENT_BOUNDARY","problem":reason}]);
+                        plan_input["validationIssues"]=planner_validation_issues(&reason,&raw,&rows);
                         plan_input["planRepair"]=json!({"version":"rejected-plan-repair/v1","attempt":attempt,"maximumAttempts":2,"sourceSha256":source.sha256,"originDomainRequestSha256":origin_hash,"originalPlanSha256":original_raw_hash,"previousRequestSha256":request_hash,"previousPlanSha256":digest(&raw.to_string())});
                     },
                     (Err(reason),None)=>return Err(reason),
@@ -2540,6 +2640,7 @@ pub async fn run_storyboard(
                 creative::mark_input(&mut author_input, creative_enabled);
                 creative::attach_carrier_profile(&mut author_input, input)?;
                 creative::attach_scene_profile(&mut author_input, input)?;
+                super::storyboard_scene_facts::attach_scope(&mut author_input, input, &source)?;
                 attach_repetition_transport_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
                 if !continuity_revision.is_null(){author_input["continuityRevision"]=continuity_revision.clone();}
@@ -2669,7 +2770,8 @@ pub async fn run_storyboard(
                         Err(reason)=>{
                             executor.reject(&request,&original_response,&reason).await?;
                             let new_use_source_repair=super::asset_use_binding::enabled(&request.input)? && reason==crate::text_executor::AUTHOR_SHOT_SOURCE_REJECTION;
-                            if !creative_enabled || (!new_use_source_repair && ![crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION,crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION].contains(&reason.as_str())) {return Err(reason);}
+                            let new_use_identity_repair=super::asset_use_binding::enabled(&request.input)? && reason==crate::text_executor::AUTHOR_ASSET_USE_DUPLICATE_REJECTION;
+                            if !creative_enabled || (!new_use_source_repair && !new_use_identity_repair && ![crate::text_executor::AUTHOR_ASSET_SCOPE_REJECTION,crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION].contains(&reason.as_str())) {return Err(reason);}
                             // The editor can reintroduce a reference rejected in
                             // an author. The original coordinator routes either
                             // unadopted role back to the same bounded editor.
@@ -2678,9 +2780,11 @@ pub async fn run_storyboard(
                             let preserved_units:HashSet<_>=base["units"].as_array().unwrap().iter().map(|unit|text(unit,"id").to_string()).collect();
                             let preserved_shots:HashSet<_>=base["units"].as_array().unwrap().iter().flat_map(|unit|unit["shots"].as_array().unwrap()).map(|shot|text(shot,"id").to_string()).collect();
                             prefix_ids_preserving(&mut candidate,&new_prefix,&preserved_units,&preserved_shots)?;
-                            if !new_use_source_repair { original::pack_event_units(&mut candidate,&plan,caps["maxDuration"].as_f64().unwrap())?; }
+                            if !new_use_source_repair && !new_use_identity_repair { original::pack_event_units(&mut candidate,&plan,caps["maxDuration"].as_f64().unwrap())?; }
                             let validation_caps=carrier_validation_caps(&candidate,caps,true);
-                            let (candidate,issues)=if new_use_source_repair {
+                            let (candidate,issues)=if new_use_identity_repair {
+                                asset_use_repair::candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
+                            } else if new_use_source_repair {
                                 author_shot_source_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
                             } else if reason==crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
                                 author_duration_candidate(&source,&candidate,&current_assets,&validation_caps,&scope_refs,style,&format!("{}:",episode.id),&plan,&finish_candidates)?
@@ -2923,6 +3027,10 @@ fn image_identity(asset: &Value, assets: &[Value]) -> Option<(String, String)> {
 }
 
 fn materialize_asset_references(draft: &mut Value, assets: &[Value]) -> Result<(), String> {
+    materialize_asset_references_with_order(draft,assets,false)
+}
+
+fn materialize_asset_references_with_order(draft:&mut Value,assets:&[Value],preserve_order:bool)->Result<(),String>{
     for unit in draft["units"].as_array_mut().ok_or("缺少分镜单元")? {
         let mut sound_sources = unit["soundSources"].as_array().cloned().unwrap_or_default();
         let owned = strings(unit, "sourceRefs")?;
@@ -2975,7 +3083,7 @@ fn materialize_asset_references(draft: &mut Value, assets: &[Value]) -> Result<(
                     map.insert("imageBindingRequired".into(), json!(true));
                 }
             }
-            reference["order"] = json!(references.len() + 1);
+            if !preserve_order { reference["order"] = json!(references.len() + 1); }
             references.push(reference);
         }
         unit["assetRefs"] = json!(references);
@@ -3112,6 +3220,9 @@ fn author_validation_candidate(
     selected: &[Value],
     reason: &str,
 ) -> Result<(Value, Vec<Value>), String> {
+    if reason==crate::text_executor::AUTHOR_ASSET_USE_DUPLICATE_REJECTION {
+        return asset_use_repair::candidate(source,raw,assets,caps,refs,style,prefix,plan,selected);
+    }
     if crate::text_executor::author_unit_duration_rejection(reason) {
         return author_unit_duration_candidate(source,raw,assets,caps,refs,style,prefix,plan,selected);
     }
@@ -3326,6 +3437,7 @@ fn scope_repair_candidate(
         defer_scene_coordinate,
         false,
         false,
+        false,
     )?;
     validate_event_bindings_for_repair(&draft, plan, Some(&issues))?;
     validate_fantasy_profile(&draft, selected, creative_enabled)?;
@@ -3379,7 +3491,7 @@ fn author_package_source_candidate(
     add_delivery_fields(&mut draft, style)?;
     let mut issues = Vec::new();
     validate_storyboard_repair_scope(source, &draft, assets, caps, Some(refs),
-        Some(&mut issues), false, false, true)?;
+        Some(&mut issues), false, false, true, false)?;
     if !issues.iter().any(package_source_issue)
         || require_shot_issue && !issues.iter().any(|issue| issue["code"] == "SHOT_SOURCE_SCOPE")
     {
@@ -3439,6 +3551,7 @@ fn author_duration_candidate(
         false,
         true,
         false,
+        false,
     )?;
     if !issues.iter().any(|issue| issue["code"] == "SHOT_DURATION") {
         return Err("原镜长拒绝没有可定位的零秒无对白镜；未扩大修订".into());
@@ -3492,6 +3605,13 @@ fn author_scope_problem_signature(issues: &[Value]) -> String {
         if issue["code"]=="UNIT_DURATION" {
             identity["originalDuration"]=issue["originalDuration"].clone();
             identity["maximumDuration"]=issue["maximumDuration"].clone();
+        }
+        if issue["code"]=="ASSET_USE_IDENTITY" {
+            identity["coordinate"]=issue["coordinate"].clone();
+            identity["uses"]=issue["uses"].clone();
+        }
+        if issue["code"]=="ASSET_USE_ORDER" {
+            for field in ["unitId","coordinate","actualOrders","expectedOrders","referenceSelectionSha256"] {identity[field]=issue[field].clone();}
         }
         if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE","SHOT_SOURCE_SCOPE","SHOT_DURATION"].contains(&text(issue,"code")) {
             for field in ["coordinate","lineId","quoteStart","quoteEnd","allowedSpokenRanges","requiredSourceRefs","shotId","originalDuration"] {identity[field]=issue[field].clone();}
@@ -3594,6 +3714,44 @@ fn author_scope_repair_units(base: &Value, issues: &[Value]) -> Result<HashSet<S
 /// Equivalent to the original coordinator's unresolved-author -> finish(delta)
 /// route. The author remains rejected; only the fully validated Finisher result
 /// becomes a usable scope and supplies the next author's real continuity.
+// Compare only fields in this frozen model schema. Rust-owned identity,
+// coverage and export projections do not become new model requirements.
+fn validate_order_repair_delta(request:&TextRequest,raw:&Value,base:&Value,issues:&[Value])->Result<(),String>{
+    const HELD:&str="素材顺序修订须明确替换问题单元，仅改连续order，原引用选择及正文保持";
+    if !super::asset_use_binding::enabled(&request.input)? || request.input["finishRepair"]["attempt"]!=2
+        || issues.is_empty() || issues.iter().any(|issue|issue["code"]!="ASSET_USE_ORDER") {return Err(HELD.into());}
+    fn projection(value:&Value,schema:&Value,asset_ref:bool)->Value{
+        if let Some(properties)=schema["properties"].as_object(){
+            return Value::Object(properties.iter().filter(|(key,_)|!(asset_ref&&key.as_str()=="order"))
+                .map(|(key,child)|(key.clone(),projection(&value[key],child,key=="assetRefs"))).collect());
+        }
+        if let Some(items)=value.as_array(){return json!(items.iter().map(|item|projection(item,&schema["items"],asset_ref)).collect::<Vec<_>>());}
+        value.clone()
+    }
+    let schema=&request.schema["properties"]["replacements"]["items"]["properties"]["units"]["items"];
+    if !schema["properties"].is_object(){return Err(HELD.into());}
+    let groups=raw["replacements"].as_array().ok_or(HELD)?;
+    for group in groups {
+        let replaced=group["replaces"].as_array().ok_or(HELD)?;
+        let units=group["units"].as_array().ok_or(HELD)?;
+        if replaced.len()!=units.len(){return Err(HELD.into());}
+        for (id,new) in replaced.iter().zip(units) {
+            let old=base["units"].as_array().into_iter().flatten().find(|unit|unit["id"]==*id).ok_or(HELD)?;
+            if new["id"]!=*id || projection(old,schema,false)!=projection(new,schema,false){return Err(HELD.into());}
+        }
+        let fantasy=json!(base["fantasyRealization"].as_array().into_iter().flatten().filter(|item|
+            item["unitIds"].as_array().is_some_and(|ids|ids.iter().any(|id|replaced.contains(id)))).collect::<Vec<_>>());
+        let fantasy_schema=&request.schema["properties"]["replacements"]["items"]["properties"]["fantasyRealization"];
+        if projection(&fantasy,fantasy_schema,false)!=projection(&group["fantasyRealization"],fantasy_schema,false){return Err(HELD.into());}
+    }
+    for issue in issues {
+        let found=groups.iter().filter(|group|group["replaces"].as_array().is_some_and(|ids|ids.contains(&issue["unitId"])))
+            .flat_map(|group|group["units"].as_array().into_iter().flatten()).filter(|unit|unit["id"]==issue["unitId"]).collect::<Vec<_>>();
+        if found.len()!=1{return Err(HELD.into());}
+    }
+    Ok(())
+}
+
 async fn repair_author_scope(
     source: &LockedSource,
     original_raw: &Value,
@@ -3649,6 +3807,7 @@ async fn repair_author_scope(
             "SHOT_SOURCE_SCOPE",
             "SHOT_DURATION",
             "UNIT_DURATION",
+            "ASSET_USE_IDENTITY",
         ]
         .contains(&text(issue, "code"))
     });
@@ -3701,7 +3860,20 @@ async fn repair_author_scope(
                     );
                 }
             }
-            let projected = materialize_role_result(&request.input, &raw)?;
+            // A remaining order issue must be explicitly replaced by the
+            // original editor; retaining it cannot reach legacy renumbering.
+            if issues.iter().any(|issue|issue["code"]=="ASSET_USE_ORDER") {
+                validate_order_repair_delta(&request,&raw,&base,&issues)?;
+            }
+            let (projected, order_issues) = match materialize_role_result(&request.input, &raw) {
+                Ok(projected)=>(projected,Vec::new()),
+                Err(reason) if finish_origin && reason==super::asset_use_binding::ORDER_REJECTION => {
+                    let order_issues=super::asset_use_binding::order_gap_issues(&request.input,&raw,&base,&issues)?;
+                    let bound=super::asset_use_binding::materialize_order_gap_diagnostic(&request.input,&raw,&order_issues)?;
+                    (super::storyboard_sound_events::materialize(&request.input,&bound)?,order_issues)
+                }
+                Err(reason)=>return Err(reason),
+            };
             let mut draft = apply_finish_delta(&base, &projected)?;
             let preserved_units: HashSet<_> = base["units"]
                 .as_array()
@@ -3728,7 +3900,20 @@ async fn repair_author_scope(
             let selected = request.input["selectedFantasy"]
                 .as_array()
                 .ok_or("主创修订缺少冻结幻想选择")?;
-            let (next, remaining) = if source_repair {
+            let (next, remaining) = if !order_issues.is_empty() {
+                // Diagnostic candidate only: prove every other domain gate
+                // without altering the failed raw or its gapped numbering.
+                materialize_dialogue(source,&mut draft,false)?;
+                materialize_asset_references_with_order(&mut draft,assets,true)?;
+                add_delivery_fields(&mut draft,style)?;
+                validate_storyboard_repair_scope_with_order(source,&draft,assets,caps,Some(&refs),
+                    None,false,false,false,false,Some(&order_issues))?;
+                validate_event_bindings(&draft,plan)?;
+                validate_fantasy_profile(&draft,selected,true)?;
+                materialize_unit_coverage(source,&mut draft)?;
+                creative::add_delivery(&mut draft,source,style,assets,true)?;
+                (draft,order_issues)
+            } else if source_repair {
                 let mut checked = draft.clone();
                 match validate_authored(
                     source,
@@ -3819,6 +4004,8 @@ async fn repair_author_scope(
                             .any(|issue| issue["code"] == "UNIT_SCENE_COORDINATE")
                         {
                             "单元来源跨集/跨场或包含非制作资料"
+                        } else if remaining.iter().any(|issue|issue["code"]=="ASSET_USE_ORDER") {
+                            super::asset_use_binding::ORDER_REJECTION
                         } else if source_repair {
                             remaining
                                 .iter()
@@ -4780,6 +4967,7 @@ async fn run_storyboard_revision(
             creative::mark_input(&mut author_input, creative_enabled);
             creative::attach_carrier_profile(&mut author_input, input)?;
             creative::attach_scene_profile(&mut author_input, input)?;
+            super::storyboard_scene_facts::attach_scope(&mut author_input, input, source)?;
             attach_repetition_transport_profile(&mut author_input, input)?;
             super::stage3_pack::attach_profile(&mut author_input, input)?;
             if let Some(context) = &accepted_context {
@@ -4808,6 +4996,7 @@ async fn run_storyboard_revision(
             creative::mark_input(&mut finish_input, creative_enabled);
             creative::attach_carrier_profile(&mut finish_input, input)?;
             creative::attach_scene_profile(&mut finish_input, input)?;
+            super::storyboard_scene_facts::attach_scope(&mut finish_input, input, source)?;
             attach_repetition_transport_profile(&mut finish_input, input)?;
             super::stage3_pack::attach_profile(&mut finish_input, input)?;
             if accepted_context.is_some() {
@@ -5593,6 +5782,9 @@ mod production_contract_tests {
     use super::*;
     use tokio::sync::Mutex;
     include!("storyboard_unit_duration_tests.rs");
+    include!("storyboard_planner_scene_repair_tests.rs");
+    include!("storyboard_scene_facts_tests.rs");
+    include!("storyboard_asset_use_repair_tests.rs");
 
     #[derive(Default)]
     struct Recorded {
@@ -7286,6 +7478,7 @@ mod production_contract_tests {
                 Some(&refs),
                 Some(&mut issues),
                 true,
+                false,
                 false,
                 false,
             )

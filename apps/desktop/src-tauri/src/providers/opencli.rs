@@ -8,15 +8,48 @@ const COMPILED_RUNTIME_PIN: &str = include_str!("../../../../../web-image-bridge
 // Future runtimes must explicitly review their compatibility before adding a pair.
 const READ_ONLY_READER_MIGRATIONS: &[(&str, &str)] = &[(
     "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
-    "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
 ), (
     "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+), (
     "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+), (
+    "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+), (
+    "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+), (
+    "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
 )];
 
 pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
     to == COMPILED_RUNTIME_PIN.trim()
         && READ_ONLY_READER_MIGRATIONS.iter().any(|(old,new)| *old==from && *new==to)
+}
+
+// These exact already-reviewed receipts remain valid after upgrading the app.
+// They are not in reader_policy and cannot select or execute an old reader.
+pub(crate) fn read_only_reader_audit_allowed(from: &str, to: &str) -> bool {
+    read_only_reader_migration_allowed(from,to)
+        || (to=="f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"].contains(&from))
+        || (to=="54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70"].contains(&from))
+        || (to=="afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0"].contains(&from))
 }
 
 fn executable_readers(executable: &Path) -> Vec<PathBuf> {
@@ -66,17 +99,16 @@ fn verify_reader(runner: &Path, pin: &str) -> ProviderResult<VerifiedReader> {
     let runner = runtime_file(&root, "bridge.mjs")?;
     let declared = fs::read_to_string(runtime_file(&root, "runtime.sha256")?).map_err(|_| reader_mismatch())?;
     if declared.trim() != pin { return Err(reader_mismatch()); }
-    let mut aggregate = Sha256::new();
-    for name in ["bridge.mjs", "vendor-source.json", "package-lock.json"] {
-        aggregate.update(fs::read(runtime_file(&root, name)?).map_err(|_| reader_mismatch())?);
-    }
-    if format!("{:x}", aggregate.finalize()) != pin { return Err(reader_mismatch()); }
     let manifest_path = runtime_file(&root, "runtime-manifest.json")?;
     let manifest_bytes = fs::read(manifest_path).map_err(|_| reader_mismatch())?;
     if manifest_bytes.len() > 4 * 1024 * 1024 { return Err(reader_mismatch()); }
     let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|_| reader_mismatch())?;
     let files = manifest["files"].as_array().filter(|files| !files.is_empty() && files.len() <= 16_384).ok_or_else(reader_mismatch)?;
     if manifest["version"] != "director-opencli-runtime/v1" { return Err(reader_mismatch()); }
+    let owned=files.iter().any(|f|f["path"]=="composer-transport.mjs");
+    let names:Vec<&str>=if owned {vec!["bridge.mjs","composer-transport.mjs","vendor-source.json","package-lock.json"]}else{vec!["bridge.mjs","vendor-source.json","package-lock.json"]};
+    let mut aggregate=Sha256::new();for name in names {aggregate.update(fs::read(runtime_file(&root,name)?).map_err(|_|reader_mismatch())?);}
+    if format!("{:x}",aggregate.finalize())!=pin{return Err(reader_mismatch());}
     let mut verified = std::collections::HashMap::new();
     for file in files {
         let relative = file["path"].as_str().ok_or_else(reader_mismatch)?;
@@ -90,6 +122,7 @@ fn verify_reader(runner: &Path, pin: &str) -> ProviderResult<VerifiedReader> {
     for required in ["bridge.mjs", "vendor-source.json", "package-lock.json", "package.json", "runtime.sha256"] {
         if !verified.contains_key(required) { return Err(reader_mismatch()); }
     }
+    if owned&&!verified.contains_key("composer-transport.mjs"){return Err(reader_mismatch());}
     // The compiled aggregate pins vendor-source.json; its file hashes must also
     // agree with the complete package manifest, rather than trusting a sidecar.
     let vendor: Value = serde_json::from_slice(&fs::read(runtime_file(&root, "vendor-source.json")?).map_err(|_| reader_mismatch())?).map_err(|_| reader_mismatch())?;
@@ -203,6 +236,15 @@ pub fn invoke(c:&ProviderConfig,operation:&str,request:Option<&GenerationRequest
     if expected.len()!=64 || actual.as_deref().map(str::trim)!=Some(expected) {
         return Err(ProviderError::new("OPENCLI_COMPONENT_MISMATCH","网页组件与原冻结版本不一致，请恢复对应组件；原任务未重发。"));
     }
+    // New send intents are meaningful only for these exact owned adapter bytes.
+    // Historical frozen readers retain their old contract and are never resent.
+    if expected==COMPILED_RUNTIME_PIN.trim(){
+        let directory=runner.parent().ok_or_else(reader_mismatch)?;let mut aggregate=Sha256::new();
+        for name in ["bridge.mjs","composer-transport.mjs","vendor-source.json","package-lock.json"]{
+            aggregate.update(fs::read(directory.join(name)).map_err(|_|reader_mismatch())?);
+        }
+        if format!("{:x}",aggregate.finalize())!=expected{return Err(reader_mismatch());}
+    }
     let root=PathBuf::from(t["stateRoot"].as_str().unwrap_or(""));
     if !root.is_absolute(){return Err(ProviderError::new("OPENCLI_CONFIG","网页状态目录必须为绝对路径"));}
     fs::create_dir_all(&root).map_err(|e|ProviderError::new("OPENCLI_STORAGE",e.to_string()))?;
@@ -236,6 +278,7 @@ fn connection_error_message(code:&str)->&'static str {
         "OPENCLI_BROWSER_NOT_CONNECTED"=>"未找到所选浏览器的可用连接，请打开该浏览器、登录 ChatGPT 并确认已安装组件。",
         "LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。",
         "OPENCLI_OWNED_PAGE_REQUIRED"=>"请先在所选浏览器打开 ChatGPT 网页，再点击“连接并检查”。",
+        "OWNED_NO_CLICK_UNPROVEN"=>"旧网页任务的未发送证明未通过校验，已保留原任务；未提交新的图片生成。",
         _=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。",
     }
 }
@@ -247,7 +290,11 @@ pub fn capabilities(c:&ProviderConfig)->ProviderResult<Capabilities>{
 pub fn prepare(c:&ProviderConfig,r:&GenerationRequest)->ProviderResult<PreparedRequest>{
     if r.kind!="image" {return Err(ProviderError::new("IMAGE_ONLY","网页渠道仅支持图片"));}
     let data=invoke(c,"prepare",Some(r))?;
-    Ok(PreparedRequest{provider:"chrome".into(),request:r.clone(),capability_version:"opencli-image/v1".into(),upload_receipts:vec![],wire:json!({"transport":"opencli/v1","requestHash":data["requestHash"],"profile":data["profile"],"accountKey":data["accountKey"]}),estimated_cost:None,prepared_at:now()})
+    let mut wire=json!({"transport":"opencli/v1","requestHash":data["requestHash"],"profile":data["profile"],"accountKey":data["accountKey"]});
+    if data["sendProtocol"]=="owned-composer-send/v2" {
+        wire["sendProtocol"]=data["sendProtocol"].clone();wire["composerAdapterSha256"]=data["composerAdapterSha256"].clone();
+    }
+    Ok(PreparedRequest{provider:"chrome".into(),request:r.clone(),capability_version:"opencli-image/v1".into(),upload_receipts:vec![],wire,estimated_cost:None,prepared_at:now()})
 }
 pub fn recover_prepare(c:&ProviderConfig,r:&GenerationRequest,proof:&Value)->ProviderResult<PreparedRequest>{
     let held=||ProviderError::new("OPENCLI_PREPARE_RECOVERY_HELD","原网页准备证据不足，保留原任务，不重新提交。");
@@ -304,6 +351,12 @@ pub fn download(c:&ProviderConfig,url:&str,target:&Path)->ProviderResult<Downloa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_owned_no_click_proof_failure_is_not_reported_as_network_or_login_failure() {
+        let message=connection_error_message("OWNED_NO_CLICK_UNPROVEN");
+        assert!(message.contains("未发送证明")&&message.contains("未提交"));
+        assert!(!message.contains("连接")&&!message.contains("网络")&&!message.contains("登录"));
+    }
     #[test]
     fn network_status_is_distinct_from_login_and_reports_the_real_browser() {
         let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"saved","accountKey":"digest","browserKind":"edge"}})).unwrap();
