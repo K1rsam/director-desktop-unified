@@ -3,6 +3,157 @@ use super::*;
 use crate::store::s;
 use std::{io::{Read,Write},process::{Command,Stdio},time::{Duration,Instant}};
 
+const COMPILED_RUNTIME_PIN: &str = include_str!("../../../../../web-image-bridge/runtime.sha256");
+// Only this reviewed reader correction may observe an already submitted job.
+// Future runtimes must explicitly review their compatibility before adding a pair.
+const READ_ONLY_READER_MIGRATIONS: &[(&str, &str)] = &[(
+    "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+    "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+)];
+
+fn executable_readers(executable: &Path) -> Vec<PathBuf> {
+    let Some(parent) = executable.parent() else { return vec![]; };
+    let mut readers = vec![];
+    if let Ok((sha, _)) = crate::store::hash_file(executable) {
+        readers.push(parent.join(".client-resources").join(sha).join("opencli/bridge.mjs"));
+    }
+    readers.push(parent.join("opencli/bridge.mjs"));
+    readers
+}
+
+fn current_executable_readers() -> Vec<PathBuf> {
+    std::env::current_exe().map(|exe| executable_readers(&exe)).unwrap_or_default()
+}
+
+struct VerifiedReader {
+    runner: PathBuf,
+    runner_sha256: String,
+    manifest_sha256: String,
+}
+
+fn reader_mismatch() -> ProviderError {
+    ProviderError::new("OPENCLI_COMPONENT_MISMATCH", "网页只读组件校验失败，保留原任务，未重新发送。")
+}
+
+fn runtime_file(root: &Path, relative: &str) -> ProviderResult<PathBuf> {
+    if relative.is_empty() || relative.contains('\\')
+        || !Path::new(relative).components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return Err(reader_mismatch());
+    }
+    let file = root.join(relative);
+    let metadata = fs::symlink_metadata(&file).map_err(|_| reader_mismatch())?;
+    let canonical = fs::canonicalize(&file).map_err(|_| reader_mismatch())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || !canonical.starts_with(root) {
+        return Err(reader_mismatch());
+    }
+    Ok(canonical)
+}
+
+fn verify_reader(runner: &Path, pin: &str) -> ProviderResult<VerifiedReader> {
+    let sha_valid = |sha: &str| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    if !runner.is_absolute() || runner.file_name().and_then(|p| p.to_str()) != Some("bridge.mjs") || !sha_valid(pin) {
+        return Err(reader_mismatch());
+    }
+    let root = fs::canonicalize(runner.parent().ok_or_else(reader_mismatch)?).map_err(|_| reader_mismatch())?;
+    let runner = runtime_file(&root, "bridge.mjs")?;
+    let declared = fs::read_to_string(runtime_file(&root, "runtime.sha256")?).map_err(|_| reader_mismatch())?;
+    if declared.trim() != pin { return Err(reader_mismatch()); }
+    let mut aggregate = Sha256::new();
+    for name in ["bridge.mjs", "vendor-source.json", "package-lock.json"] {
+        aggregate.update(fs::read(runtime_file(&root, name)?).map_err(|_| reader_mismatch())?);
+    }
+    if format!("{:x}", aggregate.finalize()) != pin { return Err(reader_mismatch()); }
+    let manifest_path = runtime_file(&root, "runtime-manifest.json")?;
+    let manifest_bytes = fs::read(manifest_path).map_err(|_| reader_mismatch())?;
+    if manifest_bytes.len() > 4 * 1024 * 1024 { return Err(reader_mismatch()); }
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|_| reader_mismatch())?;
+    let files = manifest["files"].as_array().filter(|files| !files.is_empty() && files.len() <= 16_384).ok_or_else(reader_mismatch)?;
+    if manifest["version"] != "director-opencli-runtime/v1" { return Err(reader_mismatch()); }
+    let mut verified = std::collections::HashMap::new();
+    for file in files {
+        let relative = file["path"].as_str().ok_or_else(reader_mismatch)?;
+        let expected = file["sha256"].as_str().filter(|sha| sha_valid(sha)).ok_or_else(reader_mismatch)?;
+        let path = runtime_file(&root, relative)?;
+        if verified.insert(relative.to_owned(), expected.to_owned()).is_some()
+            || crate::store::hash_file(&path).map_err(|_| reader_mismatch())?.0 != expected {
+            return Err(reader_mismatch());
+        }
+    }
+    for required in ["bridge.mjs", "vendor-source.json", "package-lock.json", "package.json", "runtime.sha256"] {
+        if !verified.contains_key(required) { return Err(reader_mismatch()); }
+    }
+    // The compiled aggregate pins vendor-source.json; its file hashes must also
+    // agree with the complete package manifest, rather than trusting a sidecar.
+    let vendor: Value = serde_json::from_slice(&fs::read(runtime_file(&root, "vendor-source.json")?).map_err(|_| reader_mismatch())?).map_err(|_| reader_mismatch())?;
+    if vendor["commit"] != manifest["sourceCommit"] { return Err(reader_mismatch()); }
+    let vendor_files = vendor["files"].as_array().filter(|files| !files.is_empty()).ok_or_else(reader_mismatch)?;
+    for file in vendor_files {
+        let relative = file["path"].as_str().ok_or_else(reader_mismatch)?;
+        let expected = file["sha256"].as_str().ok_or_else(reader_mismatch)?;
+        if verified.get(&format!("vendor/opencli/{relative}")).map(String::as_str) != Some(expected) {
+            return Err(reader_mismatch());
+        }
+    }
+    Ok(VerifiedReader { runner, runner_sha256: verified["bridge.mjs"].clone(), manifest_sha256: hex_hash(&manifest_bytes) })
+}
+
+#[derive(Clone, Copy)]
+struct ReaderPolicy<'a> {
+    compiled_pin: &'a str,
+    migrations: &'a [(&'a str, &'a str)],
+}
+
+fn reader_policy() -> ReaderPolicy<'static> {
+    ReaderPolicy { compiled_pin: COMPILED_RUNTIME_PIN.trim(), migrations: READ_ONLY_READER_MIGRATIONS }
+}
+
+fn read_only_reader_config(
+    original: &ProviderConfig, request: &GenerationRequest, operation: &str,
+    policy: ReaderPolicy<'_>, locate: impl FnOnce() -> Vec<PathBuf>,
+) -> ProviderResult<(ProviderConfig, Option<Value>)> {
+    let frozen = original.browser_transport.as_ref();
+    let old_pin = frozen.and_then(|v| v["runtimeSha256"].as_str()).unwrap_or("");
+    if !matches!(operation, "query" | "reconcile") || original.kind != "chrome" || !enabled(original)
+        || request.kind != "image" || request.model != "chatgpt-image" || old_pin == policy.compiled_pin
+        || !policy.migrations.iter().any(|(old, new)| *old == old_pin && *new == policy.compiled_pin) {
+        return Ok((original.clone(), None));
+    }
+    // No executable-bound current reader means the original recovery remains in
+    // charge. Installed/global/dev components are deliberately not candidates.
+    let Some(current) = locate().iter().find_map(|path| verify_reader(path, policy.compiled_pin).ok()) else {
+        return Ok((original.clone(), None));
+    };
+    let old_runner = PathBuf::from(frozen.and_then(|v| v["runner"].as_str()).unwrap_or(""));
+    let old = verify_reader(&old_runner, old_pin)?;
+    let mut temporary = original.clone();
+    let transport = temporary.browser_transport.as_mut().and_then(Value::as_object_mut).ok_or_else(reader_mismatch)?;
+    transport.insert("runner".into(), json!(current.runner));
+    transport.insert("runtimeSha256".into(), json!(policy.compiled_pin));
+    let audit = json!({"schemaVersion":"opencli-readonly-reader-migration/v1","operation":operation,
+        "bridgeOperation":"query","readOnly":true,"resubmitted":false,"frozenConfigUnchanged":true,
+        "fromRuntimeSha256":old_pin,"toRuntimeSha256":policy.compiled_pin,
+        "fromRunnerSha256":old.runner_sha256,"toRunnerSha256":current.runner_sha256,
+        "fromManifestSha256":old.manifest_sha256,"toManifestSha256":current.manifest_sha256,
+        "frozenConfigSha256":crate::pipeline::digest(&json!(original).to_string()),
+        "generationRequestSha256":crate::pipeline::digest(&json!(request).to_string())});
+    Ok((temporary, Some(audit)))
+}
+
+fn query_with_reader(
+    original: &ProviderConfig, request: &GenerationRequest, operation: &str, policy: ReaderPolicy<'_>,
+    locate: impl FnOnce() -> Vec<PathBuf>,
+    read: impl FnOnce(&ProviderConfig, &str, &GenerationRequest) -> ProviderResult<Value>,
+) -> ProviderResult<QueryResult> {
+    let (temporary, audit) = read_only_reader_config(original, request, operation, policy, locate)?;
+    let value = read(&temporary, "query", request)?;
+    let mut result: QueryResult = serde_json::from_value(value).map_err(|_| ProviderError::new("OPENCLI_PACKET", "原网页回执无效"))?;
+    if let Some(audit) = audit {
+        let raw = result.raw.as_object_mut().filter(|raw| !raw.contains_key("readerMigration")).ok_or_else(|| ProviderError::new("OPENCLI_PACKET", "只读组件回执无法保全原始证明"))?;
+        raw.insert("readerMigration".into(), audit);
+    }
+    Ok(result)
+}
+
 pub fn enabled(c:&ProviderConfig)->bool { c.browser_transport.as_ref().is_some_and(|v|v["transport"]=="opencli/v1") }
 pub fn setup_status(c:&ProviderConfig)->Value {
     setup_view(c,invoke(c,"status",None))
@@ -27,11 +178,11 @@ pub fn config(home:&Path,settings:&Value)->ProviderResult<(ProviderConfig,String
         .filter(|p|p.is_file()).ok_or_else(||ProviderError::new("OPENCLI_COMPONENT_MISSING","请先在 OpenAI 设置安装 Node 组件。"))?;
     let profile=settings["opencliProfileId"].as_str().unwrap_or("");
     let account=settings["opencliAccountKey"].as_str().unwrap_or("");
-    let deployed=std::env::current_exe().ok().and_then(|p|p.parent().map(|parent|crate::store::hash_file(&p).ok().map(|(sha,_)|parent.join(".client-resources").join(sha).join("opencli/bridge.mjs")).filter(|p|p.is_file()).unwrap_or_else(||parent.join("opencli/bridge.mjs"))));
+    let deployed=current_executable_readers().into_iter().find(|path|path.is_file());
     let installed=std::env::var_os("LOCALAPPDATA").map(|p|PathBuf::from(p).join("Programs/Director-OpenCLI-Bridge/runtime-1.0.0/bridge.mjs"));
     let dev=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../web-image-bridge/bridge.mjs");
     let runner=deployed.filter(|p|p.is_file()).or_else(||installed.filter(|p|p.is_file())).or_else(||(cfg!(debug_assertions)&&dev.is_file()).then_some(dev)).ok_or_else(||ProviderError::new("OPENCLI_COMPONENT_MISSING","未安装网页出图组件。"))?;
-    let runtime_sha=include_str!("../../../../../web-image-bridge/runtime.sha256").trim();
+    let runtime_sha=COMPILED_RUNTIME_PIN.trim();
     let transport=json!({"transport":"opencli/v1","runtimeSha256":runtime_sha,"runner":fs::canonicalize(runner).map_err(|e|ProviderError::new("OPENCLI_COMPONENT_MISSING",e.to_string()))?,"stateRoot":home.join("opencli-requests"),"profile":profile,"accountKey":account});
     let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","endpoint":"http://127.0.0.1:19825","cliPath":node,"browserTransport":transport,"timeoutSeconds":90,"chromeBinding":{"profileId":profile,"endpoint":"http://127.0.0.1:19825","bundleId":"opencli-1.0.24"}})).map_err(|e|ProviderError::new("OPENCLI_CONFIG",e.to_string()))?;
     Ok((c,format!("chrome:opencli:{profile}:{account}")))
@@ -117,7 +268,7 @@ pub fn submit(c:&ProviderConfig,p:&PreparedRequest)->ProviderResult<SubmitReceip
 }
 pub fn query(c:&ProviderConfig,p:&PreparedRequest,id:&str)->ProviderResult<QueryResult>{
     if p.wire["transport"]!="opencli/v1"||p.request.request_id!=id{return Err(ProviderError::new("PROVIDER_MISMATCH","网页原任务身份不匹配"));}
-    let v=invoke(c,"query",Some(&p.request))?;let mut result:QueryResult=serde_json::from_value(v).map_err(|e|ProviderError::new("OPENCLI_PACKET",e.to_string()))?;result.actual_cost=None;Ok(result)
+    let mut result=query_with_reader(c,&p.request,"query",reader_policy(),current_executable_readers,|config,operation,request|invoke(config,operation,Some(request)))?;result.actual_cost=None;Ok(result)
 }
 pub fn reconcile(c:&ProviderConfig,id:&str)->ProviderResult<QueryResult>{
     valid_id(id)?;
@@ -125,9 +276,12 @@ pub fn reconcile(c:&ProviderConfig,id:&str)->ProviderResult<QueryResult>{
     let saved:Value=serde_json::from_slice(&fs::read(root.join(id).join("request.json")).map_err(|_|ProviderError::new("ORIGINAL_REQUEST_REQUIRED","未找到原网页请求，禁止重发"))?).map_err(|_|ProviderError::new("ORIGINAL_REQUEST_REQUIRED","原网页请求损坏"))?;
     let r:GenerationRequest=serde_json::from_value(saved["request"].clone()).map_err(|_|ProviderError::new("ORIGINAL_REQUEST_REQUIRED","原冻结请求缺失"))?;
     if r.request_id!=id{return Err(ProviderError::new("IMAGE_PROVENANCE","原请求身份不匹配"));}
-    let v=invoke(c,"query",Some(&r))?;
-    serde_json::from_value(v).map_err(|_|ProviderError::new("OPENCLI_PACKET","原网页回执无效"))
+    query_with_reader(c,&r,"reconcile",reader_policy(),current_executable_readers,|config,operation,request|invoke(config,operation,Some(request)))
 }
+
+#[cfg(test)]
+#[path = "opencli_reader_migration_tests.rs"]
+mod reader_migration_tests;
 pub fn download(c:&ProviderConfig,url:&str,target:&Path)->ProviderResult<DownloadReceipt>{
     let parts:Vec<_>=url.split(':').collect();if parts.len()!=3||parts[0]!="opencli-image"||parts[2].len()!=64||!parts[2].bytes().all(|b|b.is_ascii_hexdigit()) {return Err(ProviderError::new("OPENCLI_FILE","网页原图引用无效"));}valid_id(parts[1])?;
     let root=PathBuf::from(c.browser_transport.as_ref().unwrap()["stateRoot"].as_str().unwrap_or(""));let dir=root.join(parts[1]);

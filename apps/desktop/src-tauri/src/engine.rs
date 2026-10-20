@@ -28,6 +28,9 @@ pub mod background_chrome_images;
 pub mod task_record_maintenance;
 #[path = "unit_save_guard.rs"]
 mod unit_save_guard;
+#[cfg(test)]
+#[path = "engine_backup_restore_tests.rs"]
+mod backup_restore_tests;
 
 // Bound short-lived local CLI/process and file I/O work, not outstanding cloud tasks.
 const IMAGE_SUBMIT_WORKERS: usize = 8;
@@ -3582,7 +3585,18 @@ impl Engine {
         fs::create_dir_all(root.join("media")).map_err(|e| e.to_string())?;
         fs::copy(&source, root.join("project.sqlite")).map_err(|e| e.to_string())?;
         let restored = Store::open(root)?;
-        for m in restored.values("media")? {
+        // UI media projection creates thumbnails and reads the original file.
+        // A fresh restore has neither yet: enumerate immutable snapshot metadata,
+        // copy and verify every original, then relocate/project the completed copy.
+        let media = {
+            let c = restored.conn()?;
+            let mut query = c.prepare("SELECT data FROM media ORDER BY rowid").map_err(|e| e.to_string())?;
+            let values = query.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
+                .map(|row| crate::store::parse(row.map_err(|e| e.to_string())?))
+                .collect::<Result<Vec<_>>>()?;
+            values
+        };
+        for m in media {
             let src = store.verify_media(&m)?;
             let dst = restored.absolute_media(&m)?;
             if let Some(p) = dst.parent() {

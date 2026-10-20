@@ -36,7 +36,9 @@ function atomic(file, data) {
   fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 }); fs.renameSync(temp, file);
 }
 function error(code, unknown = false) { const e = new Error(code); e.code = code; e.unknown = unknown; return e; }
-const activeCode = `!!document.querySelector('[data-testid="stop-button"],button[aria-label="停止"],button[aria-label="Stop"],button[aria-label*="停止生成"],button[aria-label*="Stop generating"]')`;
+// ChatGPT retains hidden stop controls after the image is complete. They are
+// not a running generation; a visible control in the owned page still blocks.
+export const activeCode = `[...document.querySelectorAll('[data-testid="stop-button"],button[aria-label="停止"],button[aria-label="Stop"],button[aria-label*="停止生成"],button[aria-label*="Stop generating"]')].some(button=>button.getClientRects().length>0&&!button.closest('[hidden],[aria-hidden="true"]')&&getComputedStyle(button).visibility!=='hidden')`;
 const session = profile => new Page('site:chatgpt', undefined, profile, 'background', 'adapter', 'persistent');
 
 async function daemonStatus() {

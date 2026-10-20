@@ -1,4 +1,5 @@
-import test from'node:test';import assert from'node:assert/strict';import{validateRequest,checkIdentity,requestHash,stableConversation,dispatch,waitForIdentity,ensureLocalService,connectedProfile,connectAvailable}from'./bridge.mjs';
+import vm from'node:vm';
+import test from'node:test';import assert from'node:assert/strict';import{validateRequest,checkIdentity,requestHash,stableConversation,dispatch,waitForIdentity,ensureLocalService,connectedProfile,connectAvailable,activeCode}from'./bridge.mjs';
 const request={requestId:'synthetic-request',kind:'image',model:'chatgpt-image',prompt:'synthetic',ratio:'16:9',resolution:'native',references:[],options:{}};
 test('video and other channels are rejected before any browser access',()=>{assert.throws(()=>validateRequest({...request,kind:'video'}));assert.throws(()=>validateRequest({...request,model:'api-image'}));});
 test('request id traversal and empty prompt are rejected',()=>{assert.throws(()=>validateRequest({...request,requestId:'../other'}));assert.throws(()=>validateRequest({...request,prompt:''}));});
@@ -14,3 +15,12 @@ test('an unavailable local service stops waiting without browser or generation c
 test('another connected browser does not invalidate the saved execution browser',()=>{const s={extensionConnected:false,profiles:[{contextId:'original',extensionConnected:true},{contextId:'other',extensionConnected:true}]};assert.equal(connectedProfile(s,'original').contextId,'original');assert.throws(()=>connectedProfile(s),/BROWSER_SELECTION_REQUIRED/);assert.throws(()=>connectedProfile(s,'missing'),/OPENCLI_BROWSER_NOT_CONNECTED/);});
 test('explicit reconnect can use a responsive browser only with the same saved account',async()=>{const calls=[];const status={profiles:[{contextId:'original',extensionConnected:true},{contextId:'new',extensionConnected:true}]};const ready=await connectAvailable({profile:'original',accountKey:'same'},async()=>status,async c=>{calls.push(c.profile);if(c.profile==='original')throw Error('read-only timeout');return {profile:c.profile,accountKey:'same',ready:true};});assert.equal(ready.profile,'new');assert.deepEqual(calls,['original','new']);await assert.rejects(connectAvailable({accountKey:'same'},async()=>status,async()=>({accountKey:'changed'})),/ACCOUNT_CHANGED/);});
 test('first connection never silently chooses among multiple accounts or browsers',async()=>{await assert.rejects(connectAvailable({},async()=>({profiles:[{extensionConnected:true},{extensionConnected:true}]}),async()=>assert.fail()),/BROWSER_SELECTION_REQUIRED/);});
+
+test('hidden retained stop controls do not hold a completed image indefinitely',()=>{
+ const button=(visible,hidden=false,visibility='visible')=>({getClientRects:()=>visible?[{}]:[],closest:()=>hidden?{}:null,visibility});
+ const evaluate=buttons=>vm.runInNewContext(activeCode,{document:{querySelectorAll:()=>buttons},getComputedStyle:b=>({visibility:b.visibility})});
+ assert.equal(evaluate([button(false)]),false);
+ assert.equal(evaluate([button(true,true),button(true,false,'hidden')]),false);
+ assert.equal(evaluate([]),false);
+ assert.equal(evaluate([button(false),button(true)]),true);
+});
