@@ -13,6 +13,9 @@ use std::path::Path;
 #[path = "tasks_chrome_queue_tests.rs"]
 mod chrome_queue_tests;
 #[cfg(test)]
+#[path = "tasks_reconcile_tests.rs"]
+mod reconcile_tests;
+#[cfg(test)]
 #[path = "tasks_chrome_cleanup_tests.rs"]
 pub(crate) mod chrome_cleanup_tests;
 #[path="tasks_chrome_prepare_recovery.rs"]
@@ -594,7 +597,7 @@ fn persist_query_result(
         }
     };
     let error = message.map(str::to_owned).or_else(|| result.error.clone());
-    store.update_job(key, state, &json!({"result":result,"error":error}))?;
+    store.update_job(key, state, &json!({"providerTaskId":result.task_id,"result":result,"error":error}))?;
     if state == "query_failed" {
         store.retry_job(
             key,
@@ -828,15 +831,12 @@ pub fn reconcile(
             if r.task_id.is_empty() || r.status == "unknown" {
                 return Err("未能确定原任务，请在渠道记录中人工核对".into());
             }
-            store.update_job(
-                key,
-                if r.status == "succeeded" {
-                    "succeeded"
-                } else {
-                    "submitted"
-                },
-                &json!({"providerTaskId":r.task_id,"result":r}),
-            )
+            if !s(&j,"providerTaskId").is_empty() && s(&j,"providerTaskId") != r.task_id {
+                return Err("渠道核对返回的任务身份与原任务不一致，未采用结果".into());
+            }
+            // Reconciliation is a query. Preserve terminal failures, expiry and
+            // missing-output recovery exactly as a normal original-task query.
+            persist_query_result(store,key,&r,false).map(|_|())
         }
         Err(e) => Err(e.message),
     }

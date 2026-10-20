@@ -8,8 +8,16 @@ const COMPILED_RUNTIME_PIN: &str = include_str!("../../../../../web-image-bridge
 // Future runtimes must explicitly review their compatibility before adding a pair.
 const READ_ONLY_READER_MIGRATIONS: &[(&str, &str)] = &[(
     "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+    "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+), (
     "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+    "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
 )];
+
+pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
+    to == COMPILED_RUNTIME_PIN.trim()
+        && READ_ONLY_READER_MIGRATIONS.iter().any(|(old,new)| *old==from && *new==to)
+}
 
 fn executable_readers(executable: &Path) -> Vec<PathBuf> {
     let Some(parent) = executable.parent() else { return vec![]; };

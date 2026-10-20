@@ -940,7 +940,8 @@ pub async fn run_asset_design(
                     continue;
                 }
             };
-            // Shared-source prop candidates are text consistency inputs only.
+            // Shared-source prop candidates (CH, and LOC under frozen v3) are
+            // text consistency inputs only.
             // Wait for related original targets; never add targets or images.
             // Manual/reused implicit drafts above keep their original handling.
             if prop_dependencies.get(&id).is_some_and(|props| props.iter().any(|prop| {
@@ -1289,6 +1290,10 @@ pub async fn run_asset_design(
         json!({"schemaVersion":"asset-design-batch/v1","sourceSha256":source.sha256,"assets":updated,"designs":designs,"imagePlan":image_plan,"imageProductionPolicy":policy,"facts":visual["facts"],"visualFactBatches":visual["visualFactBatches"],"visualFactCacheReuses":visual["visualFactCacheReuses"].as_array().cloned().unwrap_or_default(),"blocked":blocked,"skipped":skipped,"trialApproved":trial_approved,"ruleSnapshots":[rule_snapshot("asset-visual-facts-extractor")?,rule_snapshot("asset-art-director")?,rule_snapshot("asset-image-production")?]}),
     )
 }
+
+#[cfg(test)]
+#[path = "assets_scene_prop_context_tests.rs"]
+mod scene_prop_context_tests;
 
 #[cfg(test)]
 #[path = "assets_inline_delta_tests.rs"]

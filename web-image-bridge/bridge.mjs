@@ -41,6 +41,68 @@ function error(code, unknown = false) { const e = new Error(code); e.code = code
 export const activeCode = `[...document.querySelectorAll('[data-testid="stop-button"],button[aria-label="停止"],button[aria-label="Stop"],button[aria-label*="停止生成"],button[aria-label*="Stop generating"]')].some(button=>button.getClientRects().length>0&&!button.closest('[hidden],[aria-hidden="true"]')&&getComputedStyle(button).visibility!=='hidden')`;
 const session = profile => new Page('site:chatgpt', undefined, profile, 'background', 'adapter', 'persistent');
 
+// The daemon accepts at most 1 MiB per command. The upstream fallback puts a
+// complete image into one evaluate call; a normal PNG can exceed that limit.
+// Keep the pinned upstream code intact and supply its file-input hook with a
+// bounded, hash-checked browser upload instead. This never sends the prompt.
+export async function attachReferenceFiles(page, references, token, chunkBytes = 128 * 1024) {
+  if (!Array.isArray(references) || !references.length || references.length>10 || !/^[a-zA-Z0-9_-]{1,100}$/.test(token) || !Number.isInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > 128 * 1024) throw error('REFERENCE_UPLOAD_CONFIG');
+  const key = `__director_reference_${token}`;
+  const files = references.map(ref => {
+    const bytes = fs.readFileSync(ref.path);
+    if (bytes.length > 20 * 1024 * 1024 || sha(bytes) !== ref.sha256) throw error('REFERENCE_CHANGED');
+    return { name:path.basename(ref.path), sha256:ref.sha256, bytes, mime:/\.png$/i.test(ref.path)?'image/png':/\.webp$/i.test(ref.path)?'image/webp':/\.gif$/i.test(ref.path)?'image/gif':/\.heic$/i.test(ref.path)?'image/heic':/\.heif$/i.test(ref.path)?'image/heif':'image/jpeg' };
+  });
+  const meta = files.map(({name,sha256,bytes,mime})=>({name,sha256,size:bytes.length,mime}));
+  const initialized = await page.evaluate(`(()=>{const key=${JSON.stringify(key)},meta=${JSON.stringify(meta)};const old=globalThis[key];if(old){if(JSON.stringify(old.meta)!==JSON.stringify(meta))throw Error('REFERENCE_UPLOAD_IDENTITY');return{ok:true,phase:old.phase};}globalThis[key]={meta,parts:meta.map(()=>[]),files:[],phase:'collecting'};return{ok:true,phase:'collecting'};})()`);
+  if (!initialized?.ok) throw error('REFERENCE_UPLOAD_UNCONFIRMED');
+  if (initialized.phase === 'attached') return { count: files.length };
+  if (initialized.phase !== 'collecting') throw error('REFERENCE_UPLOAD_UNCONFIRMED');
+  for (let fileIndex=0; fileIndex<files.length; fileIndex++) {
+    const file=files[fileIndex];
+    for (let offset=0,index=0; offset<file.bytes.length; offset+=chunkBytes,index++) {
+      const data=file.bytes.subarray(offset,offset+chunkBytes).toString('base64');
+      const result=await page.evaluate(`(()=>{const s=globalThis[${JSON.stringify(key)}];if(!s||s.phase!=='collecting')throw Error('REFERENCE_UPLOAD_PHASE');const a=s.parts[${fileIndex}],i=${index},b=${JSON.stringify(data)};if(i<a.length){if(a[i]!==b)throw Error('REFERENCE_UPLOAD_IDENTITY');}else{if(i!==a.length)throw Error('REFERENCE_UPLOAD_ORDER');a.push(b);}return{ok:true,index:i};})()`);
+      if (!result?.ok || result.index!==index) throw error('REFERENCE_UPLOAD_UNCONFIRMED');
+    }
+  }
+  const attached=await page.evaluate(`(async()=>{const key=${JSON.stringify(key)},s=globalThis[key];if(!s)throw Error('REFERENCE_UPLOAD_MISSING');if(s.phase==='attached')return{ok:true,count:s.meta.length};if(s.phase!=='collecting')throw Error('REFERENCE_UPLOAD_UNCONFIRMED');const hash=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(v=>v.toString(16).padStart(2,'0')).join('');const files=[];for(let i=0;i<s.meta.length;i++){const m=s.meta[i],chunks=s.parts[i].map(v=>Uint8Array.from(atob(v),c=>c.charCodeAt(0)));const blob=new Blob(chunks,{type:m.mime});if(blob.size!==m.size||await hash(await blob.arrayBuffer())!==m.sha256)throw Error('REFERENCE_UPLOAD_BYTES');files.push(new File([blob],m.name,{type:m.mime}));}const inputs=[...document.querySelectorAll('input[type="file"]')];const input=inputs.find(n=>/image|\.png|\.jpg|\.jpeg/i.test(n.accept||''))||inputs.find(n=>!(n.accept||''));if(!input)throw Error('REFERENCE_FILE_INPUT_MISSING');const dt=new DataTransfer();for(const file of files)dt.items.add(file);s.phase='invoking';input.files=dt.files;const propsKey=Object.keys(input).find(k=>k.startsWith('__reactProps$'));if(propsKey&&typeof input[propsKey]?.onChange==='function'){const nativeEvent=new Event('change',{bubbles:true});input[propsKey].onChange({target:input,currentTarget:input,nativeEvent,preventDefault(){},stopPropagation(){},isDefaultPrevented(){return false},isPropagationStopped(){return false},persist(){}});}else{input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));}s.phase='attached';delete s.parts;s.files=s.meta.map(m=>({name:m.name,size:m.size,sha256:m.sha256}));return{ok:true,count:s.meta.length};})()`);
+  if (!attached?.ok || attached.count!==files.length) throw error('REFERENCE_UPLOAD_UNCONFIRMED');
+  return { count:files.length };
+}
+
+export function preSendJournal(saved) {
+  return saved?.version==='opencli-task/v1' && ['preparing','submission_unknown','not_submitted'].includes(saved.status)
+    && typeof saved.page==='string' && /^[a-zA-Z0-9_-]{4,100}$/.test(saved.page)
+    && saved.conversationUrl===null && !Object.hasOwn(saved,'sentAt') && !Object.hasOwn(saved,'sendConfirmed');
+}
+const emptyCheck = async (page, id) => ({ page:id, ...await page.evaluate(`(()=>{const c=document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea');return{url:location.href,userCount:document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message').length,assistantCount:document.querySelectorAll('[data-message-author-role=assistant]').length,composerEmpty:!!c&&!(c.innerText||'').trim(),generating:${activeCode}};})()`), accountKey:(await browserIdentity(page)).accountKey });
+function emptyCheckValid(check, saved) {
+  return check.page===saved.page && ['https://chatgpt.com/','https://chatgpt.com/new'].includes(check.url)
+    && check.accountKey===saved.accountKey && check.userCount===0 && check.assistantCount===0 && check.composerEmpty===true && check.generating===false;
+}
+function notSubmittedResult(request,saved,loc) {
+  const proof={...saved.notSubmittedProof,journalAfterSha256:sha(fs.readFileSync(loc.file))};
+  if (!preSendJournal(saved) || saved.status!=='not_submitted' || saved.requestId!==request.requestId || requestHash(saved.request)!==saved.requestHash || proof.requestId!==request.requestId || proof.requestHash!==saved.requestHash
+      || proof.version!=='opencli-pre-send-not-submitted/v1' || !/^[a-f0-9]{64}$/.test(proof.runtimeSha256||'') || !/^[a-f0-9]{64}$/.test(proof.journalBeforeSha256||'') || proof.journalBeforeSha256===proof.journalAfterSha256
+      || proof.sendMarkerAbsent!==true || proof.sendConfirmedAbsent!==true || proof.conversationUrlAbsent!==true || proof.checks?.length!==2 || !proof.checks.every(c=>emptyCheckValid(c,saved))) throw error('PRE_SEND_SETTLEMENT_UNPROVEN');
+  return {taskId:request.requestId,status:'failed',resultUrls:[],error:'参考图片准备在发送提示词前中断，已核实未提交生成；可继续制作，原记录保留。',raw:{transport:'opencli/v1',requestHash:saved.requestHash,opencliNotSubmitted:proof,taskSettlement:{id:request.requestId,status:'failed',reason:'not_submitted'}}};
+}
+export async function settlePreSendFailure(config,request,saved,loc,page,check=emptyCheck) {
+  if (!preSendJournal(saved) || !['preparing','submission_unknown'].includes(saved.status)) return null;
+  const before=fs.readFileSync(loc.file);checkIdentity(saved,request);
+  if(saved.requestId!==request.requestId || requestHash(saved.request)!==saved.requestHash)throw error('REQUEST_IDENTITY_CHANGED');
+  const checks=[await check(page,saved.page),await check(page,saved.page)];
+  if (!checks.every(c=>emptyCheckValid(c,saved)) || !fs.readFileSync(loc.file).equals(before)) return null;
+  const beforeSha=sha(before),archive=path.join(path.dirname(loc.file),`pre-send-interruption-${beforeSha}.json`);
+  if(fs.existsSync(archive)){if(!fs.readFileSync(archive).equals(before))throw error('PRE_SEND_ARCHIVE_CHANGED');}
+  else fs.writeFileSync(archive,before,{flag:'wx',mode:0o600});
+  saved.status='not_submitted';saved.settledAt=new Date().toISOString();
+  saved.notSubmittedProof={version:'opencli-pre-send-not-submitted/v1',requestId:request.requestId,requestHash:saved.requestHash,runtimeSha256:config.runtimeSha256,journalBeforeSha256:beforeSha,journalBeforeArchive:path.basename(archive),sendMarkerAbsent:true,sendConfirmedAbsent:true,conversationUrlAbsent:true,page:saved.page,checks};
+  atomic(loc.file,saved);
+  return notSubmittedResult(request,saved,loc);
+}
+
 async function daemonStatus() {
   let r;
   try { r = await fetch('http://127.0.0.1:19825/status', { headers: { 'X-OpenCLI': '1' }, signal: AbortSignal.timeout(3000) }); }
@@ -148,7 +210,12 @@ function activeOwner(loc, requestId) {
   const active = read(loc.active);
   if (active.requestId === requestId) return;
   const previous = path.join(loc.root, active.requestId, 'request.json');
-  if (!fs.existsSync(previous) || read(previous).status !== 'downloaded') throw error('BRIDGE_BUSY');
+  if (!fs.existsSync(previous)) throw error('BRIDGE_BUSY');
+  const saved=read(previous);
+  if (saved.status!=='downloaded') {
+    if (saved.status!=='not_submitted' || !preSendJournal(saved) || saved.notSubmittedProof?.requestId!==active.requestId) throw error('BRIDGE_BUSY');
+    notSubmittedResult(saved.request,saved,{file:previous});
+  }
 }
 async function submit(config, request) {
   validateRequest(request); const loc = paths(config, request.requestId), hash = requestHash(request);
@@ -165,7 +232,7 @@ async function submit(config, request) {
     p.setActivePage(saved.page); let blank = false;
     for (let i = 0; i < 15; i++) { blank = await p.evaluate(`(()=>{const c=document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea');return !!c&&!(c.innerText||'').trim()&&document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message').length===0;})()`); if (blank) break; await p.sleep(1); }
     if (!blank || await p.evaluate(activeCode)) throw error('EMPTY_PREFLIGHT', true);
-    if (request.references.length) { const refs = [...request.references].sort((a,b) => a.order - b.order); const upload = await uploadChatGPTImages(p, refs.map(r => r.path)); if (!upload?.ok) throw error('REFERENCE_UPLOAD_UNCONFIRMED', true); }
+    if (request.references.length) { const refs = [...request.references].sort((a,b) => a.order - b.order); const upload = await uploadChatGPTImages({setFileInput:()=>attachReferenceFiles(p,refs,request.requestId),evaluate:p.evaluate.bind(p),sleep:p.sleep.bind(p)},refs.map(r => r.path)); if (!upload?.ok) throw error('REFERENCE_UPLOAD_UNCONFIRMED', true); }
     saved.status = 'send_dispatching'; saved.sentAt = new Date().toISOString(); atomic(loc.file, saved);
     const sent = await sendChatGPTMessage(p, saved.prompt); if (!sent) throw error('SUBMISSION_UNKNOWN', true);
     saved.status = 'processing'; saved.sendConfirmed = true;
@@ -179,7 +246,9 @@ async function query(config, request) {
   if (!fs.existsSync(loc.file)) throw error('ORIGINAL_TASK_MISSING'); const saved = read(loc.file); checkIdentity(saved, request);
   if (saved.profile !== config.profile || saved.accountKey !== config.accountKey) throw error('ACCOUNT_CHANGED');
   if (saved.status === 'downloaded') return { taskId: request.requestId, status: 'succeeded', resultUrls: saved.resultUrls, raw: saved.proof };
+  if (saved.status === 'not_submitted') return notSubmittedResult(request,saved,loc);
   await health(config.profile); const p = session(saved.profile); p.setActivePage(saved.page);
+  if (preSendJournal(saved)) { const settled=await settlePreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
   let url;
   try { url = await p.evaluate('location.href'); } catch { if (!stableConversation(saved.conversationUrl)) throw error('ORIGINAL_PAGE_UNAVAILABLE'); const page = await p.newTab(saved.conversationUrl); saved.page = page; p.setActivePage(page); atomic(loc.file, saved); await p.sleep(1); url = await p.evaluate('location.href'); }
   if (stableConversation(url)) { if (saved.conversationUrl && saved.conversationUrl !== url) throw error('CONVERSATION_CHANGED'); saved.conversationUrl = url; atomic(loc.file, saved); }

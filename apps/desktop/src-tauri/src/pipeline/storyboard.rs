@@ -3112,6 +3112,9 @@ fn author_validation_candidate(
     selected: &[Value],
     reason: &str,
 ) -> Result<(Value, Vec<Value>), String> {
+    if crate::text_executor::author_unit_duration_rejection(reason) {
+        return author_unit_duration_candidate(source,raw,assets,caps,refs,style,prefix,plan,selected);
+    }
     if reason == crate::text_executor::AUTHOR_SHOT_DURATION_REJECTION {
         return author_duration_candidate(
             source, raw, assets, caps, refs, style, prefix, plan, selected,
@@ -3447,12 +3450,49 @@ fn author_duration_candidate(
     Ok((draft, issues))
 }
 
+/// A carrier overrun in an unadopted Author is repair data, not permission to
+/// adopt it. The normal validator/publication limits above remain unchanged.
+fn author_unit_duration_candidate(
+    source:&LockedSource,raw:&Value,assets:&[Value],caps:&Value,refs:&[String],
+    style:&str,prefix:&str,plan:&Value,selected:&[Value],
+) -> Result<(Value,Vec<Value>),String> {
+    if raw["schemaVersion"]!="storyboard-draft/v2" {return Err("单元时长修订缺少原话区间协议；未调用模型".into());}
+    let mut draft=raw.clone();
+    materialize_dialogue(source,&mut draft,false)?;
+    materialize_asset_references(&mut draft,assets)?;
+    prefix_ids(&mut draft,prefix)?;
+    add_delivery_fields(&mut draft,style)?;
+    // Existing carrier preparation checks all source, identity and voice-window
+    // invariants while collecting the limit defect. This candidate is never
+    // accepted; the bounded editor below is validated against the original caps.
+    let candidate_caps=carrier_validation_caps(&draft,caps,true);
+    validate_storyboard_scope(source,&draft,assets,&candidate_caps,Some(refs))?;
+    validate_event_bindings(&draft,plan)?;
+    validate_fantasy_profile(&draft,selected,true)?;
+    materialize_unit_coverage(source,&mut draft)?;
+    creative::add_delivery(&mut draft,source,style,assets,true)?;
+    let maximum=caps["maxDuration"].as_f64().ok_or("单元时长修订缺少原渠道最大时长")?;
+    let issues=draft["units"].as_array().unwrap().iter().filter_map(|unit|{
+        let actual=unit["duration"].as_f64()?;
+        (actual>maximum+0.000001).then(||json!({"code":"UNIT_DURATION","unitId":unit["id"],
+            "episodeId":unit["episodeId"],"sceneId":unit["sceneId"],"sourceRefs":unit["sourceRefs"],
+            "coordinate":format!("{}.duration",text(unit,"id")),"originalDuration":actual,"maximumDuration":maximum,
+            "problem":format!("单元 {} 时长 {actual:.2} 秒超过渠道 {maximum:.2} 秒；须修订而非截断",text(unit,"id"))}))
+    }).collect::<Vec<_>>();
+    if issues.is_empty(){return Err("原单元时长拒绝没有可定位的实际超限；保留原回包，不创建修订".into());}
+    Ok((draft,issues))
+}
+
 fn author_scope_problem_signature(issues: &[Value]) -> String {
     let mut keys: Vec<_> = issues.iter().map(|issue| {
         let mut refs:Vec<_>=issue["sourceRefs"].as_array().into_iter().flatten().cloned().collect();
         refs.sort_by_key(Value::to_string);refs.dedup();
         let mut identity=json!({"code":issue["code"],"assetId":issue["assetId"],"variantId":issue["variantId"],"episodeId":issue["episodeId"],"sceneId":issue["sceneId"],"sourceRefs":refs});
         if issue["code"]=="UNIT_SCENE_COORDINATE" {identity["expectedSceneId"]=issue["expectedSceneId"].clone();}
+        if issue["code"]=="UNIT_DURATION" {
+            identity["originalDuration"]=issue["originalDuration"].clone();
+            identity["maximumDuration"]=issue["maximumDuration"].clone();
+        }
         if ["DIALOGUE_SOURCE_INTERVAL","DIALOGUE_SOURCE_COVERAGE","UNIT_SOURCE_COVERAGE","ASSET_SOURCE_SCOPE","SHOT_SOURCE_SCOPE","SHOT_DURATION"].contains(&text(issue,"code")) {
             for field in ["coordinate","lineId","quoteStart","quoteEnd","allowedSpokenRanges","requiredSourceRefs","shotId","originalDuration"] {identity[field]=issue[field].clone();}
             if package_source_issue(issue) {
@@ -3608,6 +3648,7 @@ async fn repair_author_scope(
             "ASSET_SOURCE_SCOPE",
             "SHOT_SOURCE_SCOPE",
             "SHOT_DURATION",
+            "UNIT_DURATION",
         ]
         .contains(&text(issue, "code"))
     });
@@ -5551,6 +5592,7 @@ mod tests {
 mod production_contract_tests {
     use super::*;
     use tokio::sync::Mutex;
+    include!("storyboard_unit_duration_tests.rs");
 
     #[derive(Default)]
     struct Recorded {
@@ -5961,6 +6003,14 @@ mod production_contract_tests {
                 }
                 if let Some(mode) = self.author_source_error {
                     match mode {
+                        "UNIT_DURATION" => {
+                            let first = draft["units"][0]["shots"][0].clone();
+                            draft["units"][0]["shots"] = json!((0..10).map(|i| {
+                                let mut shot=first.clone();shot["id"]=json!(format!("duration-shot-{i}"));shot["duration"]=json!(3.03);
+                                if i>0 {shot["dialogueParts"]=json!([]);}
+                                shot
+                            }).collect::<Vec<_>>());
+                        }
                         "DIALOGUE" => {
                             for part in draft["units"][0]["shots"][0]["dialogueParts"]
                                 .as_array_mut()

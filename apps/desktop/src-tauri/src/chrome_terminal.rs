@@ -43,11 +43,86 @@ pub(crate) fn proof_valid(proof:&Value,prepared:&Value,task:&str)->bool{
 }
 pub(crate) fn settled_job(job:&Value)->bool{
     let task=s(job,"providerTaskId");let result=&job["result"];
-    job["provider"]=="chrome"&&job["kind"]=="image"&&job["status"]=="failed"&&!task.is_empty()
-        &&job["snapshot"]["requestId"]==task&&result["taskId"]==task&&result["status"]=="failed"&&result["resultUrls"].as_array().is_some_and(Vec::is_empty)
-        &&(proof_valid(&result["raw"]["nativeProof"],&job["prepared"],task)||upload_not_submitted_valid(&result["raw"]["uploadNotSubmitted"],&job["prepared"],task))
+    if !(job["provider"]=="chrome"&&job["kind"]=="image"&&job["status"]=="failed"&&!task.is_empty()
+        &&job["snapshot"]["requestId"]==task&&result["taskId"]==task&&result["status"]=="failed"&&result["resultUrls"].as_array().is_some_and(Vec::is_empty)) {
+        return false;
+    }
+    // OpenCLI has its own frozen wire and journal contract. A malformed new
+    // proof must never obtain settlement from an unrelated legacy proof.
+    if job["prepared"]["wire"]["transport"]=="opencli/v1"
+        || job["snapshot"]["providerConfig"]["browserTransport"]["transport"]=="opencli/v1" {
+        return opencli_not_submitted_valid(job,task);
+    }
+    (proof_valid(&result["raw"]["nativeProof"],&job["prepared"],task)||upload_not_submitted_valid(&result["raw"]["uploadNotSubmitted"],&job["prepared"],task))
         &&result["raw"]["taskSettlement"]["id"]==task
         &&["failed","cancelled","interrupted","completed_without_artifact"].contains(&s(&result["raw"]["taskSettlement"],"status"))
+}
+
+fn opencli_sha(value:&Value)->bool {
+    value.as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))
+}
+
+fn no_opencli_send_markers(value:&Value,depth:usize)->bool {
+    if depth>32 {return false;}
+    match value {
+        Value::Object(fields)=>fields.iter().all(|(key,value)|
+            !["sentAt","sendConfirmed","conversationUrl"].contains(&key.as_str())
+                &&no_opencli_send_markers(value,depth+1)),
+        Value::Array(values)=>values.iter().all(|value|no_opencli_send_markers(value,depth+1)),
+        _=>true,
+    }
+}
+
+fn opencli_reader_bound(job:&Value,proof:&Value)->bool {
+    let raw=&job["result"]["raw"];
+    let config=&job["snapshot"]["providerConfig"];
+    let frozen=&config["browserTransport"]["runtimeSha256"];
+    if !opencli_sha(frozen)||!opencli_sha(&proof["runtimeSha256"]) {return false;}
+    let Some(audit)=raw.get("readerMigration") else{return proof["runtimeSha256"]==*frozen;};
+    // This is the existing query-only provider audit, not a new execution
+    // identity. Its destination is also bound to this binary's pinned reader.
+    audit["schemaVersion"]=="opencli-readonly-reader-migration/v1"
+        &&["query","reconcile"].contains(&s(audit,"operation"))&&audit["bridgeOperation"]=="query"
+        &&audit["readOnly"]==true&&audit["resubmitted"]==false&&audit["frozenConfigUnchanged"]==true
+        &&audit["fromRuntimeSha256"]==*frozen&&audit["toRuntimeSha256"]==proof["runtimeSha256"]
+        &&audit["fromRuntimeSha256"]!=audit["toRuntimeSha256"]
+        &&crate::providers::opencli::read_only_reader_migration_allowed(s(audit,"fromRuntimeSha256"),s(audit,"toRuntimeSha256"))
+        &&["fromRunnerSha256","toRunnerSha256","fromManifestSha256","toManifestSha256"].iter().all(|key|opencli_sha(&audit[key]))
+        &&audit["frozenConfigSha256"]==crate::pipeline::digest(&config.to_string())
+        &&audit["generationRequestSha256"]==crate::pipeline::digest(&job["prepared"]["request"].to_string())
+}
+
+fn opencli_not_submitted_valid(job:&Value,task:&str)->bool {
+    let prepared=&job["prepared"];let wire=&prepared["wire"];let result=&job["result"];let raw=&result["raw"];
+    let proof=&raw["opencliNotSubmitted"];let config=&job["snapshot"]["providerConfig"];let frozen=&config["browserTransport"];
+    // Compare the typed original request, not metadata added to the snapshot.
+    // In particular, do not recompute Node's wire hash with Rust's key order.
+    let Ok(original)=serde_json::from_value::<crate::providers::GenerationRequest>(job["snapshot"].clone()) else{return false;};
+    let Ok(original)=serde_json::to_value(original) else{return false;};
+    let Ok(request)=serde_json::from_value::<crate::providers::GenerationRequest>(prepared["request"].clone()) else{return false;};
+    let Ok(request)=serde_json::to_value(request) else{return false;};
+    let Some(checks)=proof["checks"].as_array().filter(|checks|checks.len()==2) else{return false;};
+    let page=s(proof,"page");let account=s(wire,"accountKey");let profile=s(wire,"profile");
+    let error=s(result,"error");
+    prepared["provider"]=="chrome"&&request==prepared["request"]&&original==request
+        &&request["requestId"]==task&&request["kind"]=="image"&&request["model"]=="chatgpt-image"
+        &&uuid::Uuid::parse_str(task).is_ok()
+        &&wire["transport"]=="opencli/v1"&&config["kind"]=="chrome"&&frozen["transport"]=="opencli/v1"
+        &&!account.trim().is_empty()&&frozen["accountKey"]==account&&!profile.trim().is_empty()&&frozen["profile"]==profile
+        &&raw["transport"]=="opencli/v1"&&opencli_sha(&wire["requestHash"])&&raw["requestHash"]==wire["requestHash"]
+        &&proof["version"]=="opencli-pre-send-not-submitted/v1"&&proof["requestId"]==task&&proof["requestHash"]==wire["requestHash"]
+        &&opencli_reader_bound(job,proof)
+        &&opencli_sha(&proof["journalBeforeSha256"])&&opencli_sha(&proof["journalAfterSha256"])
+        &&proof["journalBeforeSha256"]!=proof["journalAfterSha256"]
+        &&proof["sendMarkerAbsent"]==true&&proof["sendConfirmedAbsent"]==true&&proof["conversationUrlAbsent"]==true
+        &&!page.trim().is_empty()&&page.len()<=256&&no_opencli_send_markers(raw,0)
+        &&checks.iter().all(|check|check["page"]==page&&check["accountKey"]==account
+            &&["https://chatgpt.com/","https://chatgpt.com/new"].contains(&s(check,"url"))
+            &&check["userCount"].as_u64()==Some(0)&&check["assistantCount"].as_u64()==Some(0)
+            &&check["composerEmpty"]==true&&check["generating"]==false)
+        &&raw["taskSettlement"]["id"]==task&&raw["taskSettlement"]["status"]=="failed"&&raw["taskSettlement"]["reason"]=="not_submitted"
+        &&(error.contains("未提交")||error.contains("未发送")||error.contains("没有提交")
+            ||error.to_ascii_lowercase().contains("not_submitted")||error.to_ascii_lowercase().contains("not submitted"))
 }
 /// A halted upload effect plus fresh native empty-page proof does not grant a
 /// retry until the original bridge task has been cancelled and rechecked empty.
@@ -80,6 +155,10 @@ pub(crate) fn upload_not_submitted_valid(p:&Value,prepared:&Value,task:&str)->bo
  &&empty_receipt(&p["nativeEmptyAfter"],&p["sourceClientId"])&&p["originalTaskSettlement"]["id"]==task
  &&["failed","cancelled","interrupted"].contains(&s(&p["originalTaskSettlement"],"status"))
 }
+
+#[cfg(test)]
+#[path = "chrome_terminal_opencli_not_submitted_tests.rs"]
+mod opencli_not_submitted_tests;
 
 #[cfg(test)]pub(crate) mod tests{
  use super::*;use serde_json::json;

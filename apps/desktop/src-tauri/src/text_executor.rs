@@ -4648,6 +4648,21 @@ pub(crate) const AUTHOR_ASSET_SOURCE_REJECTION: &str = "单元资产引用越出
 pub(crate) const AUTHOR_SHOT_SOURCE_REJECTION: &str = "镜头引用越出本单元来源";
 pub(crate) const AUTHOR_SHOT_DURATION_REJECTION: &str = "镜长须为正数";
 
+/// Recognize only the strict validator's existing, immutable unit-limit error.
+/// The pipeline independently proves the actual overrun and all source facts
+/// before it can create an unadopted candidate for the original editor.
+pub(crate) fn author_unit_duration_rejection(reason:&str)->bool {
+    let Some(value)=reason.strip_prefix("单元 ") else{return false;};
+    let Some((unit,value))=value.split_once(" 时长 ") else{return false;};
+    let Some((actual,maximum))=value.split_once(" 秒超过渠道 ") else{return false;};
+    let Some(maximum)=maximum.strip_suffix(" 秒；须修订而非截断") else{return false;};
+    let decimal=|value:&str|value.split_once('.').is_some_and(|(whole,fraction)|
+        !whole.is_empty()&&whole.bytes().all(|b|b.is_ascii_digit())&&fraction.len()==2&&fraction.bytes().all(|b|b.is_ascii_digit()));
+    if unit.is_empty()||unit.chars().any(char::is_whitespace)||!decimal(actual)||!decimal(maximum){return false;}
+    matches!((actual.parse::<f64>(),maximum.parse::<f64>()),(Ok(actual),Ok(maximum))
+        if actual.is_finite()&&maximum.is_finite()&&maximum>0.0&&actual>=maximum)
+}
+
 pub(crate) fn author_missing_dialogue(reason: &str) -> Option<&str> {
     let id = reason.strip_prefix("对白 ")?.strip_suffix(" 未完整出现一次")?;
     (id.starts_with("dialogue:row:") && !id.chars().any(char::is_whitespace)).then_some(id)
@@ -4662,7 +4677,7 @@ pub(crate) fn author_repairable_rejection(reason: &str) -> bool {
         AUTHOR_SHOT_SOURCE_REJECTION,
         AUTHOR_SHOT_DURATION_REJECTION,
     ]
-    .contains(&reason) || author_missing_dialogue(reason).is_some()
+    .contains(&reason) || author_missing_dialogue(reason).is_some() || author_unit_duration_rejection(reason)
 }
 
 pub(crate) fn planner_repairable_rejection(reason:&str) -> bool {
@@ -6217,6 +6232,13 @@ impl SavedTextExecutor {
         let saved_errors:Option<(Option<String>,Option<String>)>=c.query_row(
             "SELECT w.error,j.error FROM workflow_steps w LEFT JOIN jobs j ON j.id=w.text_job_id WHERE w.workflow_id=?1 AND w.node_key=?2",
             params![run,key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        // Include only this exact node's preserved dynamic duration error. The
+        // SQL below still binds both rejected rows, request hash and raw event.
+        if let Some((step,job))=&saved_errors {
+            for reason in step.iter().chain(job) {
+                if author_unit_duration_rejection(reason)&&!repairable.contains(reason){repairable.push(reason.clone());}
+            }
+        }
         if saved_errors.as_ref().is_some_and(|(step,job)|step.iter().chain(job).any(|reason|
             author_missing_dialogue(reason).is_some() && !repairable.contains(reason))) {
             return Err("原缺失对白节点与冻结正文身份不一致；保留原拒绝，禁止重发主创".into());
@@ -10206,6 +10228,7 @@ mod carrier_continuity_key_tests {
             AUTHOR_ASSET_SOURCE_REJECTION,
             AUTHOR_SHOT_SOURCE_REJECTION,
             "对白 dialogue:row:source:0:8 未完整出现一次",
+            "单元 episode:test:unit:02 时长 30.30 秒超过渠道 30.00 秒；须修订而非截断",
         ] {
             let (_temp, exec, request, job, raw) = rejected_author_fixture();
             let connection = exec.store.conn().unwrap();

@@ -467,6 +467,7 @@ pub(in crate::pipeline) fn prepare_request(
                         || issues.iter().any(|issue| {
                             issue["code"] != "ASSET_SCENE_SCOPE"
                                 && issue["code"] != "SHOT_DURATION"
+                                && issue["code"] != "UNIT_DURATION"
                                 && !source_coordinate_issue(issue)
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
@@ -510,6 +511,7 @@ pub(in crate::pipeline) fn prepare_request(
                         || issues.iter().any(|issue| {
                             issue["code"] != "ASSET_SCENE_SCOPE"
                                 && issue["code"] != "SHOT_DURATION"
+                                && issue["code"] != "UNIT_DURATION"
                                 && !(asset_use_profile && matches!(text(issue,"code"),"SHOT_SOURCE_SCOPE" | "ASSET_SOURCE_SCOPE"))
                                 && !(proof["attempt"] == 2
                                     && issue["code"] == "UNIT_SCENE_COORDINATE")
@@ -613,6 +615,12 @@ pub(in crate::pipeline) fn prepare_request(
         runtime_contract["finishRepairProfile"] = json!(FINISH_SCOPE_REPAIR_PROFILE);
         runtime_contract["content"] = json!(content);
         runtime_contract["sha256"] = json!(digest(text(&runtime_contract, "content")));
+    }
+    if (author_repair || finish_repair) && request.input["validationIssues"].as_array()
+        .is_some_and(|issues|issues.iter().any(|issue|issue["code"]=="UNIT_DURATION")) {
+        let content=format!("{}\n\nUNIT_DURATION：原未采用单元的实际镜长合计超过冻结渠道 maximumDuration。仅由本次原整编在受影响单元及必要关联组内重新组织声画共时、动作节奏和切点；必要时合法拆分单元，原话全部按序恰好一次、说者/声道和必要动作保留。maximumDuration仍是原上限，不能放宽、硬截原文、裁声窗、按比例压缩或自动取整。差量作品须通过原渠道完整复验；最多沿用两次修订预算，相同问题无进展即停止。",text(&runtime_contract,"content"));
+        runtime_contract["content"]=json!(content);
+        runtime_contract["sha256"]=json!(digest(text(&runtime_contract,"content")));
     }
     if (author_repair || finish_repair)
         && request.input["validationIssues"]

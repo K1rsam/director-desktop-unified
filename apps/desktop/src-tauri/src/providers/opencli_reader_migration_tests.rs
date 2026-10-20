@@ -47,11 +47,14 @@ fn response(request: &GenerationRequest) -> Value {
 }
 
 #[test]
-fn reader_policy_allows_only_the_reviewed_old_and_current_pin_pair() {
-    assert_eq!(READ_ONLY_READER_MIGRATIONS.len(), 1);
-    assert_eq!(READ_ONLY_READER_MIGRATIONS[0], (
-        "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
-        "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3"));
+fn reader_policy_allows_only_the_reviewed_old_and_current_pin_pairs() {
+    assert_eq!(READ_ONLY_READER_MIGRATIONS, &[
+        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"),
+        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8"),
+    ]);
+    for (from,to) in READ_ONLY_READER_MIGRATIONS {assert!(read_only_reader_migration_allowed(from,to));}
+    assert!(!read_only_reader_migration_allowed(&"f".repeat(64),COMPILED_RUNTIME_PIN.trim()));
+    assert!(!read_only_reader_migration_allowed(READ_ONLY_READER_MIGRATIONS[0].0,&"f".repeat(64)));
     assert_eq!(reader_policy().compiled_pin, COMPILED_RUNTIME_PIN.trim());
 }
 
