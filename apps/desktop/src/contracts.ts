@@ -181,7 +181,8 @@ export function initializeImageParameters(workspace: Workspace, provider: string
   const choices = generationChoices(workspace, provider, 'image', { ...current, model });
   if (!choices.selected || choices.selected.adapted !== true || choices.selected.available === false) return { ...current, model };
   const savedResolution = sameProvider ? String(workspace.settings.imageResolution || '') : '';
-  const defaultResolution = provider === 'chrome' ? (choices.resolutions.includes('native') ? 'native' : '') : (choices.resolutions.includes('2k') ? '2k' : '');
+  const declaredDefault = object(object(choices.selected.raw)?.desktopParameterContract)?.defaultOutput;
+  const defaultResolution = provider === 'chrome' ? (choices.resolutions.includes('native') ? 'native' : '') : imageOutputLabel(choices.selected) === '图片质量' ? (typeof declaredDefault === 'string' && choices.resolutions.includes(declaredDefault) ? declaredDefault : '') : (choices.resolutions.includes('2k') ? '2k' : '');
   return { model, ratio: current.ratio || String(workspace.settings.ratio || '') || (choices.ratios.includes('16:9') ? '16:9' : ''), resolution: current.resolution || savedResolution || defaultResolution };
 }
 const COMMON_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '3:2', '2:3', '21:9'];
@@ -196,11 +197,13 @@ export function generationChoices(workspace: Workspace, provider: string, kind: 
   if (!selected) problems.push(parameters.model ? `模型 ${parameters.model} 不在已核实的${kind === 'image' ? '图片' : '视频'}目录中，请重新选择。` : '请选择已核实的模型。');
   else if (selected.adapted !== true || selected.available === false) problems.push('当前模型尚未完成参数适配或不可用，请选择其他模型。');
   if (selected && !ratios.includes(parameters.ratio)) problems.push(ratios.length ? `比例 ${parameters.ratio || '未选择'} 不适用于当前模型，请重新选择。` : '渠道尚未提供可用比例，请先核实模型能力。');
-  if (selected && !resolutions.includes(parameters.resolution)) problems.push(resolutions.length ? `尺寸 ${parameters.resolution || '未选择'} 不适用于当前模型，请重新选择。` : '渠道尚未提供可用尺寸，请先核实模型能力。');
+  if (selected && !resolutions.includes(parameters.resolution)) { const label = kind === 'image' && imageOutputLabel(selected) === '图片质量' ? '质量' : '尺寸'; problems.push(resolutions.length ? `${label} ${parameters.resolution || '未选择'} 不适用于当前模型，请重新选择。` : `渠道尚未提供可用${label}，请先核实模型能力。`); }
   return { models, selected, ratios, resolutions, problems, valid: problems.length === 0 };
 }
 export function ratioLabel(value: string): string { const label: Record<string, string> = { '16:9': '横屏', '9:16': '竖屏', '1:1': '方形', '4:3': '横向', '3:4': '竖向', '3:2': '横向', '2:3': '竖向', '21:9': '宽银幕' }; return label[value] ? `${value} · ${label[value]}` : value; }
 export function resolutionLabel(value: string, kind: 'image' | 'video'): string { const normalized = value.toLowerCase(); if (normalized === 'native') return '网页原生尺寸'; if (kind === 'image' && normalized === '1080p') return '1080P（像素尺寸）'; if (kind === 'image' && /^\d+(\.\d+)?k$/.test(normalized)) return normalized.toUpperCase(); if (/^\d+p$/.test(normalized)) return normalized.toUpperCase(); return value; }
+export function imageOutputLabel(model?: Model): string { return object(object(model?.raw)?.desktopParameterContract)?.outputParameter === 'quality_level' ? '图片质量' : '图片尺寸'; }
+export function imageOutputValueLabel(value: string, model?: Model): string { return imageOutputLabel(model) === '图片质量' ? (({ low: '低', medium: '标准', high: '高' } as Record<string, string>)[value] || value) : resolutionLabel(value, 'image'); }
 
 export function storyboardRange(workspace: Workspace, selection = 'all') {
   const seen = new Set<string>();

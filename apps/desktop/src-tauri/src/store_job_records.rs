@@ -60,9 +60,9 @@ impl Store {
     /// pending_jobs(), and all channel ownership or retry queries.
     pub fn archived_task_record_ids(&self) -> Result<HashSet<String>> {
         let connection = self.conn()?;
-        let query = format!("SELECT {JOB_COLUMNS},m.value FROM jobs AS j JOIN metadata AS m ON m.key=?1||j.id WHERE j.kind='image' AND j.state='failed'");
+        let query = format!("SELECT {JOB_COLUMNS},m.value AS task_record_visibility FROM jobs AS j JOIN metadata AS m ON m.key=?1||j.id WHERE j.kind='image' AND j.state='failed'");
         let mut statement = connection.prepare(&query).map_err(|e| e.to_string())?;
-        let rows = statement.query_map([PREFIX], |row| Ok((read_job(row)?,row.get::<_,String>(18)?))).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([PREFIX], |row| Ok((read_job(row)?,row.get::<_,String>("task_record_visibility")?))).map_err(|e| e.to_string())?;
         let mut ids = HashSet::new();
         for row in rows {
             let (raw, metadata) = row.map_err(|e| e.to_string())?;

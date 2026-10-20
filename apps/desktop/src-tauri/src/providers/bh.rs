@@ -1,5 +1,161 @@
 use super::*;
 use reqwest::blocking::multipart::{Form, Part};
+use std::io::Read;
+
+const UPLOAD_PROOF_VERSION: &str = "bh-local-upload-readback/v1";
+
+fn upload_url(config: &ProviderConfig, value: &str) -> ProviderResult<(reqwest::Url, i64)> {
+    let fail = || {
+        ProviderError::new(
+            "UPLOAD_URL_INVALID",
+            "BH 未返回可核验的完整签名 OSS 地址，已阻止生成。",
+        )
+    };
+    let url = reqwest::Url::parse(value).map_err(|_| fail())?;
+    let base = reqwest::Url::parse(&wire::base(config, false)?).map_err(|_| fail())?;
+    // Only a deliberately configured loopback fixture may read from its exact
+    // origin. A production upload cannot redirect this read to an arbitrary URL.
+    let local = matches!(
+        base.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+    ) && base.scheme() == "http"
+        && url.origin() == base.origin();
+    let oss = url.scheme() == "https"
+        && url.port().is_none_or(|port| port == 443)
+        && url.host_str().is_some_and(|host| {
+            regex::Regex::new(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.oss-[a-z0-9-]+\.aliyuncs\.com$")
+                .unwrap()
+                .is_match(host)
+        });
+    if (!local && !oss)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(fail());
+    }
+    let mut query = std::collections::HashMap::new();
+    for (key, value) in url.query_pairs() {
+        if query.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(fail());
+        }
+    }
+    let expiry = if query.get("x-oss-signature").is_some_and(|v| !v.is_empty()) {
+        let stamp = query.get("x-oss-date").ok_or_else(fail)?;
+        let start = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ")
+            .map_err(|_| fail())?
+            .and_utc()
+            .timestamp();
+        let seconds = query
+            .get("x-oss-expires")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(fail)?;
+        start.checked_add(seconds).ok_or_else(fail)?
+    } else if query.get("Signature").is_some_and(|v| !v.is_empty()) {
+        query
+            .get("Expires")
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(fail)?
+    } else {
+        return Err(fail());
+    };
+    if expiry.saturating_sub(chrono::Utc::now().timestamp()) <= 120 {
+        return Err(ProviderError::new(
+            "UPLOAD_URL_EXPIRED",
+            "BH 参考素材地址已过期或临近过期；请重新准备，尚未提交生成。",
+        ));
+    }
+    Ok((url, expiry))
+}
+
+fn verify_uploaded_media(
+    config: &ProviderConfig,
+    value: &str,
+    reference: &MediaReference,
+    bytes: u64,
+    model: &str,
+) -> ProviderResult<Value> {
+    let (url, expiry) = upload_url(config, value)?;
+    // No provider credential, cookies or referer are attached. Redirects are
+    // disabled, so a signed OSS response cannot bounce into an internal service.
+    let mut response = wire::client(130)?.get(url).send().map_err(|_| {
+        ProviderError::new(
+            "UPLOAD_READBACK_FAILED",
+            "BH 素材读回暂时失败；尚未提交生成。",
+        )
+    })?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length != bytes)
+    {
+        return Err(ProviderError::new(
+            "UPLOAD_READBACK_FAILED",
+            "BH 素材读回状态或字节数不一致，尚未提交生成。",
+        ));
+    }
+    let mut actual = Vec::new();
+    response
+        .by_ref()
+        .take(bytes + 1)
+        .read_to_end(&mut actual)
+        .map_err(|_| {
+            ProviderError::new(
+                "UPLOAD_READBACK_FAILED",
+                "BH 素材读回不完整；尚未提交生成。",
+            )
+        })?;
+    if actual.len() as u64 != bytes || hex_hash(&actual) != reference.sha256 {
+        return Err(ProviderError::new(
+            "UPLOAD_READBACK_MISMATCH",
+            "BH 素材读回哈希或字节数不一致，尚未提交生成。",
+        ));
+    }
+    upload_url(config, value)?;
+    Ok(
+        json!({"version":UPLOAD_PROOF_VERSION,"model":model,"kind":reference.kind,"sha256":reference.sha256,
+        "bytes":bytes,"urlSha256":hex_hash(value.as_bytes()),"expiresAt":expiry,"verifiedAt":now(),
+        "localReadbackVerified":true,"upstreamReadConfirmed":false}),
+    )
+}
+
+fn validate_upload_proofs(
+    config: &ProviderConfig,
+    prepared: &PreparedRequest,
+) -> ProviderResult<()> {
+    let fail = || {
+        ProviderError::new(
+            "BH_UPLOAD_PREPARATION_REQUIRED",
+            "BH 原准备记录缺少可靠素材读回证明；请重新准备，尚未提交生成。",
+        )
+    };
+    let references = sorted_references(&prepared.request);
+    if references.len() != prepared.upload_receipts.len() {
+        return Err(fail());
+    }
+    for (reference, receipt) in references.iter().zip(&prepared.upload_receipts) {
+        let url = receipt.url.as_deref().ok_or_else(fail)?;
+        let (_, expiry) = upload_url(config, url)?;
+        let proof = &receipt.raw;
+        if receipt.media_id != reference.media_id
+            || receipt.kind != reference.kind
+            || receipt.sha256 != reference.sha256
+            || receipt.order != reference.order
+            || proof["version"] != UPLOAD_PROOF_VERSION
+            || proof["model"] != prepared.request.model
+            || proof["kind"] != reference.kind
+            || proof["sha256"] != reference.sha256
+            || proof["urlSha256"] != hex_hash(url.as_bytes())
+            || proof["bytes"].as_u64() != fs::metadata(&reference.path).ok().map(|m| m.len())
+            || proof["localReadbackVerified"] != true
+            || proof["expiresAt"].as_i64() != Some(expiry)
+        {
+            return Err(fail());
+        }
+    }
+    Ok(())
+}
 
 const ADAPTED: &[&str] = &[
     "bh2.0-mini-480p",
@@ -28,6 +184,30 @@ const ADAPTED: &[&str] = &[
     "image2-high",
     "gpt-image-2",
 ];
+
+// Explicit image execution manifests from the SHUO BH catalogue template.
+// A model's name alone must not opt an unknown protocol into this mapping.
+#[derive(Clone, Copy, PartialEq)]
+enum ImageProtocol {
+    Resolution,
+    HighResolution,
+    QualityLevel,
+}
+fn image_protocol(id: &str) -> Option<ImageProtocol> {
+    match id {
+        "gemini-3-pro-image-preview"
+        | "gemini-3.1-flash-image-preview"
+        | "image2k4k"
+        | "image4k" => Some(ImageProtocol::Resolution),
+        "image2-high" => Some(ImageProtocol::HighResolution),
+        "gpt-image-2" => Some(ImageProtocol::QualityLevel),
+        _ => None,
+    }
+}
+const IMAGE_RATIOS: &[&str] = &[
+    "1:1", "5:4", "4:5", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9",
+];
+const IMAGE_QUALITY_LEVELS: &[&str] = &["low", "medium", "high"];
 fn strings(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .map(|xs| {
@@ -195,18 +375,44 @@ pub(super) fn parse_catalog(_config: &ProviderConfig, raw: Value) -> ProviderRes
                 .and_then(Value::as_f64)
                 .filter(|x| x.is_finite() && *x >= 0.)
         };
-        let ratios = strings(
-            row.get("allowed_sizes")
-                .or_else(|| row.get("ratios"))
-                .or_else(|| row.get("aspect_ratios")),
-        );
-        let resolutions = strings(row.get("resolutions"));
+        let image_protocol = (kind == "image").then(|| image_protocol(id)).flatten();
+        let declared_ratios = row
+            .get("allowed_sizes")
+            .or_else(|| row.get("ratios"))
+            .or_else(|| row.get("aspect_ratios"));
+        let ratios = if image_protocol.is_some() && declared_ratios.is_none() {
+            // BH's live image rows omit ratios; the six known execution
+            // manifests declare these options. Explicit server limits win.
+            IMAGE_RATIOS.iter().map(|value| (*value).into()).collect()
+        } else {
+            strings(declared_ratios)
+        };
+        // GPT Image 2 has no pixel-resolution control in its BH manifest.
+        // Project its actual quality selector through the common output-choice
+        // field, retaining the original catalogue row and labelling the mapping.
+        let resolutions = if image_protocol == Some(ImageProtocol::QualityLevel) {
+            IMAGE_QUALITY_LEVELS
+                .iter()
+                .map(|value| (*value).into())
+                .collect()
+        } else {
+            strings(row.get("resolutions"))
+        };
         // A directory ID or configuration allowlist cannot establish parameter compatibility.
         // New protocols require an explicit code mapping and wire tests before enabling.
-        let protocol_known = ADAPTED.contains(&id);
+        let protocol_known = if kind == "image" {
+            image_protocol.is_some()
+        } else {
+            ADAPTED.contains(&id) && self::image_protocol(id).is_none()
+        };
         let complete = !ratios.is_empty()
             && !resolutions.is_empty()
             && reference.is_some()
+            && (image_protocol != Some(ImageProtocol::QualityLevel)
+                || row
+                    .get("resolutions")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty))
             && (kind == "image" || min.is_some() && max.is_some());
         let multiplier = row
             .get("video_price_multiplier")
@@ -223,6 +429,16 @@ pub(super) fn parse_catalog(_config: &ProviderConfig, raw: Value) -> ProviderRes
                     None
                 }
             });
+        let mut projected_raw = row.clone();
+        if let Some(protocol) = image_protocol {
+            projected_raw["desktopParameterContract"] = json!({
+                "version":"bh-image-shuo/v1",
+                "source":"shuo-bh-execution-manifest",
+                "outputParameter":if protocol == ImageProtocol::QualityLevel {"quality_level"} else {"resolution"},
+                "defaultOutput":if protocol == ImageProtocol::QualityLevel {json!("medium")} else {Value::Null},
+                "ratiosSource":if declared_ratios.is_none() {"execution-manifest"} else {"live_catalog"}
+            });
+        }
         models.push(ModelCapability {
             id: id.into(),
             kind: kind.into(),
@@ -241,7 +457,7 @@ pub(super) fn parse_catalog(_config: &ProviderConfig, raw: Value) -> ProviderRes
             billing,
             currency: row.get("unit").and_then(Value::as_str).map(str::to_string),
             video_price_multiplier: multiplier,
-            raw: row,
+            raw: projected_raw,
         });
     }
     if models.len() > 2000 {
@@ -303,14 +519,14 @@ pub(super) fn prepare(
         || last_count > 0 && first_count == 0
         || first_count + last_count > 0
             && request.references.iter().any(|r| {
-                r.kind == "image"
-                    && !["start_frame", "first_frame", "end_frame", "last_frame"]
+                r.kind != "image"
+                    || !["start_frame", "first_frame", "end_frame", "last_frame"]
                         .contains(&r.usage.as_str())
             })
     {
         return Err(ProviderError::new(
             "FRAME_MODE",
-            "首尾帧与普通图片参考不能混用。",
+            "首尾帧不能与普通图片、音频或视频参考混用。",
         ));
     }
     if first_count + last_count > 0
@@ -369,6 +585,7 @@ pub(super) fn prepare(
                 "参考素材超过 BH 单文件大小限制。",
             ));
         }
+        let bytes_len = bytes.len() as u64;
         let part = Part::bytes(bytes)
             .file_name(format!("{}.{}", reference.sha256, ext))
             .mime_str(mime)
@@ -376,7 +593,11 @@ pub(super) fn prepare(
         let response = client
             .post(format!("{base}/assets/uploads"))
             .bearer_auth(&key)
-            .multipart(Form::new().part("file", part))
+            .multipart(
+                Form::new()
+                    .part("file", part)
+                    .text("model", request.model.clone()),
+            )
             .send()
             .map_err(|_| {
                 ProviderError::new("UPLOAD_FAILED", "素材上传结果未确认；尚未提交生成。")
@@ -386,25 +607,20 @@ pub(super) fn prepare(
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::new("UPLOAD_NO_URL", "上传回执未返回完整 URL。"))?;
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|_| ProviderError::new("UPLOAD_NO_URL", "上传地址无效。"))?;
-        if parsed.scheme() != "https"
-            || !parsed
-                .query_pairs()
-                .any(|(k, _)| k == "x-oss-signature" || k == "Signature")
-            || !parsed
-                .host_str()
-                .is_some_and(|h| h.ends_with(".aliyuncs.com"))
+        if body
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != reference.kind)
             || body
-                .get("kind")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind != reference.kind)
+                .get("bytes")
+                .is_some_and(|value| value.as_u64() != Some(bytes_len))
         {
             return Err(ProviderError::new(
                 "UPLOAD_URL_INVALID",
                 "BH 未返回匹配素材的完整签名 OSS 地址，已阻止生成。",
             ));
         }
+        let proof = verify_uploaded_media(config, url, &reference, bytes_len, &request.model)?;
         match reference.kind.as_str() {
             "image" => match reference.usage.as_str() {
                 "start_frame" | "first_frame" => first.push(url.to_string()),
@@ -424,16 +640,18 @@ pub(super) fn prepare(
             file_id: None,
             uploaded_at: now(),
             upstream_read_confirmed: false,
+            raw: proof,
         });
     }
     if first.len() > 1
         || last.len() > 1
         || (!last.is_empty() && first.is_empty())
-        || ((!first.is_empty() || !last.is_empty()) && !images.is_empty())
+        || ((!first.is_empty() || !last.is_empty())
+            && (!images.is_empty() || !videos.is_empty() || !audios.is_empty()))
     {
         return Err(ProviderError::new(
             "FRAME_MODE",
-            "首尾帧与普通图片参考不能混用。",
+            "首尾帧不能与普通图片、音频或视频参考混用。",
         ));
     }
     let resolution = model
@@ -441,10 +659,10 @@ pub(super) fn prepare(
         .iter()
         .find(|value| value.eq_ignore_ascii_case(&request.resolution))
         .unwrap();
-    let mut body =
-        json!({"model":request.model,"prompt":request.prompt,"n":1,"resolution":resolution});
+    let mut body = json!({"model":request.model,"prompt":request.prompt,"n":1});
     let obj = body.as_object_mut().unwrap();
     if request.kind == "video" {
+        obj.insert("resolution".into(), json!(resolution));
         obj.insert("duration".into(), json!(request.duration));
         obj.insert("ratio".into(), json!(request.ratio));
         obj.insert("reference_videos".into(), json!(videos));
@@ -465,10 +683,24 @@ pub(super) fn prepare(
         }
     } else {
         obj.insert("size".into(), json!(request.ratio));
-        obj.insert("quality".into(), json!(resolution));
         obj.insert("response_format".into(), json!("url"));
+        match image_protocol(&request.model) {
+            Some(ImageProtocol::QualityLevel) => {
+                obj.insert("quality_level".into(), json!(resolution));
+            }
+            Some(protocol) => {
+                obj.insert("resolution".into(), json!(resolution));
+                obj.insert("quality".into(), json!(resolution));
+                if protocol == ImageProtocol::HighResolution {
+                    obj.insert("quality_level".into(), json!("high"));
+                }
+            }
+            None => unreachable!("check_model rejects unknown image protocols"),
+        }
     }
-    obj.insert("images".into(), json!(images));
+    if request.kind == "video" || !images.is_empty() {
+        obj.insert("images".into(), json!(images));
+    }
     let mut frozen = request.clone();
     frozen.references = sorted_references(request);
     Ok(PreparedRequest {
@@ -499,6 +731,7 @@ pub(super) fn submit(
         .find(|m| m.id == prepared.request.model)
         .ok_or_else(|| ProviderError::new("MODEL_UNAVAILABLE", "当前目录已不提供此模型。"))?;
     check_model(model, &prepared.request)?;
+    validate_upload_proofs(config, prepared)?;
     if shutting_down() {
         return Err(ProviderError::new(
             "CLIENT_CLOSING",
@@ -588,6 +821,11 @@ pub(super) fn query(config: &ProviderConfig, task_id: &str) -> ProviderResult<Qu
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let status = if status == "success" {
+        "succeeded"
+    } else {
+        status
+    };
     let urls = if status == "succeeded" {
         body.get("result_url")
             .or_else(|| body.get("url"))
@@ -621,7 +859,8 @@ mod tests {
             credential_env: None,
             cli_path: None,
             bridge_token_env: None,
-            chrome_binding: None,browser_transport:None,
+            chrome_binding: None,
+            browser_transport: None,
             timeout_seconds: 10,
             adapted_models: Vec::new(),
         }
@@ -640,3 +879,7 @@ mod tests {
         assert!(parse_catalog(&config(), raw).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "bh_image_contract_tests.rs"]
+mod image_contract_tests;

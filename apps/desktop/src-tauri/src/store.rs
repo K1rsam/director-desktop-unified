@@ -1263,7 +1263,7 @@ impl Store {
         let unknown = if has_steps { JOB_SUMMARY_UNKNOWN_COLUMN } else { "j.state='submission_unknown'" };
         let query=format!("SELECT {JOB_SUMMARY_COLUMNS},{unknown} AS summary_submission_unknown FROM jobs AS j WHERE j.kind IN ('image','video') OR (j.kind IN ('workflow','text') AND (j.state IN ('queued','running','preparing','auth_required') OR ({unknown}) OR j.id IN (SELECT value FROM json_each(?1)) OR j.id IN (SELECT id FROM jobs WHERE kind IN ('workflow','text') ORDER BY created_at DESC,rowid DESC LIMIT 100))) ORDER BY j.created_at DESC,j.rowid DESC");
         let mut q = c.prepare(&query).map_err(|e| e.to_string())?;
-        let rows = q.query_map([cli_ids], |row| Ok((read_job(row)?,row.get::<_,bool>(19)?))).map_err(|e| e.to_string())?;
+        let rows = q.query_map([cli_ids], |row| Ok((read_job(row)?,row.get::<_,bool>("summary_submission_unknown")?))).map_err(|e| e.to_string())?;
         rows.map(|row| {
             let (raw,unknown) = row.map_err(|e|e.to_string())?;
             let mut job = finish_job(raw)?;
@@ -2497,11 +2497,26 @@ pub fn atomic_json(path: &Path, value: &Value) -> Result<()> {
         unsafe extern "system" {
             fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
         }
-        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // std::fs accepts long paths, while raw Win32 calls require an absolute
+        // verbatim path. The extra UUID on the complete temporary file can
+        // exceed MAX_PATH even when the final document name does not.
+        let native_from = fs::canonicalize(&tmp).map_err(|e| e.to_string())?;
+        let native_parent = fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))).map_err(|e| e.to_string())?;
+        let native_to = native_parent.join(path.file_name().ok_or("原子写入目标缺少文件名")?);
+        let from: Vec<u16> = native_from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = native_to.as_os_str().encode_wide().chain(Some(0)).collect();
         // Same-directory atomic replacement: never remove the old registry before the rename.
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        // A reader (Explorer, an external progress observer, antivirus) can
+        // briefly deny delete-sharing. Keep the complete original in place and
+        // retry only the same atomic replacement, never the operation it records.
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(1);
+        loop {
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } != 0 {break;}
+            let error=std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(),Some(5|32|33)) || std::time::Instant::now()>=deadline {
+                return Err(error.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Ok(())
     }
@@ -3429,6 +3444,46 @@ mod tests {
             1,
             "successful replacement leaves one complete registry"
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn atomic_json_supports_long_windows_paths_for_new_and_replaced_documents() {
+        let tmp=tempfile::tempdir().unwrap();
+        let directory=tmp.path().join("a".repeat(90)).join("b".repeat(90)).join("中文目录".repeat(15));
+        let path=directory.join("sdk-compiled.json");
+        assert!(path.as_os_str().len()>260);
+        for n in 0..2 {
+            let expected=json!({"revision":n,"payload":"完整冻结输入😀"});
+            atomic_json(&path,&expected).unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),expected);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(),1);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn atomic_json_waits_for_a_short_reader_lock_without_exposing_a_partial_document() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp=tempfile::tempdir().unwrap();let path=tmp.path().join("progress.json");
+        let original=json!({"state":"original"});atomic_json(&path,&original).unwrap();
+        let locked=fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let next=json!({"state":"completed","payload":"完整结果😀"});let expected=next.clone();let target=path.clone();
+        let writer=std::thread::spawn(move||atomic_json(&target,&next));
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),original);
+        drop(locked);writer.join().unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),expected);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(),1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn atomic_json_reader_lock_has_a_bound_and_keeps_the_original_on_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp=tempfile::tempdir().unwrap();let path=tmp.path().join("progress.json");
+        let original=json!({"state":"original"});atomic_json(&path,&original).unwrap();
+        let locked=fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let started=std::time::Instant::now();assert!(atomic_json(&path,&json!({"state":"new"})).is_err());
+        assert!(started.elapsed()<std::time::Duration::from_secs(3));
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),original);drop(locked);
     }
     #[test]
     fn workflow_summary_propagates_child_unknown_without_mutating_parent_or_exposing_payloads() {

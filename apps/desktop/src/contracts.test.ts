@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { assetImages, assetImageSelection, createCatalogDiscovery, frozenReference, generationChoices, imageBatchBlocked, imageBatchEstimate, imageDesignBusy, imageDesignJob, initializeImageParameters, mediaMatchesAsset, missingCatalogs, moveItem, normalizeWorkspace, packageEstimate, packageReady, ratioLabel, referenceTimingProblems, resolutionLabel, selectedUnitsForScope, storyboardRange, toggleUnitSelection, unitResultIds, unitsForScope, videoAdoptionProblems, videoContainerVerified, workflowResult } from './contracts.ts';
+import { assetImages, assetImageSelection, createCatalogDiscovery, frozenReference, generationChoices, imageOutputLabel, imageOutputValueLabel, imageBatchBlocked, imageBatchEstimate, imageDesignBusy, imageDesignJob, initializeImageParameters, mediaMatchesAsset, missingCatalogs, moveItem, normalizeWorkspace, packageEstimate, packageReady, ratioLabel, referenceTimingProblems, resolutionLabel, selectedUnitsForScope, storyboardRange, toggleUnitSelection, unitResultIds, unitsForScope, videoAdoptionProblems, videoContainerVerified, workflowResult } from './contracts.ts';
 import type { PreparedPackage, SourcePromptProvenance, Unit, Workspace } from './types.ts';
 
 function fixture(): Workspace { return { project: { id: 'p', title: '项目' }, assets: [{ id: 'a', name: '形象', variantId: 'v', adoptedMediaId: 'image', candidates: ['shared'] }], media: [{ id: 'image', kind: 'image', path: 'a.png', assetId: 'a', variantId: 'v' }, { id: 'shared', kind: 'image', path: 'b.png', assetId: 'other', variantId: 'other' }, { id: 'old-video', kind: 'video', path: 'old.mp4' }], units: [{ id: 'u', prompt: '完整提示词', duration: 12, version: 2, assetRefs: [{ assetId: 'a', variantId: 'v', use: 'scene', role: '', order: 1 }], preparedPackage: { provider: 'bh', model: 'm', unitVersion: 2, ratio: '16:9', resolution: '720p', duration: 12, prompt: '完整提示词', estimatedCost: 0, references: [{ assetId: 'a', variantId: 'v', role: 'scene', order: 0, mediaId: 'image' }] }, resultMediaIds: ['new-video'], adoptedMediaId: 'old-video' }], jobs: [{ id: 'j', kind: 'video', entityId: 'u', provider: 'bh', status: 'downloaded', snapshot: { model: 'm', unitVersion: 2 }, prepared: { estimatedCost: 0.25 }, result: { mediaIds: ['new-video'], actualCost: 0.2 } }, { id: 'design', kind: 'workflow', entityId: 'images.design:', provider: 'local', status: 'completed', result: { blocked: [{ reason: '来源缺失' }], imagePlan: [{ status: 'awaitingTrial' }] } }], settings: {}, providers: [], rules: [] }; }
@@ -319,4 +319,17 @@ test('手动取消后保留精确筛选，不自动选新稿；再次全选恢�
   assert.ok(!selected.some(unit => unit.id === 'new' || unit.id === 'current-1'));
   assert.equal(selectedUnitsForScope(updated, 'all', null).length, 19);
   assert.ok(selectedUnitsForScope(updated, 'all', null).some(unit => unit.id === 'new'));
+});
+
+ test('BH 质量字段来自显式合同，旧尺寸必须重新选择，空值采用已核实默认质量', () => {
+ const model = { id: 'gpt-image-2', kind: 'image', adapted: true, ratios: ['16:9'], resolutions: ['low','medium','high'], raw: { desktopParameterContract: { outputParameter: 'quality_level', defaultOutput: 'medium' } } };
+ const workspace = fixture(); workspace.settings = { imageProvider: 'bh', imageModel: model.id }; workspace.providers = [{id:'bh',models:[model]}];
+ assert.equal(imageOutputLabel(model), '图片质量'); assert.equal(imageOutputValueLabel('medium', model), '标准');
+ assert.equal(imageOutputLabel({...model,raw:{}}), '图片尺寸'); assert.equal(imageOutputValueLabel('2k', {...model,raw:{}}), '2K');
+ const initialized = initializeImageParameters(workspace,'bh',{model:model.id,ratio:'16:9',resolution:''});
+ assert.equal(initialized.resolution,'medium'); assert.equal(generationChoices(workspace,'bh','image',initialized).valid,true);
+ workspace.settings.imageResolution='2k'; const historical=initializeImageParameters(workspace,'bh',{model:model.id,ratio:'16:9',resolution:''});
+ assert.equal(historical.resolution,'2k'); const choices=generationChoices(workspace,'bh','image',historical);
+ assert.equal(choices.valid,false); assert.match(choices.problems.join(' '),/质量 2k/);
+ assert.equal(imageOutputValueLabel('unrecognized',model),'unrecognized');
 });

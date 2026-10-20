@@ -471,6 +471,7 @@ fn prepare_inner(config:&ProviderConfig,request:&GenerationRequest,observer:Opti
             file_id: Some(file_id.into()),
             uploaded_at: now(),
             upstream_read_confirmed: false,
+            raw: Value::Null,
         });
     }
     let message=format!("{}\n\n画面比例：{}。请生成 1 张原图。",request.prompt,request.ratio);

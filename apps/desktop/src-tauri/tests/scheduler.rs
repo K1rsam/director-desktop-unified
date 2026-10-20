@@ -737,6 +737,7 @@ fn failed_local_ready_persistence_preserves_upload_receipts_and_other_preparatio
                 file_id: Some("offline-upload-receipt".into()),
                 uploaded_at: "test".into(),
                 upstream_read_confirmed: false,
+                raw: serde_json::Value::Null,
             });
         }
         Ok(())

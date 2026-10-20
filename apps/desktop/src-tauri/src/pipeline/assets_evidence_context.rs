@@ -4,14 +4,27 @@ use super::*;
 use std::collections::BTreeSet;
 
 pub(crate) const DESIGN_EVIDENCE_PROFILE_FIELD: &str = "stage2DesignEvidence";
-pub(crate) const DESIGN_EVIDENCE_PROFILE: &str = "asset-design-evidence/v1";
+const LEGACY_DESIGN_EVIDENCE_PROFILE: &str = "asset-design-evidence/v1";
+pub(crate) const DESIGN_EVIDENCE_PROFILE: &str = "asset-design-evidence/v2";
 const INSTRUCTIONS: &str = "本合同补充C基础/D派生的取料和普通美术补足，不修改任何原文、facts、claim、资产身份或父链。evidence中标为SOURCE_CONTEXT的行是阅读材料，不自动成为当前资产的SOURCE事实；按当前asset.scope、准确集场坐标及variantId核对。LOC补入的整场原文只来自当前形象明确适用场次，GLOBAL只读原sourceRefs定位场次，不扩展全剧；此处readScenes说明本请求实际已提供的场次，优先于旧制作说明中的取料范围描述。逐场区分稳定空间结构/必要环境物件与事件造成的临时变化，物件存在与事件造成的破坏分别处理，不要求基础空间永远保留破坏状态；不能把同场其它主体、后来损坏、伤病或服装变化变成基线，也不能改写或删除原有事实。原文明示约束、当前形象有效状态、用户手写说明及已采用父稿中仍适用的设计均须遵守。preparation.note或identityProductionMaterial等制作资料中的‘原文未明确/无参考/不补造’若仅说明缺少原文依据，表示未知，不等于用户禁止普通美术设计；不取消其中的具体明示约束。对原文未限定的普通外貌、日常完整衣装、物件基本形制比例、基础材质和颜色等，按时代、身份与已确认画风提供保守且可直接制作的非剧情美术方案，写入freeDesignScope，绝不升级为SOURCE或新增剧情/能力/标识。人物全身设计不能因衣装未知而留空或要求用户另行确认；DERIVED保留直接父稿的稳定身份和未变设计，仅按当前有效变化调整。已限定使用场次的配饰/道具不得自动常驻。用户手写提示词始终保留，不据此合同自动改写。";
+const CHARACTER_CONTEXT_INSTRUCTIONS: &str = "人物补充取料仅为当前形象准确适用集场内、名称命中行及其紧邻原行的有界片段，不表示已通读整场或全剧；readScenes只标识片段涉及场次。名称仅用来定位材料，不证明身份属性。先结合完整片段确认姓名、直接动作和代词实际所指，再遵守其中明确的身份/性别依据；不能因facts为空就忽略已提供原文中的明示约束，也不能按名字或美术偏好猜性别。代词可能指同场其他人；有歧义则保留未知，不由程序生成性别事实。不得把片段中的他人外貌、未来状态、临时伤病或衣装套给当前形象。";
+const CHARACTER_CONTEXT_ROWS: usize = 48;
+const CHARACTER_CONTEXT_UTF16: usize = 8_000;
+
+fn profile_instructions(version: &str) -> Option<String> {
+    match version {
+        LEGACY_DESIGN_EVIDENCE_PROFILE => Some(INSTRUCTIONS.into()),
+        DESIGN_EVIDENCE_PROFILE => Some(format!("{INSTRUCTIONS}{CHARACTER_CONTEXT_INSTRUCTIONS}")),
+        _ => None,
+    }
+}
 
 /// Called only by the new-workflow boundary, never while replaying a saved job.
 pub(crate) fn freeze_design_evidence_profile(input: &mut Value) {
+    let instructions = profile_instructions(DESIGN_EVIDENCE_PROFILE).unwrap();
     input[DESIGN_EVIDENCE_PROFILE_FIELD] = json!({
-        "version":DESIGN_EVIDENCE_PROFILE,"instructions":INSTRUCTIONS,
-        "instructionsSha256":digest(INSTRUCTIONS)
+        "version":DESIGN_EVIDENCE_PROFILE,"instructions":instructions,
+        "instructionsSha256":digest(&instructions)
     });
 }
 
@@ -22,9 +35,10 @@ pub(super) fn enabled(input: &Value) -> Result<bool, String> {
     else {
         return Ok(false);
     };
-    if profile["version"] != DESIGN_EVIDENCE_PROFILE
-        || profile["instructions"] != INSTRUCTIONS
-        || profile["instructionsSha256"] != digest(INSTRUCTIONS)
+    let instructions = profile_instructions(text(profile, "version"));
+    if instructions.as_ref().is_none_or(|instructions|
+        profile["instructions"] != *instructions
+        || profile["instructionsSha256"] != digest(instructions))
     {
         return Err("第二阶段设计取料合同版本或指令摘要无效；保留冻结请求，不自动升级".into());
     }
@@ -45,7 +59,12 @@ pub(super) fn scene_context<'a>(
     if !matches!(text(asset, "kind"), "LOC" | "location" | "场景")
         && !matches!(text(asset, "type"), "LOC" | "location" | "场景")
     {
-        return Ok(legacy); // A many-scene character must not expand to the whole script.
+        if input[DESIGN_EVIDENCE_PROFILE_FIELD]["version"] == DESIGN_EVIDENCE_PROFILE
+            && super::super::asset_design_contract::is_character(asset)
+        {
+            return character_context(input, source, asset);
+        }
+        return Ok(legacy); // v1 keeps its exact frozen character evidence.
     }
     if has_program_source_scope(asset) && asset["sourceScope"]["sourceSha256"] != source.sha256 {
         return Err("场景设计取料的来源摘要与锁定原文不一致".into());
@@ -142,11 +161,92 @@ pub(crate) fn design_evidence_binding(
         .filter_map(|row| Some((row.episode_id.as_ref()?, row.scene_id.as_ref()?)))
         .collect();
     Ok(Some(json!({
-        "version":DESIGN_EVIDENCE_PROFILE,"instructionsSha256":digest(INSTRUCTIONS),
+        "version":input[DESIGN_EVIDENCE_PROFILE_FIELD]["version"],
+        "instructionsSha256":input[DESIGN_EVIDENCE_PROFILE_FIELD]["instructionsSha256"],
         "sourceSha256":source.sha256,"evidenceSha256":digest(&json!(evidence).to_string()),
         "evidenceRowIds":evidence.iter().map(|row|&row.id).collect::<Vec<_>>(),
         "readScenes":read_pairs.into_iter().map(|(episode,scene)|json!({"episodeId":episode,"sceneId":scene})).collect::<Vec<_>>()
     })))
+}
+
+/// Carry raw identity evidence rather than infer a gender fact. A sparse scope
+/// reference can coexist with one body anchor, so the legacy all-or-none scene
+/// fallback is insufficient. Search only exact applicable scenes, then read
+/// small named windows in fair scene rounds under a fixed additional budget.
+fn character_context<'a>(
+    input: &Value,
+    source: &'a LockedSource,
+    asset: &Value,
+) -> Result<Vec<&'a SourceRow>, String> {
+    if has_program_source_scope(asset) && asset["sourceScope"]["sourceSha256"] != source.sha256 {
+        return Err("人物设计取料的来源摘要与锁定原文不一致".into());
+    }
+    let pairs = if asset["scope"]["kind"] == "SCENES" {
+        super::super::asset_design_contract::scope_pairs(&asset["scope"])
+            .ok_or("人物设计的准确集场范围无效，未扩大取料")?
+    } else {
+        // GLOBAL is applicability, never permission to read the full script.
+        let refs = exact_strings(asset, "sourceRefs")?;
+        source.rows.iter().filter(|row| refs.contains(&row.id))
+            .filter_map(|row| Some((row.episode_id.clone()?, row.scene_id.clone()?)))
+            .collect()
+    };
+    if pairs.iter().any(|(episode,scene)| !source.scenes.iter()
+        .any(|s| s.episode_id == *episode && s.id == *scene))
+    { return Err("人物设计范围与锁定原文集场坐标不一致".into()); }
+    let identity = super::super::asset_design_contract::identity(asset);
+    let subject = input["foundation"]["assets"].as_array().into_iter().flatten()
+        .find(|subject| text(subject,"id") == identity);
+    let mut names = BTreeSet::new();
+    if let Some(subject) = subject {
+        let name = text(subject,"name").trim();
+        if !name.is_empty() { names.insert(name.to_owned()); }
+        for alias in subject["aliases"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if !alias.trim().is_empty() { names.insert(alias.trim().to_owned()); }
+        }
+    }
+    if names.is_empty() {
+        // Display text is only a locator. It is not promoted to identity proof.
+        if let Some(name) = text(asset,"name").split('｜').next().map(str::trim).filter(|s| !s.is_empty()) {
+            names.insert(name.to_owned());
+        }
+    }
+    let mut windows = Vec::new();
+    for scene in source.scenes.iter().filter(|s| pairs.contains(&(s.episode_id.clone(),s.id.clone()))) {
+        let rows: Vec<_> = source.rows.iter().filter(|row|
+            row.episode_id.as_deref() == Some(scene.episode_id.as_str())
+                && row.scene_id.as_deref() == Some(scene.id.as_str())).collect();
+        let mut candidates: Vec<_> = rows.iter().enumerate()
+            .filter(|(_,row)| row.kind != "format" && names.iter().any(|name| row.text.contains(name)))
+            .map(|(index,row)| {
+                // Ranking merely selects raw text. Attribution remains C/D's
+                // job; a pronoun may refer to somebody else in the same row.
+                let has_pronoun = row.text.chars().any(|ch| ['她','他','它'].contains(&ch));
+                (usize::from(!has_pronoun),index)
+            }).collect();
+        candidates.sort_unstable();
+        windows.push(candidates.into_iter().map(|(_,index)| {
+            rows[index.saturating_sub(1)..(index+3).min(rows.len())].to_vec()
+        }).collect::<Vec<_>>());
+    }
+    // Original sourceRefs/facts are always materialized separately by the
+    // caller. Do not seed the old full-scene fallback into this bounded lane.
+    let mut selected = BTreeSet::new();
+    let mut additional_rows=0;
+    let mut additional_utf16=0;
+    for round in 0..windows.iter().map(Vec::len).max().unwrap_or(0) {
+        for scene in &windows {
+            let Some(window) = scene.get(round) else { continue; };
+            let fresh: Vec<_> = window.iter().filter(|row| !selected.contains(row.id.as_str())).collect();
+            let units: usize = fresh.iter().map(|row| row.text.encode_utf16().count()).sum();
+            // Never slice an original row or separate a name from its window.
+            if additional_rows+fresh.len() > CHARACTER_CONTEXT_ROWS
+                || additional_utf16+units > CHARACTER_CONTEXT_UTF16 { continue; }
+            additional_rows+=fresh.len();additional_utf16+=units;
+            selected.extend(fresh.iter().map(|row| row.id.as_str()));
+        }
+    }
+    Ok(source.rows.iter().filter(|row| selected.contains(row.id.as_str())).collect())
 }
 
 pub(super) fn request_context(input: &Value, binding: &Value) -> Value {
@@ -158,3 +258,7 @@ pub(super) fn request_context(input: &Value, binding: &Value) -> Value {
 #[cfg(test)]
 #[path = "assets_evidence_context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "assets_character_context_tests.rs"]
+mod character_tests;

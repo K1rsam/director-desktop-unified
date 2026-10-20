@@ -1239,13 +1239,11 @@ impl Engine {
                 return Ok(j);
             }
             "source.import" => {
-                let text = if let Some(text) = request["text"].as_str() {
-                    text.to_owned()
-                } else {
-                    crate::importer::read_source(Path::new(s(&request, "path")))?
-                };
+                let source = crate::importer::prepare_source_import(
+                    request["text"].as_str(), Path::new(s(&request, "path")),
+                )?;
                 store.save_source(
-                    serde_json::to_value(pipeline::prepare_source(&text)?)
+                    serde_json::to_value(source)
                         .map_err(|e| e.to_string())?,
                 )?;
             }

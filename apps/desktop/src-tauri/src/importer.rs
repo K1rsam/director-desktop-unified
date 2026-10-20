@@ -46,6 +46,51 @@ pub fn read_source(path: &Path) -> Result<String> {
             .map_err(|_| "源文件必须为UTF-8文本或DOCX".into())
     }
 }
+
+/// File-name evidence applies only to an actual file import. Pasted text never
+/// inherits a caller-supplied path or an unrelated document's title evidence.
+pub fn prepare_source_import(text: Option<&str>, path: &Path) -> Result<crate::pipeline::LockedSource> {
+    if let Some(text) = text {
+        return crate::pipeline::prepare_source(text);
+    }
+    let text = read_source(path)?;
+    let source = crate::pipeline::prepare_source(&text)?;
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()).filter(|name| !name.is_empty()) else {
+        return Ok(source);
+    };
+    let mut nonempty = source.rows.iter().filter(|row| !row.text.trim().is_empty());
+    let Some(title) = nonempty.next() else { return Ok(source); };
+    let Some(next) = nonempty.next() else { return Ok(source); };
+    // Remove line terminators only: no whitespace, punctuation, spelling or
+    // case normalization can turn an unrelated first line into a title.
+    if title.text.trim_end_matches(['\r', '\n']) != stem || title.kind != "body"
+        || title.episode_id.is_some() || title.scene_id.is_some() {
+        return Ok(source);
+    }
+    let Some(first_episode) = source.episodes.first() else { return Ok(source); };
+    let is_first = first_episode.source_number == "一"
+        || first_episode.source_number.parse::<u32>() == Ok(1);
+    let direct_first = next.kind == "format" && first_episode.row_ids.first() == Some(&next.id);
+    // Existing parsing already treats episode zero as auxiliary context. This
+    // exception changes only the cover row, never the zero-episode material.
+    let zero_context = next.kind == "context" && next.episode_id.is_none()
+        && regex::Regex::new(r"^(?:#{1,6}\s*)?第\s*(?:0+|零|〇)\s*集(?:\s|[:：｜|—-]|$)").unwrap().is_match(next.text.trim());
+    if !is_first || !(direct_first || zero_context) { return Ok(source); }
+    let evidence = json!({"version":"document-title/file-stem-exact/v1",
+        "fileName":path.file_name().and_then(|name|name.to_str()),"sourceSha256":source.sha256,
+        "titleRowId":title.id,"nextRowId":next.id,"start":title.range.start,"end":title.range.end,
+        "nextBoundary":if direct_first {"first-production-episode"} else {"existing-zero-episode-context"},
+        "firstProductionEpisodeId":first_episode.id});
+    crate::pipeline::apply_boundary_decisions(&source, &[crate::pipeline::BoundaryDecision {
+        start:title.range.start,end:title.range.end,kind:"context".into(),episode_number:None,scene_title:None,
+        reason:format!("文件导入自动识别文档标题；{evidence}"),decision_version:None,confirmation:None,
+    }])
+}
+
+#[cfg(test)]
+#[path = "importer_source_title_tests.rs"]
+mod source_title_tests;
+
 fn legacy_paths(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let root = if path.is_dir() {
         path.to_path_buf()

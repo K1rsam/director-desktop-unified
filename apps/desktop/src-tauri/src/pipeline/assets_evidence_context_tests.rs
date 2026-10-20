@@ -90,11 +90,20 @@ fn global_location_and_many_scene_character_do_not_read_whole_script() {
         .unwrap();
     assert_eq!(global["readScenes"].as_array().unwrap().len(), 1);
     input["assets"][0]["kind"] = json!("CH");
+    input[DESIGN_EVIDENCE_PROFILE_FIELD] = json!({"version":LEGACY_DESIGN_EVIDENCE_PROFILE,
+        "instructions":INSTRUCTIONS,"instructionsSha256":digest(INSTRUCTIONS)});
     let character = design_evidence_binding(&input, &input["assets"][0])
         .unwrap()
         .unwrap();
     assert!(character["readScenes"].as_array().unwrap().is_empty());
     assert_eq!(character["evidenceRowIds"].as_array().unwrap().len(), 2);
+    freeze_design_evidence_profile(&mut input);
+    let current = design_evidence_binding(&input, &input["assets"][0]).unwrap().unwrap();
+    assert!(current["readScenes"].as_array().unwrap().len() <= 1);
+    assert!(current["evidenceRowIds"].as_array().unwrap().len() <= CHARACTER_CONTEXT_ROWS + 2);
+    let source: LockedSource = serde_json::from_value(input["source"].clone()).unwrap();
+    let unread = source.rows.iter().find(|row|row.text.contains("木箱")).unwrap();
+    assert!(!current["evidenceRowIds"].as_array().unwrap().contains(&json!(unread.id)));
 }
 
 #[test]

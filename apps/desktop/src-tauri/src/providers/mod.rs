@@ -164,6 +164,9 @@ pub struct UploadReceipt {
     pub file_id: Option<String>,
     pub uploaded_at: String,
     pub upstream_read_confirmed: bool,
+    /// Local transport evidence only; this never proves model-side reference adoption.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

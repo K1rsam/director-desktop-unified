@@ -10,14 +10,18 @@ use std::{
 pub(super) struct Fixture {
     pub(super) endpoint: String,
     pub(super) requests: Arc<Mutex<Vec<(String, String)>>>,
+    pub(super) headers: Arc<Mutex<Vec<String>>>,
     pub(super) thread: thread::JoinHandle<()>,
 }
 pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let fixture_origin = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let saved = requests.clone();
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let saved_headers = headers.clone();
     let thread = thread::spawn(move || {
         let mut recovery_alias=String::new();
         for mut reply in replies {
@@ -66,6 +70,7 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
             }
             let headers = String::from_utf8_lossy(&bytes[..header_end]);
             let line = headers.lines().next().unwrap().to_string();
+            saved_headers.lock().unwrap().push(headers.to_string());
             let body = String::from_utf8_lossy(&bytes[header_end..header_end + length]).to_string();
             if line.starts_with("POST /browser/tabs/open "){
                 recovery_alias=serde_json::from_str::<Value>(&body).ok().and_then(|v|v["launchToken"].as_str().map(String::from)).unwrap_or_default();
@@ -77,7 +82,12 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
             }
             let status=reply.get("__httpStatus").and_then(Value::as_u64).unwrap_or(200);
             if let Some(object)=reply.as_object_mut() {object.remove("__httpStatus");}
-            let body = if reply == json!("invalid-json") {
+            // Upload fixtures expose only their own loopback origin. Raw bytes
+            // support hash readback without any request to a public test host.
+            reply = serde_json::from_str(&reply.to_string().replace("__FIXTURE_ORIGIN__", &fixture_origin)).unwrap();
+            let body = if let Some(bytes) = reply.get("__rawBody").and_then(Value::as_array) {
+                bytes.iter().map(|v| u8::try_from(v.as_u64().unwrap()).unwrap()).collect()
+            } else if reply == json!("invalid-json") {
                 b"not json".to_vec()
             } else {
                 serde_json::to_vec(&reply).unwrap()
@@ -90,6 +100,7 @@ pub(super) fn fixture(replies: Vec<Value>) -> Fixture {
     Fixture {
         endpoint,
         requests,
+        headers,
         thread,
     }
 }
@@ -141,19 +152,21 @@ fn chrome_wire_detail_and_safe_code_survive_500_without_exposing_credentials_or_
 
 #[test]
 fn bh_upload_submit_and_resume_queries_only_original_id() {
-    let url="https://fixture.oss-cn-shenzhen.aliyuncs.com/api-assets/image.png?x-oss-signature=complete-signature&x-oss-date=20261004";
+    let url="__FIXTURE_ORIGIN__/api-assets/image.png?Signature=complete-signature&Expires=4102444800";
+    let bytes = b"\x89PNG\r\n\x1a\nfixture";
     let fixture = fixture(vec![
         catalog(),
         json!({"url":url,"kind":"image"}),
+        json!({"__rawBody":bytes.to_vec()}),
         catalog(),
         json!({"task_id":"task-original","status":"processing"}),
         json!({"task_id":"task-original","status":"processing","progress":50}),
         json!({"task_id":"task-original","status":"succeeded","result_url":"https://example.test/result.mp4?signature=keep"}),
     ]);
     let config = config(fixture.endpoint.clone());
+    let url = url.replace("__FIXTURE_ORIGIN__", fixture.endpoint.trim_end_matches("/v1"));
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("reference.png");
-    let bytes = b"\x89PNG\r\n\x1a\nfixture";
     fs::write(&path, bytes).unwrap();
     let mut input = request();
     input.references.push(MediaReference {
@@ -166,7 +179,7 @@ fn bh_upload_submit_and_resume_queries_only_original_id() {
         duration_seconds: None,
     });
     let prepared = prepare(&config, &input).unwrap();
-    assert_eq!(prepared.upload_receipts[0].url.as_deref(), Some(url));
+    assert_eq!(prepared.upload_receipts[0].url.as_deref(), Some(url.as_str()));
     assert!(!prepared.upload_receipts[0].upstream_read_confirmed);
     assert_eq!(prepared.estimated_cost, Some(2.5));
     let saved: PreparedRequest =
