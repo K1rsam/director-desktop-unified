@@ -1,6 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { actionBlockReason, assertOfflineAction, classifyAction, CREDENTIAL_SETTING_KEYS, dispatchOfflineRequest, OFFLINE_EXECUTION_POLICY, validateExecutionPolicy } from './executionPolicy.ts';
+import { rustStandardActionCatalogue } from './test-support/rustExecutionPolicy.ts';
+
+test('the complete native Rust action catalogue installs without disabling SDK or Dreamina authorization', async () => {
+  const { installExecutionPolicy, hasSdkExecutionCapability } = await import('./executionPolicy.ts');
+  const allowedActions = rustStandardActionCatalogue();
+  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true,
+    stage3CreativePackStatus: 'verified_active', reasons: ['complete source-bound native catalogue'], allowedActions,
+    readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'dreamina', 'dreamina_canvas', 'codex_sdk'], generationAllowed: false },
+    textBackends: [{ id: 'codex_cli', status: 'enabled' }, { id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
+  try {
+    assert.ok(allowedActions.includes('storyboard.refinement.continuity.preview'));
+    const checked = await dispatchOfflineRequest({ action: 'getExecutionPolicy' }, async () => policy);
+    assert.equal(checked.mode, 'standard_native');
+    assert.equal(hasSdkExecutionCapability(), true);
+    for (const action of ['dreamina.login', 'dreamina.status', 'dreamina.open_authorization', 'textCli.login', 'readiness.check', 'storyboard.refinement.continuity.preview']) assert.equal(actionBlockReason(action), null, action);
+    assert.equal(classifyAction('storyboard.refinement.continuity.preview'), 'local_read');
+    assert.throws(() => validateExecutionPolicy({ ...policy, allowedActions: [...allowedActions, 'future.unknown.action'] }), /标准版功能策略无效/);
+  } finally { installExecutionPolicy(OFFLINE_EXECUTION_POLICY); }
+  assert.equal(actionBlockReason('storyboard.refinement.continuity.preview'), null);
+  assert.ok(actionBlockReason('storyboard.refinement.adopt'));
+  assert.ok(actionBlockReason('dreamina.login'));
+});
 
 test('standard native capabilities enable existing flows and keep unported Stage3 closed', async () => {
   const { installExecutionPolicy } = await import('./executionPolicy.ts');

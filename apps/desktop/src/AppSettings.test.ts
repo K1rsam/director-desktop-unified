@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import * as React from 'react';
 import { createServer } from 'vite';
+import { rustStandardActionCatalogue } from './test-support/rustExecutionPolicy.ts';
 type Slot = { value?: any; deps?: unknown[]; cleanup?: () => void };
 type Frame = { type: unknown; slots: Slot[]; index: number };
 type Host = { type: string; props: Record<string, any>; children: (Host | string)[] };
@@ -61,7 +62,7 @@ for (const mode of ['already-completed', 'pending-completed', 'timeout', 'leave'
   const prior = '2026-10-10T00:00:00Z', fresh = '2026-10-10T00:00:01Z';
   let software: any = { schemaVersion: 'app-settings/v1', revision: 4, settings: { textProvider: 'codex_cli', dreaminaPath: '/auto/dreamina' }, providers: [], rules: [], dreaminaAccount: { status: 'authenticated', ready: true, identityVerified: true, accountKey: 'synthetic-account', checkedAt: prior, credits: { total: 10 }, message: '旧状态' } };
   const complete = () => { software = { ...software, dreaminaAccount: { ...software.dreaminaAccount, checkedAt: fresh, credits: { total: 20 }, message: '已有检查已完成，账户身份与积分已核对。' } }; };
-  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: ['projects.list', 'settings.global.get', 'settings.global.save', 'runtime.status', 'chrome.status', 'dreamina.status'], readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'dreamina'], generationAllowed: false }, textBackends: [{ id: 'codex_cli', status: 'enabled' }] };
+  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: rustStandardActionCatalogue(), readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'dreamina'], generationAllowed: false }, textBackends: [{ id: 'codex_cli', status: 'enabled' }] };
   const respond = async (input: any) => {
     calls.push(input);
     if (input.action === 'getExecutionPolicy') return policy;
@@ -88,6 +89,8 @@ for (const mode of ['already-completed', 'pending-completed', 'timeout', 'leave'
     const rendered = async () => { view.render(element); await settle(); return view.render(element); };
     let nodes = await rendered();
     nodes.find(node => node.type === 'button' && content(node) === '软件设置')!.props.onClick(); nodes = await rendered(); nodes = await rendered();
+    const oauth = nodes.find(node => node.type === 'button' && node.props['data-execution-action'] === 'dreamina.login'); assert.ok(oauth); assert.equal(oauth.props.disabled, false, 'the full native policy must leave Dreamina authorization usable');
+    assert.ok(!nodes.map(content).join(' ').includes('标准版功能策略无效'));
     const refresh = nodes.find(node => node.type === 'button' && content(node) === '刷新登录状态'); assert.ok(refresh); assert.equal(refresh.props.disabled, false);
     refresh.props.onClick(); nodes = await rendered(); nodes = await rendered(); nodes = await rendered();
     assert.equal(calls.filter(input => input.action === 'dreamina.status').length, 1);
@@ -133,7 +136,7 @@ for (const mode of ['ordinary', 'poll', 'leave-while-queued']) await t.test(mode
   const concurrentPoll = mode !== 'ordinary';
   const calls: any[] = [], timers = new Map<number, () => void>();
   let timerId = 0, resolveSave!: (value: unknown) => void, resolvePoll!: (value: unknown) => void;
-  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: ['projects.list', 'settings.global.get', 'settings.global.save', 'runtime.status', 'runtime.prepare', 'readiness.check', 'textCli.login', 'dreamina.login', 'dreamina.status', 'providers.refresh'], readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'codex_sdk', 'dreamina'], generationAllowed: false }, textBackends: [{ id: 'codex_cli', status: 'enabled' }, { id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
+  const policy = { version: 'execution-policy/v3', mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: rustStandardActionCatalogue(), readiness: { version: 'provider-readiness/v1', enabled: true, providers: ['codex_cli', 'codex_sdk', 'dreamina'], generationAllowed: false }, textBackends: [{ id: 'codex_cli', status: 'enabled' }, { id: 'codex_sdk', status: 'explicit_selection_when_ready' }] };
   let appSettings = { schemaVersion: 'app-settings/v1', revision: 0, settings: { textProvider: 'codex_sdk', textModel: 'test-model', reasoning: 'medium' }, providers: [], rules: [], ...(concurrentPoll ? { dreaminaAccount: { status: 'authorizing', ready: false, identityVerified: false, authorization: { pollIntervalSeconds: 3 } } } : {}) };
   const respond = async (input: any) => {
     calls.push(input);
