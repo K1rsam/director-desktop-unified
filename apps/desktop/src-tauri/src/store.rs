@@ -297,7 +297,7 @@ impl Store {
     }
     pub fn unit_summaries(&self) -> Result<Vec<Value>> {
         let c = self.conn()?;
-        let mut q=c.prepare("SELECT json_remove(data,'$.shots','$.plan','$.emotionPlan','$.performance','$.ruleSnapshots') FROM units WHERE COALESCE(json_extract(data,'$.retired'),0)<>1 ORDER BY rowid").map_err(|e|e.to_string())?;
+        let mut q=c.prepare("SELECT CASE WHEN json_extract(data,'$.origin')='imported-storyboard' THEN json_set(json_remove(data,'$.shots','$.mentions','$.plan','$.emotionPlan','$.performance','$.ruleSnapshots'),'$.prompt','') ELSE json_remove(data,'$.shots','$.plan','$.emotionPlan','$.performance','$.ruleSnapshots') END FROM units WHERE COALESCE(json_extract(data,'$.retired'),0)<>1 ORDER BY rowid").map_err(|e|e.to_string())?;
         let rows = q
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
@@ -1129,7 +1129,7 @@ impl Store {
             };
             if let Some(media) = candidates
                 .into_iter()
-                .find(|m| self.verify_media(m).is_ok())
+                .find(|m| m["placeholder"] != true && self.verify_media(m).is_ok())
             {
                 prepared.push((asset, variant, version, s(&media, "id").to_owned()));
             } else {

@@ -45,6 +45,48 @@ test('所有集数就绪数接受11个核心编译证明而保留8个真实阻�
   assert.equal(selectedUnitsForScope(units, 'all', null).filter(unit => packageReady(unit, 'bh', 'm', { ratio: '16:9', resolution: '720p' })).length, 11);
   assert.ok(units.slice(11).every(unit => !packageReady(unit, 'bh', 'm')));
 });
+
+function importedPackageUnit(): Unit {
+  const base = fixture().units[0], markdownSha256 = 'a'.repeat(64), sourcePrompt = '片段1\n时长：12秒\n@[角色CH]推门。\n', prompt = '片段1\n时长：12秒\n@图片1推门。\n';
+  const importSource = { documentId: markdownSha256, markdownSha256, lineStart: 7, lineEnd: 10, byteStart: 51, byteEnd: 120, externalUnitId: 'EP01-S01-U01' };
+  const sourcePromptProvenance: SourcePromptProvenance = { version: 'unit-source-prompt/v1', origin: 'imported-unit-version-and-reference-compilation', jobId: 'import-prepared', unitId: base.id, unitVersion: base.version!, sourceVersion: null, compiledPromptVerified: true, compiledPrompt: prompt, sourcePromptSha256: createHash('sha256').update(sourcePrompt).digest('hex'), importSource };
+  return { ...base, origin: 'imported-storyboard', importSource, prompt: sourcePrompt, preparedPackage: { ...base.preparedPackage!, jobId: 'import-prepared', prompt, sourcePrompt, sourcePromptProvenance } };
+}
+
+test('导入成稿采用独立来源证明，无原剧本版本也能核对冻结包', () => {
+  const unit = importedPackageUnit();
+  assert.equal(unit.sourceVersion, undefined);
+  assert.equal(packageReady(unit, 'bh', 'm'), true);
+  const proof = unit.preparedPackage!.sourcePromptProvenance!;
+  assert.equal(proof.origin, 'imported-unit-version-and-reference-compilation');
+  if (proof.origin !== 'imported-unit-version-and-reference-compilation') throw new Error('missing imported proof');
+  const reordered = Object.fromEntries(Object.entries(proof.importSource).reverse());
+  assert.equal(packageReady({ ...unit, importSource: reordered }, 'bh', 'm'), true, 'JSON key order is not provenance');
+  const withoutExternalId = structuredClone(unit);
+  (withoutExternalId.importSource as Record<string, unknown>).externalUnitId = null;
+  (withoutExternalId.preparedPackage!.sourcePromptProvenance as typeof proof).importSource.externalUnitId = null;
+  assert.equal(packageReady(withoutExternalId, 'bh', 'm'), true, 'pure MD imports have no external catalog unit ID');
+});
+
+test('导入来源与冻结证明篡改逐项拒绝，不能回退旧编译器', () => {
+  const unit = importedPackageUnit(), pkg = unit.preparedPackage!, proof = pkg.sourcePromptProvenance!;
+  assert.equal(proof.origin, 'imported-unit-version-and-reference-compilation');
+  if (proof.origin !== 'imported-unit-version-and-reference-compilation') throw new Error('missing imported proof');
+  for (const change of [{ documentId: 'b'.repeat(64) }, { markdownSha256: 'b'.repeat(64) }, { lineStart: 8 }, { lineEnd: 11 }, { byteStart: 52 }, { byteEnd: 121 }, { externalUnitId: 'other-unit' }, { extra: 'unverified' }]) {
+    assert.equal(packageReady({ ...unit, importSource: { ...proof.importSource, ...change } }, 'bh', 'm'), false, JSON.stringify(change));
+    assert.equal(packageReady({ ...unit, preparedPackage: { ...pkg, sourcePromptProvenance: { ...proof, importSource: { ...proof.importSource, ...change } } } }, 'bh', 'm'), false, JSON.stringify(change));
+  }
+  for (const change of [{ jobId: 'other-job' }, { unitId: 'other-unit' }, { unitVersion: 5 }, { sourceVersion: 1 }, { importSource: undefined }, { compiledPromptVerified: false }, { compiledPrompt: unit.prompt }, { sourcePromptSha256: 'invalid' }, { origin: 'unit-version-and-reference-compilation' }]) {
+    const nextProof = { ...proof, ...change } as SourcePromptProvenance;
+    assert.equal(packageReady({ ...unit, preparedPackage: { ...pkg, sourcePromptProvenance: nextProof } }, 'bh', 'm'), false, JSON.stringify(change));
+  }
+  for (const change of [{ sourceVersion: 1 }, { version: 3 }, { prompt: unit.prompt + ' ' }, { origin: 'generated-storyboard' }, { importSource: undefined }]) assert.equal(packageReady({ ...unit, ...change }, 'bh', 'm'), false, JSON.stringify(change));
+  for (const change of [{ sourcePrompt: unit.prompt + ' ' }, { prompt: pkg.prompt + ' ' }, { sourcePromptProvenance: undefined }, { sourcePrompt: undefined, sourcePromptProvenance: undefined }]) assert.equal(packageReady({ ...unit, preparedPackage: { ...pkg, ...change } }, 'bh', 'm'), false, JSON.stringify(change));
+  for (const change of [{ lineStart: 0 }, { lineEnd: 6 }, { byteStart: -1 }, { byteEnd: 51 }, { externalUnitId: undefined }]) {
+    const source: Record<string, unknown> = { ...proof.importSource, ...change };
+    assert.equal(packageReady({ ...unit, importSource: source, preparedPackage: { ...pkg, sourcePromptProvenance: { ...proof, importSource: source } as SourcePromptProvenance } }, 'bh', 'm'), false, 'matching malformed provenance must still fail');
+  }
+});
 test('冻结配图不依赖UI一基序号，视频保留旧采用与新候选', () => { const workspace = normalizeWorkspace(fixture()), unit = workspace.units[0]; assert.equal(frozenReference(unit.preparedPackage, unit.assetRefs![0]), 'image'); assert.deepEqual(unitResultIds(workspace, unit).sort(), ['new-video', 'old-video']); });
 test('共用图片、设计阻塞与计划可读取，未知参考时长必须阻止提交', () => { const workspace = fixture(); assert.equal(mediaMatchesAsset(workspace.assets[0], workspace.media[1]), true); assert.equal(workflowResult(workspace, 'images.design')?.blocked instanceof Array, true); const unit = { ...workspace.units[0], mediaRefs: [{ mediaId: 'sound', role: 'reference' }] }; assert.equal(referenceTimingProblems(workspace, unit).length, 1); workspace.media.push({ id: 'sound', kind: 'audio', path: 'sound.wav', durationSeconds: 8, metadataVerified: false }); assert.equal(referenceTimingProblems(workspace, unit).length, 1); workspace.media.at(-1)!.metadataVerified = true; assert.equal(referenceTimingProblems(workspace, unit).length, 0); workspace.media.at(-1)!.durationSeconds = 0; assert.equal(referenceTimingProblems(workspace, unit).length, 1); });
 

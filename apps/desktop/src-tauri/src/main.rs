@@ -14,6 +14,7 @@ struct StartupVerification {
     finished: Arc<std::sync::atomic::AtomicBool>,
     development_server_at_start: bool,
     diagnostics: Arc<StartupDiagnostics>,
+    lingmo_input: Option<std::path::PathBuf>,
 }
 
 fn development_server_available() -> bool {
@@ -414,6 +415,7 @@ fn main() {
         diagnostics.install_panic_hook();
         diagnostics.mark(DiagnosticStage::ArgumentsAccepted);
         StartupVerification {
+            lingmo_input: args.iter().position(|a| a == "--verify-lingmo-input").and_then(|i|args.get(i+1)).map(std::path::PathBuf::from).filter(|p|p.is_absolute() && p.is_file()),
             diagnostics,
             home: output.parent().unwrap().join("startup-verification-home"),
             output,
@@ -465,18 +467,20 @@ fn main() {
             if let Some(v) = &setup_verification {
                 v.diagnostics.mark(DiagnosticStage::EngineReady);
                 if engine.project_list().map_err(std::io::Error::other)?.is_empty() {
-                    let project = engine.dispatch(serde_json::json!({"action":"projects.create","title":"桌面启动离线验证"})).map_err(std::io::Error::other)?;
+                    let project = engine.dispatch(serde_json::json!({"action":"projects.create","title":if v.lingmo_input.is_some(){"灵墨原生导入验收"}else{"桌面启动离线验证"}})).map_err(std::io::Error::other)?;
                     let pid = project["id"].as_str().unwrap();
+                    if v.lingmo_input.is_none() {
                     engine.dispatch(serde_json::json!({"action":"source.import","projectId":pid,"text":"【故事简介】\n甲与旧友重逢。\n【人物关系】\n甲：主角。\n第1集\n场景：门口\n甲：走吧。\n"})).map_err(std::io::Error::other)?;
                     let png = v.home.join("startup-reference.png");
                     image::RgbImage::from_pixel(32, 24, image::Rgb([42, 73, 104])).save(&png)?;
                     engine.store(pid).map_err(std::io::Error::other)?.import_media(&png, "image", None, None).map_err(std::io::Error::other)?;
+                    }
                 }
                 v.diagnostics.mark(DiagnosticStage::FixtureSeeded);
                 let handle = app.handle().clone();
                 let v = v.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    std::thread::sleep(std::time::Duration::from_secs(if v.lingmo_input.is_some(){180}else{30}));
                     if !v.finished.load(std::sync::atomic::Ordering::SeqCst) {
                         v.diagnostics.mark(DiagnosticStage::WatchdogTimeout);
                         if director_core::store::atomic_json(&v.output, &serde_json::json!({"ok":false,"error":"Desktop startup probe timed out","diagnosticPid":std::process::id(),"diagnosticSchema":"startup-diagnostics/v1"})).is_ok() {
@@ -505,7 +509,8 @@ fn main() {
             if let Some(v) = &page_verification {
                 if payload.event() == tauri::webview::PageLoadEvent::Finished {
                     v.diagnostics.mark(DiagnosticStage::PageLoaded);
-                    v.diagnostics.mark(if webview.eval(STARTUP_PROBE).is_ok() {
+                    let probe=if let Some(path)=&v.lingmo_input {format!("window.__lingmoVerificationInput={};\n{}",serde_json::json!(path),include_str!("lingmo_startup_probe.js"))}else{STARTUP_PROBE.to_owned()};
+                    v.diagnostics.mark(if webview.eval(&probe).is_ok() {
                         DiagnosticStage::ProbeInjected
                     } else { DiagnosticStage::ProbeInjectionFailed });
                 }

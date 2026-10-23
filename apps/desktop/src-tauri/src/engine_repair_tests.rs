@@ -2,6 +2,70 @@ use super::*;
 use crate::providers::*;
 use std::sync::atomic::AtomicUsize;
 
+fn imported_prompt_fixture() -> (Fixture, Value, Value, String) {
+    let f = Fixture::new(Duration::ZERO);
+    let text = "第1集\n1-1\n场景：外来阳台\n片段1\n时长：4秒\n[场景] @[外来阳台SC]\n分镜1｜0-4s｜4s\n画面：外部原文。\n";
+    crate::lingmo_import::import(&f.store, &json!({"text":text,"expectedSha256":pipeline::digest(text)})).unwrap();
+    let asset = f.store.values("assets").unwrap().into_iter().find(|a| a["lingmoType"] == "SC").unwrap();
+    let path = f._temp.path().join("external-scene.png");
+    image::RgbImage::from_pixel(3, 2, image::Rgb([40, 80, 120])).save(&path).unwrap();
+    let media = f.store.import_media(&path, "image", Some(s(&asset,"id")), Some(s(&asset,"variantId"))).unwrap();
+    f.store.adopt(s(&asset,"id"), s(&asset,"variantId"), s(&media,"id")).unwrap();
+    let unit = f.store.values("units").unwrap().into_iter().find(|u| u["origin"] == "imported-storyboard").unwrap();
+    let snapshot = binding::bind(&f.store, &unit, "offline", "offline-video").unwrap();
+    assert_eq!(snapshot["problems"], json!([]));
+    let job = f.store.add_job("video",s(&unit,"id"),"offline","offline-account",&snapshot,"ready").unwrap();
+    (f,unit,snapshot,job)
+}
+
+#[test]
+fn imported_prepared_prompt_proof_survives_lazy_summary_without_requiring_stage_one_version() {
+    let (f, unit, snapshot, job) = imported_prompt_fixture();
+    let before = raw_job_record(&f.store, &job);
+    let workspace = f.engine.workspace(&f.store, None).unwrap();
+    let summary = workspace["units"].as_array().unwrap().iter().find(|u| u["id"] == unit["id"]).unwrap();
+    assert_eq!(summary["prompt"], "");
+    assert!(summary["mentions"].is_null());
+    let package = &summary["preparedPackage"];
+    assert_eq!(package["sourcePrompt"], unit["prompt"]);
+    assert_eq!(package["sourcePromptProvenance"]["compiledPromptVerified"], true, "{package}");
+    assert_eq!(package["sourcePromptProvenance"]["origin"], "imported-unit-version-and-reference-compilation");
+    assert_eq!(package["sourcePromptProvenance"]["importSource"], unit["importSource"]);
+    let evidence = ready_prompt_evidence(&f.store.conn().unwrap()).unwrap();
+    let (selected_snapshot, selected_unit) = &evidence[&job];
+    assert_eq!(selected_snapshot["mentions"], snapshot["mentions"]);
+    assert_eq!(selected_unit["mentions"], unit["mentions"]);
+    for source_version in [0,999] {
+        assert!(prepared_source_prompt_provenance(&job,summary,selected_unit,selected_snapshot,
+            workspace["assets"].as_array().unwrap(),source_version,&f.store.settings().unwrap()).is_ok());
+    }
+    assert_eq!(before, raw_job_record(&f.store, &job));
+    assert_eq!(f.channels.calls.load(Ordering::SeqCst),0);
+}
+
+#[test]
+fn imported_prepared_prompt_proof_rejects_changed_provenance_refs_or_frozen_prompt() {
+    let (f, unit, snapshot, job) = imported_prompt_fixture();
+    let workspace = f.engine.workspace(&f.store, None).unwrap();
+    let summary = workspace["units"].as_array().unwrap().iter().find(|u| u["id"] == unit["id"]).unwrap();
+    let assets = workspace["assets"].as_array().unwrap();
+    let settings = f.store.settings().unwrap();
+    for field in ["origin","importSource","mentions","audioAssetRefs","sourcePrompt","sourcePromptSha256","prompt"] {
+        let mut wrong = snapshot.clone();
+        wrong[field] = json!("changed");
+        assert!(prepared_source_prompt_provenance(&job,summary,&unit,&wrong,assets,0,&settings).is_err(),"{field}");
+    }
+    for field in ["id","version","assetRefs","importSource","audioAssetRefs","mediaRefs","origin"] {
+        let mut wrong = summary.clone();
+        wrong[field] = json!("changed");
+        assert!(prepared_source_prompt_provenance(&job,&wrong,&unit,&snapshot,assets,0,&settings).is_err(),"{field}");
+    }
+    let mut changed_assets = assets.clone();
+    let reference_id = s(&snapshot["references"][0],"assetId");
+    changed_assets.iter_mut().find(|a|s(a,"id")==reference_id).unwrap()["version"] = json!(999);
+    assert!(prepared_source_prompt_provenance(&job,summary,&unit,&snapshot,&changed_assets,0,&settings).is_err());
+}
+
 struct OfflineChannels {
     calls: AtomicUsize,
     submitting: AtomicBool,

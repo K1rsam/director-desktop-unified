@@ -22,6 +22,17 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         .as_array()
         .ok_or("分镜没有结构化assetRefs，请先完成旧分镜资产映射")?
         .clone();
+    let imported = s(unit, "origin") == "imported-storyboard";
+    if imported {
+        crate::lingmo_import::validate_unit(store, unit)?;
+        for reference in unit["audioAssetRefs"].as_array().into_iter().flatten() {
+            if !refs.iter().any(|r| {
+                r["assetId"] == reference["assetId"] && r["variantId"] == reference["variantId"]
+            }) {
+                refs.push(reference.clone());
+            }
+        }
+    }
     refs.sort_by_key(|r| r.get("order").and_then(Value::as_u64).unwrap_or(0));
     let mut media = Vec::new();
     let mut inline_references = Vec::new();
@@ -35,12 +46,18 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         problems.push(json!({"code":"DURATION_REVISION_REQUIRED","message":"首版视频渠道要求正整秒载体；请修订单元时长，不自动取整或填空"}));
     }
     let source = store.source()?;
-    if source.is_null() {
+    if imported {
+        // The saved external Markdown is the source contract. Stage 1 source
+        // rows must neither be invented nor required for a direct Stage 4 import.
+    } else if source.is_null() {
         problems.push(
             json!({"code":"MISSING_SOURCE","message":"请先导入源文档，为单元保存明确来源版本"}),
         );
     } else {
-        if unit["sourceVersion"].as_i64().is_some_and(|version|Some(version)!=source["version"].as_i64()) {
+        if unit["sourceVersion"]
+            .as_i64()
+            .is_some_and(|version| Some(version) != source["version"].as_i64())
+        {
             problems.push(json!({"code":"SOURCE_VERSION_MISMATCH","message":"单元仍绑定旧原文版本，须通过当前原文完整校验后重新准备。"}));
         }
         let episode = s(unit, "episodeId");
@@ -154,6 +171,31 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
                 continue;
             }
         }
+        if imported && matches!(s(&a, "lingmoType"), "SE" | "OM") {
+            let mut explicit = r.clone();
+            if s(&explicit, "mediaId").is_empty() {
+                let matches = unit["mediaRefs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|mr| s(mr, "assetId") == aid && s(mr, "variantId") == variant)
+                    .collect::<Vec<_>>();
+                if matches.len() > 1 {
+                    problems.push(json!({"code":"AMBIGUOUS_MEDIA","assetId":aid,"message":"同一资产版本绑定了多个媒体，请明确采用素材"}));
+                    continue;
+                }
+                if let Some(mr) = matches.first() {
+                    explicit["mediaId"] = mr["mediaId"].clone();
+                }
+            }
+            match bind_imported_media(store, &a, &explicit, media.len()) {
+                Ok(reference) => media.push(reference),
+                Err(message) => problems.push(
+                    json!({"code":"IMPORTED_MEDIA_REQUIRED","assetId":aid,"message":message}),
+                ),
+            }
+            continue;
+        }
         // INLINE is a semantic appearance, not a request for a new image. Resolve
         // its actual material ancestor in Rust while retaining its scope/version.
         if a.pointer("/preparation/mode").and_then(Value::as_str) == Some("AUDIO") {
@@ -207,6 +249,14 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
             }
         };
         let m = store.get("media", &mid)?;
+        if placeholder_media(&image_asset, &m) {
+            problems.push(json!({"code":"PLACEHOLDER_MEDIA","assetId":aid,"mediaId":mid,"message":"当前采用的是占位图片，请补充并采用真实素材后制作"}));
+            continue;
+        }
+        if s(&m, "kind") != "image" {
+            problems.push(json!({"code":"MEDIA_KIND_MISMATCH","assetId":aid,"mediaId":mid,"message":"图片资产必须绑定图片媒介"}));
+            continue;
+        }
         let p = match store.verify_media(&m) {
             Ok(p) => p,
             Err(e) => {
@@ -231,7 +281,21 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         let mut ordered = extras.clone();
         ordered.sort_by_key(|r| r["order"].as_u64().unwrap_or(0));
         for r in &ordered {
+            if imported
+                && media.iter().any(|bound| {
+                    !s(r, "assetId").is_empty()
+                        && r["assetId"] == bound["assetId"]
+                        && r["variantId"] == bound["variantId"]
+                        && r["mediaId"] == bound["mediaId"]
+                })
+            {
+                continue;
+            }
             let m = store.get("media", s(r, "mediaId"))?;
+            if m["placeholder"] == true {
+                problems.push(json!({"code":"PLACEHOLDER_MEDIA","mediaId":m["id"],"message":"占位素材不能进入制作"}));
+                continue;
+            }
             let p = store.verify_media(&m)?;
             if ["audio", "video"].contains(&s(&m, "kind"))
                 && m["metadataVerified"].as_bool() != Some(true)
@@ -265,8 +329,62 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
     let wire_duration = integer_duration
         .map(|duration| json!(duration))
         .unwrap_or_else(|| unit["duration"].clone());
+    let mut snapshot = json!({"requestId":id(),"kind":"video","provider":provider,"model":model,"unitId":unit["id"],"unitVersion":unit["version"],"episodeId":unit["episodeId"],"sourceVersion":source["version"],"sourcePrompt":unit["prompt"],"sourcePromptSha256":crate::pipeline::digest(s(unit,"prompt")),"prompt":prompt,"duration":wire_duration,"ratio":store.settings()?["ratio"],"resolution":store.settings()?.get("videoResolution").cloned().unwrap_or(json!("720p")),"references":media,"inlineReferences":inline_references,"problems":problems,"ruleSnapshot":crate::pipeline::rule_snapshot("unit-video-production")?,"options":options});
+    if imported {
+        for field in ["origin", "importSource", "mentions", "audioAssetRefs"] {
+            snapshot[field] = unit[field].clone();
+        }
+        snapshot["sourceVersion"] = Value::Null;
+    }
+    Ok(snapshot)
+}
+
+fn placeholder_media(asset: &Value, media: &Value) -> bool {
+    media["placeholder"] == true
+        || (!s(asset, "importedPlaceholderMediaId").is_empty()
+            && s(asset, "importedPlaceholderMediaId") == s(media, "id"))
+}
+
+/// Sound-effect and other-media identities retain their original domain kind.
+/// The actual verified adopted medium chooses its provider reference slot.
+fn bind_imported_media(
+    store: &Store,
+    asset: &Value,
+    reference: &Value,
+    order: usize,
+) -> Result<Value> {
+    let aid = s(asset, "id");
+    let variant = s(asset, "variantId");
+    let explicit = !s(reference, "mediaId").is_empty();
+    let mid = if explicit {
+        s(reference, "mediaId").to_owned()
+    } else {
+        store
+            .adopted(aid, variant)?
+            .ok_or("该声音或其它素材尚无已绑定的真实媒体")?
+    };
+    let media = store.get("media", &mid)?;
+    if placeholder_media(asset, &media) {
+        return Err("占位素材不能进入制作，请先补充并采用真实素材".into());
+    }
+    let kind = s(&media, "kind");
+    if !matches!(kind, "image" | "audio" | "video")
+        || (s(asset, "lingmoType") == "SE" && kind != "audio")
+    {
+        return Err("素材类型不匹配：SE 声音标签只能绑定音频，OM 需真实图片、音频或视频".into());
+    }
+    if matches!(kind, "audio" | "video") && media["metadataVerified"] != true {
+        return Err("音视频时长尚未可靠读取，请先核对媒体信息".into());
+    }
+    if kind == "image" && store.adopted(aid, variant)?.as_deref() != Some(mid.as_str()) {
+        return Err("显式图片引用已不是当前采用版本".into());
+    }
+    let path = store.verify_media(&media)?;
     Ok(
-        json!({"requestId":id(),"kind":"video","provider":provider,"model":model,"unitId":unit["id"],"unitVersion":unit["version"],"episodeId":unit["episodeId"],"sourceVersion":store.source()?["version"],"sourcePrompt":unit["prompt"],"sourcePromptSha256":crate::pipeline::digest(s(unit,"prompt")),"prompt":prompt,"duration":wire_duration,"ratio":store.settings()?["ratio"],"resolution":store.settings()?.get("videoResolution").cloned().unwrap_or(json!("720p")),"references":media,"inlineReferences":inline_references,"problems":problems,"ruleSnapshot":crate::pipeline::rule_snapshot("unit-video-production")?,"options":options}),
+        json!({"mediaId":mid,"assetId":aid,"assetVersion":asset["version"],"variantId":variant,
+        "lingmoType":asset["lingmoType"],"bindingSource":if kind == "image" {"current-adoption"} else {"unit-media-ref"},"kind":kind,"path":path,"relativePath":media["relativePath"],
+        "sha256":media["sha256"],"order":order,"usage":reference.get("usage").or(reference.get("role")).cloned().unwrap_or(json!("reference")),
+        "durationSeconds":media["durationSeconds"],"assetName":asset["name"]}),
     )
 }
 
@@ -283,7 +401,9 @@ pub(crate) fn compile_bound_prompt(
         .ok_or("单元资产引用缺失")?
         .clone();
     refs.sort_by_key(|r| r.get("order").and_then(Value::as_u64).unwrap_or(0));
-    let mut prompt = if s(unit, "storyboardCreativeProfile") == "original-production-contract/v1" {
+    let mut prompt = if s(unit, "origin") == "imported-storyboard" {
+        crate::lingmo_import::compile_prompt(unit, assets)?
+    } else if s(unit, "storyboardCreativeProfile") == "original-production-contract/v1" {
         let mut bindings = Vec::new();
         for reference in &refs {
             let Some(asset) = assets
@@ -359,7 +479,16 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
     if unit["version"] != snapshot["unitVersion"] {
         return Err("分镜版本已变化，请重新准备".into());
     }
-    if store.source()?["version"] != snapshot["sourceVersion"] {
+    if s(&unit, "origin") == "imported-storyboard" {
+        for field in ["origin", "importSource", "mentions", "audioAssetRefs"] {
+            if unit[field] != snapshot[field] {
+                return Err("导入分镜来源或资产标签已经变化，请重新准备".into());
+            }
+        }
+        crate::lingmo_import::validate_unit(store, &unit)?;
+    } else if s(snapshot, "origin") == "imported-storyboard"
+        || store.source()?["version"] != snapshot["sourceVersion"]
+    {
         return Err("原文版本已变化，请重新准备".into());
     }
     if snapshot.get("sourcePrompt").is_some() || snapshot.get("sourcePromptSha256").is_some() {
@@ -416,6 +545,15 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
             }
         }
         let m = store.get("media", s(r, "mediaId"))?;
+        if m["placeholder"] == true {
+            return Err("占位素材不能进入制作，请重新准备".into());
+        }
+        if s(&unit, "origin") == "imported-storyboard"
+            && (m["kind"] != r["kind"]
+                || (matches!(s(&m, "kind"), "audio" | "video") && m["metadataVerified"] != true))
+        {
+            return Err("导入分镜引用的媒体类型或可靠元数据已变化，请重新准备".into());
+        }
         let p = store.verify_media(&m)?;
         if !same_path(&p, s(r, "path")) {
             return Err("素材执行路径已经变化，请重新准备".into());
@@ -425,12 +563,25 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
         }
         if !s(r, "assetId").is_empty() {
             let a = store.active_asset(s(r, "assetId"))?;
-            if a["version"] != r["assetVersion"]
-                || store
+            let current_binding = if s(r, "bindingSource") == "unit-media-ref" {
+                s(&unit, "origin") == "imported-storyboard"
+                    && s(&a, "variantId") == s(r, "variantId")
+                    && ["assetRefs", "audioAssetRefs", "mediaRefs"]
+                        .iter()
+                        .any(|field| {
+                            unit[*field].as_array().into_iter().flatten().any(|mr| {
+                                mr["assetId"] == r["assetId"]
+                                    && mr["variantId"] == r["variantId"]
+                                    && mr["mediaId"] == r["mediaId"]
+                            })
+                        })
+            } else {
+                store
                     .adopted(s(r, "assetId"), s(r, "variantId"))?
                     .as_deref()
-                    != Some(s(r, "mediaId"))
-            {
+                    == Some(s(r, "mediaId"))
+            };
+            if placeholder_media(&a, &m) || a["version"] != r["assetVersion"] || !current_binding {
                 return Err("采用图片或形象版本已变化，请重新准备".into());
             }
         }
@@ -560,11 +711,15 @@ pub fn validate_generation_snapshot(store: &Store, snapshot: &Value) -> Result<(
             return Err("图片设计版本已变化，请重新准备".into());
         }
         let assets = store.values("assets")?;
-        if snapshot["sourceChain"].is_array() && json!(crate::pipeline::asset_design_contract::source_chain(&assets,&asset)?) != snapshot["sourceChain"] {
+        if snapshot["sourceChain"].is_array()
+            && json!(crate::pipeline::asset_design_contract::source_chain(
+                &assets, &asset
+            )?) != snapshot["sourceChain"]
+        {
             return Err("冻结图片来源设计语义版本已变化，请重新准备".into());
         }
         let gate = json!({"source":store.source()?,"foundation":store.foundation()?,"assets":assets,"selection":{"assetIds":[asset["id"]]}});
-        crate::pipeline::validate_asset_visual_gate(&gate,&asset)?;
+        crate::pipeline::validate_asset_visual_gate(&gate, &asset)?;
         if crate::pipeline::asset_visual_facts::cached_visual_check_required(&gate)? {
             return Err("视觉状态待核对，已有提示词不能绕过未归属或不适用裁决".into());
         }
@@ -605,6 +760,10 @@ pub fn validate_generation_snapshot(store: &Store, snapshot: &Value) -> Result<(
 fn same_path(path: &std::path::Path, other: &str) -> bool {
     !other.is_empty() && std::fs::canonicalize(path).ok() == std::fs::canonicalize(other).ok()
 }
+
+#[cfg(test)]
+#[path = "lingmo_binding_tests.rs"]
+mod lingmo_binding_tests;
 
 #[cfg(test)]
 mod image_semantic_tests {

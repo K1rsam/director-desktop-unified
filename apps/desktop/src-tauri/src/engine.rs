@@ -136,6 +136,10 @@ fn ready_prompt_evidence(
                 'sourceVersion',json_extract(j.snapshot,'$.sourceVersion'),
                 'sourcePrompt',json_extract(j.snapshot,'$.sourcePrompt'),
                 'sourcePromptSha256',json_extract(j.snapshot,'$.sourcePromptSha256'),
+                'origin',json_extract(j.snapshot,'$.origin'),
+                'importSource',json_extract(j.snapshot,'$.importSource'),
+                'mentions',json_extract(j.snapshot,'$.mentions'),
+                'audioAssetRefs',json_extract(j.snapshot,'$.audioAssetRefs'),
                 'prompt',json_extract(j.snapshot,'$.prompt'),
                 'duration',json_extract(j.snapshot,'$.duration'),
                 'ratio',json_extract(j.snapshot,'$.ratio'),
@@ -148,6 +152,11 @@ fn ready_prompt_evidence(
                 'prompt',json_extract(v.data,'$.prompt'),
                 'duration',json_extract(v.data,'$.duration'),
                 'assetRefs',json_extract(v.data,'$.assetRefs'),
+                'origin',json_extract(v.data,'$.origin'),
+                'importSource',json_extract(v.data,'$.importSource'),
+                'mentions',json_extract(v.data,'$.mentions'),
+                'audioAssetRefs',json_extract(v.data,'$.audioAssetRefs'),
+                'mediaRefs',json_extract(v.data,'$.mediaRefs'),
                 'storyboardCreativeProfile',json_extract(v.data,'$.storyboardCreativeProfile'))
         FROM jobs j LEFT JOIN unit_versions v
             ON v.unit_id=j.entity_id AND v.version=json_extract(j.snapshot,'$.unitVersion')
@@ -184,6 +193,7 @@ fn prepared_source_prompt_provenance(
     source_version: i64,
     settings: &Value,
 ) -> Result<Value> {
+    let imported = s(frozen_unit, "origin") == "imported-storyboard";
     if s(frozen_unit, "id").is_empty()
         || snapshot["unitId"] != frozen_unit["id"]
         || snapshot["unitVersion"]
@@ -193,15 +203,41 @@ fn prepared_source_prompt_provenance(
         || snapshot["unitVersion"] != frozen_unit["version"]
         || current_unit["id"] != frozen_unit["id"]
         || current_unit["version"] != frozen_unit["version"]
-        || snapshot["sourceVersion"].as_i64() != Some(source_version)
-        || source_version <= 0
-        || frozen_unit["sourceVersion"] != snapshot["sourceVersion"]
-        || current_unit["sourceVersion"] != snapshot["sourceVersion"]
         || current_unit["assetRefs"] != frozen_unit["assetRefs"]
         || current_unit["storyboardCreativeProfile"] != frozen_unit["storyboardCreativeProfile"]
         || current_unit["continuityStale"] == true
         || s(frozen_unit, "prompt").trim().is_empty()
+    {
+        return Err("素材包缺少一致的不可变单元原文版本".into());
+    }
+    if imported {
+        // Imported workspace summaries omit the large prompt and mentions.
+        // Prove against the actual frozen unit-version row instead. bind and
+        // validate_snapshot separately verify the persisted original Markdown.
+        if s(current_unit, "origin") != "imported-storyboard"
+            || s(snapshot, "origin") != "imported-storyboard"
+            || !snapshot["sourceVersion"].is_null()
+            || !frozen_unit["importSource"].is_object()
+            || s(&frozen_unit["importSource"], "markdownSha256").is_empty()
+            || current_unit["importSource"] != frozen_unit["importSource"]
+            || !frozen_unit["mentions"].is_array()
+            || ["origin", "importSource", "mentions", "audioAssetRefs"].iter()
+                .any(|field| snapshot[*field] != frozen_unit[*field])
+            || ["audioAssetRefs", "mediaRefs"].iter()
+                .any(|field| current_unit[*field] != frozen_unit[*field])
+            || (!s(current_unit, "prompt").is_empty() && current_unit["prompt"] != frozen_unit["prompt"])
+            || snapshot["sourcePrompt"] != frozen_unit["prompt"]
+            || s(snapshot, "sourcePromptSha256") != pipeline::digest(s(frozen_unit, "prompt"))
+        {
+            return Err("导入成稿素材包缺少一致的来源、标签或冻结原文证明".into());
+        }
+    } else if snapshot["sourceVersion"].as_i64() != Some(source_version)
+        || source_version <= 0
+        || frozen_unit["sourceVersion"] != snapshot["sourceVersion"]
+        || current_unit["sourceVersion"] != snapshot["sourceVersion"]
         || current_unit["prompt"] != frozen_unit["prompt"]
+        || s(current_unit, "origin") == "imported-storyboard"
+        || s(snapshot, "origin") == "imported-storyboard"
     {
         return Err("素材包缺少一致的不可变单元原文版本".into());
     }
@@ -247,7 +283,18 @@ fn prepared_source_prompt_provenance(
         }
         if !s(reference, "assetId").is_empty() {
             let physical = reference_assets(reference)?;
-            if physical["adoptedMediaId"] != reference["mediaId"] {
+            if imported && s(reference, "bindingSource") == "unit-media-ref" {
+                if !matches!(s(reference, "kind"), "audio" | "video")
+                    || !["assetRefs", "audioAssetRefs", "mediaRefs"].iter().any(|field| {
+                        frozen_unit[*field].as_array().into_iter().flatten().any(|r|
+                            r["assetId"] == reference["assetId"]
+                            && r["variantId"] == reference["variantId"]
+                            && r["mediaId"] == reference["mediaId"])
+                    })
+                {
+                    return Err("导入成稿音视频引用与冻结关联不同".into());
+                }
+            } else if physical["adoptedMediaId"] != reference["mediaId"] {
                 return Err("素材包采用图已变化".into());
             }
         }
@@ -331,11 +378,15 @@ fn prepared_source_prompt_provenance(
     {
         return Err("原提示词按冻结引用编译后与素材包不一致".into());
     }
-    Ok(
+    let mut proof =
         json!({"version":"unit-source-prompt/v1","origin":"unit-version-and-reference-compilation","jobId":job_id,
         "unitId":frozen_unit["id"],"unitVersion":frozen_unit["version"],"sourceVersion":snapshot["sourceVersion"],
-        "sourcePromptSha256":pipeline::digest(s(frozen_unit,"prompt")),"compiledPrompt":snapshot["prompt"],"compiledPromptVerified":true}),
-    )
+        "sourcePromptSha256":pipeline::digest(s(frozen_unit,"prompt")),"compiledPrompt":snapshot["prompt"],"compiledPromptVerified":true});
+    if imported {
+        proof["origin"] = json!("imported-unit-version-and-reference-compilation");
+        proof["importSource"] = frozen_unit["importSource"].clone();
+    }
+    Ok(proof)
 }
 impl Engine {
     /// Normal installed desktop. Isolated probes and the one-shot diagnostic
@@ -1065,7 +1116,7 @@ impl Engine {
         if let Some(object)=display_settings.as_object_mut(){object.remove(crate::app_settings::SCOPE);}
         if self.standard_native {if let Some(global)=crate::app_settings::load(&self.home)? {for (_,entry) in global["catalogs"].as_object().into_iter().flatten(){let cap=entry["capabilities"].clone();providers.retain(|p|p["provider"]!=cap["provider"]);providers.push(cap);}}}
         Ok(
-            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report}),
+            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report,"lingmoDocuments":crate::lingmo_import::documents(store)?}),
         )
     }
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }
@@ -1186,6 +1237,16 @@ impl Engine {
             "workspace.get" => {
                 store.ensure_current_images()?;
                 return self.workspace(&store, request.get("episodeId").and_then(Value::as_str));
+            }
+            "lingmo.preview" => return crate::lingmo_import::preview(&store, &request),
+            "lingmo.document" => return crate::lingmo_import::document(&store, s(&request,"documentId")),
+            "lingmo.scene" => return crate::lingmo_import::scene(&store, s(&request,"documentId"), s(&request,"sceneId")),
+            "lingmo.original" => return crate::lingmo_import::original(&store, s(&request,"documentId"), request["unitId"].as_str()),
+            "lingmo.import" => {
+                let report=crate::lingmo_import::import(&store,&request)?;
+                let mut workspace=self.workspace(&store,None)?;
+                workspace["lingmoImportReport"]=report;
+                return Ok(workspace);
             }
             "units.get" => return store.get("units", s(&request, "unitId")),
             "units.versions.list" => return store.unit_versions(s(&request, "unitId")),
@@ -1323,6 +1384,10 @@ impl Engine {
                     .get("units", s(&request["unit"], "id"))
                     .unwrap_or(json!({}));
                 let mut merged = merge(original.clone(), &request["unit"]);
+                if original["origin"]=="imported-storyboard" || merged["origin"]=="imported-storyboard" {
+                    crate::lingmo_import::save_unit(&store,&original,merged)?;
+                    return self.workspace(&store,None);
+                }
                 unit_save_guard::check_shots_unchanged(&original, &mut merged)?;
                 let value = store.save_unit(merged)?;
                 if original["exitState"] != value["exitState"]

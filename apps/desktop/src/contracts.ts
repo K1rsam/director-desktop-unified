@@ -31,22 +31,43 @@ function compiledPrompt(unit: Unit, pkg: PreparedPackage): string {
   for (const reference of pkg.references || []) { const kind = reference.kind === 'video' ? 'video' : reference.kind === 'audio' ? 'audio' : 'image'; counts[kind]++; const marker = '@' + ({ image: '图片', video: '视频', audio: '音频' }[kind]) + counts[kind]; prompt = prompt.split('{{asset:' + (reference.assetId || '') + ':' + (reference.variantId || '') + '}}').join(marker); }
   return prompt;
 }
+function sameJsonIdentity(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => sameJsonIdentity(item, right[index]));
+  const a = object(left), b = object(right);
+  return !!a && !!b && Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(key => Object.prototype.hasOwnProperty.call(b, key) && sameJsonIdentity(a[key], b[key]));
+}
+function importedPromptIdentity(unit: Unit, proof: Record<string, unknown>): boolean {
+  const source = object(unit.importSource);
+  return unit.origin === 'imported-storyboard' && proof.origin === 'imported-unit-version-and-reference-compilation'
+    && proof.sourceVersion === null && unit.sourceVersion == null && !!source
+    && typeof source.markdownSha256 === 'string' && /^[a-f0-9]{64}$/i.test(source.markdownSha256)
+    && source.documentId === source.markdownSha256
+    && Number.isSafeInteger(source.lineStart) && Number(source.lineStart) >= 1
+    && Number.isSafeInteger(source.lineEnd) && Number(source.lineEnd) >= Number(source.lineStart)
+    && Number.isSafeInteger(source.byteStart) && Number(source.byteStart) >= 0
+    && Number.isSafeInteger(source.byteEnd) && Number(source.byteEnd) > Number(source.byteStart)
+    && (source.externalUnitId === null || typeof source.externalUnitId === 'string' && source.externalUnitId.length > 0)
+    && sameJsonIdentity(source, proof.importSource);
+}
 function packagePromptMatches(unit: Unit, pkg: PreparedPackage): boolean {
   if (pkg.sourcePrompt !== undefined || pkg.sourcePromptProvenance !== undefined) {
     const proof = object(pkg.sourcePromptProvenance);
     // Rust proves the immutable unit version compiled to this frozen request.
     // Compare both texts and every identity; a partial proof never falls back.
-    return !!proof && proof.version === 'unit-source-prompt/v1' && proof.origin === 'unit-version-and-reference-compilation'
+    const sourceMatches = proof && (unit.origin === 'imported-storyboard'
+      ? importedPromptIdentity(unit, proof)
+      : proof.origin === 'unit-version-and-reference-compilation' && Number.isInteger(unit.sourceVersion) && Number(unit.sourceVersion) > 0 && proof.sourceVersion === unit.sourceVersion);
+    return !!proof && proof.version === 'unit-source-prompt/v1' && !!sourceMatches
       && typeof pkg.jobId === 'string' && !!pkg.jobId && proof.jobId === pkg.jobId
       && proof.unitId === unit.id && Number.isInteger(unit.version) && Number(unit.version) > 0 && proof.unitVersion === unit.version && proof.unitVersion === pkg.unitVersion
-      && Number.isInteger(unit.sourceVersion) && Number(unit.sourceVersion) > 0 && proof.sourceVersion === unit.sourceVersion
       && proof.compiledPromptVerified === true && proof.compiledPrompt === pkg.prompt
       && typeof proof.sourcePromptSha256 === 'string' && /^[a-f0-9]{64}$/i.test(proof.sourcePromptSha256)
       && typeof pkg.sourcePrompt === 'string' && !!pkg.sourcePrompt.trim() && pkg.sourcePrompt === unit.prompt;
   }
   // The legacy compiler only knows identity placeholders. It cannot reproduce
   // creative name templates, INLINE text or semantic ancestor bindings.
-  if (unit.storyboardCreativeProfile === 'original-production-contract/v1' || pkg.inlineReferences?.length || pkg.references?.some(reference => reference.semanticBindings?.length)) return false;
+  if (unit.origin === 'imported-storyboard' || unit.storyboardCreativeProfile === 'original-production-contract/v1' || pkg.inlineReferences?.length || pkg.references?.some(reference => reference.semanticBindings?.length)) return false;
   return pkg.prompt === compiledPrompt(unit, pkg);
 }
 export function packageDifferences(unit: Unit, provider: string, model: string, parameters?: VideoParameters): string[] {
