@@ -28,6 +28,8 @@ pub mod background_chrome_images;
 pub mod task_record_maintenance;
 #[path = "unit_save_guard.rs"]
 mod unit_save_guard;
+#[path = "lingmo_project.rs"]
+mod lingmo_project;
 #[path = "engine_refinement_identity.rs"]
 mod refinement_identity;
 #[cfg(test)]
@@ -619,6 +621,18 @@ impl Engine {
         result["lifecycleVersion"] = json!(next);
         result["filesRetained"] = json!(true);
         if action == "projects.delete" {
+            // Finish a possibly interrupted global-import receipt before
+            // removing its registration. A later retry must respect deletion.
+            if key.starts_with("lingmo-") {
+                let receipt_path=Path::new(s(current,"rootPath")).join(".lingmo-create.json");
+                if receipt_path.is_file() {
+                    let mut receipt:Value=serde_json::from_slice(&fs::read(&receipt_path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+                    if format!("lingmo-{}",s(&receipt,"identity"))==key {
+                        receipt["state"]=json!("deleted");
+                        atomic_json(&receipt_path,&receipt)?;
+                    }
+                }
+            }
             result["deleted"] = json!(true);
             rows.remove(index);
         } else {
@@ -1178,6 +1192,7 @@ impl Engine {
         // File pickers and library reads must not hold a project lifecycle reservation.
         match action {
             "projects.list" => return Ok(json!(self.project_list()?)),
+            "lingmo.preview_file" => return crate::lingmo_import::preview_file(&request),
             "files.choose" => return choose_files(&request),
             "legacy.inspect" => {
                 return crate::importer::inspect_legacy(Path::new(s(&request, "path")))
@@ -1186,6 +1201,7 @@ impl Engine {
         }
         let lifecycle = self.lifecycle_mutex.lock().map_err(|e| e.to_string())?;
         match action {
+            "lingmo.create_project" => return self.create_lingmo_project(&request),
             "projects.archive" | "projects.restore" | "projects.delete" => {
                 return self.project_lifecycle(&request)
             }

@@ -10,6 +10,7 @@ import { UnitPanel } from './UnitPanel';
 import { TextExecutionSummary } from './TextExecutionSettings';
 import { ProjectLibrary } from './ProjectLibrary';
 import { InlineProjectCreate } from './InlineProjectCreate';
+import { LingmoImportDialog } from './LingmoImportDialog';
 import { createWorkspacePoller } from './workflowProgressModel';
 import { workspacePollIntervalMs } from './generationState';
 import type { ProjectFilter, ProjectLifecycleAction } from './ProjectLibrary';
@@ -57,6 +58,7 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]), [storedWorkspace, setWorkspace] = useState<Workspace | null>(null);
   const [page, setPage] = useState<Page>('projects'), [busy, setBusy] = useState(''), [loading, setLoading] = useState(true), [notice, setNotice] = useState(''), [error, setError] = useState('');
   const [projectFilter, setProjectFilter] = useState<ProjectFilter>('active');
+  const [lingmoImportOpen, setLingmoImportOpen] = useState(false);
   const [inspected, setInspected] = useState<Media | null>(null), [mobileNav, setMobileNav] = useState(false);
   const [catalogStates, setCatalogStates] = useState<CatalogDiscoveryState[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null), [settingsLoading, setSettingsLoading] = useState(false), [settingsBusy, setSettingsBusy] = useState('');
@@ -249,6 +251,14 @@ export default function App() {
     busyRef.current = 'project.import'; setBusy('project.import'); setError('');
     try { const paths = await choose('file'); if (!paths[0]) return; const result = await request<Workspace | ProjectSummary>({ action: 'project.import', path: paths[0] }); setProjectFilter('active'); await listProjects(); if (isWorkspace(result)) { setWorkspace(normalize(result)); setPage('videos'); } else if (result?.id) await loadProject(result, 'videos'); setNotice('项目包已导入，可继续整理资料和制作。'); } catch (reason) { setError(messageOf(reason)); } finally { busyRef.current = ''; setBusy(''); }
   }
+  async function openImportedStoryboard(result: Workspace) {
+    ++requestSequence.current;
+    const next = freshWorkspace(result);
+    workspaceRef.current = next; setWorkspace(next); setProjectFilter('active');
+    setPage('videos'); setMobileNav(false); setLingmoImportOpen(false); setError('');
+    setNotice('分镜已导入，现在可以按集场浏览、配图和继续制作。');
+    await listProjects();
+  }
   async function exportProject() { const paths = await choose('directory'); if (paths[0] && workspace) { const filename = `${workspace.project.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')}-${new Date().toISOString().replace(/[:.]/g, '-')}.director.zip`; await mutate('project.export', { path: `${paths[0].replace(/[\\/]$/, '')}/${filename}` }, `项目包已导出：${filename}`); } }
   const selectedStage = stages.find(stage => stage.id === page), activeJobs = workspace?.jobs.filter(jobActive).length || 0;
   const pageTitle = selectedStage?.title || ({ projects: '所有项目', jobs: '任务记录', settings: '软件设置', 'project-settings': '项目制作设置' } as Partial<Record<Page, string>>)[page];
@@ -273,7 +283,7 @@ export default function App() {
       {workspace?.readState?.error && !['projects', 'settings'].includes(page) && <div className="notification error" role="status"><span>最新制作状态读取失败，以下为上次保存状态。正在继续读取：{workspace.readState.error}</span></div>}
       <div className="page-content">
         {workspace && ['foundation', 'images', 'storyboard'].includes(page) && <TextExecutionSummary settings={workspace.settings} stage={page as 'foundation' | 'images' | 'storyboard'} onConfigure={() => navigate('settings')}/>}
-        {page === 'settings' ? appSettings ? <SettingsPanel appSettings={appSettings} writable={connectionAllowed} mutate={globalMutate} onError={setError}/> : <Empty title={settingsLoading ? '正在读取软件设置…' : '软件设置尚未读取'}><Button icon="refresh" disabled={settingsLoading} onClick={() => void loadAppSettings()}>重新读取</Button></Empty> : loading && !workspace ? <Empty title="正在读取项目…"/> : page === 'projects' ? <><ProjectLibrary projects={projects} filter={projectFilter} writable={writable} busy={!!busy} onFilterChange={setProjectFilter} onOpen={project => void loadProject(project)} createForm={<InlineProjectCreate writable={writable} busy={!!busy} onCreate={createProject}/>} onLifecycle={projectLifecycle}/><div className="flow-guide">{stages.map(stage => <div key={stage.id}><span>{stage.number}</span><Icon name={stage.icon}/><strong>{stage.title}</strong><small>{stage.subtitle}</small></div>)}</div></> : workspace ? <>
+        {page === 'settings' ? appSettings ? <SettingsPanel appSettings={appSettings} writable={connectionAllowed} mutate={globalMutate} onError={setError}/> : <Empty title={settingsLoading ? '正在读取软件设置…' : '软件设置尚未读取'}><Button icon="refresh" disabled={settingsLoading} onClick={() => void loadAppSettings()}>重新读取</Button></Empty> : loading && !workspace ? <Empty title="正在读取项目…"/> : page === 'projects' ? <><section className="lingmo-home-import" aria-label="从现成分镜开始"><span className="lingmo-file-icon"><Icon name="story" size={25}/></span><div><h2>已经有分镜？直接开始制作</h2><p>导入分镜 MD，自动建立项目，直接进入集场工作台。</p></div><Button icon="upload" variant="primary" disabled={!writable} onClick={() => setLingmoImportOpen(true)}>导入分镜 MD</Button></section><ProjectLibrary projects={projects} filter={projectFilter} writable={writable} busy={!!busy} onFilterChange={setProjectFilter} onOpen={project => void loadProject(project)} createForm={<InlineProjectCreate writable={writable} busy={!!busy} onCreate={createProject}/>} onLifecycle={projectLifecycle}/><div className="flow-guide">{stages.map(stage => <div key={stage.id}><span>{stage.number}</span><Icon name={stage.icon}/><strong>{stage.title}</strong><small>{stage.subtitle}</small></div>)}</div></> : workspace ? <>
           {page === 'foundation' && <FoundationPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} onNotice={setNotice} onError={setError}/>}
           {page === 'images' && <AssetPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} inspect={setInspected} onNotice={setNotice} onError={setError} onTasks={() => setPage('jobs')}/>}
           {(page === 'storyboard' || page === 'videos') && <UnitPanel key={`${workspace.project.id}-${page}`} workspace={workspace} mode={page} writable={writable} mutate={mutate} inspect={setInspected} onNotice={setNotice} onError={setError}/>}
@@ -282,6 +292,7 @@ export default function App() {
         </> : <Empty title="先选择一个项目"/>}
       </div>
     </main>
+    {lingmoImportOpen && <LingmoImportDialog writable={writable} onClose={() => setLingmoImportOpen(false)} onImported={openImportedStoryboard}/>}
     {inspected && <Modal title={inspected.name || '原始媒体'} onClose={() => setInspected(null)}><div className="full-media"><MediaPreview media={inspected}/></div><div className="form-actions"><small className="muted">{inspected.sha256 || inspected.hash ? `SHA-256 ${inspected.sha256 || inspected.hash}` : '原始文件'}</small>{mediaUrl(inspected) && <a className="button secondary" href={mediaUrl(inspected)} download={inspected.name || inspected.relativePath?.split('/').at(-1) || 'media'}>下载原文件</a>}</div></Modal>}
   </div>;
 }

@@ -1,33 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { choose, request } from './api';
 import { moveItem } from './contracts';
-import { adoptedImage, Button, JsonDetails, MediaPreview, messageOf, Modal } from './components';
-import { lingmoImportBlocked, boundLingmoMentions, replaceLingmoReference, importedUnit, insertLingmoToken, lingmoAssetToken, lingmoAssetType, lingmoMentions, lingmoPromptParts, lingmoTypeNames, lingmoTypes, lingmoUnitDocument } from './lingmo';
-import type { Asset, AssetRef, LingmoMention, LingmoPreview, LingmoScene, LingmoScope, Media, Mutation, Unit, Workspace } from './types';
+import { adoptedImage, Button, Icon, JsonDetails, MediaPreview, messageOf, Modal } from './components';
+import { LingmoImportDialog } from './LingmoImportDialog';
+import { boundLingmoMentions, replaceLingmoReference, importedUnit, insertLingmoToken, lingmoAssetToken, lingmoAssetType, lingmoMentions, lingmoPromptParts, lingmoTypeNames, lingmoTypes, lingmoUnitDocument } from './lingmo';
+import type { Asset, AssetRef, LingmoMention, LingmoScene, LingmoScope, Media, Mutation, Unit, Workspace } from './types';
 import './lingmo.css';
 
-type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; inspect: (media: Media) => void; onError: (message: string) => void; onScope: (scope: LingmoScope | null) => void };
-type Preview = LingmoPreview & { revisionComparison?: { existingDocumentIds: string[]; previousCounts: unknown; newCounts: unknown } };
+type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; inspect: (media: Media) => void; onError: (message: string) => void; onScope: (scope: LingmoScope | null) => void; children?: ReactNode };
 function assetVersionLabel(asset: Asset): string {
   const revision = asset.assetRevision;
   return asset.externalId != null && (typeof revision === 'number' || typeof revision === 'string') ? `资产版本 ${revision}` : '本地版本';
 }
 
-export function LingmoPanel({ workspace, writable, mutate, inspect, onError, onScope }: Props) {
+export function LingmoPanel({ workspace, writable, mutate, inspect, onError, onScope, children }: Props) {
   const documents = workspace.lingmoDocuments || [];
   const [documentId, setDocumentId] = useState(documents[0]?.id || ''), [episodeId, setEpisodeId] = useState(''), [sceneId, setSceneId] = useState('');
-  const [path, setPath] = useState(''), [catalogPath, setCatalogPath] = useState(''), [imageZipPath, setImageZipPath] = useState(''), [imageDirectory, setImageDirectory] = useState('');
-  const [preview, setPreview] = useState<Preview | null>(null), [busy, setBusy] = useState(false), [allowNewRevision, setAllowNewRevision] = useState(false);
+  const [showImport, setShowImport] = useState(false), [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [sceneData, setSceneData] = useState<{ units: Unit[]; scene: LingmoScene; assets: Asset[] } | null>(null);
   const [loadError, setLoadError] = useState(''), [reload, setReload] = useState(0);
-  const [importReport, setImportReport] = useState<{ media?: { imported?: number; missing?: number; placeholders?: number; failures?: { message?: string; filename?: string }[] }; milliseconds?: number } | null>(null);
   const doc = documents.find(item => item.id === documentId);
   const episode = doc?.episodes.find(item => item.id === episodeId) || doc?.episodes[0];
   const scenes = doc?.scenes.filter(item => item.episodeId === episode?.id) || [];
   const scene = scenes.find(item => item.id === sceneId) || scenes[0];
   const onScopeRef = useRef(onScope); onScopeRef.current = onScope;
   const requestedScene = useRef('');
-  // Version changes cause a fresh read of only the current scene, never 883 full prompts.
+  // Polls update media in place; only changed unit versions reload scene text.
+  // Preserve the mounted content while a same-scene version refresh is pending.
   const sceneVersions = scene?.unitIds.map(id => { const unit = workspace.units.find(item => item.id === id); return `${id}:${unit?.version}`; }).join('|') || '';
   useEffect(() => {
     if (!doc || !scene) { requestedScene.current = ''; setSceneData(null); onScopeRef.current(null); return; }
@@ -36,52 +36,54 @@ export function LingmoPanel({ workspace, writable, mutate, inspect, onError, onS
     const key = `${workspace.project.id}:${doc.id}:${scene.id}`;
     const changedScene = requestedScene.current !== key;
     requestedScene.current = key;
-    // A workspace poll returns fresh array objects even when nothing changed.
-    // Media renders from workspace directly. Only changed unit versions need a
-    // scene read; keep the current scene mounted while that refresh is pending.
-    if (changedScene) { setSceneData(null); onScopeRef.current(scope); }
+    if (changedScene) { setSceneData(null); setSelectedAsset(null); onScopeRef.current(scope); }
     setLoadError('');
     void request<{ units: Unit[]; scene: LingmoScene; assets: Asset[] }>({ action: 'lingmo.scene', projectId: workspace.project.id, documentId: doc.id, sceneId: scene.id }).then(data => {
       if (!alive) return; setSceneData(data); onScopeRef.current({ ...scope, units: data.units, loading: false });
     }).catch(error => { if (alive) { setLoadError(messageOf(error)); if (changedScene) onScopeRef.current({ ...scope, loading: false }); } });
     return () => { alive = false; };
   }, [workspace.project.id, doc?.id, scene?.id, sceneVersions, reload]);
-  async function selectFile(kind: 'md' | 'catalog' | 'zip' | 'directory') {
-    try { const [selected] = await choose(kind === 'directory' ? 'directory' : 'file'); if (!selected) return;
-      if (kind === 'md') setPath(selected); if (kind === 'catalog') setCatalogPath(selected); if (kind === 'zip') setImageZipPath(selected); if (kind === 'directory') setImageDirectory(selected);
-      setPreview(null); setAllowNewRevision(false);
-    } catch (reason) { onError(messageOf(reason)); }
-  }
-  async function previewImport() {
-    setBusy(true); setPreview(null); setAllowNewRevision(false);
-    try { setPreview(await request<Preview>({ action: 'lingmo.preview', projectId: workspace.project.id, path, ...(catalogPath ? { catalogPath } : {}) })); }
-    catch (reason) { onError(messageOf(reason)); } finally { setBusy(false); }
-  }
-  async function importDocument() {
-    if (!preview || lingmoImportBlocked(preview.diagnostics)) return;
-    setBusy(true);
-    try {
-      const next = await mutate('lingmo.import', { path, ...(catalogPath ? { catalogPath } : {}), ...(imageZipPath ? { imageZipPath } : {}), ...(imageDirectory ? { imageDirectory } : {}), expectedSha256: preview.markdownSha256, previewToken: preview.previewToken, allowNewRevision }, '分镜已导入第四阶段，可按集场浏览和补充素材。');
-      if (next) { setImportReport((next as Workspace & { lingmoImportReport?: typeof importReport }).lingmoImportReport || null); setDocumentId(preview.markdownSha256); setEpisodeId(''); setSceneId(''); setPreview(null); setReload(value => value + 1); }
-    } catch (reason) { onError(messageOf(reason)); } finally { setBusy(false); }
-  }
   async function importImage(asset: Asset, kind: 'image' | 'audio' | 'video' = lingmoAssetType(asset) === 'SE' ? 'audio' : 'image') {
     try { const paths = await choose('file', true); if (!paths.length) return; await mutate('media.import', { paths, kind, assetId: asset.id, variantId: asset.variantId || '' }, '素材已入库；请核对并采用正确版本。'); }
     catch (reason) { onError(messageOf(reason)); }
   }
-  return <section className="surface lingmo-panel" aria-label="灵墨分镜导入与集场浏览">
-    <div className="mini-heading"><h3>导入现成分镜 MD</h3><span className="muted">本地解析 · 直接进入第四阶段</span></div>
-    {importReport && <div role="status"><p>分镜正文已保存。导入耗时 {((importReport.milliseconds || 0) / 1000).toFixed(1)} 秒；已有图片入库 {importReport.media?.imported || 0} 张，白图占位 {importReport.media?.placeholders || 0} 张。</p>{!!importReport.media?.missing && <p className="warning">缺少 {importReport.media.missing} 张目录图片，可在本场资产区补充。</p>}{!!importReport.media?.failures?.length && <details open><summary className="warning">部分素材未导入，已保存的正文不受影响</summary>{importReport.media.failures.map((failure, index) => <p key={index}>{failure.filename || ''} {failure.message || '素材导入失败'}</p>)}</details>}</div>}
-    <div className="lingmo-import-row"><Button onClick={() => void selectFile('md')} disabled={busy}>选择分镜 MD</Button><span title={path}>{path || '选择灵墨格式的完整分镜文档'}</span><Button disabled={!path || busy} onClick={() => void previewImport()}>{busy ? '处理中…' : '预览结构'}</Button></div>
-    <details className="details"><summary>可选：同版资产目录与已有图片</summary><div className="lingmo-import-row"><Button disabled={busy} onClick={() => void selectFile('catalog')}>选择 .md.assets.json</Button><span>{catalogPath || '无目录也可导入浏览'}</span>{catalogPath && <Button disabled={busy} onClick={() => { setCatalogPath(''); setPreview(null); }}>清除</Button>}</div><div className="lingmo-import-row"><Button disabled={busy} onClick={() => void selectFile('zip')}>选择图片 ZIP</Button><span>{imageZipPath || '白图占位会保留占位标识'}</span>{imageZipPath && <Button disabled={busy} onClick={() => setImageZipPath('')}>清除</Button>}</div><div className="lingmo-import-row"><Button disabled={busy} onClick={() => void selectFile('directory')}>选择图片文件夹</Button><span>{imageDirectory}</span>{imageDirectory && <Button disabled={busy} onClick={() => setImageDirectory('')}>清除</Button>}</div></details>
-    {preview && <div className="lingmo-preview"><strong>{preview.counts.episodes} 集 · {preview.counts.scenes} 场 · {preview.counts.fragments} 片段 · {preview.counts.shots} 镜</strong><p>{preview.counts.mentionOccurrences} 处资产标签 · {preview.counts.assets} 项资产 · {preview.catalogMatched ? '同版资产目录已匹配' : '未匹配资产目录'}</p><small>文件 SHA-256：{preview.markdownSha256}</small>{preview.diagnostics.length > 0 && <details open={lingmoImportBlocked(preview.diagnostics)}><summary>{preview.diagnostics.length} 条解析诊断</summary>{preview.diagnostics.map((item, index) => <p className={item.blocking ? 'warning' : 'muted'} key={index}>{item.line ? `第 ${item.line} 行 · ` : ''}{item.message}</p>)}</details>}{!!preview.revisionComparison?.existingDocumentIds.length && <><p className="warning">检测到此文件的新修订，导入将建立独立版本，保留已有编辑与绑定。</p><JsonDetails title="修订数量对比" value={preview.revisionComparison}/><label className="check-label"><input type="checkbox" checked={allowNewRevision} onChange={event => setAllowNewRevision(event.target.checked)}/>确认作为独立修订导入</label></>}<Button executionAction="lingmo.import" variant="primary" disabled={!writable || busy || lingmoImportBlocked(preview.diagnostics) || !!preview.revisionComparison?.existingDocumentIds.length && !allowNewRevision} onClick={() => void importDocument()}>确认导入</Button><p className="muted">仅保存文档、结构与已有素材，不启动生成。</p></div>}
-    {!!documents.length && <><div className="lingmo-navigation"><label>分镜来源<select value={documentId} onChange={event => { setDocumentId(event.target.value); setEpisodeId(''); setSceneId(''); }}><option value="">原项目单元</option>{documents.map(item => <option value={item.id} key={item.id}>{item.filename} · {item.markdownSha256.slice(0, 8)}</option>)}</select></label>{doc && <><label>剧集<select value={episode?.id || ''} onChange={event => { setEpisodeId(event.target.value); setSceneId(''); }}>{doc.episodes.map(item => <option key={item.id} value={item.id}>{item.title || `第 ${item.number} 集`}</option>)}</select></label><label>场次<select value={scene?.id || ''} onChange={event => setSceneId(event.target.value)}>{scenes.map(item => <option key={item.id} value={item.id}>{item.number} · {item.title || '场次'} · {item.unitIds.length} 片段</option>)}</select></label></>}</div>{doc && <><p className="muted">{doc.counts.episodes} 集 / {doc.counts.scenes} 场 / {doc.counts.fragments} 片段 / {doc.counts.shots} 镜 · 当前仅加载所选场次。场次可包含多种场景资产。</p><details className="details"><summary>导入来源与解析诊断 · {doc.diagnostics.length} 项</summary><p className="lingmo-source-hash">SHA-256：{doc.markdownSha256}</p><p>解析版本：{doc.parserVersion}</p>{doc.diagnostics.filter(item => !item.line || !scene || item.line >= (scene.lineStart || 0) && item.line <= (scene.lineEnd || Infinity)).map((item, index) => <p className={item.blocking ? 'warning' : 'muted'} key={index}>{item.line ? `第 ${item.line} 行 · ` : ''}{item.message}</p>)}</details></>}{loadError && <p className="warning">本场读取失败：{loadError} <Button onClick={() => setReload(value => value + 1)}>重试读取</Button></p>}{doc && scene && !sceneData && !loadError && <p role="status">正在读取当前场次…</p>}{sceneData && <div className="lingmo-scene-assets"><h4>本场资产 · {sceneData.assets.length} 项</h4><p className="muted">{sceneData.assets.filter(asset => lingmoAssetType(asset) !== 'SE' && !adoptedImage(workspace, workspace.assets.find(item => item.id === asset.id) || asset)).length} 项尚无当前图片；白图只作为待补素材。</p>{lingmoTypes.map(type => { const assets = sceneData.assets.filter(asset => lingmoAssetType(asset) === type); return assets.length ? <section key={type}><h5>{lingmoTypeNames[type]} · {assets.length}</h5><div className="lingmo-asset-grid">{assets.map(asset => { const current = workspace.assets.find(item => item.id === asset.id) || asset, media = adoptedImage(workspace, current), candidates = workspace.media.filter(item => item.assetId === asset.id && (item.variantId || '') === (asset.variantId || '') || (current.candidates || []).some(candidate => (typeof candidate === 'string' ? candidate : candidate.id) === item.id)); return <article id={`lingmo-asset-${asset.id}`} key={asset.id} tabIndex={-1} className="lingmo-asset-card"><MediaPreview media={media} compact onInspect={inspect}/><strong>{asset.name}</strong><small>{type} · {assetVersionLabel(asset)}</small><details className="lingmo-asset-identity"><summary>资产身份详情</summary><p>资产 ID：{asset.id}</p><p>版本 ID：{asset.variantId || '未设置'}</p>{asset.externalId != null && <p>目录 ID：{String(asset.externalId)}</p>}</details><small>{media && (media as Media & { placeholder?: boolean }).placeholder === true ? '白图占位 · 待补真实素材' : media ? '当前采用素材' : '缺少当前素材'}</small><Button disabled={!writable} onClick={() => void importImage(asset)}>{type === 'SE' ? '导入声音' : '补充 / 替换图片'}</Button>{type === 'OM' && <><Button disabled={!writable} onClick={() => void importImage(asset, 'audio')}>导入音频</Button><Button disabled={!writable} onClick={() => void importImage(asset, 'video')}>导入视频参考</Button></>}{candidates.length > 0 && <details><summary>已有素材 · {candidates.length}</summary>{candidates.map(candidate => <div key={candidate.id}><MediaPreview media={candidate} compact onInspect={inspect}/><small>{candidate.name || candidate.id.slice(0, 8)}{(candidate as Media & { placeholder?: boolean }).placeholder ? ' · 白图占位' : ''}</small>{candidate.kind === 'image' && <Button executionAction="media.adopt" disabled={!writable || candidate.id === current.adoptedMediaId || (candidate as Media & { placeholder?: boolean }).placeholder === true} onClick={() => void mutate('media.adopt', { assetId: asset.id, variantId: asset.variantId || '', mediaId: candidate.id }, '已采用该资产图片；引用身份保持不变。')}>{candidate.id === current.adoptedMediaId ? '当前图片' : '采用此图片'}</Button>}</div>)}</details>}</article>; })}</div></section> : null; })}{sceneData.scene.declaredAssets != null && <JsonDetails title="原场级资产清单" value={sceneData.scene.declaredAssets}/>}</div>}</>}
+  function changeDocument(id: string) { setDocumentId(id); setEpisodeId(''); setSceneId(''); }
+  function changeEpisode(id: string) { setEpisodeId(id); setSceneId(''); }
+  const asset = selectedAsset ? workspace.assets.find(item => item.id === selectedAsset) || sceneData?.assets.find(item => item.id === selectedAsset) : undefined;
+  const currentMedia = asset ? adoptedImage(workspace, asset) : undefined;
+  const assetCandidates = asset ? workspace.media.filter(item => item.assetId === asset.id && (item.variantId || '') === (asset.variantId || '') || (asset.candidates || []).some(candidate => (typeof candidate === 'string' ? candidate : candidate.id) === item.id)) : [];
+  const missingImages = sceneData?.assets.filter(item => lingmoAssetType(item) !== 'SE' && !adoptedImage(workspace, workspace.assets.find(current => current.id === item.id) || item)).length || 0;
+  const scenePosition = scenes.findIndex(item => item.id === scene?.id);
+  return <section className={`lingmo-panel ${doc ? 'lingmo-workbench' : 'lingmo-no-document'}`} aria-label="灵墨分镜导入与集场浏览">
+    <aside className="lingmo-sidebar">
+      <div className="lingmo-sidebar-heading"><span><Icon name="story"/>分镜目录</span><Button variant="ghost" icon="plus" aria-label="导入分镜 MD" title="导入现成分镜" disabled={!writable} onClick={() => setShowImport(true)}/></div>
+      {!!documents.length ? <>
+        <div className="lingmo-navigation">
+          <label>分镜文档<select aria-label="分镜文档" value={documentId} onChange={event => changeDocument(event.target.value)}><option value="">原项目单元</option>{documents.map(item => <option value={item.id} key={item.id}>{item.filename}</option>)}</select></label>
+          {doc && <><label>剧集<select aria-label="剧集" value={episode?.id || ''} onChange={event => changeEpisode(event.target.value)}>{doc.episodes.map(item => <option key={item.id} value={item.id}>{item.title || `第 ${item.number} 集`}</option>)}</select></label><label className="lingmo-scene-select">场次<select aria-label="场次" value={scene?.id || ''} onChange={event => setSceneId(event.target.value)}>{scenes.map(item => <option key={item.id} value={item.id}>{item.number} · {item.title || '场次'} · {item.unitIds.length} 片段</option>)}</select></label></>}
+        </div>
+        {doc && <>
+          <div className="lingmo-scene-list" aria-label="本集场次"><div className="lingmo-list-caption">本集场次 <span>{scenes.length}</span></div>{scenes.map(item => <button type="button" key={item.id} className={`lingmo-scene-item ${item.id === scene?.id ? 'selected' : ''}`} aria-current={item.id === scene?.id ? 'true' : undefined} onClick={() => setSceneId(item.id)}>{item.title && item.title !== item.number && <span className="lingmo-scene-number">{item.number}</span>}<strong>{item.title && item.title !== item.number ? item.title : `场次 ${item.number}`}</strong><small>{item.unitIds.length} 个片段</small><Icon name="chevron" size={14}/></button>)}</div>
+          <div className="lingmo-document-summary"><span>{doc.counts.episodes} 集</span><span>{doc.counts.scenes} 场</span><span>{doc.counts.fragments} 片段</span></div>
+          <details className="lingmo-source-details"><summary>文档信息{doc.diagnostics.length ? ` · ${doc.diagnostics.length} 条提示` : ''}</summary><p>{doc.filename}</p><p>{doc.counts.shots} 个镜头 · 解析版本 {doc.parserVersion}</p><p className="lingmo-source-hash">SHA-256：{doc.markdownSha256}</p>{doc.diagnostics.filter(item => !item.line || !scene || item.line >= (scene.lineStart || 0) && item.line <= (scene.lineEnd || Infinity)).map((item, index) => <p className={item.blocking ? 'warning' : 'muted'} key={index}>{item.line ? `第 ${item.line} 行 · ` : ''}{item.message}</p>)}</details>
+        </>}
+      </> : <div className="lingmo-empty-import"><Icon name="source" size={28}/><h3>已有分镜，直接开始制作</h3><p>导入灵墨 MD，按集、场次浏览分镜并补充素材。</p><Button variant="primary" icon="upload" disabled={!writable} onClick={() => setShowImport(true)}>导入分镜 MD</Button></div>}
+    </aside>
+    <div className="lingmo-main">
+      {doc && scene && <header className="lingmo-scene-heading"><div><span className="lingmo-breadcrumb">第 {episode?.number} 集 <span>/</span> 分镜工作台</span><h2>{scene.title && scene.title !== scene.number ? scene.title : `场次 ${scene.number}`}</h2><p>{scene.unitIds.length} 个片段 · 点击资产查看素材，点击正文标签定位绑定</p></div><div className="lingmo-scene-stepper"><Button aria-label="上一场" disabled={scenePosition <= 0} onClick={() => setSceneId(scenes[scenePosition - 1].id)}>←</Button><span>{scenePosition + 1} / {scenes.length}</span><Button aria-label="下一场" disabled={scenePosition < 0 || scenePosition >= scenes.length - 1} onClick={() => setSceneId(scenes[scenePosition + 1].id)}>→</Button></div></header>}
+      {loadError && <p className="warning">本场读取失败：{loadError} <Button onClick={() => setReload(value => value + 1)}>重试读取</Button></p>}
+      {doc && scene && !sceneData && !loadError && <p className="lingmo-loading" role="status">正在读取当前场次…</p>}
+      {sceneData && <div className="lingmo-scene-assets"><div className="lingmo-assets-heading"><strong>本场素材 <span>{sceneData.assets.length}</span></strong><small>{missingImages ? `${missingImages} 项待补图` : '配图已齐备'} · 点击管理</small></div><div className="lingmo-assets-strip">{lingmoTypes.map(type => { const items = sceneData.assets.filter(item => lingmoAssetType(item) === type); return items.length ? <section className="lingmo-asset-group" key={type}><h5>{lingmoTypeNames[type]} <span>{items.length}</span></h5><div className="lingmo-asset-grid">{items.map(item => { const current = workspace.assets.find(current => current.id === item.id) || item, media = adoptedImage(workspace, current); return <button type="button" id={`lingmo-asset-${item.id}`} key={item.id} className={`lingmo-asset-card ${media ? 'has-media' : 'needs-media'}`} onClick={() => setSelectedAsset(item.id)} title={`${item.name} · ${assetVersionLabel(item)} · 点击管理素材`}><span className="lingmo-asset-thumb">{media ? <MediaPreview media={media} compact/> : <Icon name={type === 'SE' ? 'source' : 'image'} size={20}/>}</span><span className="lingmo-asset-copy"><strong>{item.name}</strong><small>{media ? '已配图' : type === 'SE' ? '待配音' : '待补图'}</small></span></button>; })}</div></section> : null; })}</div></div>}
+      <div className="lingmo-fragment-workspace">{children}</div>
+    </div>
+    {showImport && <LingmoImportDialog projectId={workspace.project.id} writable={writable} onClose={() => setShowImport(false)} onImported={async next => { await mutate('workspace.get', {}, '分镜已导入，可按集场浏览。'); changeDocument((next as Workspace & { lingmoImportReport?: { documentId?: string } }).lingmoImportReport?.documentId || next.lingmoDocuments?.at(-1)?.id || ''); setReload(value => value + 1); setShowImport(false); }}/>}
+    {asset && <Modal title={`${lingmoTypeNames[lingmoAssetType(asset) || 'OM']}素材 · ${asset.name}`} onClose={() => setSelectedAsset(null)}><div className="lingmo-asset-detail"><div className="lingmo-asset-current"><MediaPreview media={currentMedia} onInspect={inspect}/><p>{currentMedia ? '当前采用素材' : '尚未配图，补充后采用即可用于本场片段。'}</p></div><div><p className="lingmo-asset-detail-type">{assetVersionLabel(asset)} · {lingmoAssetToken(asset)}</p><div className="actions"><Button disabled={!writable} icon="upload" onClick={() => void importImage(asset)}>{lingmoAssetType(asset) === 'SE' ? '导入声音' : '补充 / 替换图片'}</Button>{lingmoAssetType(asset) === 'OM' && <><Button disabled={!writable} onClick={() => void importImage(asset, 'audio')}>导入音频</Button><Button disabled={!writable} onClick={() => void importImage(asset, 'video')}>导入视频参考</Button></>}</div><p className="muted">补图与替换保留资产身份、版本及已有分镜引用。</p><details className="lingmo-asset-identity"><summary>资产身份详情</summary><p>资产 ID：{asset.id}</p><p>版本 ID：{asset.variantId || '未设置'}</p>{asset.externalId != null && <p>目录 ID：{String(asset.externalId)}</p>}</details></div></div>{assetCandidates.length > 0 && <><h3>已有素材 · {assetCandidates.length}</h3><div className="lingmo-candidate-grid">{assetCandidates.map(candidate => <article key={candidate.id}><MediaPreview media={candidate} compact onInspect={inspect}/><small>{candidate.name || candidate.id.slice(0, 8)}{(candidate as Media & { placeholder?: boolean }).placeholder ? ' · 白图占位' : ''}</small>{candidate.kind === 'image' && <Button executionAction="media.adopt" disabled={!writable || candidate.id === asset.adoptedMediaId || (candidate as Media & { placeholder?: boolean }).placeholder === true} onClick={() => void mutate('media.adopt', { assetId: asset.id, variantId: asset.variantId || '', mediaId: candidate.id }, '已采用该资产图片；引用身份保持不变。')}>{candidate.id === asset.adoptedMediaId ? '当前图片' : '采用此图片'}</Button>}</article>)}</div></>}{sceneData?.scene.declaredAssets != null && <JsonDetails title="原场级资产清单" value={sceneData.scene.declaredAssets}/>}</Modal>}
   </section>;
 }
 
 export function LingmoPrompt({ text, mentions, assets }: { text: string; mentions?: LingmoMention[]; assets: Asset[] }) {
   const refs = mentions || lingmoMentions(text, assets);
-  return <pre className="prompt-document lingmo-prompt">{lingmoPromptParts(text, refs).map((part, index) => part.mention ? <button type="button" className={`lingmo-token ${part.mention.assetId ? '' : 'unbound'}`} key={index} title={part.mention.assetId ? `查看绑定资产 ${part.mention.name}` : '尚未唯一绑定，保存时会再次校验'} onClick={() => { if (!part.mention?.assetId) return; const card = document.getElementById(`lingmo-asset-${part.mention.assetId}`); card?.scrollIntoView({ block: 'nearest' }); card?.focus(); }}>{part.text}</button> : part.text)}</pre>;
+  return <pre className="prompt-document lingmo-prompt">{lingmoPromptParts(text, refs).map((part, index) => part.mention ? <button type="button" className={`lingmo-token ${part.mention.assetId ? '' : 'unbound'}`} key={index} title={part.mention.assetId ? `查看绑定资产 ${part.mention.name}` : '尚未唯一绑定，保存时会再次校验'} onClick={() => { if (!part.mention?.assetId) return; const card = document.getElementById(`lingmo-asset-${part.mention.assetId}`); card?.focus({ preventScroll: true }); card?.click(); }}>{part.text}</button> : part.text)}</pre>;
 }
 
 export function LingmoShotDetails({ unit }: { unit: Unit }) {

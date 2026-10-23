@@ -35,7 +35,7 @@ export function Empty({ icon = 'folder', title, children }: { icon?: IconName; t
 export function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => { const previous = document.activeElement as HTMLElement | null; ref.current?.showModal(); return () => { previous?.focus(); }; }, []);
-  return <dialog ref={ref} onCancel={onClose} className="modal" onClick={event => { if (event.target === event.currentTarget) onClose(); }}><div className="modal-header"><h2>{title}</h2><Button variant="ghost" icon="close" aria-label="关闭" onClick={onClose}/></div><div className="modal-body">{children}</div></dialog>;
+  return <dialog ref={ref} onCancel={event => { event.preventDefault(); onClose(); }} className="modal" onClick={event => { if (event.target === event.currentTarget) onClose(); }}><div className="modal-header"><h2>{title}</h2><Button variant="ghost" icon="close" aria-label="关闭" onClick={onClose}/></div><div className="modal-body">{children}</div></dialog>;
 }
 export function MediaPreview({ media, className = '', onInspect, compact = false }: { media?: Media; className?: string; onInspect?: (media: Media) => void; compact?: boolean }) {
   const thumbnailUrl = mediaUrl(media, compact), originalUrl = mediaUrl(media);

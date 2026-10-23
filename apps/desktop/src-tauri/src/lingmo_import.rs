@@ -84,6 +84,50 @@ pub fn documents(store: &Store) -> Result<Vec<Value>> {
 pub fn document(store: &Store, id: &str) -> Result<Value> {
     metadata(store, &format!("{PREFIX}{id}"))
 }
+/// Global entry point: no project, database or generation channel is needed.
+pub fn preview_file(request: &Value) -> Result<Value> {
+    if s(request, "path").is_empty() || request.get("text").is_some() {
+        return Err("请选择本机分镜MD文件".into());
+    }
+    let start = Instant::now();
+    let (parsed, catalog, filename) = read_input(request)?;
+    let mut output = summary(&parsed, &filename);
+    output["previewToken"] = json!(digest(&format!(
+        "{}:{}",
+        s(&parsed, "markdownSha256"),
+        catalog
+    )));
+    output["parseMilliseconds"] = json!(start.elapsed().as_secs_f64() * 1000.0);
+    output["generationSubmissions"] = json!(0);
+    Ok(output)
+}
+
+/// Validate the exact preview before creating any project directory. Import
+/// repeats these checks at its own transaction boundary in case the file changes.
+pub fn validate_project_input(request: &Value) -> Result<Value> {
+    let preview = preview_file(request)?;
+    if s(request, "expectedSha256") != s(&preview, "markdownSha256") {
+        return Err("预览后MD内容已变化，请重新预览后导入".into());
+    }
+    if s(request, "previewToken").is_empty() || request["previewToken"] != preview["previewToken"] {
+        return Err("缺少有效预览或资产目录已变化，请重新预览".into());
+    }
+    if preview["counts"]["fragments"].as_u64().unwrap_or(0) == 0 {
+        return Err("未识别到有效片段，未创建项目".into());
+    }
+    if array(&preview, "diagnostics").iter().any(|d| {
+        [
+            "duplicate_number",
+            "scene_without_episode",
+            "scene_episode_mismatch",
+            "unit_without_scene",
+        ]
+        .contains(&s(d, "code"))
+    }) {
+        return Err("MD存在集场/片段结构冲突，请按预览行号修正；未创建项目".into());
+    }
+    Ok(preview)
+}
 pub fn preview(store: &Store, request: &Value) -> Result<Value> {
     let start = Instant::now();
     let (parsed, catalog, filename) = read_input(request)?;

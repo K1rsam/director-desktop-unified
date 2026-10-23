@@ -26,6 +26,8 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "workspace.get",
     "units.get",
     "lingmo.preview",
+    "lingmo.preview_file",
+    "lingmo.create_project",
     "lingmo.import",
     "lingmo.document",
     "lingmo.scene",
