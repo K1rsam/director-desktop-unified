@@ -86,7 +86,7 @@ export function LingmoPanel({ workspace, writable, mutate, inspect, onError, onS
 
 export function LingmoPrompt({ text, mentions, assets }: { text: string; mentions?: LingmoMention[]; assets: Asset[] }) {
   const refs = mentions || lingmoMentions(text, assets);
-  return <pre className="prompt-document lingmo-prompt">{lingmoPromptParts(text, refs).map((part, index) => part.mention ? <button type="button" className={`lingmo-token ${part.mention.assetId ? '' : 'unbound'}`} key={index} title={part.mention.assetId ? `查看绑定资产 ${part.mention.name}` : '尚未唯一绑定，保存时会再次校验'} onClick={() => { if (!part.mention?.assetId) return; const card = document.getElementById(`lingmo-asset-${part.mention.assetId}`); card?.focus({ preventScroll: true }); card?.click(); }}>{part.text}</button> : part.text)}</pre>;
+  return <pre className="prompt-document lingmo-prompt" tabIndex={0} role="region" aria-label="完整分镜正文">{lingmoPromptParts(text, refs).map((part, index) => part.mention ? <button type="button" className={`lingmo-token ${part.mention.assetId ? '' : 'unbound'}`} key={index} title={part.mention.assetId ? `查看绑定资产 ${part.mention.name}` : '尚未唯一绑定，保存时会再次校验'} onClick={() => { if (!part.mention?.assetId) return; const card = document.getElementById(`lingmo-asset-${part.mention.assetId}`); card?.focus({ preventScroll: true }); card?.click(); }}>{part.text}</button> : part.text)}</pre>;
 }
 
 export function LingmoShotDetails({ unit }: { unit: Unit }) {

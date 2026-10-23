@@ -53,7 +53,7 @@ test('local materials retain document identities, paginate and safely preview, m
     finish({ ...workspace, lingmoMediaImportReport: { imported: 1, adopted: 0, placeholders: 0, skipped: 1, failed: 1, rows: [{ rowId: 'r0', status: 'imported', mediaId: 'new' }, { rowId: 'r1', status: 'adoption_conflict', message: '文件已变化，请重新扫描' }], milliseconds: 30 } } as Workspace); nodes = await render();
     assert.ok(nodes.some(node => content(node).includes('文件已变化，请重新扫描'))); assert.ok(nodes.some(node => node.props.role === 'alert' && content(node).includes('失败 1')));
     nodes.find(node => node.type === 'button' && content(node) === '清除已完成')!.props.onClick(); nodes = await render(); assert.equal(nodes.some(node => node.props['aria-label'] === '绑定资产 a.png'), false); assert.equal(nodes.some(node => node.props['aria-label'] === '绑定资产 b.png'), true);
-    assert.ok(calls.every(call => ['getExecutionPolicy', 'files.choose', 'lingmo.media.preview'].includes(call.action))); assert.ok(writes.every(call => call.action === 'lingmo.media.commit'));
+    assert.ok(calls.every(call => ['getExecutionPolicy', 'files.choose', 'lingmo.media.preview', 'lingmo.media.latest'].includes(call.action))); assert.ok(writes.every(call => call.action === 'lingmo.media.commit'));
   } finally { view.unmount(); await server.close(); }
 });
 

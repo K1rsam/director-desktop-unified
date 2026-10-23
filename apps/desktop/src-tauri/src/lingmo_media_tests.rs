@@ -38,6 +38,32 @@ fn commit_selections(store: &Store, pre: &Value, selections: Vec<Value>) -> Valu
 }
 
 #[test]
+fn last_scan_survives_reopen_and_distinguishes_file_counts_from_assets() {
+    let (_dir, store, folder, doc) = setup();
+    image(&folder.join("角色-甲.png"), 15);
+    image(&folder.join("道具-甲.png"), 25);
+    image(&folder.join("角色-甲额外.png"), 35);
+    assert!(latest(&store,&json!({"documentId":doc})).unwrap().is_null());
+    let pre=preview_folder(&store,&folder,&doc);
+    commit_selections(&store,&pre,vec![select(&pre,"角色-甲.png",false)]);
+    let restored=Store::open(store.root.clone()).unwrap();
+    let scan=latest(&restored,&json!({"documentId":doc})).unwrap();
+    assert_eq!(scan["assetCount"],5);
+    assert_eq!(scan["fileCount"],3);
+    assert_eq!(scan["importedFiles"],1);
+    assert_eq!(scan["pendingFiles"],2);
+    let row=values(&pre,"rows").into_iter().find(|r|s(r,"filename")=="角色-甲额外.png").unwrap();
+    let target=asset(&store,"甲受伤","CH");
+    commit_selections(&store,&pre,vec![json!({"rowId":row["id"],"assetId":target["id"],"variantId":target["variantId"],"adopt":false})]);
+    let scan=latest(&restored,&json!({"documentId":doc})).unwrap();
+    assert_eq!(scan["pendingFiles"],1);
+    assert_eq!(scan["importedFiles"],2);
+    assert_eq!(scan["pendingRows"][0]["filename"],"道具-甲.png");
+    assert!(store.job_summaries().unwrap().is_empty());
+    assert!(latest(&restored,&json!({"documentId":"other"})).is_err());
+}
+
+#[test]
 fn typed_exact_matching_no_substrings_or_cross_revision_identity() {
     let (_dir, store, folder, doc) = setup();
     for name in [

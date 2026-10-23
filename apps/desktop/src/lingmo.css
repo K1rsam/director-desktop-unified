@@ -51,3 +51,20 @@
 @media(min-width:1500px){.lingmo-workbench{grid-template-columns:210px minmax(0,1fr);gap:26px}.lingmo-workbench .video-unit .unit-body{grid-template-columns:minmax(0,1fr) 255px;gap:20px}.lingmo-workbench .unit-materials{border-top:0;border-left:1px solid #e5eaf2;padding-top:0;padding-left:18px}.lingmo-workbench .unit-reference-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:1100px){.lingmo-workbench{grid-template-columns:160px minmax(0,1fr);gap:14px}.lingmo-sidebar{padding:12px 9px}.lingmo-scene-heading h2{font-size:18px}.lingmo-fragment-heading>span{display:none}.lingmo-workbench .unit-heading{flex-wrap:wrap}.lingmo-workbench .unit-heading-actions{margin-left:auto}.lingmo-workbench .unit-heading-actions>.button{font-size:10px;min-height:28px}}
 @media(max-width:850px){.lingmo-workbench{grid-template-columns:minmax(0,1fr);gap:14px}.lingmo-sidebar{position:static;max-height:none;padding:12px 14px}.lingmo-sidebar-heading{margin-bottom:9px}.lingmo-navigation{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:10px}.lingmo-scene-list{display:flex;gap:6px;overflow:auto;margin-top:12px;scrollbar-width:thin}.lingmo-list-caption{display:none}.lingmo-scene-item{flex:0 0 125px;padding:7px 9px}.lingmo-scene-item>small{font-size:9px}.lingmo-document-summary,.lingmo-source-details{display:none}.lingmo-scene-heading{margin-bottom:12px}.lingmo-scene-heading h2{font-size:17px}.lingmo-scene-heading p{font-size:10px}.lingmo-assets-heading>small{font-size:9px}.lingmo-production-settings.compact>summary>span{font-size:9px}.lingmo-workbench .unit-heading-actions{width:auto}.lingmo-asset-detail{grid-template-columns:1fr}.lingmo-asset-current{max-width:300px}.lingmo-no-document .lingmo-empty-import{grid-template-columns:30px minmax(0,1fr)}.lingmo-empty-import>.button{grid-column:2;grid-row:3;justify-self:start;margin-top:10px}}
+
+/* Reading workspace: narrow navigation, compact references above bounded text. */
+.lingmo-workbench{grid-template-columns:150px minmax(0,1fr);gap:16px}
+.lingmo-workbench .lingmo-sidebar{padding:12px 9px}
+.lingmo-workbench .video-unit .unit-body{display:flex;flex-direction:column;gap:12px}
+.lingmo-workbench .unit-prompt .prompt-document{height:clamp(260px,44dvh,420px);min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.lingmo-workbench .unit-materials{order:-1;border:0;border-bottom:1px solid #e5eaf2;padding:0 0 10px}
+.lingmo-workbench .unit-reference-grid{display:flex;flex-wrap:wrap;max-width:none;gap:6px}
+.lingmo-workbench .unit-reference{display:grid;grid-template-columns:36px minmax(0,1fr);grid-template-rows:18px 14px 26px;gap:2px 6px;flex:0 0 128px;height:76px;padding:6px;border-radius:8px}
+.lingmo-workbench .reference-image{grid-column:1;grid-row:1/4;height:62px;min-width:0}
+.lingmo-workbench .unit-reference strong{grid-column:2;margin:0;align-self:center;font-size:10px}
+.lingmo-workbench .unit-reference>small{grid-column:2;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:8px}
+.lingmo-workbench .unit-reference select{grid-column:2;width:100%;margin:0;min-height:24px;font-size:9px;padding:3px 1px}
+.lingmo-workbench .reference-number{top:2px;left:2px;width:15px;height:15px;font-size:9px}
+@media(max-width:850px){.lingmo-workbench{grid-template-columns:minmax(0,1fr)}.lingmo-workbench .unit-prompt .prompt-document{height:330px;max-height:50dvh}}
+
+.lingmo-prompt:focus-visible{outline:2px solid #9eb5d9;outline-offset:2px}

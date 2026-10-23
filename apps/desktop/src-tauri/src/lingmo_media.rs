@@ -341,6 +341,45 @@ fn placeholder(store: &Store, media: &Value) -> Result<bool> {
         .all(|p| p[3] == 0 || p.0[..3].iter().all(|c| *c >= 250)))
 }
 
+/// Restore the last scan without rescanning or adopting anything. File counts
+/// and document asset counts are distinct; unmatched variants remain visible.
+pub fn latest(store: &Store, request: &Value) -> Result<Value> {
+    let document = s(request, "documentId");
+    let current = assets(store, document)?;
+    let conn = store.conn()?;
+    let saved: Option<String> = conn.query_row(
+        "SELECT value FROM metadata WHERE key LIKE 'lingmo.media.preview:%' AND json_extract(value,'$.preview.documentId')=?1 ORDER BY json_extract(value,'$.createdAt') DESC,rowid DESC LIMIT 1",
+        [document], |r| r.get(0),
+    ).optional().map_err(|e|e.to_string())?;
+    let Some(saved) = saved else { return Ok(Value::Null) };
+    let saved = parse(saved)?;
+    let preview = &saved["preview"];
+    let ids: HashSet<&str> = current.iter().map(|a| s(a,"id")).collect();
+    let mut links = HashSet::<(String,String,String)>::new();
+    let mut query = conn.prepare("SELECT m.sha256,ma.asset_id,ma.variant_id FROM media_assets ma JOIN media m ON m.id=ma.media_id").map_err(|e|e.to_string())?;
+    let rows = query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?;
+    for row in rows { let row=row.map_err(|e|e.to_string())?; if ids.contains(row.1.as_str()) { links.insert(row); } }
+    let mut completed = HashMap::<String,Vec<Value>>::new();
+    let mut query = conn.prepare("SELECT value FROM metadata WHERE key LIKE 'lingmo.media.completed:%'").map_err(|e|e.to_string())?;
+    for row in query.query_map([], |r|r.get::<_,String>(0)).map_err(|e|e.to_string())? {
+        let done=parse(row.map_err(|e|e.to_string())?)?;
+        completed.entry(s(&done,"rowId").to_owned()).or_default().push(done);
+    }
+    let mut pending = Vec::new();
+    for row in values(preview,"rows") {
+        let hash=s(&row,"sha256");
+        let automatic = !hash.is_empty() && links.contains(&(hash.to_owned(),s(&row,"assetId").to_owned(),s(&row,"variantId").to_owned()));
+        if automatic {continue;}
+        let manual = completed.get(s(&row,"id")).is_some_and(|records| records.iter().any(|done| {
+            !hash.is_empty() && links.contains(&(hash.to_owned(),s(done,"assetId").to_owned(),s(done,"variantId").to_owned()))
+            && store.get("media",s(done,"mediaId")).is_ok_and(|media|s(&media,"sha256")==hash)
+        }));
+        if !manual {pending.push(row);}
+    }
+    let total=values(preview,"rows").len();
+    Ok(json!({"preview":preview,"scannedAt":saved["createdAt"],"assetCount":current.len(),"fileCount":total,"importedFiles":total-pending.len(),"pendingFiles":pending.len(),"pendingRows":pending}))
+}
+
 pub fn commit(store: &Store, request: &Value) -> Result<Value> {
     let start = Instant::now();
     // Concurrent identical clicks must share the same once-only receipt and

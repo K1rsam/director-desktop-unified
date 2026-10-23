@@ -68,6 +68,8 @@ export default function App() {
   if (pageRef.current !== page) globalViewRevision.current++;
   pageRef.current = page;
   const workspaceRef = useRef(workspace), busyRef = useRef(''), requestSequence = useRef(0), projectListSequence = useRef(0);
+  const pageScroll = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (page === 'projects') pageScroll.current?.scrollTo?.(0, 0); }, [page]);
   const mounted = useRef(true), discoverCatalogs = useRef<ReturnType<typeof createCatalogDiscovery> | null>(null);
   workspaceRef.current = workspace;
   if (!discoverCatalogs.current) discoverCatalogs.current = createCatalogDiscovery({
@@ -166,11 +168,11 @@ export default function App() {
     return () => { window.removeEventListener('focus', refreshLibrary); document.removeEventListener('visibilitychange', refreshLibrary); };
   }, [page, listProjects]);
 
-  const loadProject = useCallback(async (project: ProjectSummary, target: Page = 'foundation') => {
+  const loadProject = useCallback(async (project: ProjectSummary, target?: Page) => {
     if (project.archivedAt || busyRef.current && !['projects.create', 'project.import'].includes(busyRef.current)) return;
     const sequence = ++requestSequence.current;
     setLoading(true); setError(''); setNotice('');
-    try { const next = await request<Workspace>({ action: 'workspace.get', projectId: project.id }); if (sequence === requestSequence.current) { setWorkspace(freshWorkspace(next)); setPage(target); setMobileNav(false); } } catch (reason) { if (sequence === requestSequence.current) setError(messageOf(reason)); } finally { if (sequence === requestSequence.current) setLoading(false); }
+    try { const next = await request<Workspace>({ action: 'workspace.get', projectId: project.id }); if (sequence === requestSequence.current) { setWorkspace(freshWorkspace(next)); setPage(target || (next.lingmoDocuments?.length && !next.source ? 'videos' : 'foundation')); setMobileNav(false); } } catch (reason) { if (sequence === requestSequence.current) setError(messageOf(reason)); } finally { if (sequence === requestSequence.current) setLoading(false); }
   }, []);
 
   const projectLifecycle = useCallback(async (action: ProjectLifecycleAction, project: ProjectSummary): Promise<boolean> => {
@@ -281,7 +283,7 @@ export default function App() {
       {(error || notice) && <div className={`notification ${error ? 'error' : ''}`} role={error ? 'alert' : 'status'}><span>{error || notice}</span><Button variant="ghost" icon="close" aria-label="关闭提示" onClick={() => { setError(''); setNotice(''); }}/></div>}
       {desktop && !['projects', 'settings'].includes(page) && catalogNotices.map(item => <div key={item.key} className={`notification ${item.status === 'error' ? 'error' : ''}`} role="status"><span>{providerName(item.provider)}：{item.status === 'checking' ? '正在读取渠道能力与模型目录。' : `自动读取未完成：${item.error} 请到软件设置检查连接。`}</span><Button variant="ghost" icon="settings" onClick={() => navigate('settings')}>软件设置</Button></div>)}
       {workspace?.readState?.error && !['projects', 'settings'].includes(page) && <div className="notification error" role="status"><span>最新制作状态读取失败，以下为上次保存状态。正在继续读取：{workspace.readState.error}</span></div>}
-      <div className="page-content">
+      <div className="page-content" ref={pageScroll}>
         {workspace && ['foundation', 'images', 'storyboard'].includes(page) && <TextExecutionSummary settings={workspace.settings} stage={page as 'foundation' | 'images' | 'storyboard'} onConfigure={() => navigate('settings')}/>}
         {page === 'settings' ? appSettings ? <SettingsPanel appSettings={appSettings} writable={connectionAllowed} mutate={globalMutate} onError={setError}/> : <Empty title={settingsLoading ? '正在读取软件设置…' : '软件设置尚未读取'}><Button icon="refresh" disabled={settingsLoading} onClick={() => void loadAppSettings()}>重新读取</Button></Empty> : loading && !workspace ? <Empty title="正在读取项目…"/> : page === 'projects' ? <><section className="lingmo-home-import" aria-label="从现成分镜开始"><span className="lingmo-file-icon"><Icon name="story" size={25}/></span><div><h2>已经有分镜？直接开始制作</h2><p>导入分镜 MD，自动建立项目，直接进入集场工作台。</p></div><Button icon="upload" variant="primary" disabled={!writable} onClick={() => setLingmoImportOpen(true)}>导入分镜 MD</Button></section><ProjectLibrary projects={projects} filter={projectFilter} writable={writable} busy={!!busy} onFilterChange={setProjectFilter} onOpen={project => void loadProject(project)} createForm={<InlineProjectCreate writable={writable} busy={!!busy} onCreate={createProject}/>} onLifecycle={projectLifecycle}/><div className="flow-guide">{stages.map(stage => <div key={stage.id}><span>{stage.number}</span><Icon name={stage.icon}/><strong>{stage.title}</strong><small>{stage.subtitle}</small></div>)}</div></> : workspace ? <>
           {page === 'foundation' && <FoundationPanel key={workspace.project.id} workspace={workspace} writable={writable} mutate={mutate} onNotice={setNotice} onError={setError}/>}

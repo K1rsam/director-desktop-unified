@@ -30,6 +30,7 @@
     await wait(()=>[...document.querySelectorAll('.project-card')].some(c=>c.dataset.projectId===pid),'created project');
     [...document.querySelectorAll('.project-card')].find(c=>c.dataset.projectId===pid).querySelector('.project-card-open').click();
     await wait(()=>[...document.querySelectorAll('.stage-nav button')].some(b=>!b.disabled && b.textContent.includes('单元视频')),'stage navigation enabled after project load');
+    await wait(()=>[...document.querySelectorAll('.stage-nav button')].some(b=>b.classList.contains('selected') && b.textContent.includes('单元视频')),'imported project reopens directly in Stage 4');
     [...document.querySelectorAll('.stage-nav button')].find(b=>b.textContent.includes('单元视频')).click();
     const displayStart=performance.now();
     await wait(()=>document.querySelectorAll('.lingmo-scene-assets .lingmo-asset-card').length && document.querySelectorAll('.lingmo-token').length,'first scene assets/tags');

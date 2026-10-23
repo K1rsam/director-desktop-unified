@@ -1259,6 +1259,7 @@ impl Engine {
             "lingmo.scene" => return crate::lingmo_import::scene(&store, s(&request,"documentId"), s(&request,"sceneId")),
             "lingmo.original" => return crate::lingmo_import::original(&store, s(&request,"documentId"), request["unitId"].as_str()),
             "lingmo.media.preview" => return crate::lingmo_media::preview(&store, &request),
+            "lingmo.media.latest" => return crate::lingmo_media::latest(&store, &request),
             "lingmo.media.commit" => {
                 let report=crate::lingmo_media::commit(&store,&request)?;
                 let mut workspace=self.workspace(&store,None)?;

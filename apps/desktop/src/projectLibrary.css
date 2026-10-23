@@ -24,3 +24,5 @@
 .project-retained-path span{display:block;font-size:.6875rem;color:var(--muted);margin-bottom:7px}
 .project-retained-path code{font-size:.75rem;line-height:1.7;overflow-wrap:anywhere;white-space:pre-wrap}
 @media(max-width:620px){.project-library-bar{gap:10px;margin-bottom:15px}.project-library .project-card-open,.project-library .project-card-summary{padding:18px}.project-library .project-grid{gap:14px}.modal:has(.project-lifecycle-dialog){width:calc(100% - 22px)}}
+
+.project-library-search{flex:1;min-width:180px;max-width:390px;margin-left:auto}.project-library .project-card h3{overflow-wrap:anywhere}
