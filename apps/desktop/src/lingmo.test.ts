@@ -108,14 +108,30 @@ test('workbench loads only the selected scene, requires import preview, and neve
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom' }), view = hookRenderer();
   try {
     const { LingmoPanel } = await server.ssrLoadModule('/src/LingmoPanel.tsx');
-    const element = React.createElement(LingmoPanel, { workspace, writable: true, mutate: async (action: string, values: any) => { mutations.push({ action, ...values }); return null; }, inspect() {}, onError(message: string) { errors.push(message); }, onScope(scope: any) { scopes.push(scope); } });
+    let element = React.createElement(LingmoPanel, { workspace, writable: true, mutate: async (action: string, values: any) => { mutations.push({ action, ...values }); return null; }, inspect() {}, onError(message: string) { errors.push(message); }, onScope(scope: any) { scopes.push(scope); } });
     const rendered = async () => { view.render(element); await settle(); return view.render(element); };
     let nodes = await rendered(); nodes = await rendered();
     assert.deepEqual(calls.filter(call => call.action === 'lingmo.scene').map(call => call.sceneId), ['s1']);
     assert.equal(scopes.at(-1).units[0].id, 'u1');
+    const settledScopes = scopes.length;
+    for (let poll = 0; poll < 3; poll++) {
+      const polled = structuredClone(workspace);
+      // Polling and unrelated media changes must not unload the selected scene.
+      polled.media.push({ id: `unrelated-${poll}`, kind: 'image', path: '/synthetic.png' });
+      element = React.cloneElement(element, { workspace: polled });
+      nodes = await rendered();
+      assert.equal(scopes.length, settledScopes, 'unchanged workspace polls must preserve the loaded scope');
+      assert.equal(calls.filter(call => call.action === 'lingmo.scene').length, 1, 'media array identity is not a scene revision');
+    }
+    element = React.cloneElement(element, { workspace: { ...workspace, units: [{ id: 'u1', version: 2, prompt: '' }] } });
+    view.render(element);
+    assert.equal(scopes.at(-1).loading, false, 'same-scene revision refresh keeps the previous complete content');
+    assert.equal(scopes.at(-1).units[0].id, 'u1');
+    nodes = await rendered();
+    assert.equal(calls.filter(call => call.action === 'lingmo.scene').length, 2, 'changed unit versions still reload scene content');
     const episodeSelect = nodes.find(node => node.type === 'select' && node.props.value === 'e1'); assert.ok(episodeSelect); episodeSelect.props.onChange({ target: { value: 'e2' } });
     nodes = await rendered(); nodes = await rendered();
-    assert.deepEqual(calls.filter(call => call.action === 'lingmo.scene').map(call => call.sceneId), ['s1', 's2']);
+    assert.deepEqual(calls.filter(call => call.action === 'lingmo.scene').map(call => call.sceneId), ['s1', 's1', 's2']);
     assert.equal(scopes.at(-1).units[0].id, 'u2');
     assert.equal(mutations.length, 0);
     nodes.find(node => node.type === 'button' && content(node) === '选择分镜 MD')!.props.onClick(); nodes = await rendered(); nodes = await rendered();

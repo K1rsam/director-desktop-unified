@@ -32,6 +32,25 @@
     const displayStart=performance.now();
     await wait(()=>document.querySelectorAll('.lingmo-scene-assets .lingmo-asset-card').length && document.querySelectorAll('.lingmo-token').length,'first scene assets/tags');
     const firstDisplayMs=performance.now()-displayStart;
+    // Exercise the same fresh-workspace replacement used by periodic polling.
+    // Hidden idle windows pause the clock, so use the actual refresh button.
+    const assetRegion=document.querySelector('.lingmo-scene-assets'), firstUnit=document.querySelector('.unit-card');
+    const identityDetails=assetRegion.querySelector('details'); identityDetails.open=true;
+    let workspaceReads=0, sceneRemovals=0;
+    const observer=new MutationObserver(records=>{
+      for(const record of records)for(const removed of record.removedNodes)if(removed===assetRegion || removed.contains?.(assetRegion))sceneRemovals++;
+    });
+    observer.observe(document.querySelector('.units-page'),{childList:true,subtree:true});
+    for(let round=0;round<3;round++){
+      await wait(()=>button('刷新')&&!button('刷新').disabled,'workspace refresh ready');button('刷新').click();
+      await new Promise(resolve=>setTimeout(resolve,50));
+      await wait(()=>!button('刷新').disabled && document.body.textContent.includes('已读取最新保存状态。'),'fresh workspace applied');
+      await new Promise(resolve=>setTimeout(resolve,150));
+      workspaceReads++;
+      if(document.querySelector('.lingmo-scene-assets')!==assetRegion || document.querySelector('.unit-card')!==firstUnit || !identityDetails.open)throw Error('workspace refresh remounted the current scene');
+    }
+    observer.disconnect();
+    if(sceneRemovals!==0)throw Error('unchanged workspace removed scene content');
     const doc=imported.lingmoDocuments.find(d=>d.id===preview.markdownSha256);
     const sceneSelect=()=>[...document.querySelectorAll('.lingmo-navigation select')][2];
     const episodeSelect=()=>[...document.querySelectorAll('.lingmo-navigation select')][1];
@@ -47,6 +66,6 @@
     const switchMs=performance.now()-switchStart;
     if(last.units.at(-1).duration!==4 || last.units.at(-1).actualDurationSeconds!==2.7)throw Error('decimal timeline');
     const final=await call({action:'workspace.get'});if(final.jobs.length)throw Error('unexpected generation');
-    await invoke('startup_verification_report',{report:{ok:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
+    await invoke('startup_verification_report',{report:{ok:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,workspaceRefreshesVerified:workspaceReads,sceneRemovals,sceneNodesRetained:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
   } catch(error) {await invoke('startup_verification_report',{report:{ok:false,error:String(error),assetCards:document.querySelectorAll('.lingmo-asset-card').length,assetTags:document.querySelectorAll('.lingmo-token').length,sceneSelectors:document.querySelectorAll('.lingmo-navigation select').length,sceneLoading:!!document.querySelector('.lingmo-panel [role=status]'),generationRequestsSent:0}});}
 })();

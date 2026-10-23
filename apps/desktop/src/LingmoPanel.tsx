@@ -26,18 +26,26 @@ export function LingmoPanel({ workspace, writable, mutate, inspect, onError, onS
   const scenes = doc?.scenes.filter(item => item.episodeId === episode?.id) || [];
   const scene = scenes.find(item => item.id === sceneId) || scenes[0];
   const onScopeRef = useRef(onScope); onScopeRef.current = onScope;
+  const requestedScene = useRef('');
   // Version changes cause a fresh read of only the current scene, never 883 full prompts.
   const sceneVersions = scene?.unitIds.map(id => { const unit = workspace.units.find(item => item.id === id); return `${id}:${unit?.version}`; }).join('|') || '';
   useEffect(() => {
-    if (!doc || !scene) { setSceneData(null); onScopeRef.current(null); return; }
+    if (!doc || !scene) { requestedScene.current = ''; setSceneData(null); onScopeRef.current(null); return; }
     let alive = true;
     const scope = { documentId: doc.id, sceneId: scene.id, label: `第 ${episode?.number} 集 · ${scene.number} 场`, units: [], loading: true };
-    setSceneData(null); setLoadError(''); onScopeRef.current(scope);
+    const key = `${workspace.project.id}:${doc.id}:${scene.id}`;
+    const changedScene = requestedScene.current !== key;
+    requestedScene.current = key;
+    // A workspace poll returns fresh array objects even when nothing changed.
+    // Media renders from workspace directly. Only changed unit versions need a
+    // scene read; keep the current scene mounted while that refresh is pending.
+    if (changedScene) { setSceneData(null); onScopeRef.current(scope); }
+    setLoadError('');
     void request<{ units: Unit[]; scene: LingmoScene; assets: Asset[] }>({ action: 'lingmo.scene', projectId: workspace.project.id, documentId: doc.id, sceneId: scene.id }).then(data => {
       if (!alive) return; setSceneData(data); onScopeRef.current({ ...scope, units: data.units, loading: false });
-    }).catch(error => { if (alive) { setLoadError(messageOf(error)); onScopeRef.current({ ...scope, loading: false }); } });
+    }).catch(error => { if (alive) { setLoadError(messageOf(error)); if (changedScene) onScopeRef.current({ ...scope, loading: false }); } });
     return () => { alive = false; };
-  }, [workspace.project.id, doc?.id, scene?.id, sceneVersions, workspace.media, reload]);
+  }, [workspace.project.id, doc?.id, scene?.id, sceneVersions, reload]);
   async function selectFile(kind: 'md' | 'catalog' | 'zip' | 'directory') {
     try { const [selected] = await choose(kind === 'directory' ? 'directory' : 'file'); if (!selected) return;
       if (kind === 'md') setPath(selected); if (kind === 'catalog') setCatalogPath(selected); if (kind === 'zip') setImageZipPath(selected); if (kind === 'directory') setImageDirectory(selected);

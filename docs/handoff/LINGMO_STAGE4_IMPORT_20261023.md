@@ -62,8 +62,18 @@ Rust 全套曾为 1496 passed、7 failed、60 ignored；7 项原生上下文失�
 
 使用既有 `apps/desktop/scripts/update-client.ps1 -PublishOnly -CandidatePath ...` 原位发布。桌面 `director-desktop.lnk` 仍指向 `apps/desktop/.local/client/director-desktop-next.exe`；只保留当前版和上一版备用，没有改动真实项目或登录状态。
 
-- 当前 EXE SHA-256：`e0b7c34e87eca744d80283788283db67c64039065badcebe13ef800537bde210`。
-- 上一版 SHA-256：`94ecf1fa3d9bf5f76c45cee98583c19f8e062bab9f5ce633c54158bfad704f0b`。
+- 首轮发布 EXE SHA-256：`e0b7c34e87eca744d80283788283db67c64039065badcebe13ef800537bde210`。
+- 首轮发布时上一版 SHA-256：`94ecf1fa3d9bf5f76c45cee98583c19f8e062bab9f5ce633c54158bfad704f0b`。
 - SDK/OpenCLI 资源沿用 SHA 隔离发布；本轮不重试账户授权或真实生成。
 - 未做 macOS 原生验收、外部灵墨平台导入或真实视频提交。518 张占位图不代表取得全部 539 项资产设计/声音，也不代表真实成图质量通过。
 - 父 CL 的 AOCI 现有索引陈旧且未管理此子仓库源码；本次未修改父索引，也不宣称父目录治理已对齐。
+
+## 同日修复：定时刷新导致场次闪动
+
+用户导入另一份 MD 后报告页面每隔几秒闪动。根因是 `LingmoPanel` 的场次读取 effect 依赖 `workspace.media` 数组对象；每次后台读取返回新数组（空数组也相同）都会清空场次和片段，再读取一遍。空闲读取间隔约 8 秒，有活动任务时更短。
+
+已移除媒体数组对象作为场次重载条件。媒体展示仍随 workspace 更新，场次正文仅在项目、文档、场次、当前片段版本或显式重试变化时重新读取。同一场次的版本更新保留已有内容，实际切场仍清空旧范围，保留异步结果取消保护。
+
+验证：前端 267 项通过，新增连续 workspace 快照、无关媒体变化不重读，以及片段版本变化仍刷新且不清空内容的断言。真实隐藏 WebView 在完整 150 集样本上连续点击实际刷新按钮三轮（走与轮询相同的 workspace 更新路径），资产区与首片段 DOM 身份保持、展开状态保持、区域移除次数为 0；候选及发布位置各通过一次。该测试没有冒称隐藏空闲窗口执行了定时轮询。测试探针最初尝试拦截原生调用计数但未生效，已改为验证真实刷新完成提示和 MutationObserver，不将该次失败计为通过。
+
+证据在 `.local/lingmo-import-20261023/flicker-frontend.log`、`flicker-native-v2/first.json` 和 `flicker-published/first.json`。无生成提交。用户关闭程序后已按原路径发布：当前 EXE SHA-256 为 `b0920affc0e24aea1d04e268efb40ff58be4a887311e96b1359a6f896ff89df2`，上一版为 `e0b7c34e87eca744d80283788283db67c64039065badcebe13ef800537bde210`，发布目录只保留这两份 EXE。
