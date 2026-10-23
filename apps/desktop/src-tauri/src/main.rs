@@ -15,6 +15,7 @@ struct StartupVerification {
     development_server_at_start: bool,
     diagnostics: Arc<StartupDiagnostics>,
     lingmo_input: Option<std::path::PathBuf>,
+    lingmo_media_input: Option<std::path::PathBuf>,
 }
 
 fn development_server_available() -> bool {
@@ -416,6 +417,7 @@ fn main() {
         diagnostics.mark(DiagnosticStage::ArgumentsAccepted);
         StartupVerification {
             lingmo_input: args.iter().position(|a| a == "--verify-lingmo-input").and_then(|i|args.get(i+1)).map(std::path::PathBuf::from).filter(|p|p.is_absolute() && p.is_file()),
+            lingmo_media_input: args.iter().position(|a| a == "--verify-lingmo-media-directory").and_then(|i|args.get(i+1)).map(std::path::PathBuf::from).filter(|p|p.is_absolute() && p.is_dir()),
             diagnostics,
             home: output.parent().unwrap().join("startup-verification-home"),
             output,
@@ -509,7 +511,7 @@ fn main() {
             if let Some(v) = &page_verification {
                 if payload.event() == tauri::webview::PageLoadEvent::Finished {
                     v.diagnostics.mark(DiagnosticStage::PageLoaded);
-                    let probe=if let Some(path)=&v.lingmo_input {format!("window.__lingmoVerificationInput={};\n{}",serde_json::json!(path),include_str!("lingmo_startup_probe.js"))}else{STARTUP_PROBE.to_owned()};
+                    let probe=if let Some(path)=&v.lingmo_input {format!("window.__lingmoVerificationInput={};window.__lingmoVerificationMedia={};\n{}",serde_json::json!(path),serde_json::json!(v.lingmo_media_input),include_str!("lingmo_startup_probe.js"))}else{STARTUP_PROBE.to_owned()};
                     v.diagnostics.mark(if webview.eval(&probe).is_ok() {
                         DiagnosticStage::ProbeInjected
                     } else { DiagnosticStage::ProbeInjectionFailed });

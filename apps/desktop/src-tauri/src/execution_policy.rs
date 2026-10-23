@@ -32,6 +32,8 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "lingmo.document",
     "lingmo.scene",
     "lingmo.original",
+    "lingmo.media.preview",
+    "lingmo.media.commit",
     "storyboard.refinement.continuity.preview",
     "units.versions.list",
     "units.version.restore",

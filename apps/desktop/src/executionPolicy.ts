@@ -46,12 +46,12 @@ export function installExecutionPolicy(policy: ExecutionPolicy): void {
 const NATIVE_EXTRA_ACTIONS = new Set(['foundation.run', 'images.design', 'workflows.resume', 'textCli.status', 'storyboard.run', 'storyboard.decision.resolve']);
 
 const LOCAL_READ_ACTIONS = new Set([
-  'lingmo.preview', 'lingmo.preview_file', 'lingmo.document', 'lingmo.scene', 'lingmo.original',
+  'lingmo.preview', 'lingmo.preview_file', 'lingmo.document', 'lingmo.scene', 'lingmo.original', 'lingmo.media.preview',
   'getExecutionPolicy', 'settings.global.get', 'runtime.status', 'chrome.status', 'chrome.managed.status', 'textSdk.status', 'images.previewPrompt', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get',
   'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail', 'storyboard.refinement.continuity.preview',
 ]);
 const LOCAL_WRITE_ACTIONS = new Set([
-  'lingmo.import', 'lingmo.create_project',
+  'lingmo.import', 'lingmo.create_project', 'lingmo.media.commit',
   'projects.create', 'projects.archive', 'projects.restore', 'projects.delete',
   'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save',
   'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete',

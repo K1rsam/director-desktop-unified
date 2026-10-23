@@ -517,11 +517,11 @@ fn import_images(store: &Store, request: &Value, parsed: &Value) -> Result<Value
             )?;
             // White placeholder bytes remain non-production even if the package
             // label is absent; never auto-approve a blank image as finished art.
-            let image = image::open(&canonical)
-                .map_err(|e| e.to_string())?
-                .to_rgb8();
-            let placeholder = asset["placeholder"] == true
-                || image.pixels().all(|p| p.0.iter().all(|v| *v >= 250));
+            let placeholder = match media["placeholderSource"].as_str().filter(|v| *v == "image-pixels/v1").and(media["placeholder"].as_bool()) {
+                Some(value) => value,
+                None => image::open(&canonical).map_err(|e| e.to_string())?
+                    .to_rgba8().pixels().all(|p| p[3] == 0 || p.0[..3].iter().all(|v| *v >= 250)),
+            };
             if placeholder {
                 media["placeholder"] = json!(true);
                 store

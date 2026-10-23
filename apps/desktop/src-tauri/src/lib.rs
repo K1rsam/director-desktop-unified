@@ -8,6 +8,7 @@ pub mod executable_paths;
 pub mod importer;
 pub mod lingmo_parser;
 pub mod lingmo_import;
+pub mod lingmo_media;
 pub mod media_probe;
 pub mod pipeline;
 pub mod portable;

@@ -34,6 +34,23 @@
     const displayStart=performance.now();
     await wait(()=>document.querySelectorAll('.lingmo-scene-assets .lingmo-asset-card').length && document.querySelectorAll('.lingmo-token').length,'first scene assets/tags');
     const firstDisplayMs=performance.now()-displayStart;
+    button('本剧素材').click();
+    await wait(()=>document.querySelector('dialog[open] .lingmo-materials'),'whole-document materials');
+    if(document.querySelectorAll('.lingmo-materials-card').length!==80)throw Error('material list must paginate the full asset inventory');
+    change(document.querySelector('[aria-label="素材类型"]'),'SE');
+    await wait(()=>document.querySelectorAll('.lingmo-materials-card').length===0,'material type filter');
+    document.querySelector('dialog[open] button[aria-label="关闭"]').click();
+    let localFolder=null;
+    if(window.__lingmoVerificationMedia){
+      const baseline=imported.units.map(unit=>[unit.id,unit.version]);
+      const folderPreview=await call({action:'lingmo.media.preview',documentId:preview.markdownSha256,directory:window.__lingmoVerificationMedia});
+      if(folderPreview.counts.files!==518 || folderPreview.counts.matched!==518)throw Error('full folder exact matching');
+      const folderResult=await call({action:'lingmo.media.commit',documentId:preview.markdownSha256,previewToken:folderPreview.previewToken,selections:folderPreview.rows.map(row=>({rowId:row.id,assetId:row.assetId,variantId:row.variantId,adopt:true,expectedAdoptedMediaId:row.expectedAdoptedMediaId??null}))});
+      const report=folderResult.lingmoMediaImportReport;
+      if(report.failed || report.placeholders!==518 || report.adopted!==0)throw Error('white placeholders must remain non-production candidates');
+      if(folderResult.jobs.length || JSON.stringify(folderResult.units.map(unit=>[unit.id,unit.version]))!==JSON.stringify(baseline))throw Error('backfill changed frozen jobs or storyboards');
+      localFolder={files:518,previewMilliseconds:folderPreview.milliseconds,importMilliseconds:report.milliseconds,placeholders:report.placeholders,adopted:report.adopted,failed:report.failed};
+    }
     await new Promise(resolve=>setTimeout(resolve,800));
     // Exercise the same fresh-workspace replacement used by periodic polling.
     // Hidden idle windows pause the clock, so use the actual refresh button.
@@ -73,6 +90,6 @@
     const switchMs=performance.now()-switchStart;
     if(last.units.at(-1).duration!==4 || last.units.at(-1).actualDurationSeconds!==2.7)throw Error('decimal timeline');
     const final=await call({action:'workspace.get'});if(final.jobs.length)throw Error('unexpected generation');
-    await invoke('startup_verification_report',{report:{ok:true,homeImportWithoutProject:true,globalProjectImport:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,workspaceRefreshesVerified:workspaceReads,sceneRemovals,sceneNodesRetained:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
+    await invoke('startup_verification_report',{report:{ok:true,homeImportWithoutProject:true,globalProjectImport:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,wholeDocumentMaterialsVerified:true,localFolder,workspaceRefreshesVerified:workspaceReads,sceneRemovals,sceneNodesRetained:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
   } catch(error) {await invoke('startup_verification_report',{report:{ok:false,error:String(error),assetCards:document.querySelectorAll('.lingmo-asset-card').length,assetTags:document.querySelectorAll('.lingmo-token').length,sceneSelectors:document.querySelectorAll('.lingmo-navigation select').length,sceneLoading:!!document.querySelector('.lingmo-loading'),generationRequestsSent:0}});}
 })();

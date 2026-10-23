@@ -799,11 +799,11 @@ impl Store {
             if (w as u64) * (h as u64) > 100_000_000 {
                 return Err("图片超过1亿像素导入上限".into());
             }
-            Some(format)
+            Some((format, w, h))
         } else {
             None
         };
-        let ext = if let Some(format) = guessed {
+        let ext = if let Some((format, _, _)) = guessed {
             format.extensions_str()[0]
         } else {
             path.extension()
@@ -835,12 +835,16 @@ impl Store {
         if hash_file(&dst)?.0 != hash {
             return Err("项目媒体文件已损坏，未覆盖原文件".into());
         }
+        let mut image_placeholder = None;
         let thumb = if kind == "image" {
             let t = self.root.join("thumbnails").join(format!("{hash}.webp"));
+            // Decode once for both thumbnail and blank-image classification.
+            // Batch backfill must inspect the new pixels, not the asset's old
+            // placeholder label, which may describe a previous white image.
+            let decoded = image::open(&dst).map_err(|e| e.to_string())?;
+            image_placeholder = Some(decoded.to_rgba8().pixels().all(|p| p[3] == 0 || p.0[..3].iter().all(|v| *v >= 250)));
             if !t.exists() {
-                image::open(&dst)
-                    .map_err(|e| e.to_string())?
-                    .thumbnail(640, 640)
+                decoded.thumbnail(640, 640)
                     .save(&t)
                     .map_err(|e| e.to_string())?;
             }
@@ -850,11 +854,13 @@ impl Store {
         };
         let mut media = json!({"id":id(),"kind":kind,"relativePath":rel,"path":dst,"thumbnailRelativePath":if kind=="image"{Some(format!("thumbnails/{hash}.webp"))}else{None},"thumbnailPath":thumb,"sha256":hash,"size":size,"name":path.file_name().and_then(|v|v.to_str()),"assetId":asset_id,"variantId":variant,"createdAt":now()});
         if kind == "image" {
-            let (w, h) = image::image_dimensions(&dst).map_err(|e| e.to_string())?;
+            let (_, w, h) = guessed.ok_or("图片尺寸信息缺失")?;
             media["width"] = json!(w);
             media["height"] = json!(h);
             media["metadataVerified"] = json!(true);
             media["metadataSource"] = json!("image-container");
+            media["placeholder"] = json!(image_placeholder.unwrap_or(false));
+            media["placeholderSource"] = json!("image-pixels/v1");
         } else {
             match crate::media_probe::probe(&dst, &self.settings()?) {
                 Ok(metadata) => {
@@ -1119,7 +1125,7 @@ impl Store {
         for (asset, variant, version) in missing {
             let candidates: Vec<Value> = {
                 let c = self.conn()?;
-                let mut q=c.prepare("SELECT m.data FROM media_assets ma JOIN media m ON m.id=ma.media_id WHERE ma.asset_id=?1 AND ma.variant_id=?2 AND m.kind='image' AND NOT EXISTS(SELECT 1 FROM job_media jm JOIN jobs j ON j.id=jm.job_id WHERE jm.media_id=m.id AND j.kind='image' AND (j.state!='downloaded' OR COALESCE(json_extract(j.snapshot,'$.assetId'),'')!=?1 OR COALESCE(json_extract(j.snapshot,'$.variantId'),'')!=?2 OR COALESCE(json_extract(j.snapshot,'$.assetVersion'),-1)!=?3 OR jm.media_id!=COALESCE(json_extract(j.result,'$.mediaIds[0]'),(SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid LIMIT 1)))) ORDER BY m.created_at DESC,ma.rowid DESC").map_err(|e|e.to_string())?;
+                let mut q=c.prepare("SELECT m.data FROM media_assets ma JOIN media m ON m.id=ma.media_id WHERE ma.asset_id=?1 AND ma.variant_id=?2 AND m.kind='image' AND NOT EXISTS(SELECT 1 FROM metadata pending WHERE pending.key=('lingmo.media.candidate:'||?1||':'||?2||':'||m.id)) AND NOT EXISTS(SELECT 1 FROM job_media jm JOIN jobs j ON j.id=jm.job_id WHERE jm.media_id=m.id AND j.kind='image' AND (j.state!='downloaded' OR COALESCE(json_extract(j.snapshot,'$.assetId'),'')!=?1 OR COALESCE(json_extract(j.snapshot,'$.variantId'),'')!=?2 OR COALESCE(json_extract(j.snapshot,'$.assetVersion'),-1)!=?3 OR jm.media_id!=COALESCE(json_extract(j.result,'$.mediaIds[0]'),(SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid LIMIT 1)))) ORDER BY m.created_at DESC,ma.rowid DESC").map_err(|e|e.to_string())?;
                 let rows = q
                     .query_map(params![asset, variant, version], |r| r.get::<_, String>(0))
                     .map_err(|e| e.to_string())?
@@ -2339,7 +2345,7 @@ pub(crate) fn same_content(a: &Value, b: &Value) -> bool {
 }
 /// One selection primitive serves manual history, user import, backfill and
 /// completed image jobs; every path has the same precise preparation invalidation.
-fn set_current_image(
+pub(crate) fn set_current_image(
     tx: &rusqlite::Transaction<'_>,
     asset: &str,
     variant: &str,
