@@ -8,7 +8,7 @@ import { createServer } from 'vite';
 Object.assign(globalThis, { isTauri: false, location: { search: '' } });
 
 test('same frozen source and episode scope offers original continuation, not a new generation label', async () => {
-  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false }, appType: 'custom' });
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom' });
   try {
     const { Stage3Panel, storyboardStartContinuation } = await server.ssrLoadModule('/src/Stage3Panel.tsx');
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
@@ -28,14 +28,14 @@ test('same frozen source and episode scope offers original continuation, not a n
     workspace.jobs = [{ ...job, status: 'completed' }, job];
     assert.equal(storyboardStartContinuation(workspace, ['e1', 'e2']), null);
     const completed = renderToStaticMarkup(createElement(Stage3Panel, { workspace, writable: true, mutate: async () => { mutations++; return workspace; } }));
-    assert.match(completed, /生成分镜提示词/);
+    assert.match(completed, /一键创作分镜/);
     assert.doesNotMatch(completed, /同范围的分镜尚未完成/);
     assert.equal(mutations, 0);
   } finally { await server.close(); }
 });
 
 test('different source/units do not masquerade as continuation and known unknown remains disabled', async () => {
-  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false }, appType: 'custom' });
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom' });
   try {
     const { Stage3Panel, storyboardStartContinuation } = await server.ssrLoadModule('/src/Stage3Panel.tsx');
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');

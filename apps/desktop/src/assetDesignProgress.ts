@@ -2,6 +2,7 @@ import { imageDesignJob } from './contracts.ts';
 import { jobActive } from './generationState.ts';
 import { record, records, words } from './stageProduction.ts';
 import type { Job, Workspace } from './types.ts';
+import { SERIES_WORKFLOW_PROFILE } from './workflowNavigation.ts';
 
 function created(job: Job): number { const value = Date.parse(job.createdAt || ''); return Number.isFinite(value) ? value : 0; }
 function ids(value: unknown): string[] | null {
@@ -21,6 +22,7 @@ export function selectAssetDesignProgress(workspace: Workspace, now = Date.now()
   const active = jobActive(job);
   if (!active && !unknown && !['failed', 'interrupted', 'blocked', 'partially_blocked', 'auth_required'].includes(job.status)) return null;
   const progress = records(workspace.workflowProgress).find(item => item.workflowId === job.id && /^images\.(design|produce)(:|$)/.test(words(item.stage)));
+  const modern = progress?.workflowProfile === SERIES_WORKFLOW_PROFILE || record(job.snapshot).workflowProfile === SERIES_WORKFLOW_PROFILE;
   const nodes = records(progress?.nodes), designNodes = nodes.filter(node => node.stage === 'assetDesign'), factNodes = nodes.filter(node => node.stage === 'assetVisualFacts');
   const plan = record(progress?.assetDesignPlan), designIds = ids(plan.designAssetIds), inlineIds = ids(plan.inlineAssetIds);
   const designRun = record(job.snapshot).stage === 'images.design' || /^images\.design(:|$)/.test(words(job.entityId));
@@ -37,9 +39,13 @@ export function selectAssetDesignProgress(workspace: Workspace, now = Date.now()
   const endedAt = readFailed ? Date.parse(workspace.readState?.checkedAt || '') : active || unknown ? now : Date.parse(job.updatedAt || '');
   const elapsedSeconds = Number.isFinite(startedAt) && Number.isFinite(endedAt) ? Math.max(0, Math.floor((endedAt - startedAt) / 1000)) : null;
   const designed = designCountAvailable ? acceptedAssetIds.size : null, total = exactPlan ? designIds.length : null;
-  const phase = unknown ? '图片制作执行身份待核对' : !active ? '图片制作需要处理' : runningFacts ? '提取原文视觉事实' : runningDesigns ? '设计资产提示词' : total !== null && designed === total ? '核对并保存整批设计' : designed ? '设计资产提示词' : '准备图片制作';
-  const designLabel = designed === null ? '正在读取本次设计进度' : total === null ? `本次已设计 ${designed} 项提示词` : `已设计 ${designed}/${total} 项提示词`;
+  const phase = modern
+    ? unknown ? '提示词原提交待核对' : !active ? '提示词编写需要处理' : runningDesigns ? '编写资产提示词' : total !== null && designed === total ? '核对并保存提示词' : '准备资产提示词'
+    : unknown ? '图片制作执行身份待核对' : !active ? '图片制作需要处理' : runningFacts ? '提取原文视觉事实' : runningDesigns ? '设计资产提示词' : total !== null && designed === total ? '核对并保存整批设计' : designed ? '设计资产提示词' : '准备图片制作';
+  const designLabel = designed === null ? '正在读取本次设计进度' : total === null ? `本次已${modern ? '核验' : '设计'} ${designed} 项提示词` : `已${modern ? '核验' : '设计'} ${designed}/${total} 项提示词`;
   const inlineLabel = exactPlan && inlineIds.length ? ` · ${inlineIds.length} 项复用来源或仅作文字表现` : '';
-  const factLabel = !factCountAvailable ? '原文事实进度待刷新' : runningFacts ? `原文事实：本次已提取 ${acceptedPackets.size} 批，正在提取` : acceptedPackets.size ? `原文事实：本次已提取 ${acceptedPackets.size} 批` : '原文事实：正在准备或复用有效缓存';
-  return { job, active, unknown, readFailed, workflowId: job.id, designed, total, inlineCount: exactPlan ? inlineIds.length : null, factBatches: factCountAvailable ? acceptedPackets.size : null, runningFacts, runningDesigns, elapsedSeconds, phase, designLabel: designLabel + inlineLabel, factLabel };
+  const sourceLabels: Record<string, string> = { 'original-script': '锁定原剧本', 'adopted-storyboard': '本软件同版采用分镜', 'external-handoff': '外部完整接续资料', 'imported-md': '导入分镜 MD' };
+  const factLabel = modern ? `取料依据：${sourceLabels[words(progress?.sourceKind)] || '本次冻结来源，等待读取详情'}` : !factCountAvailable ? '原文事实进度待刷新' : runningFacts ? `原文事实：本次已提取 ${acceptedPackets.size} 批，正在提取` : acceptedPackets.size ? `原文事实：本次已提取 ${acceptedPackets.size} 批` : '原文事实：正在准备或复用有效缓存';
+  const publicationLabel = modern ? '本次编写不生成图片；可成功的提示词独立保存，缺母图只影响实际出图。' : '资产设计按来源依赖推进；已核验结果保存在本次任务中，完整流程结束后整批保存到资产库。';
+  return { job, active, unknown, readFailed, workflowId: job.id, designed, total, inlineCount: exactPlan ? inlineIds.length : null, factBatches: factCountAvailable ? acceptedPackets.size : null, runningFacts, runningDesigns, elapsedSeconds, phase, designLabel: designLabel + inlineLabel, factLabel, publicationLabel };
 }

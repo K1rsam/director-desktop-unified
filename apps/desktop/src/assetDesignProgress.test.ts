@@ -101,3 +101,30 @@ test('真实AssetPanel渲染当前checkpoint数量及整批保存边界，不读
     assert.doesNotMatch(html, /本步已运行|已有 0 项提示词/); assert.equal(mutations, 0); assert.ok(workspace.assets.every(asset => !asset.prompt));
   } finally { await server.close(); }
 });
+
+test('新版 MD 提示词进度绑定本次冻结范围，不能冒称读取原剧本或实际生成图片', () => {
+  const workspace = fixture(), progress = workspace.workflowProgress![0];
+  progress.workflowProfile = 'desktop-series672-assets112/v1'; progress.sourceKind = 'imported-md';
+  progress.assetDesignPlan = { designAssetIds: ['shape-0', 'shape-1'], inlineAssetIds: [] };
+  progress.nodes = [design('shape-0'), design('shape-1', 'running'), design('unselected', 'accepted')];
+  workspace.assets = [];
+  const value = selectAssetDesignProgress(workspace, now)!;
+  assert.equal(value.total, 2); assert.equal(value.designed, 1);
+  assert.equal(value.phase, '编写资产提示词'); assert.equal(value.designLabel, '已核验 1/2 项提示词');
+  assert.equal(value.factLabel, '取料依据：导入分镜 MD');
+  assert.match(value.publicationLabel, /不生成图片.*缺母图只影响实际出图/);
+  assert.doesNotMatch(value.factLabel + value.publicationLabel, /原文事实|已读取图片/);
+  progress.nodes = [design('shape-0'), design('shape-1')];
+  assert.equal(selectAssetDesignProgress(workspace, now)!.phase, '核对并保存提示词');
+  workspace.jobs[0].submissionUnknown = true;
+  assert.equal(selectAssetDesignProgress(workspace, now)!.phase, '提示词原提交待核对');
+});
+
+test('新版来源尚未投影时只显示待核来源，不从当前项目猜测 frozen MD 的来源', () => {
+  const workspace = fixture();
+  workspace.jobs[0].snapshot = { workflowProfile: 'desktop-series672-assets112/v1' };
+  workspace.source = { text: '与原任务无关的新源', version: 99 };
+  const value = selectAssetDesignProgress(workspace, now)!;
+  assert.equal(value.factLabel, '取料依据：本次冻结来源，等待读取详情');
+  assert.doesNotMatch(value.factLabel, /锁定原剧本/);
+});

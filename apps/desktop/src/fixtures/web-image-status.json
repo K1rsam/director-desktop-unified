@@ -3,7 +3,7 @@
   "installed": true,
   "configured": true,
   "status": "ready",
-  "message": "已连接，可以到第二阶段选择资产并生成图片。",
+  "message": "已连接，可以到第三阶段选择资产并生成图片。",
   "clients": 1,
   "usableClients": 1,
   "transport": "opencli",

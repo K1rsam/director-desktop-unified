@@ -16,15 +16,16 @@ class HookHost {
   async flush() { for (const effect of this.effects) effect(); this.effects = []; await new Promise(done => setImmediate(done)); }
 }
 let replacements = 0;
-const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, hmr: false }, appType: 'custom', plugins: [{ name: 'refinement-isolated-hooks', enforce: 'pre', transform(code, id) {
+const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, hmr: false, ws: false }, appType: 'custom', plugins: [{ name: 'refinement-isolated-hooks', enforce: 'pre', transform(code, id) {
   if (!['/src/StoryboardRefinement.tsx', '/src/Stage3Panel.tsx'].some(path => id.replaceAll('\\', '/').split('?')[0].endsWith(path))) return;
-  for (const [from, to] of [["import { useEffect, useRef, useState } from 'react';", "import { useEffect, useRef, useState } from '/@refine-hooks';"], ["import { request } from './api';", "import { request } from '/@refine-api';"]]) {
+  const apiImport = code.includes("import { choose, request } from './api';") ? "import { choose, request } from './api';" : "import { request } from './api';";
+  for (const [from, to] of [["import { useEffect, useRef, useState } from 'react';", "import { useEffect, useRef, useState } from '/@refine-hooks';"], [apiImport, apiImport.replace("'./api'", "'/@refine-api'")]]) {
     assert.equal(code.split(from).length, 2); code = code.replace(from, to);
   }
   replacements++; return code;
 }, resolveId(id) { if (id === '/@refine-hooks' || id === '/@refine-api') return '\0' + id; }, load(id) {
   if (id === '\0/@refine-hooks') return ['useState', 'useEffect', 'useRef'].map(name => `export function ${name}(...args) { return globalThis.__refineHooks.${name}(...args); }`).join('\n');
-  if (id === '\0/@refine-api') return 'export async function request(value) { return globalThis.__refineApi(value); }';
+  if (id === '\0/@refine-api') return 'export async function request(value) { return globalThis.__refineApi(value); } export async function choose() { throw Error("File selection is forbidden in refinement tests"); }';
 } }] });
 const { StoryboardRefinement } = await server.ssrLoadModule('/src/StoryboardRefinement.tsx');
 const { projectProductionBusy } = await server.ssrLoadModule('/src/stageProduction.ts');
@@ -146,4 +147,45 @@ test('镜表仅在已冻结声音合同及精确事件枚举同时满足时显�
     assert.deepEqual(ui.workspace, before, '展示不得重分类或修改原单元数据');
   }
   assert.deepEqual(ui.calls, []);
+});
+
+test('新版分镜保留文字编辑但旧重做按钮及已开表单都不能提交', async () => {
+  const ui = await view(), host = new HookHost();
+  Object.assign(ui.workspace, { assets: [], providers: [], rules: [], settings: {}, foundation: {} });
+  Object.assign(ui.workspace.units[0], { version: 3, prompt: '原完整稿' });
+  shared.__refineApi = async request => { assert.equal(request.action, 'units.get'); return structuredClone(ui.workspace.units[0]); };
+  const render = () => host.render(Stage3Panel, ui.props);
+  render(); await host.flush();
+  button(render(), '重做单元').onClick();
+  nodes(render()).find(node => node.type === 'textarea').props.onChange({ target: { value: '旧窗口已填写的修改要求' } });
+  Object.assign(ui.workspace.units[0], { version: 4, timingProfile: 'lingmo-v7-nanoseconds/v1' });
+  const tree = render();
+  assert.equal(button(tree, '开始重做文字').disabled, true);
+  nodes(tree).find(node => node.type === 'form').props.onSubmit({ preventDefault() {} }); await tick();
+  assert.deepEqual(ui.calls, []);
+  button(render(), '取消').onClick();
+  const modern = render(); const redo = button(modern, '重做单元');
+  assert.equal(redo.disabled, true); redo.onClick();
+  assert.ok(!nodes(render()).some(node => node.type === 'form'));
+  assert.equal(button(modern, '编辑文字').disabled, false);
+  assert.match(text(modern), /新的整集精修尚未开放/);
+  button(modern, '编辑文字').onClick(); await tick();
+  assert.ok(nodes(render()).some(node => node.type === 'form'));
+  assert.deepEqual(ui.calls, []);
+});
+
+test('新版整集不进入旧精修，旧候选仍可阅读而不能覆盖新版采用稿', async () => {
+  const ui = await view();
+  button(ui.render(), '精修当前集').onClick();
+  Object.assign(ui.workspace.units[0], { timingProfile: 'lingmo-v7-nanoseconds/v1' });
+  const start = button(ui.render(), '开始精修'); assert.equal(start.disabled, true); start.onClick(); await tick();
+  assert.deepEqual(ui.calls, []);
+  button(ui.render(), '取消').onClick();
+  const open = button(ui.render(), '精修当前集'); assert.equal(open.disabled, true); open.onClick();
+  assert.ok(!text(ui.render()).includes('希望改进的地方'));
+  ui.workspace.jobs = [{ ...job('storyboard.refine', 'completed'), id: 'old-refine' }];
+  button(ui.render(), '查看').onClick(); await tick();
+  const adopt = button(ui.render(), '采用到第一集'); assert.equal(adopt.disabled, true); adopt.onClick(); await tick();
+  assert.equal(ui.reads.length, 1); assert.deepEqual(ui.calls, []);
+  assert.match(text(ui.render()), /历史精修记录继续保留/);
 });

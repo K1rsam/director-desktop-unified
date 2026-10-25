@@ -8,7 +8,7 @@ import { rustStandardActionCatalogue } from './test-support/rustExecutionPolicy.
 import type { Workspace } from './types.ts';
 
 test('file import previews without a project, then creates one idempotent request with the reviewed identity', async () => {
-  const calls: any[] = [], imported: Workspace[] = []; let closes = 0, failPreview = false;
+  const calls: any[] = [], imported: Workspace[] = [], destinations: string[] = []; let closes = 0, failPreview = false;
   let finishImport: (workspace: Workspace) => void = () => {};
   const workspace: Workspace = { project: { id: 'created', title: '新项目' }, assets: [], media: [], units: [], jobs: [], settings: {}, providers: [], rules: [] };
   const counts = { episodes: 150, scenes: 371, fragments: 883, shots: 5407, mentionOccurrences: 4736, assets: 518 };
@@ -29,7 +29,7 @@ test('file import previews without a project, then creates one idempotent reques
   let view = hookRenderer();
   try {
     const { LingmoImportDialog } = await server.ssrLoadModule('/src/LingmoImportDialog.tsx');
-    const props = { writable: true, onImported(next: Workspace) { imported.push(next); }, onClose() { closes++; } };
+    const props = { writable: true, onImported(next: Workspace, target?: string) { imported.push(next); destinations.push(target || 'videos'); }, onClose() { closes++; } };
     let element: React.ReactElement = React.createElement(LingmoImportDialog, props);
     const render = async () => { view.render(element); await settle(); return view.render(element); };
     let nodes = await render();
@@ -59,11 +59,13 @@ test('file import previews without a project, then creates one idempotent reques
     assert.equal(imported.length, 0, 'partial media failures must be shown before leaving the importer');
     assert.ok(nodes.some(node => node.props.role === 'alert' && content(node).includes('图片包损坏')));
     nodes.find(node => node.type === 'button' && content(node) === '打开工作台，稍后补图')!.props.onClick();
-    assert.deepEqual(imported, [partial]);
+    assert.deepEqual(imported, [partial]); assert.deepEqual(destinations, ['videos']);
     view.unmount(); view = hookRenderer(); element = React.createElement(LingmoImportDialog, { ...props, projectId: 'existing-project' });
     nodes = await render(); nodes.find(node => node.type === 'button' && content(node).includes('选择分镜 MD 文件'))!.props.onClick(); nodes = await render(); nodes = await render();
     assert.equal(calls.find(call => call.action === 'lingmo.preview')?.projectId, 'existing-project');
+    nodes.find(node => node.type === 'input' && node.props.type === 'radio' && node.props.checked === false)!.props.onChange(); nodes = await render();
     nodes.find(node => node.type === 'button' && content(node) === '确认导入')!.props.onClick(); await settle();
+    assert.equal(destinations.at(-1), 'images', 'MD-only can enter prompt work without image generation');
     assert.equal(calls.find(call => call.action === 'lingmo.import')?.projectId, 'existing-project');
     view.unmount(); view = hookRenderer(); failPreview = true; element = React.createElement(LingmoImportDialog, props);
     nodes = await render(); nodes.find(node => node.type === 'button' && content(node).includes('选择分镜 MD 文件'))!.props.onClick(); nodes = await render(); nodes = await render();

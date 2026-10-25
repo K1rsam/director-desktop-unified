@@ -90,7 +90,7 @@ test('channel cards keep one connection flow and save current input before check
         const element = React.createElement(SettingsPanel, { appSettings: makeSettings(), writable: true, mutate: async () => { throw new Error('view must not mutate'); } });
         view.render(element); await settle(); const nodes = view.render(element);
         const card = nodes.find(node => node.props['data-web-image-setup']); assert.ok(card);
-        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('已连接，可以到第二阶段生成图片')));
+        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('已连接，可以到第三阶段生成图片')));
         const visible: Host[] = []; const walk = (node: Host) => { visible.push(node); if (node.type === 'details' && !node.props.open) return; for (const child of node.children) if (typeof child !== 'string') walk(child); }; walk(card);
         assert.deepEqual(visible.filter(node => node.type === 'button').map(content), ['打开 ChatGPT', '连接并检查']);
         assert.ok(!visible.some(node => node.type === 'input'), 'no endpoint or token fields in normal flow');
@@ -166,7 +166,7 @@ test('channel cards keep one connection flow and save current input before check
         assert.equal(input(nodes, 'BH API 凭据').props.value, 'draft-token');
         assert.deepEqual(calls.map(item => item.action), ['chrome.status', 'chrome.connect', 'chrome.status', 'providers.refresh']);
         assert.equal(calls.find(item => item.action === 'chrome.connect').transport, 'opencli');
-        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('可以到第二阶段生成图片')));
+        assert.ok(nodes.some(node => node.props.role === 'status' && content(node).includes('可以到第三阶段生成图片')));
         assert.ok(!calls.some(item => /generate|submit|images\./.test(item.action)));
       } finally { view.unmount(); }
     });
@@ -194,6 +194,21 @@ test('channel cards keep one connection flow and save current input before check
       const view=hookRenderer();chromeRespond=async()=>({...chromeReport,status:'network_unavailable',browserKind:'chrome',clients:0,usableClients:0,errorCode:'BROWSER_NETWORK_UNAVAILABLE',message:'浏览器网络不可用，请检查网络或浏览器代理。'});
       const element=React.createElement(SettingsPanel,{appSettings:makeSettings(),writable:true,mutate:async()=>assert.fail('status cannot mutate settings')});
       try {view.render(element);await settle();const nodes=view.render(element);assert.ok(nodes.some(n=>n.props.role==='status'&&content(n).includes('浏览器网络不可用')));assert.ok(!nodes.some(n=>n.type==='details'&&content(n).includes('首次安装浏览器组件')));}finally{view.unmount();}
+    });
+
+    await t.test('connected extension without work page offers background connect instead of reinstallation', async()=>{
+      const view=hookRenderer(),calls:any[]=[];
+      chromeRespond=async request=>{calls.push(request);return {...chromeReport,status:'waiting_page',clients:1,usableClients:0,errorCode:'OPENCLI_OWNED_PAGE_REQUIRED',extensionPath:'C:/synthetic/extension',message:'浏览器组件已连接，尚未建立专属工作页。点击连接并检查即可在后台打开工作页。'};};
+      const element=React.createElement(SettingsPanel,{appSettings:makeSettings(),writable:true,mutate:async()=>assert.fail('passive status cannot mutate settings')});
+      try {
+        view.render(element);await settle();const nodes=view.render(element);
+        assert.ok(nodes.some(n=>content(n)==='待建立工作页'));
+        assert.ok(nodes.some(n=>n.props.role==='status'&&content(n).includes('后台打开工作页')));
+        assert.ok(!nodes.some(n=>n.type==='details'&&content(n).includes('首次安装浏览器组件')));
+        const connectButton=nodes.find(n=>n.type==='button'&&n.props['data-chrome-connect']);
+        assert.ok(connectButton);assert.equal(connectButton.props.disabled,false);
+        assert.deepEqual(calls.map(c=>c.action),['chrome.status'],'passive rendering never creates work pages or submits images');
+      }finally{view.unmount();}
     });
 
     await t.test('ordinary Edge and Chrome opening preserves drafts and never starts managed login or binds a browser', async () => {

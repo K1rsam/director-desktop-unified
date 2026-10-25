@@ -38,7 +38,7 @@ test('standard native capabilities enable existing flows and keep unported Stage
     assert.deepEqual(sent, ['foundation.run', 'images.design', 'textCli.login']);
     assert.equal(actionBlockReason({ action: 'settings.save', settings: { textApiKey: 'synthetic' } }), null);
     for (const action of ['storyboard.run', 'units.regenerate']) {
-      await assert.rejects(dispatchOfflineRequest({ action }, async () => assert.fail('unported Stage3 reached IPC')), /第三阶段暂不可生成/);
+      await assert.rejects(dispatchOfflineRequest({ action }, async () => assert.fail('unported Stage3 reached IPC')), /第二阶段暂不可生成/);
     }
     assert.throws(() => validateExecutionPolicy({ ...policy, allowedActions: ['storyboard.run'] }), /标准版功能策略无效/);
     assert.throws(() => validateExecutionPolicy({ ...policy, allowedActions: ['unknown.action'] }), /标准版功能策略无效/);
@@ -82,7 +82,7 @@ import { createCatalogDiscovery } from './contracts.ts';
 import type { Workspace } from './types.ts';
 
 const localReads = ['getExecutionPolicy', 'projects.list', 'files.choose', 'legacy.inspect', 'workspace.get', 'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail'];
-const localWrites = ['projects.create', 'projects.archive', 'projects.restore', 'projects.delete', 'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save', 'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete', 'assets.restore', 'jobs.close_unknown', 'source.import', 'source.resolve', 'source.reparse', 'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt', 'settings.save', 'backup.create', 'backup.restore'];
+const localWrites = ['assets.identityLayout.save', 'images.registerReference', 'projects.create', 'projects.archive', 'projects.restore', 'projects.delete', 'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save', 'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete', 'assets.restore', 'jobs.close_unknown', 'source.import', 'source.resolve', 'source.reparse', 'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt', 'settings.save', 'backup.create', 'backup.restore'];
 const generations = ['foundation.run', 'foundation.choices.apply', 'images.design', 'images.produce', 'images.run', 'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'workflows.resume', 'videos.submit'];
 const providers = ['providers.refresh', 'videos.preflight', 'videos.prepare', 'jobs.query', 'jobs.download', 'jobs.reconcile'];
 const accounts = ['textCli.status', 'textCli.login', 'textCli.loginStatus', 'textCli.cancelLogin', 'textCli.openLogin', 'dreamina.status', 'dreamina.login', 'dreamina.logout', 'dreamina.open_authorization'];

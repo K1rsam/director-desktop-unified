@@ -22,7 +22,7 @@ export function unitAssetEditingProblems(workspace: Workspace, unit: Unit, refer
     if (!asset) { problems.push(`配图 ${index + 1} 的资产已删除或不存在，请替换或移除。`); return; }
     if (!reference.role.trim()) problems.push(`配图 ${index + 1} 请填写素材用途。`);
     if ((reference.variantId || '') !== (asset.variantId || '')) problems.push(`配图 ${index + 1} 的形象已变化，请重新选择。`);
-    if (reference.mediaId && reference.mediaId !== asset.adoptedMediaId) problems.push(`配图 ${index + 1} 指定的是旧图片，请改用当前图片；历史图片可在第二阶段重新选用。`);
+    if (reference.mediaId && reference.mediaId !== asset.adoptedMediaId) problems.push(`配图 ${index + 1} 指定的是旧图片，请改用当前图片；历史图片可在第三阶段重新选用。`);
     const scope = asset.scope as { kind?: string; scenes?: { episodeId: string; sceneId: string }[] } | undefined;
     const episodes = asset.applicability?.episodes || asset.applicability?.episodeIds || [];
     const scenes = asset.applicability?.scenes || asset.applicability?.sceneIds || [];

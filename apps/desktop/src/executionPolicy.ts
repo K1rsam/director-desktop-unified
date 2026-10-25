@@ -28,7 +28,7 @@ export const OFFLINE_EXECUTION_POLICY: ExecutionPolicy = {
   stage3CreativePackStatus: 'inactive',
   reasons: [
     '当前仅开放本地资料准备与离线验证，产品端真实文本、图片和视频生成保持关闭。',
-    '第三阶段创作原件包尚未启用，须完成实际采用来源与适配核验。',
+    '第二阶段创作规则包尚未启用，须完成实际采用来源与适配核验。',
     '渠道、CLI、账户登录及凭据操作保持关闭；视频素材准备尚未形成独立离线路径。',
   ],
 };
@@ -51,10 +51,10 @@ const LOCAL_READ_ACTIONS = new Set([
   'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail', 'storyboard.refinement.continuity.preview',
 ]);
 const LOCAL_WRITE_ACTIONS = new Set([
-  'lingmo.import', 'lingmo.create_project', 'lingmo.media.commit',
+  'lingmo.import', 'lingmo.create_project', 'lingmo.media.commit', 'images.exportPrompts', 'images.exportCurrent', 'images.registerReference', 'storyboard.exportDelivery',
   'projects.create', 'projects.archive', 'projects.restore', 'projects.delete',
   'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save',
-  'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.delete',
+  'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.identityLayout.save', 'assets.delete',
   'assets.restore', 'jobs.close_unknown', 'jobs.archive', 'jobs.restore', 'source.import', 'source.resolve', 'source.reparse',
   'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt',
   'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',
@@ -99,7 +99,7 @@ export function actionBlockReason(input: PolicyRequest | string): string | null 
       && activePolicy.canvasOAuth?.enabled === true) return null;
   if (activePolicy.mode === 'standard_native') {
     if (activePolicy.allowedActions?.includes(action)) return null;
-    if (STAGE3_ACTIONS.has(action)) return '第三阶段暂不可生成：最新 3008 运行装配尚未接入，已有分镜和历史保留。';
+    if (STAGE3_ACTIONS.has(action)) return '第二阶段暂不可生成：分镜运行装配尚未接入，已有分镜和历史保留。';
     return '本机核心尚未开放此操作，请检查对应渠道或功能状态。';
   }
   if (activePolicy.mode === 'native_cli_acceptance' && NATIVE_EXTRA_ACTIONS.has(action) && activePolicy.allowedActions?.includes(action)) return null;

@@ -262,7 +262,7 @@ test('saved software choices immediately project into stages and automatic disco
     assert.equal(projected.settings.bhToken, undefined); assert.equal(projected.jobs, stored.jobs); assert.equal(projected.jobs[0].snapshot.settings.textModel, 'old-model'); assert.equal(stored.settings.textProvider, 'codex');
     assert.equal(projected.providers, software.providers);
     const inspectionsBefore = calls.filter(item => item.action === 'providers.refresh').length;
-    nodes.find(node => node.type === 'button' && node.props.className?.includes('stage-link') && content(node).includes('图片资产'))!.props.onClick(); nodes = await rendered(); nodes = await rendered();
+    nodes.find(node => node.type === 'button' && node.props.className?.includes('stage-link') && content(node).includes('提示词与图片'))!.props.onClick(); nodes = await rendered(); nodes = await rendered();
     const manualCheck = nodes.find(node => node.type === 'button' && content(node) === '核实模型'); assert.ok(manualCheck); manualCheck.props.onClick(); nodes = await rendered();
     assert.equal(calls.filter(item => item.action === 'providers.refresh').length, inspectionsBefore + 1);
     assert.ok(calls.filter(item => item.action === 'providers.refresh').every(item => item.scope === 'global' && item.projectId === undefined), 'manual stage checks also remain software scoped');
@@ -272,7 +272,7 @@ test('saved software choices immediately project into stages and automatic disco
     inspectionFailure = 'pending';
     nodes.find(node => node.type === 'button' && content(node) === '核实模型')!.props.onClick(); nodes = await rendered();
     assert.ok(!nodes.some(node => node.props.role === 'alert'), 'retry clears the old error');
-    nodes.find(node => node.type === 'button' && node.props.className?.includes('stage-link') && content(node).includes('剧本与基础'))!.props.onClick(); nodes = view.render(element);
+    nodes.find(node => node.type === 'button' && node.props.className?.includes('stage-link') && content(node).includes('剧本策划'))!.props.onClick(); nodes = view.render(element);
     rejectInspection!(new Error('late error from asset page')); await settle(); nodes = view.render(element);
     assert.ok(!nodes.some(node => node.props.role === 'alert' && content(node).includes('late error')), 'a response from the page left behind cannot overwrite current feedback');
     assert.ok(!calls.some(item => ['settings.save', 'foundation.run', 'images.run', 'videos.submit'].includes(item.action)), 'no project record or generation is written');

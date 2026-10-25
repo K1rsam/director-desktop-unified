@@ -12,13 +12,13 @@ export function WebImageConnection({ status, busy, disabled, error, onConnect, o
   const browser = choice || status?.browserKind || 'chrome';
   const accountChangeRequired = /账户.*不同/.test(error) || status?.errorCode === 'ACCOUNT_CHANGED';
   const ready = !error && status?.status === 'ready';
-  const label = busy ? '正在连接检查' : error ? '检查未完成' : ready ? '已连接' : status?.status === 'network_unavailable' ? '网络异常' : status?.status === 'busy' ? '连接正忙' : status ? '等待连接' : '正在读取状态';
+  const label = busy ? '正在连接检查' : error ? '检查未完成' : ready ? '已连接' : status?.status === 'waiting_page' ? '待建立工作页' : status?.status === 'network_unavailable' ? '网络异常' : status?.status === 'busy' ? '连接正忙' : status ? '等待连接' : '正在读取状态';
   return <section className="surface channel-provider-card web-image-connection" aria-label="ChatGPT 网页" data-web-image-setup>
     <div className="section-heading compact"><h3>ChatGPT 网页出图</h3><Badge status={ready ? 'available' : error ? 'error' : 'draft'}>{label}</Badge></div>
     <p className="muted">使用你已登录的浏览器生成图片，完成后自动下载到项目。连接一次，所有项目共用。</p>
-    <ol className="web-image-steps"><li>打开浏览器，登录 ChatGPT</li><li>点击“连接并检查”</li><li>到第二阶段选择资产，批量制作</li></ol>
+    <ol className="web-image-steps"><li>打开浏览器，登录 ChatGPT</li><li>点击“连接并检查”</li><li>到第三阶段选择资产，批量制作</li></ol>
     <div className={`web-image-result ${ready ? 'ready' : error ? 'error' : ''}`} role={error ? 'alert' : 'status'}>
-      {busy ? '正在核对浏览器、登录状态和图片渠道，请稍候…' : error || (ready ? '已连接，可以到第二阶段生成图片。' : status?.message || '正在读取连接状态…')}
+      {busy ? '正在核对浏览器、登录状态和图片渠道，请稍候…' : error || (ready ? '已连接，可以到第三阶段生成图片。' : status?.message || '正在读取连接状态…')}
     </div>
     <div className="actions">
       <label className="web-image-browser">浏览器<select aria-label="网页出图浏览器" value={browser} disabled={disabled || busy} onChange={event => { setBrowser(event.target.value as 'edge' | 'chrome'); setAllowAccountChange(false); }}><option value="edge">Edge</option><option value="chrome">Chrome</option></select></label>
