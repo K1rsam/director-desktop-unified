@@ -54,7 +54,7 @@ const LOCAL_WRITE_ACTIONS = new Set([
   'lingmo.import', 'lingmo.create_project', 'lingmo.media.commit', 'images.exportPrompts', 'images.exportCurrent', 'images.registerReference', 'storyboard.exportDelivery',
   'projects.create', 'projects.archive', 'projects.restore', 'projects.delete',
   'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save',
-  'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.identityLayout.save', 'assets.delete',
+  'production.direction.save', 'foundation.choice.confirm', 'assets.save', 'assets.imagePrompt.save', 'assets.identityLayout.save', 'assets.delete',
   'assets.restore', 'jobs.close_unknown', 'jobs.archive', 'jobs.restore', 'source.import', 'source.resolve', 'source.reparse',
   'media.import', 'media.adopt', 'media.adopt_batch', 'images.ensure_current', 'videos.adopt',
   'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',

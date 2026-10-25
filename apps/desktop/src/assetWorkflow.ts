@@ -65,6 +65,12 @@ export function assetPromptStatus(asset: Asset): string {
   const labels: Record<string, string> = { draft: '待编写', pending: '待编写', writing: '编写中', generating: '编写中', ready: '提示词已编写', completed: '提示词已编写', needs_review: '提示词待复核', stale: '提示词待复核', blocked: '提示词待补料' };
   return labels[status] || (imagePromptText(asset).trim() ? '提示词已编写' : '待编写');
 }
+export function imagePromptNeedsReview(asset?: Asset): boolean {
+  return [asset?.promptStatus, record(asset?.imagePrompt).status].some(value => ['needs_review', 'stale', 'rejected', 'invalid'].includes(text(value)));
+}
+export function imagePromptDesignBlocked(asset?: Asset): boolean {
+  return ['needs_review', 'stale', 'rejected', 'invalid'].includes(text(asset?.designStatus));
+}
 export function assetImageStatus(workspace: Workspace, asset: Asset): string {
   const status = text(asset.imageStatus), images = assetImages(workspace, asset);
   const waiting = imageWaitingNames(workspace, asset), waitingLayout = waiting.some(name => name.endsWith('（锁脸区域待登记）'));

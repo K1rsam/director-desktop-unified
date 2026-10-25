@@ -44,9 +44,10 @@ function fixture() {
     { id: 'inline-design', name: '随镜表现', kind: 'PROP', variantId: 'inline', version: 1, prompt: '', preparation: { mode: 'INLINE' } },
   ], media: [], units: [], jobs: [] as any[], settings: {}, providers: [], rules: [] };
 }
-async function view(options: { writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale'; imageReady?: boolean; imageProvider?: string; afterMutation?: (workspace: any) => void } = {}) {
+async function view(options: { modernPrompt?: boolean; promptReview?: boolean; designReview?: boolean; writable?: boolean; prompt?: string; mode?: string; jobs?: any[]; detail?: 'missing' | 'stale'; imageReady?: boolean; imageProvider?: string; afterMutation?: (workspace: any) => void } = {}) {
   const workspace = fixture(), calls: { action: string; payload: any }[] = [], reads: any[] = [], notices: string[] = [];
   if (options.prompt !== undefined) workspace.assets[0].prompt = options.prompt;
+  if (options.modernPrompt) Object.assign(workspace.assets[0], { workflowProfile: 'desktop-series672-assets112/v1', imagePrompt: { text: '保留手工完整提示词。', status: 'ready', origin: 'manual' }, promptStatus: options.promptReview ? 'needs_review' : 'ready', designStatus: options.designReview ? 'needs_review' : 'adopted' });
   if (options.mode) workspace.assets[0].preparation.mode = options.mode;
   if (options.jobs) workspace.jobs = options.jobs;
   if (options.imageReady) Object.assign(workspace, { settings: { imageProvider: options.imageProvider || 'bh', imageModel: 'synthetic-image', imageResolution: '2k', ratio: '16:9', bhAccountId: 'offline-account', trialApproved: true }, providers: [{ id: options.imageProvider || 'bh', models: [{ id: 'synthetic-image', kind: 'image', adapted: true, ratios: ['16:9', '1:1'], resolutions: ['2k'] }] }] });
@@ -63,6 +64,30 @@ test('单项重新设计只传当前子形象，不传父资产、不保存图�
   await ui.click('重写当前提示词');
   assert.deepEqual(ui.calls, [{ action: 'images.design', payload: { workflowProfile: 'desktop-series672-assets112/v1', assetIds: ['child-design'] } }]);
   assert.deepEqual(ui.reads, [{ action: 'assets.get', projectId: ui.workspace.project.id, assetId: 'child-design' }]);
+});
+
+test('依据变化后可显式核对未改字的手工提示词，由本地后端冻结当前依据', async () => {
+  const ui = await view({ modernPrompt: true, promptReview: true });
+  assert.ok(text(ui.render()).includes('原手工正文已保留'));
+  await ui.click('核对并保存提示词');
+  assert.equal(ui.calls.length, 1);
+  assert.equal(ui.calls[0].action, 'assets.imagePrompt.save');
+  assert.equal(ui.calls[0].payload.assetId, 'child-design');
+  assert.equal(ui.calls[0].payload.text, '保留手工完整提示词。');
+  assert.equal(ui.calls[0].payload.reviewCurrentBasis, true);
+  assert.equal(ui.calls[0].payload.expectedVersion, 2);
+  assert.equal(ui.calls[0].payload.asset, undefined, 'the UI cannot rewrite design or source proof');
+});
+
+test('设计本身未采用时可存手工正文但不宣称解除设计或提示词复核', async () => {
+  const ui = await view({ modernPrompt: true, promptReview: true, designReview: true });
+  assert.ok(text(ui.render()).includes('采用设计仍待复核'));
+  assert.ok(!nodes(ui.render()).some(node => node.type?.name === 'Button' && text(node) === '核对并保存提示词'));
+  nodes(ui.render()).find(node => node.type === 'textarea' && node.props.className === 'asset-prompt-input').props.onChange({ target: { value: '保留我的新草稿。' } });
+  await ui.click('保存提示词');
+  assert.equal(ui.calls[0].action, 'assets.imagePrompt.save');
+  assert.equal(ui.calls[0].payload.text, '保留我的新草稿。');
+  assert.equal(ui.calls[0].payload.reviewCurrentBasis, false);
 });
 test('尚无设计正文时显示设计提示词并走同一个精确单项入口', async () => {
   const ui = await view({ prompt: '' }); await ui.click('编写当前提示词');
@@ -243,11 +268,13 @@ test('新版提示词编辑只修改imagePrompt，完整采用设计和旧手写
   nodes(tree).find(node => node.type === 'textarea' && node.props.className === 'asset-prompt-input').props.onChange({ target: { value: '用户只调整图片材质说明' } });
   await ui.click('保存提示词');
   assert.equal(ui.calls.length, 1);
-  const saved = ui.calls[0].payload.asset;
-  assert.equal(saved.imagePrompt.text, '用户只调整图片材质说明');
-  assert.equal(saved.prompt, '已有设计正文。');
-  assert.equal(saved.adoptedDesign.full, '服装结构、动作条件及源事实完整设计');
-  assert.equal(saved.imagePrompt.basedOnDesignRevision, 4);
+  assert.equal(ui.calls[0].action, 'assets.imagePrompt.save');
+  const saved = ui.calls[0].payload;
+  assert.equal(saved.text, '用户只调整图片材质说明');
+  assert.equal(saved.asset, undefined, 'the server resolves frozen design/source rather than accepting a rewritten asset');
+  assert.equal(ui.workspace.assets[0].prompt, '已有设计正文。');
+  assert.equal((ui.workspace.assets[0] as any).adoptedDesign.full, '服装结构、动作条件及源事实完整设计');
+  assert.equal(saved.reviewCurrentBasis, false);
   assert.equal(saved.expectedVersion, 5);
 });
 
