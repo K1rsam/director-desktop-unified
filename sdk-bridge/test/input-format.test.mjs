@@ -34,7 +34,7 @@ async function fixture(t, scenario = 'happy') {
 for (const format of [false, true]) for (const scenario of ['happy', 'configuration-notice-only']) {
   test(`${format ? 'v3 rules-first' : 'v2 legacy'} ${scenario} retains frozen input and reopens with zero dispatch`, async t => {
     const { directory, bridge } = await fixture(t, scenario);
-    assert.deepEqual(bridge.inspect().capabilities.compiledInputFormats, ['legacy-json/v1', 'rules-first-json/v1']);
+    assert.deepEqual(bridge.inspect().capabilities.compiledInputFormats, ['legacy-json/v1', 'rules-first-json/v1', 'rules-first-json-strict/v2']);
     const message = command(format);
     await bridge.handle(message); await bridge.active?.task;
     const original = bridge.observe(message.attemptId);

@@ -41,6 +41,31 @@ function streamReconnectDiagnostic(event) {
   const match = /^Reconnecting\.\.\. ([1-9][0-9]?)\/([1-9][0-9]?) \(stream disconnected before completion: [^\r\n]+\)$/.exec(event.message);
   return match !== null && Number(match[1]) <= Number(match[2]) && Number(match[2]) <= 10;
 }
+// An exact API schema rejection is distinct from TLS, timeout or reconnect
+// failures. Rust still proves stop and lineage before a corrected successor.
+export function schemaRejection(event) {
+  if (!object(event) || !['error', 'turn.failed'].includes(event.type)) return null;
+  const message = event.type === 'error' ? event.message : event.error?.message;
+  if (typeof message !== 'string' || Buffer.byteLength(message) > 16384) return null;
+  let value; try { value = JSON.parse(message); } catch { return null; }
+  if (!object(value) || value.type !== 'error' || value.status !== 400
+    || !object(value.error) || value.error.type !== 'invalid_request_error'
+    || value.error.code !== 'invalid_json_schema' || value.error.param !== 'text.format.schema'
+    || typeof value.error.message !== 'string' || !value.error.message.startsWith("Invalid schema for response_format 'codex_output_schema': ")) return null;
+  return value;
+}
+export function schemaRejectionJournal(events) {
+  let thread = false, turn = false, terminal = null;
+  for (const event of events) {
+    if (!object(event) || terminal) return false;
+    if (event.type === 'thread.started' && !thread && !turn && typeof event.thread_id === 'string' && event.thread_id.length) thread = true;
+    else if (event.type === 'turn.started' && thread && !turn) turn = true;
+    else if (thread && diagnosticItem(event)) { /* Diagnostic has no model output. */ }
+    else if (thread && turn && schemaRejection(event)) terminal = event;
+    else return false;
+  }
+  return terminal !== null;
+}
 function receiptPayload(value) { const { receiptEnvelopeSha256, ...payload } = value; return payload; }
 async function atomicJson(file, value) {
   const payload = receiptPayload(value);
@@ -57,7 +82,8 @@ async function atomicJson(file, value) {
 /** Real official SDK adapter. No mock SDK object, resume, alternate model or provider. */
 function supportedFrozenFormat(attempt) {
   return object(attempt) && ((attempt.version === 'text-attempt/v2' && !Object.hasOwn(attempt, 'compiledInputFormat'))
-    || (attempt.version === 'text-attempt/v3' && attempt.compiledInputFormat === 'rules-first-json/v1'));
+    || (attempt.version === 'text-attempt/v3' && attempt.compiledInputFormat === 'rules-first-json/v1')
+    || (attempt.version === 'text-attempt/v4' && attempt.compiledInputFormat === 'rules-first-json-strict/v2'));
 }
 export class OfficialSdkBridge {
   constructor({ stateDirectory, emit = () => {}, offlineFixture = null, nativeRuntime = null, limits = {} }) {
@@ -123,7 +149,7 @@ export class OfficialSdkBridge {
         requireThat(record.frozenAttemptSha256 === sha256(JSON.stringify(record.attempt)) && record.requestSnapshotSha256 === sha256(JSON.stringify(record.attempt.request)), 'CORRUPT_RECEIPT', 'Frozen attempt/request snapshot hash mismatch; do not resend');
         requireThat(typeof record.compiledPrompt === 'string' && typeof record.compiledSchema === 'string' && record.compiledPromptSha256 === sha256(record.compiledPrompt) && record.compiledSchemaSha256 === sha256(record.compiledSchema), 'CORRUPT_RECEIPT', 'Compiled input hash mismatch; do not resend');
         requireThat(record.rawResult === null ? record.rawResultSha256 === null : record.rawResultSha256 === sha256(JSON.stringify(record.rawResult)), 'CORRUPT_RECEIPT', 'Raw result hash mismatch; do not resend');
-        requireThat(['dispatching', 'running', 'cancel_requested', 'submission_unknown', 'transport_completed'].includes(record.state) && Number.isSafeInteger(record.lastSequence) && record.lastSequence >= 0, 'CORRUPT_RECEIPT', 'Invalid receipt state/sequence; do not resend');
+        requireThat(['dispatching', 'running', 'cancel_requested', 'submission_unknown', 'transport_completed', 'transport_rejected'].includes(record.state) && Number.isSafeInteger(record.lastSequence) && record.lastSequence >= 0, 'CORRUPT_RECEIPT', 'Invalid receipt state/sequence; do not resend');
         const journalPath = path.join(this.root, entry.name, 'events.ndjson');
         const journalStat = await fs.stat(journalPath).catch(e => { if (e.code === 'ENOENT') return { size: 0 }; throw e; });
         requireThat(journalStat.size <= this.limits.journalBytes, 'JOURNAL_LIMIT', 'Persisted journal exceeds bound');
@@ -135,11 +161,13 @@ export class OfficialSdkBridge {
         }
         // A torn final line is evidence of an interrupted write, never permission to dispatch.
         let journalSequence = 0;
+        const rawEvents = [];
         for (const line of journal.split('\n').filter(Boolean)) {
           try {
             const event = JSON.parse(line);
             requireThat(event.protocolVersion === PROTOCOL_VERSION && event.attemptId === entry.name && event.sequence === journalSequence + 1, 'JOURNAL_IDENTITY', 'Journal identity or sequence mismatch');
             journalSequence = event.sequence;
+            rawEvents.push(event.rawEvent);
             record.lastSequence = Math.max(record.lastSequence, event.sequence);
           } catch {
             record.state = 'submission_unknown';
@@ -149,6 +177,19 @@ export class OfficialSdkBridge {
         if (record.state === 'transport_completed' && (!record.rawResult || record.lastSequence !== journalSequence)) {
           record.state = 'submission_unknown';
           record.error = { code: 'INCOMPLETE_COMPLETION', message: 'Completion lacks matching durable evidence; do not resend' };
+        }
+        // Old sealed receipts are classified in memory only. Their bytes and
+        // original UNKNOWN remain available for the Rust predecessor proof.
+        if (['submission_unknown', 'transport_rejected'].includes(record.state)
+          && ['SDK_TURN_FAILED', 'SDK_SCHEMA_REJECTED'].includes(record.error?.code)
+          && record.rawResult === null && record.rawResultSha256 === null && record.usage === null
+          && record.journalSha256 === sha256(journal) && journal.endsWith('\n')
+          && record.lastSequence === journalSequence && schemaRejectionJournal(rawEvents)
+          && record.error.message === (rawEvents.at(-1).message ?? rawEvents.at(-1).error?.message)) {
+          record.state = 'transport_rejected';
+        } else if (record.state === 'transport_rejected') {
+          record.state = 'submission_unknown';
+          record.error = { code: 'SCHEMA_REJECTION_UNPROVEN', message: 'Schema rejection lacks exact terminal evidence; do not resend' };
         }
         if (UNRESOLVED.has(record.state)) {
           record.state = 'submission_unknown';
@@ -167,7 +208,7 @@ export class OfficialSdkBridge {
       sdk: { package: '@openai/codex-sdk', version: SDK_VERSION, transport: 'exec --experimental-json' },
       runtime: { version: this.fixture ? 'synthetic-fixture' : this.nativeRuntime?.identity.runtimePackageVersion ?? null, verified: !!this.nativeRuntime },
       available: !!this.nativeRuntime, liveCallsAllowed: !!this.nativeRuntime, offlineFixtureAvailable: !!this.fixture,
-      capabilities: { compiledInputFormats: ['legacy-json/v1', 'rules-first-json/v1'], execute: this.fixture ? 'offline_fixture_only' : this.nativeRuntime ? 'verified_native_text_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: this.nativeRuntime ? 'AbortSignal_with_native_supervisor' : 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
+      capabilities: { compiledInputFormats: ['legacy-json/v1', 'rules-first-json/v1', 'rules-first-json-strict/v2'], execute: this.fixture ? 'offline_fixture_only' : this.nativeRuntime ? 'verified_native_text_only' : 'disabled', passiveRemoteObserve: false, localReceiptObserve: true, turnId: false, rawRuntimeBytes: false, cancel: this.nativeRuntime ? 'AbortSignal_with_native_supervisor' : 'AbortSignal_best_effort', processTreeStopProven: false, domainAcceptance: false, maxActiveAttempts: 1 },
       blockers: this.nativeRuntime ? ['Pinned SDK has no passive remote observation or turn ID; interrupted submission remains unknown'] : ['SDK live execution needs verified native supervision', 'Native runtime isolation and process-tree ownership are required'],
       limits: this.limits,
     };
@@ -361,6 +402,7 @@ export class OfficialSdkBridge {
       const sdk = new Codex({ codexPathOverride: fixture.executable, env: fixture.env, ...(this.fixture ? { config: { tools: { shell: false }, features: { web_search_request: false }, model_provider: 'openai' } } : {}) });
       const thread = sdk.startThread({ model: record.attempt.request.model, modelReasoningEffort: record.attempt.request.reasoning, workingDirectory: fixture.workingDirectory, sandboxMode: 'read-only', approvalPolicy: 'never', networkAccessEnabled: false, webSearchMode: 'disabled', skipGitRepoCheck: true });
       const { events } = await thread.runStreamed(record.compiledPrompt, { outputSchema: schema, signal: active.controller.signal });
+      const receivedEvents = [];
       active.abortable = true;
       try {
       for await (const event of events) {
@@ -370,6 +412,7 @@ export class OfficialSdkBridge {
         // Persist raw evidence before validating it. Invalid events must remain inspectable.
         if (event.type === 'thread.started' && !record.threadId && typeof event.thread_id === 'string') record.threadId = event.thread_id;
         await this.persistEvent(active, event, duplicate);
+        receivedEvents.push(event);
         if (duplicate) continue;
         active.seen.add(signature);
         requireThat(!active.completed, 'OUT_OF_ORDER', 'New event after terminal completion');
@@ -396,7 +439,7 @@ export class OfficialSdkBridge {
           // Raw event is already durable; wait for the official runtime's
           // terminal event within the existing execution deadline. No retry here.
         } else if (event.type === 'turn.failed' || event.type === 'error') {
-          throw new BridgeError('SDK_TURN_FAILED', event.error?.message ?? event.message ?? 'SDK reported failure');
+          throw new BridgeError(schemaRejectionJournal(receivedEvents) ? 'SDK_SCHEMA_REJECTED' : 'SDK_TURN_FAILED', event.error?.message ?? event.message ?? 'SDK reported failure');
         } else throw new BridgeError('UNSUPPORTED_EVENT', `Unknown SDK event type: ${String(event.type)}`);
         } catch (error) {
           // Abort while the SDK still owns its error listener, before iterator.return().
@@ -414,7 +457,7 @@ export class OfficialSdkBridge {
       record.state = active.canceled ? 'submission_unknown' : 'transport_completed';
       if (active.canceled) record.error = { code: 'CANCEL_UNCONFIRMED', message: 'Completion crossed cancellation barrier; never publish automatically' };
     } catch (error) {
-      record.state = 'submission_unknown';
+      record.state = !active.canceled && error.code === 'SDK_SCHEMA_REJECTED' ? 'transport_rejected' : 'submission_unknown';
       record.error = { code: active.canceled ? 'CANCEL_UNCONFIRMED' : (error.code ?? 'SDK_STREAM_ERROR'), message: String(error.message).slice(0, this.limits.eventBytes / 2) };
     } finally {
       clearTimeout(timeout);

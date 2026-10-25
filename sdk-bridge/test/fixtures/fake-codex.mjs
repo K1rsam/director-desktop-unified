@@ -64,6 +64,13 @@ else if (scenario.startsWith('reconnect-') || scenario === 'fatal-error-during-t
   else if (scenario === 'reconnect-hang') setTimeout(() => process.exit(0), 30_000);
   else if (scenario === 'reconnect-recovered') { event(text); event(complete); }
 }
+else if (scenario.startsWith('schema-refusal')) {
+  event(thread); event(configurationNotice); event(start);
+  if (scenario === 'schema-refusal-after-text') event(text);
+  if (scenario === 'schema-refusal-after-reasoning') event({ type: 'item.started', item: { id: 'reasoning-1', type: 'reasoning', text: 'partial' } });
+  if (scenario === 'schema-refusal-after-reconnect') event(reconnect);
+  event({ type: 'error', message: JSON.stringify({ type: 'error', status: 400, error: { type: 'invalid_request_error', code: 'invalid_json_schema', param: 'text.format.schema', message: "Invalid schema for response_format 'codex_output_schema': 'schema.properties.assets.uniqueItems' is not permitted when strict is true." } }) });
+}
 else if (scenario === 'configuration-notice') { event(thread); event(configurationNotice); event(start); event(text); event(complete); }
 else if (scenario === 'unstable-feature-notice') { event(thread); event({ ...configurationNotice, item: { ...configurationNotice.item, message: 'Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in synthetic config.toml.' } }); event(start); event(text); event(complete); }
 else if (scenario === 'ordinary-error-item') { event(thread); event({ ...configurationNotice, item: { ...configurationNotice.item, message: 'A non-fatal diagnostic unrelated to configuration, 保留原始诊断。' } }); event(start); event(text); event(complete); }

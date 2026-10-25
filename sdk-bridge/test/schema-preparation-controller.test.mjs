@@ -12,14 +12,22 @@ import { nativeRuntime } from '../src/native-runtime.mjs';
 import { createSchemaRecoveryBridge } from '../src/schema-preparation-controller.mjs';
 import { offlineFixture } from './fixture-runtime.mjs';
 const h = body => createHash('sha256').update(body).digest('hex');
-const resources = fileURLToPath(new URL('../', import.meta.url));
+const sourceResources = fileURLToPath(new URL('../', import.meta.url));
 const bridgeSha = '48af55f1835bd6959ede5801fa8ff2ca9068b267b36ec9f751949efdc9481dc7';
 const sdkSha = 'd62ed107033bdba802b283c77d875e4bec3deb2704a910bb7e3f95059473b16f';
 let sequence = 0;
 const command = (method, params = {}, id = 'schema-attempt') => ({ protocolVersion: 'director-sdk-bridge/v1', requestId: `schema_${++sequence}`, attemptId: id, method, params });
 async function fixture(t, outcome = 'happy') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'director-sdk-schema-controller-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  t.after(async () => { assert.equal(path.dirname(root),path.resolve(os.tmpdir())); assert.match(path.basename(root),/^director-sdk-schema-controller-/); await fs.rm(root, { recursive: true, force: true }); });
+  // This recovery contract belongs to the exact old package. Never substitute
+  // today's bridge or relax its content pin just because the compiler evolved.
+  const resources = path.join(root, 'pinned-resources');
+  await fs.mkdir(path.join(resources, 'src'), { recursive: true });
+  for (const name of ['main.mjs', 'native-runtime.mjs']) await fs.copyFile(path.join(sourceResources, 'src', name), path.join(resources, 'src', name));
+  await fs.copyFile(fileURLToPath(new URL('./fixtures/bridge-schema-preparation-v1.mjs',import.meta.url)), path.join(resources,'src/bridge.mjs'));
+  await fs.cp(path.join(sourceResources,'node_modules/@openai/codex-sdk'),path.join(resources,'node_modules/@openai/codex-sdk'),{recursive:true});
+  assert.equal(h(Buffer.concat(await Promise.all(['main.mjs','bridge.mjs','native-runtime.mjs'].map(name=>fs.readFile(path.join(resources,'src',name)))))),bridgeSha);
   const suffix = path.join('schema-attempt', 'native-runtime', 'tmp');
   const worker = path.join(root, 'x'.repeat(233 - root.length - suffix.length - 2));
   await fs.mkdir(worker);

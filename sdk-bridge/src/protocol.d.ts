@@ -4,6 +4,7 @@ export type BridgeMethod = 'hello' | 'inspect' | 'execute' | 'observe' | 'cancel
 export type FrozenAttempt = FrozenAttemptFields & (
   { version: 'text-attempt/v2'; compiledInputFormat?: never }
   | { version: 'text-attempt/v3'; compiledInputFormat: 'rules-first-json/v1' }
+  | { version: 'text-attempt/v4'; compiledInputFormat: 'rules-first-json-strict/v2' }
 );
 interface FrozenAttemptFields {
   attemptId: string;
@@ -43,7 +44,7 @@ export interface Receipt {
   compiledPromptSha256: string;
   compiledSchemaSha256: string;
   backend: 'codex_sdk';
-  state: 'dispatching' | 'running' | 'cancel_requested' | 'submission_unknown' | 'transport_completed';
+  state: 'dispatching' | 'running' | 'cancel_requested' | 'submission_unknown' | 'transport_completed' | 'transport_rejected';
   threadId: string | null;
   turnId: null;
   lastSequence: number;
