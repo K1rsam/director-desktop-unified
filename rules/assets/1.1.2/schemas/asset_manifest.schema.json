@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Short Drama Asset Manifest",
+  "type": "object",
+  "properties": {
+    "project": {"type": "string"},
+    "visual_bible_version": {"type": "string"},
+    "characters": {"type": "array", "items": {"type": "object"}},
+    "costumes": {"type": "array", "items": {"type": "object"}},
+    "extras": {"type": "array", "items": {"type": "object"}},
+    "scenes": {"type": "array", "items": {"type": "object"}},
+    "opening_references": {"type": "array", "items": {"type": "object"}},
+    "pending_confirmations": {"type": "array", "items": {"type": "object"}}
+  },
+  "required": ["project", "characters", "scenes"]
+}

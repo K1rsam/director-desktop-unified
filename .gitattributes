@@ -8,3 +8,6 @@ apps/chrome-bridge/overrides/extension/** -text -whitespace
 apps/chrome-bridge/overrides/src/** -text -whitespace
 # Vendored runtime files are verified against vendor-source.json byte hashes.
 web-image-bridge/vendor/** -text -whitespace
+# Complete creative rule snapshots preserve the exact frozen source bytes.
+rules/series/** -text -whitespace
+rules/assets/** -text -whitespace

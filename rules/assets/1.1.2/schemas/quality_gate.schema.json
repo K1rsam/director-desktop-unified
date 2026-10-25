@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quality Gate",
+  "type": "object",
+  "properties": {
+    "asset_id": {"type": "string"},
+    "asset_tier": {"enum": ["core", "standard"]},
+    "script_fidelity": {"type": "number", "minimum": 0, "maximum": 100},
+    "character_consistency": {"type": "number", "minimum": 0, "maximum": 100},
+    "scene_spatial_consistency": {"type": "number", "minimum": 0, "maximum": 100},
+    "cinematic_quality": {"type": "number", "minimum": 0, "maximum": 100},
+    "video_friendliness": {"type": "number", "minimum": 0, "maximum": 100},
+    "overall": {"type": "number", "minimum": 0, "maximum": 100},
+    "passed": {"type": "boolean"}
+  },
+  "required": ["asset_id", "asset_tier", "script_fidelity", "character_consistency", "scene_spatial_consistency", "overall", "passed"]
+}

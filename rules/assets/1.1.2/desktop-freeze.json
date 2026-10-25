@@ -1,0 +1,174 @@
+{
+  "schemaVersion": "desktop-rule-freeze/v1",
+  "package": "assets",
+  "version": "V1.1.2",
+  "sourceBasis": "user-installed V1.1.2",
+  "upstreamMetadataPreserved": true,
+  "authority": "This manifest binds the copied bytes; upstream SHA256SUMS/provenance may predate local amendments.",
+  "files": {
+    "CHANGELOG.md": {
+      "sha256": "bcc4d6eca3fed405ceff50e9d47882cfdd10e1076113ca7431ff151ec1f3a429",
+      "bytes": 1885
+    },
+    "examples/example_character_output.md": {
+      "sha256": "d22374c91fe11fa012346313fbe7acfebdbb3f0bef85bb46e582987e7066d831",
+      "bytes": 612
+    },
+    "examples/example_opening_reference.md": {
+      "sha256": "512cb9d90ba2d89f8debfb05951776d2dc81e626df8eae66bc5c4a263943a826",
+      "bytes": 523
+    },
+    "examples/example_scene_output.md": {
+      "sha256": "ca4fb05fdbf3ff148c012c75a442ca20873895a9332cf66ac001f1e115c0337b",
+      "bytes": 406
+    },
+    "INSTALL.md": {
+      "sha256": "9cd5b3a01a57f5dfeab1adfe8a2faf6730a378aaa8dcba0978a7b0d7ab759e55",
+      "bytes": 658
+    },
+    "modules/01_project_intake.md": {
+      "sha256": "3f92bbe5dacb87a24d7282ead1ffa099102aa63d00bfcf5df93ba1ac295a8f74",
+      "bytes": 911
+    },
+    "modules/02_script_reader.md": {
+      "sha256": "e61869e16fefdf7e82aaca1f189275dbf897e37b3bb7df6a52201024a4c63809",
+      "bytes": 1473
+    },
+    "modules/03_visual_style_recommender.md": {
+      "sha256": "6cecdd3bd44bc697a209557e505c7843071f8fa61507fd6eeea1140d7672ebef",
+      "bytes": 352
+    },
+    "modules/04_visual_bible.md": {
+      "sha256": "4935c4e13a671c8470be53dce324aea14dd695289cda7f69111d2ea9b46099e3",
+      "bytes": 521
+    },
+    "modules/05_asset_inventory.md": {
+      "sha256": "e425d6ecf1df5a977e1c516bdafb0a6408dd5cd2878af6dc339d029c5fc78f5a",
+      "bytes": 1187
+    },
+    "modules/06_character_analyzer.md": {
+      "sha256": "62549e5dd1c1a0c5b893e2d2d582bec56b481dfd868a65e47da8f11c29e8539b",
+      "bytes": 663
+    },
+    "modules/07_character_prompt_engine.md": {
+      "sha256": "ee40dce89453bdb4ac11f11cac7a64fbcad88c221569f49aac2e6bb55f222a47",
+      "bytes": 1283
+    },
+    "modules/08_costume_engine.md": {
+      "sha256": "ff2442928be1a6794d17bce60141e33092909049cb3f52e65dad58d95db11cea",
+      "bytes": 967
+    },
+    "modules/09_extra_cast_engine.md": {
+      "sha256": "4fe020efb68f5bc98c80f277a222100b2285efd3f0108a04c20fcd0cfe8ae398",
+      "bytes": 370
+    },
+    "modules/10_scene_analyzer.md": {
+      "sha256": "c15c2c995b6e29bf69b70297add8c63582f8de032a8605f633f7b37bb4337a32",
+      "bytes": 667
+    },
+    "modules/11_scene_prompt_engine.md": {
+      "sha256": "1fe726639d5377c817360929c965d8a228f7e6c0e4524a6764260b024964f01e",
+      "bytes": 431
+    },
+    "modules/12_scene_topology_lock.md": {
+      "sha256": "0b171551f98d810ebc2c82571940a32b947d8e5347b5c687dcbff07814a9021c",
+      "bytes": 404
+    },
+    "modules/13_camera_map.md": {
+      "sha256": "527dbcdc0a9c3d4b0daa58cad0887576bdadb885b7c06d0ba57355db0a4a0aa4",
+      "bytes": 306
+    },
+    "modules/14_opening_reference_engine.md": {
+      "sha256": "b41ffc1249087f61166a8c4ed30621f94c3cadce5eed17b6737537e91febc291",
+      "bytes": 609
+    },
+    "modules/15_reference_router.md": {
+      "sha256": "8c20748a252d3a3ff2b2065dc731b0a4fc9228bb2f2c56c325ccf32a2536f3fd",
+      "bytes": 426
+    },
+    "modules/16_gpt_image25_prompt_compiler.md": {
+      "sha256": "e01d55af957b7409a805f5e407ab7360d0c7ec6d887ca6dcedf0aa906f092be3",
+      "bytes": 794
+    },
+    "modules/17_quality_gate.md": {
+      "sha256": "98013e229418b469e2f87a8cfc79e38ae02d326991b9946b736df1e79a728ecd",
+      "bytes": 769
+    },
+    "modules/18_image_diagnostics.md": {
+      "sha256": "89ea3e6cf182ab933194b61ff01eba0b08b97f3145ec5e4ead0ee4507b406b73",
+      "bytes": 950
+    },
+    "modules/19_version_manager.md": {
+      "sha256": "b816afae2a1b52c1b435526a1816ad7b078a9f7bd71cafb64387f6845e37269b",
+      "bytes": 1030
+    },
+    "modules/20_context_manager.md": {
+      "sha256": "d4a3927333141386927d2f1370ad1278d7d1c565945303cf5f7261a615eda137",
+      "bytes": 857
+    },
+    "modules/21_batch_production.md": {
+      "sha256": "c91b3b62e43c515d351268f05a30e29ffe59dc4044ccd05cc271e54304d79067",
+      "bytes": 6855
+    },
+    "modules/22_storyboard_handoff.md": {
+      "sha256": "c56b36b998bb78859eea825081094b3f65e19cff8ccd2f0de840bc072e6c57e7",
+      "bytes": 6358
+    },
+    "README.md": {
+      "sha256": "e109b5e8285d176e30443a67f24fc7b489b9aed68eb671e6c4341098a338d30a",
+      "bytes": 1426
+    },
+    "schemas/asset_manifest.schema.json": {
+      "sha256": "c6ff6ee607a8a511e6c915781cd5a6fde1e96bd97e0ae057a5cf6f58d5b85b47",
+      "bytes": 689
+    },
+    "schemas/quality_gate.schema.json": {
+      "sha256": "adf3be9ce8b0fc7a1926077022861b69d6bde75737426690de99892657c6dbe1",
+      "bytes": 841
+    },
+    "scripts/season-scope.mjs": {
+      "sha256": "5c1d8e574ae1b9b3153f0af59eb92d140d3c7975228b541d8f3ac1bc6ef2be8b",
+      "bytes": 17902
+    },
+    "scripts/validate-season-image-queue.mjs": {
+      "sha256": "c101460f046edb0ec090d1ca760b51dff0b3f44fa6a8ed1778c7b9880c313707",
+      "bytes": 9472
+    },
+    "SHA256SUMS.txt": {
+      "sha256": "70d99248d99d3e08510fd5bdc7e14e8302585c3eecb4635dab5a41a8c66b3d87",
+      "bytes": 3935
+    },
+    "SKILL.md": {
+      "sha256": "c739220422736a3f4b00c7df5e688ec08a41d58016671f2eac867fde2252945d",
+      "bytes": 29427
+    },
+    "templates/character/character_asset_prompt_template.md": {
+      "sha256": "96973a04ca4aefacebfc00f12290a427e8581ff599cba8f4ad4db753ad77a5c9",
+      "bytes": 3975
+    },
+    "templates/character/extra_cast_lineup_template.md": {
+      "sha256": "6c8a81dcfb9de78b5adbdce07eaedec6435f06abca705d0ba8816e9ece31e07b",
+      "bytes": 1246
+    },
+    "templates/opening_reference/opening_reference_prompt_template.md": {
+      "sha256": "a22b4b78175ef4ad96d69620d88a2f53ac88f64c4072e63f8f864306ed002bce",
+      "bytes": 2378
+    },
+    "templates/scene/scene_master_prompt_template.md": {
+      "sha256": "c2f16eba7e955170beaf6969c07291dcce0f8468125bef4438be0e729cbc9019",
+      "bytes": 2682
+    },
+    "templates/style/style_recommendation_template.md": {
+      "sha256": "6277449d28048972b6ecddf4dd24dac0d59e3228661c439dacd5513269de464f",
+      "bytes": 459
+    },
+    "tests/season-image-queue.test.mjs": {
+      "sha256": "ec34aa2413f80f4fc75a4c09170fdb59fb9bc72e3ac267b7b7209e04feffe697",
+      "bytes": 5424
+    },
+    "VERSION": {
+      "sha256": "77123b8e4bdbd54505bf6e8021527ac60281602a06fe307564532c4dba39dbca",
+      "bytes": 6
+    }
+  }
+}
