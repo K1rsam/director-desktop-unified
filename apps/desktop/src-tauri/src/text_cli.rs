@@ -15,7 +15,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE_AGE: Duration = Duration::from_secs(45);
-static CACHE: OnceLock<Mutex<Option<(PathBuf, Instant, Value)>>> = OnceLock::new();
+const FAILED_CACHE_AGE: Duration = Duration::from_secs(2);
+static CACHE: OnceLock<Mutex<Option<(PathBuf, String, Instant, Value)>>> = OnceLock::new();
+static STATUS_INSPECTION: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static LOGIN: OnceLock<Mutex<Option<Arc<LoginSession>>>> = OnceLock::new();
 static LOGIN_START: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static CONTROL_RUNTIME: OnceLock<Result<tokio::runtime::Runtime>> = OnceLock::new();
@@ -443,6 +445,9 @@ struct RpcClient {
 }
 impl RpcClient {
     async fn open(path: &Path) -> Result<Self> {
+        Self::open_bounded(path,STATUS_TIMEOUT).await
+    }
+    async fn open_bounded(path:&Path,deadline:Duration)->Result<Self> {
         let mut cmd = command(path);
         // Inspection must refer to the same official provider used by exec with
         // --ignore-user-config, rather than a host's custom provider/profile.
@@ -477,9 +482,12 @@ impl RpcClient {
             _registration: registration,
             login_notification: None,
         };
-        rpc.send(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"director-workbench","title":"Director Workbench","version":"0.1.0"},"capabilities":{"experimentalApi":false}}})).await?;
-        rpc.response(1).await?;
-        rpc.send(&json!({"method":"initialized"})).await?;
+        let opened=tokio::time::timeout(deadline,async {
+            rpc.send(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"director-workbench","title":"Director Workbench","version":"0.1.0"},"capabilities":{"experimentalApi":false}}})).await?;
+            rpc.response(1).await?;
+            rpc.send(&json!({"method":"initialized"})).await
+        }).await.unwrap_or_else(|_|Err("CLI_STATUS_INITIALIZE_TIMEOUT: CLI 只读握手超时；未发送生成请求".into()));
+        if let Err(error)=opened {rpc.close().await?;return Err(error);}
         Ok(rpc)
     }
     async fn send(&mut self, value: &Value) -> Result<()> {
@@ -559,136 +567,156 @@ fn normalize_limits(payload: &Value) -> Vec<Value> {
     values.into_iter().map(|v| json!({"id":v["limitId"].as_str().unwrap_or("codex"),"name":v["limitName"],"planType":v["planType"],"primary":window(&v["primary"]),"secondary":window(&v["secondary"]),"credits":if v["credits"].is_object(){json!({"balance":v["credits"]["balance"],"hasCredits":v["credits"]["hasCredits"].as_bool().unwrap_or(false),"unlimited":v["credits"]["unlimited"].as_bool().unwrap_or(false)})}else{Value::Null}})).collect()
 }
 
-async fn read_status(path: &Path) -> Result<Value> {
-    let (version, help) = tokio::try_join!(
-        inspect_command(path, &["--version"]),
-        inspect_command(path, &["exec", "--help"])
-    )?;
-    let version = version
-        .lines()
-        .find(|line| line.starts_with("codex-cli "))
-        .ok_or("所选程序不是 Codex CLI")?
-        .trim()
-        .to_string();
-    let compatible = [
-        "--json",
-        "--output-schema",
-        "--output-last-message",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--ephemeral",
-    ]
-    .iter()
-    .all(|flag| help.contains(flag));
-    let mut rpc = RpcClient::open(path).await?;
-    let account = rpc
-        .call(2, "account/read", json!({"refreshToken":false}))
-        .await?;
-    let account = account["account"].clone();
-    let logged_in = account.is_object();
-    let mut warnings = vec![];
-    if !compatible {
-        warnings.push("当前 CLI 缺少文本隔离或结构化输出参数，请升级 CLI".to_string());
+#[derive(Clone,Copy)]
+struct StatusBudgets { initialize:Duration, account:Duration, catalog:Duration, quota:Duration }
+const STATUS_BUDGETS:StatusBudgets=StatusBudgets{initialize:Duration::from_secs(6),account:Duration::from_secs(5),catalog:Duration::from_secs(8),quota:Duration::from_secs(3)};
+#[derive(Default)]
+struct StatusFacts { account:Value, raw_account:Option<Value>, account_checked:bool, models:Vec<Value>, catalog_complete:bool, limits:Vec<Value>, warnings:Vec<String> }
+/// Match the installed app-server's Account tagged union. email=null is a
+/// legitimate ChatGPT response; an empty object or absent email field is not.
+/// Keep the complete object private for retry comparison, never in UI/receipts.
+fn valid_status_account(account:&Value)->bool {
+    if account.is_null(){return true;}
+    if !account.is_object(){return false;}
+    let bounded=|value:&Value,max:usize|value.as_str().is_some_and(|v|!v.trim().is_empty()&&v.len()<=max&&!v.chars().any(char::is_control));
+    match s(account,"type") {
+        "chatgpt"=>account.get("email").is_some_and(|v|v.is_null()||bounded(v,320))&&bounded(&account["planType"],128),
+        "apiKey"|"gcp"=>true,
+        "amazonBedrock"=>account["usesCodexManagedCredentials"].is_boolean(),
+        _=>false,
     }
-    let mut models = vec![];
-    let mut cursor = Value::Null;
-    for page in 0..10 {
-        match rpc
-            .call(
-                10 + page,
-                "model/list",
-                json!({"limit":100,"cursor":cursor,"includeHidden":false}),
-            )
-            .await
-        {
-            Ok(payload) => {
-                models.extend(normalize_models(&payload));
-                cursor = payload["nextCursor"].clone();
-                if cursor.is_null() {
-                    break;
-                }
-            }
-            Err(_) => {
-                warnings.push("模型目录暂时无法读取，请刷新；不会自动替换模型".into());
-                break;
-            }
-        }
-    }
-    let limits = if logged_in {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            rpc.call(30, "account/rateLimits/read", Value::Null),
-        )
-        .await
-        {
-            Ok(Ok(payload)) => normalize_limits(&payload),
-            _ => {
-                warnings.push("额度暂时无法读取，不表示剩余额度为零".into());
-                vec![]
-            }
-        }
-    } else {
-        vec![]
-    };
-    rpc.close().await?;
-    let account_summary = if logged_in {
-        json!({"type":account["type"],"email":account["email"],"planType":account["planType"]})
-    } else {
-        Value::Null
-    };
-    Ok(
-        json!({"available":true,"ready":logged_in && compatible && !models.is_empty(),"executable":path.to_string_lossy(),"version":version,"loggedIn":logged_in,"account":account_summary,"models":models,"limits":limits,"checkedAt":crate::store::now(),"warnings":warnings,"error":if logged_in{Value::Null}else{json!("Codex CLI 尚未登录，请在此完成浏览器登录")},"generationRequestsSent":0,"catalogIsEntitlementCheck":false,"globalConcurrency":4,"episodeConcurrency":2,"login":login_snapshot()}),
-    )
 }
-
-/// Forced inspection is used by Settings; execution preflight reuses a short,
-/// path-bound cache and never takes the workflow submission lock.
-pub async fn status(settings: &Value, force: bool) -> Value {
-    let path = match resolve_executable(settings) {
-        Ok(path) => path,
-        Err(error) => {
-            return json!({"available":false,"ready":false,"loggedIn":false,"executable":Value::Null,"version":Value::Null,"account":Value::Null,"models":[],"limits":[],"checkedAt":crate::store::now(),"warnings":[],"error":error,"login":login_snapshot(),"generationRequestsSent":0})
+fn account_can_bind_retry(account:&Value)->bool {
+    // The current protocol exposes no user/account ID. Complete equality of
+    // {type:apiKey} or a null-email ChatGPT object cannot identify a principal.
+    account["type"]=="chatgpt"&&account["email"].as_str().is_some_and(|v|!v.trim().is_empty())
+}
+fn status_retryable(error:&str)->bool {
+    ["CLI_STATUS_INITIALIZE_TIMEOUT:","CLI_STATUS_ACCOUNT_TIMEOUT:","CLI_STATUS_CATALOG_TIMEOUT:"].iter().any(|prefix|error.starts_with(prefix))
+        || ["Codex CLI 状态进程已退出","无法读取 CLI 状态","无法发送 CLI 状态请求"].contains(&error)
+}
+async fn status_call(rpc:&mut RpcClient,id:u64,method:&str,params:Value,limit:Duration,timeout:&str)->Result<Value> {
+    tokio::time::timeout(limit,rpc.call(id,method,params)).await.unwrap_or_else(|_|Err(timeout.into()))
+}
+async fn read_status_rpc(path:&Path,budget:StatusBudgets,facts:&mut StatusFacts)->Result<()> {
+    let mut rpc=RpcClient::open_bounded(path,budget.initialize).await?;
+    let result=async {
+        let payload=status_call(&mut rpc,2,"account/read",json!({"refreshToken":false}),budget.account,
+            "CLI_STATUS_ACCOUNT_TIMEOUT: CLI 账户读取超时；未发送生成请求").await?;
+        if !payload.is_object() || !payload.get("account").is_some_and(valid_status_account) {
+            return Err("CLI_STATUS_ACCOUNT_INVALID: CLI 未返回有效账户结构；未发送生成请求".into());
         }
+        let account=payload["account"].clone();
+        let summary=if account.is_object(){json!({"type":account["type"],"email":account["email"],"planType":account["planType"]})}else{Value::Null};
+        if facts.raw_account.as_ref().is_some_and(|original|original!=&account) {
+            return Err("CLI_STATUS_ACCOUNT_CHANGED: 两次只读检查的账户身份不同，未采用目录或发送生成请求".into());
+        }
+        facts.account=summary;facts.raw_account=Some(account.clone());facts.account_checked=true;
+        if !account.is_object(){return Err("Codex CLI 尚未登录，请在此完成浏览器登录".into());}
+        let catalogue=async {
+            let mut models=vec![];let mut cursor=Value::Null;let mut seen=std::collections::BTreeSet::new();
+            for page in 0..10 {
+                let payload=rpc.call(10+page,"model/list",json!({"limit":100,"cursor":cursor,"includeHidden":false})).await?;
+                if !payload["data"].is_array() || !payload.get("nextCursor").is_none_or(|v|v.is_null()||v.is_string()) {
+                    return Err("CLI_STATUS_CATALOG_INVALID: CLI 模型目录结构不完整，未采用部分目录".into());
+                }
+                models.extend(normalize_models(&payload));cursor=payload["nextCursor"].clone();
+                if cursor.is_null(){return Ok(models);}
+                if s(&payload,"nextCursor").is_empty() || !seen.insert(cursor.to_string()) {
+                    return Err("CLI_STATUS_CATALOG_CURSOR: 模型目录分页重复，未采用部分目录".into());
+                }
+            }
+            Err::<Vec<Value>,String>("CLI_STATUS_CATALOG_INCOMPLETE: 模型目录超过分页上限，未采用部分目录".into())
+        };
+        facts.models=tokio::time::timeout(budget.catalog,catalogue).await
+            .unwrap_or_else(|_|Err("CLI_STATUS_CATALOG_TIMEOUT: 账户已读取，模型目录暂时超时；未发送生成请求".into()))?;
+        facts.catalog_complete=true;
+        match status_call(&mut rpc,30,"account/rateLimits/read",Value::Null,budget.quota,
+            "CLI_STATUS_QUOTA_TIMEOUT: 额度读取超时").await {
+            Ok(payload)=>facts.limits=normalize_limits(&payload),
+            Err(_)=>facts.warnings.push("额度暂时无法读取，不表示剩余额度为零".into()),
+        }
+        Ok(())
+    }.await;
+    // Never cancel the entire inspection future: await owned child termination
+    // after every phase failure and before a possible read-only retry.
+    rpc.close().await?;
+    result
+}
+async fn read_status_with_budgets(path:&Path,budget:StatusBudgets)->Result<Value> {
+    let started=Instant::now();let original_sha=crate::store::hash_file(path)?.0;
+    // join! allows both bounded children to finish/close even when one fails.
+    let (version,help)=tokio::join!(inspect_command(path,&["--version"]),inspect_command(path,&["exec","--help"]));
+    let version=version?.lines().find(|line|line.starts_with("codex-cli ")).ok_or("所选程序不是 Codex CLI")?.trim().to_owned();
+    let mut facts=StatusFacts::default();let mut attempts=0u64;let mut errors=vec![];
+    let compatible=match help {
+        Ok(help)=>["--json","--output-schema","--output-last-message","--ignore-user-config","--ignore-rules","--ephemeral"].iter().all(|flag|help.contains(flag)),
+        Err(error)=>{errors.push(error);false},
     };
-    if !force {
-        if let Ok(cache) = CACHE.get_or_init(|| Mutex::new(None)).lock() {
-            if let Some((identity, checked, value)) = cache.as_ref() {
-                if identity == &path && checked.elapsed() < CACHE_AGE {
-                    let mut value = value.clone();
-                    value["login"] = login_snapshot();
-                    return value;
+    if !compatible && errors.is_empty(){errors.push("当前 CLI 缺少文本隔离或结构化输出参数，请升级 CLI".into());}
+    if compatible {
+        for attempt in 0..2 {
+            if crate::store::hash_file(path)?.0!=original_sha {errors.push("CLI_STATUS_EXECUTABLE_CHANGED: 检查期间 CLI 文件改变；未发送生成请求".into());break;}
+            attempts+=1;
+            match read_status_rpc(path,budget,&mut facts).await {
+                Ok(())=>break,
+                Err(error)=>{
+                    let retry=attempt==0&&status_retryable(&error);errors.push(error);
+                    if retry&&facts.raw_account.as_ref().is_some_and(|account|!account_can_bind_retry(account)) {
+                        errors.push("CLI_STATUS_ACCOUNT_IDENTITY_UNVERIFIABLE: 账户已读取，但当前协议未提供可区分的账户身份；本次不自动重开预检，未发送生成请求".into());break;
+                    }
+                    if !retry{break;}
                 }
             }
         }
     }
-    let result = tokio::time::timeout(STATUS_TIMEOUT, read_status(&path)).await;
-    let value = match result {
-        Ok(Ok(value)) => value,
-        failure => {
-            json!({"available":true,"ready":false,"loggedIn":false,"executable":path.to_string_lossy(),"version":Value::Null,"account":Value::Null,"models":[],"limits":[],"checkedAt":crate::store::now(),"warnings":[],"error":match failure{Ok(Err(error))=>error,_=>"Codex CLI 状态检查超时，请稍后刷新；未发送生成请求".into()},"login":login_snapshot(),"generationRequestsSent":0})
-        }
-    };
-    if let Ok(mut cache) = CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        *cache = Some((path, Instant::now(), value.clone()));
+    if crate::store::hash_file(path)?.0!=original_sha {
+        facts.catalog_complete=false;facts.models.clear();errors.push("CLI_STATUS_EXECUTABLE_CHANGED: 检查期间 CLI 文件改变；未发送生成请求".into());
     }
+    let logged_in=facts.account_checked&&facts.account.is_object();
+    let ready=logged_in&&compatible&&facts.catalog_complete&&!facts.models.is_empty()
+        && !errors.last().is_some_and(|e|e.starts_with("CLI_RPC_STOP_UNKNOWN:")||e.starts_with("CLI_STATUS_EXECUTABLE_CHANGED:"));
+    let error=if ready{Value::Null}else{json!(errors.last().cloned().unwrap_or_else(||if logged_in{"CLI 未返回可用模型目录；未发送生成请求".into()}else{"Codex CLI 尚未登录，请在此完成浏览器登录".into()}))};
+    if ready&&!errors.is_empty(){facts.warnings.push("只读预检曾短暂中断，重新核验同一账户与完整模型目录后已恢复；未重发任何生成任务".into());}
+    Ok(json!({"available":true,"ready":ready,"executable":path.to_string_lossy(),"version":version,"loggedIn":logged_in,
+        "account":facts.account,"models":facts.models,"limits":facts.limits,"checkedAt":crate::store::now(),"warnings":facts.warnings,"error":error,
+        "readinessRpcReady":facts.account_checked,"generationRequestsSent":0,"catalogIsEntitlementCheck":false,"globalConcurrency":4,"episodeConcurrency":2,"login":login_snapshot(),
+        "inspection":{"version":"cli-readonly-status/v2","attempts":attempts,"accountChecked":facts.account_checked,"catalogComplete":facts.catalog_complete,
+            "executableSha256":original_sha,"elapsedMs":started.elapsed().as_millis(),"transientErrors":errors,"modelCalls":0}}))
+}
+async fn read_status(path:&Path)->Result<Value>{read_status_with_budgets(path,STATUS_BUDGETS).await}
+fn status_failure(path:Option<&Path>,error:String)->Value {
+    json!({"available":path.is_some(),"ready":false,"loggedIn":false,"executable":path.map(|p|p.to_string_lossy().into_owned()),"version":null,"account":null,"models":[],"limits":[],
+        "readinessRpcReady":false,"checkedAt":crate::store::now(),"warnings":[],"error":error,"login":login_snapshot(),"generationRequestsSent":0})
+}
+fn cached_status(path:&Path,sha:&str,force:bool,requested:Instant)->Option<Value> {
+    let cache=CACHE.get_or_init(||Mutex::new(None)).lock().ok()?;
+    let (identity,hash,checked,value)=cache.as_ref()?;
+    let age=if value["ready"]==true{CACHE_AGE}else{FAILED_CACHE_AGE};
+    if identity==path&&hash==sha&&checked.elapsed()<age&&(!force||*checked>=requested) {
+        let mut value=value.clone();value["login"]=login_snapshot();Some(value)
+    }else{None}
+}
+/// One in-flight read-only inspection, keyed to the actual executable bytes.
+/// Concurrent refreshes share its result, while a later explicit refresh stays fresh.
+pub async fn status(settings:&Value,force:bool)->Value {
+    let requested=Instant::now();
+    let path=match resolve_executable(settings){Ok(path)=>path,Err(error)=>return status_failure(None,error)};
+    let sha=match crate::store::hash_file(&path){Ok(value)=>value.0,Err(error)=>return status_failure(Some(&path),error)};
+    if let Some(value)=cached_status(&path,&sha,force,requested){return value;}
+    let _single=STATUS_INSPECTION.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+    if let Some(value)=cached_status(&path,&sha,force,requested){return value;}
+    let value=read_status(&path).await.unwrap_or_else(|error|status_failure(Some(&path),error));
+    if let Ok(mut cache)=CACHE.get_or_init(||Mutex::new(None)).lock(){*cache=Some((path,sha,Instant::now(),value.clone()));}
     value
 }
 
 /// User-triggered readiness preserves local installation evidence when the
 /// separate account/catalog RPC fails. It does not log in, refresh a token or exec.
 pub async fn readiness_status(settings:&Value)->Value {
-    let path=match resolve_executable(settings) {Ok(path)=>path,Err(_)=>return status(settings,true).await};
-    let local=match inspect_command(&path,&["--version"]).await {
-        Ok(text)=>match text.lines().find(|line|line.starts_with("codex-cli ")) {
-            Some(version)=>version.trim().to_owned(),
-            None=>return json!({"available":true,"ready":false,"loggedIn":false,"readinessRpcReady":false,"version":null,"executable":path,"models":[],"limits":[],"warnings":[],"error":"所选程序未返回 Codex CLI 版本，未检查账户或模型","generationRequestsSent":0}),
-        },
-        Err(error)=>return json!({"available":true,"ready":false,"loggedIn":false,"readinessRpcReady":false,"version":null,"executable":path,"models":[],"limits":[],"warnings":[],"error":error,"generationRequestsSent":0}),
-    };
-    let mut result=status(settings,true).await;
-    result["readinessRpcReady"]=json!(result["version"].as_str().is_some_and(|v|v.starts_with("codex-cli ")));
-    result["version"]=json!(local);
-    result
+    // Status now retains verified local version/account facts on a later RPC
+    // failure, so readiness no longer needs a duplicate --version subprocess.
+    status(settings,true).await
 }
 
 pub fn validate_selection(status: &Value, model: &str, reasoning: &str) -> Result<()> {
@@ -963,6 +991,9 @@ async fn begin_login(settings: &Value) -> Result<Value> {
     Ok(login_status())
 }
 
+#[cfg(test)]
+#[path="text_cli_status_tests.rs"]
+mod status_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
