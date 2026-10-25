@@ -1321,7 +1321,7 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
     };
     result["installation"]=json!({"state":"ready","version":null,"executable":identity["path"]});
     result["details"]=json!({"binarySha256":identity["sha256"],"freeImageEligibility":"unverified","accountIdentityNotExported":true});
-    let mut verified_legacy_version = None;
+    let verified_legacy_version = Mutex::new(None);
     let inspected=capabilities_with_runner(config,Instant::now,|config,args,deadline| {
         let read = |arguments: &[String]| -> ProviderResult<Vec<u8>> {
             let output=execute_until(config,arguments,false,Some(deadline))?;
@@ -1331,8 +1331,8 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
         };
         let bytes=read(args)?;
         if args == ["version"] {
-            verified_legacy_version = crate::readiness_canvas::legacy_version_label(&bytes);
-            if verified_legacy_version.is_none() {
+            *verified_legacy_version.lock().unwrap() = crate::readiness_canvas::legacy_version_label(&bytes);
+            if verified_legacy_version.lock().unwrap().is_none() {
                 return Err(legacy_protocol_unsupported());
             }
             if !legacy_readiness_help_supported(None, &read(&["--help".into()])?) { return Err(legacy_protocol_unsupported()); }
@@ -1341,7 +1341,7 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
         }
         Ok(bytes)
     });
-    result["installation"]["version"] = json!(verified_legacy_version);
+    result["installation"]["version"] = json!(*verified_legacy_version.lock().unwrap());
     let mut messages=vec!["只读取官方 CLI 版本/帮助目录与账户积分；没有图片或视频生成。".to_string(),"积分余额和模型目录不能证明当前账户免费资格；免费出图尚未核验。".to_string()];
     match inspected {
         Ok(caps)=>{
@@ -1365,7 +1365,7 @@ pub(super) fn readiness(config: &ProviderConfig) -> Value {
             messages.push(format!("CLI 帮助/目录检查失败（{}），未推断可生成模型。",error.code));
         }
     }
-    if verified_legacy_version.is_none() {
+    if verified_legacy_version.lock().unwrap().is_none() {
         messages.push("未能核验旧版 CLI 协议，未继续 user_credit 账户检查；没有发起登录或生成。".into());
         result["messages"] = json!(messages); return result;
     }
@@ -1817,12 +1817,12 @@ pub(super) fn capabilities(config: &ProviderConfig) -> ProviderResult<Capabiliti
 
 fn capabilities_with_runner(
     config: &ProviderConfig,
-    mut clock: impl FnMut() -> Instant,
-    mut runner: impl FnMut(&ProviderConfig, &[String], Instant) -> ProviderResult<Vec<u8>>,
+    clock: impl Fn() -> Instant + Sync,
+    runner: impl Fn(&ProviderConfig, &[String], Instant) -> ProviderResult<Vec<u8>> + Sync,
 ) -> ProviderResult<Capabilities> {
     let overall_deadline = clock() + Duration::from_secs(30);
     let command_budget = Duration::from_secs(config.timeout_seconds.clamp(1, 15));
-    let mut inspect = |args: &[String]| -> ProviderResult<Vec<u8>> {
+    let inspect = |args: &[String]| -> ProviderResult<Vec<u8>> {
         let step = args.first().map(String::as_str).unwrap_or("help");
         let started = clock();
         if started >= overall_deadline {
@@ -1837,7 +1837,7 @@ fn capabilities_with_runner(
         Ok(bytes)
     };
     let version = inspect(&["version".into()])?;
-    let mut inspect_help = |command: &str| -> ProviderResult<String> {
+    let inspect_help = |command: &str| -> ProviderResult<String> {
         let bytes = inspect(&[command.into(), "-h".into()])?;
         String::from_utf8(bytes).map_err(|_| {
             capability_error(
@@ -1846,10 +1846,23 @@ fn capabilities_with_runner(
             )
         })
     };
-    let video_help = inspect_help("multimodal2video")?;
-    let text_video_help = inspect_help("text2video")?;
-    let image_help = inspect_help("text2image")?;
-    let edit_help = inspect_help("image2image")?;
+    // These four local --help requests have no account or generation side
+    // effects and are independent. A slow Windows process startup must not
+    // consume the shared deadline five times in sequence. Keep every child
+    // bounded by the original per-command and overall limits, and join all
+    // children even if a sibling fails before returning the failure.
+    let help = std::thread::scope(|scope| {
+        let workers: Vec<_> = ["multimodal2video", "text2video", "text2image", "image2image"]
+            .into_iter().map(|command| scope.spawn(move || inspect_help(command))).collect();
+        workers.into_iter().map(|worker| worker.join().unwrap_or_else(|_| {
+            Err(capability_error(ProviderError::new("CLI_HELP", "CLI 帮助检查线程失败。"), "help_contract"))
+        })).collect::<Vec<_>>()
+    });
+    let mut help = help.into_iter();
+    let video_help = help.next().unwrap()?;
+    let text_video_help = help.next().unwrap()?;
+    let image_help = help.next().unwrap()?;
+    let edit_help = help.next().unwrap()?;
     capabilities_from_help(
         &version,
         &video_help,
@@ -3005,21 +3018,22 @@ mod tests {
         let config: ProviderConfig =
             serde_json::from_value(json!({"kind":"dreamina","timeoutSeconds":120})).unwrap();
         let base = Instant::now();
-        let time = std::cell::Cell::new(base);
-        let mut calls = Vec::new();
+        let time = Mutex::new(base);
+        let calls = Mutex::new(Vec::new());
         let result = capabilities_with_runner(
             &config,
-            || time.get(),
+            || *time.lock().unwrap(),
             |seen, args, deadline| {
                 assert_eq!(seen.timeout_seconds, 120);
-                assert_eq!(deadline - time.get(), Duration::from_secs(15));
+                assert_eq!(deadline - *time.lock().unwrap(), Duration::from_secs(15));
                 assert!(deadline <= base + Duration::from_secs(30));
-                calls.push(args.to_vec());
-                time.set(time.get() + Duration::from_secs(3));
+                calls.lock().unwrap().push(args.to_vec());
+                if args[0] == "version" { *time.lock().unwrap() = base + Duration::from_secs(7); }
                 Ok(offline_help(args))
             },
         )
         .unwrap();
+        let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 5);
         assert_eq!(calls[0], ["version"]);
         assert!(calls[1..]
@@ -3033,30 +3047,46 @@ mod tests {
         );
     }
     #[test]
-    fn exhausted_capability_budget_stops_before_the_remaining_image_probes() {
+    fn capability_help_probes_overlap_after_version_without_generation_commands() {
         let config: ProviderConfig =
             serde_json::from_value(json!({"kind":"dreamina","timeoutSeconds":120})).unwrap();
         let base = Instant::now();
-        let time = std::cell::Cell::new(base);
-        let mut calls = 0;
+        let phase = Mutex::new(false);
+        let ready = (Mutex::new(0usize), std::sync::Condvar::new());
+        let result = capabilities_with_runner(&config, || base, |_, args, deadline| {
+            assert_eq!(deadline, base + Duration::from_secs(15));
+            if args[0] == "version" {
+                *phase.lock().unwrap() = true;
+            } else {
+                assert!(*phase.lock().unwrap());
+                assert_eq!(args[1], "-h");
+                let mut count = ready.0.lock().unwrap();
+                *count += 1;
+                ready.1.notify_all();
+                let (count, _) = ready.1.wait_timeout_while(count, Duration::from_secs(3), |n| *n < 4).unwrap();
+                assert_eq!(*count, 4, "read-only help probes must overlap, not consume four serial startup delays");
+            }
+            Ok(offline_help(args))
+        }).unwrap();
+        assert_eq!(result.models.len(), 15);
+    }
+    #[test]
+    fn failed_parallel_capability_probe_waits_for_all_owned_help_workers() {
+        let config: ProviderConfig =
+            serde_json::from_value(json!({"kind":"dreamina","timeoutSeconds":120})).unwrap();
+        let base = Instant::now();
+        let calls = Mutex::new(Vec::new());
         let error = capabilities_with_runner(
             &config,
-            || time.get(),
-            |_, args, deadline| {
-                calls += 1;
-                if calls <= 2 {
-                    assert_eq!(deadline - time.get(), Duration::from_secs(15));
-                    time.set(time.get() + Duration::from_secs(14));
-                } else {
-                    assert_eq!(deadline - time.get(), Duration::from_secs(2));
-                    assert_eq!(deadline, base + Duration::from_secs(30));
-                    time.set(deadline);
-                }
+            || base,
+            |_, args, _| {
+                calls.lock().unwrap().push(args[0].clone());
+                if args[0] == "multimodal2video" { return Err(capability_timeout()); }
                 Ok(offline_help(args))
             },
         )
         .unwrap_err();
-        assert_eq!(calls, 3);
+        assert_eq!(calls.lock().unwrap().len(), 5);
         assert_eq!(error.code, "CLI_CAPABILITY_TIMEOUT");
         assert!(!error.submission_unknown);
         assert!(!error.auth_required);
@@ -3065,20 +3095,20 @@ mod tests {
     fn capability_inspection_respects_a_shorter_user_timeout() {
         let config: ProviderConfig =
             serde_json::from_value(json!({"kind":"dreamina","timeoutSeconds":1})).unwrap();
-        let time = std::cell::Cell::new(Instant::now());
-        let mut calls = 0;
+        let time = Mutex::new(Instant::now());
+        let calls = Mutex::new(0);
         let error = capabilities_with_runner(
             &config,
-            || time.get(),
+            || *time.lock().unwrap(),
             |_, _, deadline| {
-                calls += 1;
-                assert_eq!(deadline - time.get(), Duration::from_secs(1));
-                time.set(deadline);
+                *calls.lock().unwrap() += 1;
+                assert_eq!(deadline - *time.lock().unwrap(), Duration::from_secs(1));
+                *time.lock().unwrap() = deadline;
                 Ok(b"{}".to_vec())
             },
         )
         .unwrap_err();
-        assert_eq!(calls, 1);
+        assert_eq!(*calls.lock().unwrap(), 1);
         assert_eq!(error.code, "CLI_CAPABILITY_TIMEOUT");
     }
     #[test]
@@ -3086,12 +3116,13 @@ mod tests {
         let config: ProviderConfig =
             serde_json::from_value(json!({"kind":"dreamina","timeoutSeconds":120})).unwrap();
         let base = Instant::now();
-        let mut clock_calls = 0;
+        let clock_calls = Mutex::new(0);
         let error = capabilities_with_runner(
             &config,
             || {
-                clock_calls += 1;
-                if clock_calls == 1 {
+                let mut count = clock_calls.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
                     base
                 } else {
                     base + Duration::from_secs(30)
@@ -3490,7 +3521,8 @@ mod tests {
         let (_directory, config, _) = fake_cli_prepared();
         let cache = CapabilityCache::default();
         let clock = std::cell::Cell::new(Instant::now());
-        let probes = std::cell::Cell::new(0);
+        let probes = Mutex::new(0);
+        let inspection_time = clock.get();
         let startup = cache
             .get_or_inspect(
                 &config,
@@ -3498,16 +3530,16 @@ mod tests {
                 |cfg| {
                     capabilities_with_runner(
                         cfg,
-                        || clock.get(),
+                        || inspection_time,
                         |_, args, _| {
-                            probes.set(probes.get() + 1);
+                            *probes.lock().unwrap() += 1;
                             Ok(offline_help(args))
                         },
                     )
                 },
             )
             .unwrap();
-        assert_eq!(probes.get(), 5, "one version and four help commands");
+        assert_eq!(*probes.lock().unwrap(), 5, "one version and four help commands");
         for item in 0..54 {
             let mut request = image_request("5.0", "16:9", "2k");
             request.request_id = format!("offline-cached-item-{item}");
@@ -3534,7 +3566,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reread.checked_at, startup.checked_at);
-        assert_eq!(probes.get(), 5);
+        assert_eq!(*probes.lock().unwrap(), 5);
         assert_eq!(config.timeout_seconds, 1, "generation timeout is unchanged");
     }
     #[test]
@@ -3687,7 +3719,7 @@ mod tests {
     fn capability_cache_failures_keep_typed_probe_error_and_never_prepare_or_submit() {
         let (_directory, config, _) = fake_cli_prepared();
         let cache = CapabilityCache::default();
-        let probes = std::cell::Cell::new(0);
+        let probes = Mutex::new(0);
         let submits = std::cell::Cell::new(0);
         for _ in 0..2 {
             let result = prepare_with_capability_resolver(
@@ -3696,7 +3728,7 @@ mod tests {
                 |cfg| {
                     cache.get_or_inspect(cfg, Instant::now, |cfg| {
                         capabilities_with_runner(cfg, Instant::now, |_, _, _| {
-                            probes.set(probes.get() + 1);
+                            *probes.lock().unwrap() += 1;
                             Err(ProviderError::new(
                                 "CLI_CAPABILITY_TIMEOUT",
                                 "offline bounded inspection timeout",
@@ -3724,7 +3756,7 @@ mod tests {
             }
         }
         assert_eq!(
-            probes.get(),
+            *probes.lock().unwrap(),
             2,
             "failures are not reused as a cached result"
         );
