@@ -75,10 +75,43 @@ export async function clickOwnedComposer(page, text, gate, intent) {
   if (result?.clicked !== true) throw fail('CLICK_RESULT_UNCONFIRMED');
   return result;
 }
+// Both send confirmation and passive recovery read the same logical message.
+// ChatGPT can nest all three user selectors and append collapsed-message UI
+// (ellipsis / Show more). Only the known plain-text body is the sent prompt;
+// never trim, substring-match, or remove characters from that body.
+export function readOwnedConversationDom(expected) {
+  const mains=[...document.querySelectorAll('main')];
+  const empty={url:location.href,userCount:0,promptMatched:false,images:[],imageCandidates:0,selectors:0};
+  if(mains.length!==1)return empty;
+  const main=mains[0],userSelector='[data-message-author-role="user"],[data-turn="user"],.bg-user-message';
+  const matches=[...main.querySelectorAll(userSelector)];
+  const users=matches.filter(n=>!matches.some(parent=>parent!==n&&parent.contains(n)));
+  const result={...empty,userCount:users.length};
+  if(users.length!==1)return result;
+  const user=users[0],bubbles=[user,...user.querySelectorAll('.bg-user-message')].filter(n=>n.matches('.bg-user-message'));
+  if(bubbles.length>1)return result;
+  const scope=bubbles[0]||user;
+  const bodies=[scope,...scope.querySelectorAll('.whitespace-pre-wrap')].filter(n=>n.matches('.whitespace-pre-wrap')&&!n.closest('button,[contenteditable],textarea'));
+  const body=bodies.length===1?bodies[0]:bodies.length===0?scope:null;
+  // This adapter sends plain text. Unknown structured/rendered bodies stay held.
+  if(!body||![...body.childNodes].every(n=>n.nodeType===3))return result;
+  result.promptMatched=typeof expected==='string'&&expected.length>0&&body.textContent===expected;
+  if(!result.promptMatched)return result;
+  const followsUser=n=>!user.contains(n)&&!n.closest(userSelector)&&!n.closest('nav,aside,[role="dialog"],[contenteditable]')
+    &&(user.compareDocumentPosition(n)&5)===4;
+  const candidates=[...new Set(main.querySelectorAll('[data-testid="generated-image-gallery"] img,button[data-testid="generated-image-preview"] img'))].filter(followsUser);
+  result.imageCandidates=candidates.length;
+  result.images=candidates.filter(n=>n.complete&&n.naturalWidth>128&&n.naturalHeight>128);
+  result.selectors=[...main.querySelectorAll('button[aria-label]')].filter(n=>followsUser(n)&&/^(显示生成的图像|Show generated image) [0-9]+$/.test(n.getAttribute('aria-label')||'')).length;
+  return result;
+}
+export function ownedConversationStateCode(text, generatingCode='false') {
+  return `(()=>{const readOwnedConversationDom=${readOwnedConversationDom.toString()};const state=readOwnedConversationDom(${JSON.stringify(text)});return{url:state.url,userCount:state.userCount,promptMatched:state.promptMatched,count:state.images.length,imageCandidates:state.imageCandidates,selectors:state.selectors,generating:(${generatingCode})};})()`;
+}
 export async function observeOwnedSubmission(page, text) {
   for (let i = 0; i < 20; i++) {
-    const result = await page.evaluate(`(()=>{let users=[...document.querySelectorAll('[data-message-author-role="user"]')];if(!users.length)users=[...document.querySelectorAll('[data-turn="user"],.bg-user-message')].filter(n=>!n.querySelector('[data-turn="user"],.bg-user-message'));return{url:location.href,texts:users.map(n=>n.innerText??n.textContent??'')};})()`);
-    if (result?.texts?.length === 1 && result.texts[0] === text && /^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+$/.test(result.url || '')) return { confirmed:true, conversationUrl:result.url, promptSha256:hash(text) };
+    const result = await page.evaluate(ownedConversationStateCode(text));
+    if (result?.userCount===1 && result.promptMatched===true && /^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+$/.test(result.url || '')) return { confirmed:true, conversationUrl:result.url, promptSha256:hash(text) };
     if (i < 19) await page.sleep(0.25);
   }
   throw fail('SENT_PROMPT_UNCONFIRMED');

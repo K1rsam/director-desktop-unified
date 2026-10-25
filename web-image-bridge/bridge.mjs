@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { Page } from './vendor/opencli/dist/src/browser/page.js';
 import { setDaemonCommandTimeoutSeconds } from './vendor/opencli/dist/src/browser/daemon-client.js';
 import { uploadChatGPTImages } from './vendor/opencli/clis/chatgpt/utils.js';
-import { OWNED_SEND_PROTOCOL, composerAdapterSha256, logicalComposerText, prepareOwnedComposer, clickOwnedComposer, observeOwnedSubmission } from './composer-transport.mjs';
+import { OWNED_SEND_PROTOCOL, composerAdapterSha256, logicalComposerText, prepareOwnedComposer, clickOwnedComposer, observeOwnedSubmission, readOwnedConversationDom, ownedConversationStateCode } from './composer-transport.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 export const requestHash = request => sha(JSON.stringify(request));
@@ -92,7 +92,7 @@ function ownedTerminalJournal(saved, proof) {
       && proof.composerAdapterSha256===composerAdapterSha256)
     || (proof.runtimeSha256==='f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70'
       && proof.composerAdapterSha256==='0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65')
-    || (['54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0','afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6'].includes(proof.runtimeSha256)
+    || (['54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0','afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6','c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057','6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2'].includes(proof.runtimeSha256)
       && proof.composerAdapterSha256==='5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b');
 }
 export function ownedNewPagePreflight(observed, expected) {
@@ -219,11 +219,32 @@ async function health(profile) {
   if (selected.pending) throw error('BRIDGE_BUSY');
   return selected.contextId;
 }
+// Read only bounded, direct UI text outside navigation, conversations and drafts.
+// A normal missing composer/hydration is deliberately not an account failure.
+export function accountLoadFailure() {
+  if (document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')) return false;
+  const excluded='nav,aside,[role="navigation"],[data-testid*="sidebar"],[id*="sidebar"],#history,[data-message-author-role],[data-turn],article,pre,code,.markdown,[contenteditable],textarea';
+  const titles=new Set(['无法加载你的账户','无法加载您的账户','Unable to load your account',"We couldn't load your account"]);
+  let visited=0;
+  for (const element of document.querySelectorAll('h1,h2,h3,[role="heading"],[role="alert"],p,div,span')) {
+    if (++visited>1200) break;
+    if (element.closest(excluded) || element.closest('[hidden],[aria-hidden="true"]') || !element.getClientRects().length) continue;
+    const style=getComputedStyle(element);if(style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse')continue;
+    let text='';
+    for(const node of element.childNodes) {
+      if(node.nodeType!==3)continue;
+      if(typeof node.data!=='string'||node.data.length>256){text='';break;}
+      text+=node.data;if(text.length>256){text='';break;}
+    }
+    if(titles.has(text.trim().replace(/[.!。！]$/u,'')))return true;
+  }
+  return false;
+}
 export async function browserIdentity(p) {
-  try {return await p.evaluate(`(async()=>{if(location.protocol==='chrome-error:')throw Error('BROWSER_NETWORK_UNAVAILABLE');if(location.origin!=='https://chatgpt.com')throw Error('CHATGPT_PAGE_LOADING');let r;try{r=await fetch('/api/auth/session',{credentials:'include',signal:AbortSignal.timeout(6000)});}catch{throw Error('BROWSER_NETWORK_UNAVAILABLE');}if(r.status===401)throw Error('AUTH_REQUIRED');if(r.status===403)throw Error('BROWSER_CHECK_REQUIRED');if(r.status===429)throw Error('BRIDGE_BUSY');if(!r.ok)throw Error('BROWSER_NETWORK_UNAVAILABLE');const s=await r.json();const id=s.user?.id;if(typeof id!=='string'||!id)throw Error('AUTH_REQUIRED');const key=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id)))].map(b=>b.toString(16).padStart(2,'0')).join('');return{accountKey:key,browserKind:/Edg\\//.test(navigator.userAgent)?'edge':/Chrome\\//.test(navigator.userAgent)?'chrome':'other',composer:!!document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')};})()`);}catch(e){throw identityError(e);}
+  try {return await p.evaluate(`(async()=>{if(location.protocol==='chrome-error:')throw Error('BROWSER_NETWORK_UNAVAILABLE');if(location.origin!=='https://chatgpt.com')throw Error('CHATGPT_PAGE_LOADING');if((${accountLoadFailure.toString()})())throw Error('CHATGPT_ACCOUNT_LOAD_FAILED');let r;try{r=await fetch('/api/auth/session',{credentials:'include',signal:AbortSignal.timeout(6000)});}catch{throw Error('BROWSER_NETWORK_UNAVAILABLE');}if(r.status===401)throw Error('AUTH_REQUIRED');if(r.status===403)throw Error('BROWSER_CHECK_REQUIRED');if(r.status===429)throw Error('BRIDGE_BUSY');if(!r.ok)throw Error('BROWSER_NETWORK_UNAVAILABLE');const s=await r.json();const id=s.user?.id;if(typeof id!=='string'||!id)throw Error('AUTH_REQUIRED');const key=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id)))].map(b=>b.toString(16).padStart(2,'0')).join('');return{accountKey:key,browserKind:/Edg\\//.test(navigator.userAgent)?'edge':/Chrome\\//.test(navigator.userAgent)?'chrome':'other',composer:!!document.querySelector('[contenteditable="true"][role="textbox"],#prompt-textarea')};})()`);}catch(e){throw identityError(e);}
 }
 export function identityError(e) {
-  for(const code of ['BROWSER_NETWORK_UNAVAILABLE','BROWSER_CHECK_REQUIRED','CHATGPT_PAGE_LOADING','BRIDGE_BUSY','AUTH_REQUIRED']) {
+  for(const code of ['BROWSER_NETWORK_UNAVAILABLE','BROWSER_CHECK_REQUIRED','CHATGPT_PAGE_LOADING','CHATGPT_ACCOUNT_LOAD_FAILED','BRIDGE_BUSY','AUTH_REQUIRED']) {
     if(String(e.message).includes(code)) return error(code);
   }
   return e;
@@ -332,9 +353,75 @@ export async function submitOwnedComposer(page,saved,loc) {
   const observed=await observeOwnedSubmission(page,saved.prompt);
   saved.status='processing';saved.sendConfirmed=true;saved.conversationUrl=observed.conversationUrl;
 }
+export function recordPassiveObservation(config,saved,loc,state,journalBefore) {
+  if(state.userCount!==1||state.promptMatched!==true||!stableConversation(state.url)
+      ||(saved.conversationUrl&&saved.conversationUrl!==state.url))throw error('ORIGINAL_PROMPT_UNCONFIRMED');
+  if(saved.ownedSend) {
+    const intent=saved.sendIntent;
+    if(saved.ownedSend.version!==OWNED_SEND_PROTOCOL||saved.ownedSend.token!==saved.requestId
+        ||!Number.isFinite(Date.parse(saved.sentAt))||intent?.version!=='owned-click-intent/v1'
+        ||intent.token!==saved.requestId||intent.requestId!==saved.requestId||intent.requestHash!==saved.requestHash
+        ||intent.promptSha256!==sha(saved.prompt)||typeof intent.page!=='string'||!intent.page
+        ||(intent.page!==saved.page&&!stableConversation(saved.conversationUrl)))throw error('ORIGINAL_SEND_INTENT_UNCONFIRMED');
+  }
+  if(!fs.readFileSync(loc.file).equals(journalBefore))throw error('ORIGINAL_JOURNAL_CHANGED');
+  if(!saved.sendConfirmed) {
+    const beforeSha=sha(journalBefore),name=`request.before-passive-observation.${beforeSha}.json`,archive=path.join(path.dirname(loc.file),name);
+    if(fs.existsSync(archive)){if(!fs.readFileSync(archive).equals(journalBefore))throw error('ORIGINAL_ARCHIVE_CHANGED');}
+    else fs.writeFileSync(archive,journalBefore,{flag:'wx',mode:0o600});
+    saved.passiveObservation={version:'opencli-passive-observation/v1',requestId:saved.requestId,requestHash:saved.requestHash,
+      promptSha256:sha(saved.prompt),profile:saved.profile,accountKey:saved.accountKey,page:saved.page,conversationUrl:state.url,
+      runtimeSha256:config.runtimeSha256,journalBeforeSha256:beforeSha,journalBeforeArchive:name,readOnly:true,resubmitted:false,
+      observedAt:new Date().toISOString()};
+  }
+  saved.sendConfirmed=true;saved.conversationUrl=state.url;
+  // Keep the original error/status as recovery evidence until original bytes
+  // are fully verified. Observing the DOM does not issue or retry a generation.
+  atomic(loc.file,saved);
+}
+// Runs only inside the bound page. Credentials stay inside the browser and only
+// a verified original image is returned. No conversation API or send endpoint.
+export async function readOwnedOriginalImage(expected,conversationUrl,expectedAccount) {
+  const inspect=()=>{
+    const state=readOwnedConversationDom(expected);
+    if(generationActive())throw Error('ORIGINAL_GENERATION_ACTIVE');
+    if(state.url!==conversationUrl||!/^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+$/.test(state.url)||state.userCount!==1||!state.promptMatched)throw Error('ORIGINAL_PROMPT_UNCONFIRMED');
+    if(state.imageCandidates!==1||state.images.length!==1||state.selectors>1)throw Error('ORIGINAL_IMAGE_UNCONFIRMED');
+    return state.images[0];
+  };
+  const img=inspect(),source=img.currentSrc||img.src;
+  const fetchRead=(url,options={})=>fetch(url,{...options,signal:AbortSignal.timeout(8000)});
+  const hash=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(b=>b.toString(16).padStart(2,'0')).join('');
+  const previewReply=await fetchRead(source);if(!previewReply.ok)throw Error('ORIGINAL_PREVIEW_UNAVAILABLE');
+  const preview=await previewReply.arrayBuffer(),wanted=await hash(preview);
+  const urls=[...new Map(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>{
+    try{const parsed=new URL(u);return parsed.origin===location.origin&&/^\/backend-api\/files\/download\/file_[a-z0-9]+$/.test(parsed.pathname);}catch{return false;}
+  }).map(u=>[new URL(u).pathname,u])).values()];
+  if(!urls.length||urls.length>12)throw Error('ORIGINAL_FILE_IDENTITY');
+  const auth=await fetchRead('/api/auth/session',{credentials:'include'});if(!auth.ok)throw Error('AUTH_REQUIRED');
+  const session=await auth.json();if(!session.accessToken||typeof session.user?.id!=='string'||!session.user.id)throw Error('AUTH_REQUIRED');
+  if(!/^[a-f0-9]{64}$/.test(expectedAccount||'')||await hash(new TextEncoder().encode(session.user.id))!==expectedAccount)throw Error('ACCOUNT_CHANGED');
+  const matches=await Promise.all(urls.map(async u=>{
+    const m=await fetchRead(u,{credentials:'include',headers:{Authorization:'Bearer '+session.accessToken}});if(!m.ok)return null;
+    const v=await m.json();if(typeof v.download_url!=='string')return null;
+    const x=new URL(v.download_url);
+    if(x.protocol!=='https:'||!['chatgpt.com','files.oaiusercontent.com'].some(h=>x.hostname===h||x.hostname.endsWith('.'+h)))throw Error('ORIGINAL_FILE_HOST');
+    const r=await fetchRead(x.href,{credentials:'include'});if(!r.ok)return null;
+    const blob=await r.blob(),b=await blob.arrayBuffer(),digest=await hash(b);
+    if(digest!==wanted||b.byteLength!==preview.byteLength)return null;
+    const dataUrl=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob);});
+    return{sha256:digest,bytes:b.byteLength,mime:blob.type,fileId:new URL(u).pathname.split('/').pop(),dataUrl};
+  }));
+  const match=matches.filter(Boolean);if(match.length!==1)throw Error('ORIGINAL_FILE_AMBIGUOUS');
+  const finalImage=inspect();if((finalImage.currentSrc||finalImage.src)!==source)throw Error('ORIGINAL_IMAGE_CHANGED');
+  return match[0];
+}
+export function originalImageReadCode(prompt,conversationUrl,expectedAccount) {
+  return `(async()=>{const readOwnedConversationDom=${readOwnedConversationDom.toString()};const generationActive=()=>(${activeCode});const readOwnedOriginalImage=${readOwnedOriginalImage.toString()};return readOwnedOriginalImage(${JSON.stringify(prompt)},${JSON.stringify(conversationUrl)},${JSON.stringify(expectedAccount)});})()`;
+}
 async function query(config, request) {
   validateRequest(request,false); const loc = paths(config, request.requestId);
-  if (!fs.existsSync(loc.file)) throw error('ORIGINAL_TASK_MISSING'); const saved = read(loc.file); checkIdentity(saved, request);
+  if (!fs.existsSync(loc.file)) throw error('ORIGINAL_TASK_MISSING'); const journalBefore=fs.readFileSync(loc.file),saved=JSON.parse(journalBefore); checkIdentity(saved, request);
   if (saved.profile !== config.profile || saved.accountKey !== config.accountKey) throw error('ACCOUNT_CHANGED');
   if (saved.status === 'downloaded') return { taskId: request.requestId, status: 'succeeded', resultUrls: saved.resultUrls, raw: saved.proof };
   if (saved.status === 'not_submitted') return notSubmittedResult(request,saved,loc);
@@ -342,18 +429,21 @@ async function query(config, request) {
   if (ownedPreSendJournal(saved)) { const settled=await settleOwnedPreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
   else if (preSendJournal(saved)) { const settled=await settlePreSendFailure(config,request,saved,loc,p);if(settled)return settled; }
   let url;
-  try { url = await p.evaluate('location.href'); } catch { if (!stableConversation(saved.conversationUrl)) throw error('ORIGINAL_PAGE_UNAVAILABLE'); const page = await p.newTab(saved.conversationUrl); saved.page = page; p.setActivePage(page); atomic(loc.file, saved); await p.sleep(1); url = await p.evaluate('location.href'); }
-  if (stableConversation(url)) { if (saved.conversationUrl && saved.conversationUrl !== url) throw error('CONVERSATION_CHANGED'); saved.conversationUrl = url; atomic(loc.file, saved); }
+  try { url = await p.evaluate('location.href'); } catch { if (!stableConversation(saved.conversationUrl)) throw error('ORIGINAL_PAGE_UNAVAILABLE'); const page = await p.newTab(saved.conversationUrl); saved.page = page; p.setActivePage(page); await p.sleep(1); url = await p.evaluate('location.href'); }
+  if (stableConversation(url)) { if (saved.conversationUrl && saved.conversationUrl !== url) throw error('CONVERSATION_CHANGED'); }
   else if (saved.conversationUrl) throw error('CONVERSATION_CHANGED');
   const identity = await browserIdentity(p); if (identity.accountKey !== saved.accountKey) throw error('ACCOUNT_CHANGED');
-  const state = await p.evaluate(`(()=>{const users=[...document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message')];const images=[...document.querySelectorAll('[data-testid="generated-image-gallery"] img')].filter(i=>i.complete&&i.naturalWidth>128);const selectors=[...document.querySelectorAll('button[aria-label]')].map(b=>b.getAttribute('aria-label')).filter(l=>/^(显示生成的图像|Show generated image) [0-9]+$/.test(l));return{url:location.href,userTexts:users.map(n=>n.textContent),count:images.length,selectors:selectors.length,generating:${activeCode}};})()`);
-  if (!state.userTexts.length && Date.now()-Date.parse(saved.sentAt||saved.createdAt)<60000) return {taskId:request.requestId,status:'processing',resultUrls:[],raw:{transport:'opencli/v1',phase:'loading_original_page'}};
-  if (state.userTexts.length !== 1 || !state.userTexts[0].includes(saved.prompt)) throw error('ORIGINAL_PROMPT_UNCONFIRMED');
+  const state = await p.evaluate(ownedConversationStateCode(saved.prompt,activeCode));
+  if (state.userCount===0 && Date.now()-Date.parse(saved.sentAt||saved.createdAt)<60000) return {taskId:request.requestId,status:'processing',resultUrls:[],raw:{transport:'opencli/v1',phase:'loading_original_page'}};
+  if (state.userCount!==1 || state.promptMatched!==true) throw error('ORIGINAL_PROMPT_UNCONFIRMED');
+  if (state.url!==url || !stableConversation(state.url)) throw error('CONVERSATION_CHANGED');
+  recordPassiveObservation(config,saved,loc,state,journalBefore);
   if(Date.now()-Date.parse(saved.sentAt||saved.createdAt)>15*60*1000&&state.count===0)throw error('ORIGINAL_RESULT_TIMEOUT');
-  if (state.generating || state.count === 0 || !stableConversation(url)) return { taskId: request.requestId, status: 'processing', resultUrls: [], raw: { transport:'opencli/v1', conversationUrl:saved.conversationUrl, observedImages:state.count } };
-  // One frozen asset per request avoids assuming that multi-image output order equals asset order.
-  if (state.count !== 1 || state.selectors > 1) throw error('MULTIPLE_IMAGES_REQUIRE_REVIEW');
-  const asset = await p.evaluate(`(async()=>{const img=[...document.querySelectorAll('[data-testid="generated-image-gallery"] img')].find(i=>i.complete&&i.naturalWidth>128);const hash=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(b=>b.toString(16).padStart(2,'0')).join('');const preview=await(await fetch(img.currentSrc||img.src)).arrayBuffer(),wanted=await hash(preview);const urls=[...new Map(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>new URL(u).origin===location.origin&&/^\\/backend-api\\/files\\/download\\/file_[a-z0-9]+$/.test(new URL(u).pathname)).map(u=>[new URL(u).pathname,u])).values()];if(!urls.length||urls.length>12)throw Error('ORIGINAL_FILE_IDENTITY');const session=await(await fetch('/api/auth/session',{credentials:'include'})).json();if(!session.accessToken)throw Error('AUTH_REQUIRED');const matches=await Promise.all(urls.map(async u=>{const m=await fetch(u,{credentials:'include',headers:{Authorization:'Bearer '+session.accessToken}});if(!m.ok)return null;const v=await m.json();if(typeof v.download_url!=='string')return null;const x=new URL(v.download_url);if(x.protocol!=='https:'||!['chatgpt.com','files.oaiusercontent.com'].some(h=>x.hostname===h||x.hostname.endsWith('.'+h)))throw Error('ORIGINAL_FILE_HOST');const r=await fetch(x.href,{credentials:'include'});if(!r.ok)return null;const blob=await r.blob(),b=await blob.arrayBuffer(),digest=await hash(b);if(digest!==wanted||b.byteLength!==preview.byteLength)return null;const dataUrl=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob);});return{sha256:digest,bytes:b.byteLength,mime:blob.type,fileId:new URL(u).pathname.split('/').pop(),dataUrl};}));const match=matches.filter(Boolean);if(match.length!==1)throw Error('ORIGINAL_FILE_AMBIGUOUS');return match[0];})()`);
+  if (state.imageCandidates>1 || state.selectors>1) throw error('MULTIPLE_IMAGES_REQUIRE_REVIEW');
+  if (state.generating || state.count===0) return { taskId:request.requestId,status:'processing',resultUrls:[],raw:{transport:'opencli/v1',conversationUrl:saved.conversationUrl,observedImages:state.count} };
+  // Re-read the exact conversation/prompt and its unique generated image in the
+  // same evaluation as original-byte matching; never download an arbitrary blob.
+  const asset=await p.evaluate(originalImageReadCode(saved.prompt,saved.conversationUrl,saved.accountKey));
   const bytes = Buffer.from(asset.dataUrl.replace(/^data:[^;]+;base64,/,''), 'base64');
   if (asset.mime !== 'image/png' || sha(bytes) !== asset.sha256 || bytes.length !== asset.bytes || bytes.subarray(0,8).toString('hex') !== '89504e470d0a1a0a') throw error('ORIGINAL_BYTES_INVALID');
   const file = path.join(loc.dir, asset.sha256 + '.png'); if (!fs.existsSync(file)) fs.writeFileSync(file, bytes, { flag:'wx', mode:0o600 });

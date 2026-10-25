@@ -22,7 +22,7 @@ function pageFor(saved,loc,{filled=true,ready=true,confirm=true,lostClickAck=fal
     if(code.includes('return{ok:actual.ok,token:s.token,prompt:actual.text}'))return{ok:filled,token:saved.requestId,prompt:filled?saved.prompt:''};
     if(code.includes("reason:'send_button_not_unique_or_ready'"))return ready?{ok:true,token:saved.requestId,prompt:saved.prompt,url:'https://chatgpt.com/'}:{ok:false};
     if(code.includes('s.clicked=true;')){state.intentObserved=!!JSON.parse(fs.readFileSync(loc.file)).sendIntent;assert.equal(state.intentObserved,true);state.clickCalls++;if(lostClickAck)throw Error('synthetic click ack lost');return{clicked:true};}
-    if(code.includes('texts:users.map'))return{url:confirm?'https://chatgpt.com/c/1234-abcd':'https://chatgpt.com/',texts:confirm?[saved.prompt]:[]};
+    if(code.includes('const readOwnedConversationDom='))return{url:confirm?'https://chatgpt.com/c/1234-abcd':'https://chatgpt.com/',userCount:confirm?1:0,promptMatched:confirm};
     throw Error('Unexpected synthetic evaluation');
   }};
 }

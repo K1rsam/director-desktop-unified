@@ -8,22 +8,28 @@ const COMPILED_RUNTIME_PIN: &str = include_str!("../../../../../web-image-bridge
 // Future runtimes must explicitly review their compatibility before adding a pair.
 const READ_ONLY_READER_MIGRATIONS: &[(&str, &str)] = &[(
     "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
-    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 ), (
     "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
-    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 ), (
     "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
-    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 ), (
     "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
-    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 ), (
     "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
-    "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 ), (
     "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+), (
     "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+), (
+    "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2",
+    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
 )];
 
 pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
@@ -35,6 +41,21 @@ pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
 // They are not in reader_policy and cannot select or execute an old reader.
 pub(crate) fn read_only_reader_audit_allowed(from: &str, to: &str) -> bool {
     read_only_reader_migration_allowed(from,to)
+        || (to=="6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+                "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+                "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"].contains(&from))
+        || (to=="c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+                "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6"].contains(&from))
         || (to=="f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70"
             && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
                 "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
@@ -204,8 +225,13 @@ fn setup_view(c:&ProviderConfig,result:ProviderResult<Value>)->Value {
     let browser_kind=result.as_ref().ok().and_then(|v|v["browserKind"].as_str()).filter(|k|["chrome","edge"].contains(k))
         .or_else(||c.browser_transport.as_ref().and_then(|t|t["browserKind"].as_str()).filter(|k|["chrome","edge"].contains(k))).map(str::to_owned);
     let (state,message,clients,usable,code)=match result {
-        Ok(data) if data["ready"]==true && configured=>("ready","已连接，可以到第二阶段选择资产并生成图片。".to_owned(),1,1,String::new()),
+        Ok(data) if data["ready"]==true && configured=>("ready","已连接，可以到第三阶段选择资产并生成图片。".to_owned(),1,1,String::new()),
         Ok(_)=>("unconfigured","浏览器已就绪，点击“连接并检查”保存连接。".to_owned(),1,0,String::new()),
+        // The bridge reaches this error only after daemon/profile health and a
+        // successful owned-tab listing. The extension is connected; the work
+        // page is absent. Do not tell the user to reinstall/reload the bridge.
+        Err(e) if e.code=="OPENCLI_OWNED_PAGE_REQUIRED"=>("waiting_page",e.message,1,0,e.code),
+        Err(e) if matches!(e.code.as_str(),"BROWSER_NETWORK_UNAVAILABLE"|"AUTH_REQUIRED"|"BROWSER_CHECK_REQUIRED"|"CHATGPT_PAGE_LOADING"|"CHATGPT_ACCOUNT_LOAD_FAILED"|"ACCOUNT_CHANGED"|"BROWSER_KIND_MISMATCH")=>(if e.code=="BROWSER_NETWORK_UNAVAILABLE"{"network_unavailable"}else{"waiting_browser"},e.message,1,0,e.code),
         Err(e)=>(if e.code=="BRIDGE_BUSY"{"busy"}else if e.code=="BROWSER_SELECTION_REQUIRED"{"needs_selection"}else if e.code=="BROWSER_NETWORK_UNAVAILABLE"{"network_unavailable"}else{"waiting_browser"},e.message,0,0,e.code),
     };
     let mut value=json!({"schemaVersion":"chrome-setup/v1","installed":true,"configured":configured,"componentVersion":"OpenCLI 1.8.8 / Bridge 1.0.24","status":state,"message":message,"clients":clients,"usableClients":usable,"checkedAt":now(),"browserProfiles":[],"transport":"opencli","errorCode":code});
@@ -274,10 +300,11 @@ fn connection_error_message(code:&str)->&'static str {
         "BROWSER_NETWORK_UNAVAILABLE"=>"浏览器暂时无法访问 ChatGPT，请检查网络或浏览器代理，确认网页可正常打开后再连接；无需重载扩展或重新登录。",
         "BROWSER_CHECK_REQUIRED"=>"ChatGPT 网页需要完成网站检查，请在所选浏览器中正常完成后再连接。",
         "CHATGPT_PAGE_LOADING"=>"ChatGPT 页面尚未加载完成，请等待网页打开后再连接。",
+        "CHATGPT_ACCOUNT_LOAD_FAILED"=>"浏览器组件已连接，但 ChatGPT 网页暂时无法加载账户。请先在该页点击“重试”，必要时检查网络；页面恢复后重新检查。已有任务保留，未发送图片生成，无需重载扩展。",
         "BROWSER_KIND_MISMATCH"=>"当前浏览器类型与保存的绑定不同，请在全局设置选择正确浏览器后重新连接；已有任务保留原绑定。",
         "OPENCLI_BROWSER_NOT_CONNECTED"=>"未找到所选浏览器的可用连接，请打开该浏览器、登录 ChatGPT 并确认已安装组件。",
         "LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。",
-        "OPENCLI_OWNED_PAGE_REQUIRED"=>"请先在所选浏览器打开 ChatGPT 网页，再点击“连接并检查”。",
+        "OPENCLI_OWNED_PAGE_REQUIRED"=>"浏览器组件已连接，尚未建立专属工作页。点击“连接并检查”即可在后台打开工作页并核对原登录账户，无需重载扩展。",
         "OWNED_NO_CLICK_UNPROVEN"=>"旧网页任务的未发送证明未通过校验，已保留原任务；未提交新的图片生成。",
         _=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。",
     }
@@ -367,6 +394,27 @@ mod tests {
         assert_eq!(v["browserKind"],"chrome","observed browser takes precedence over stale display metadata");
     }
     #[test]
+    fn connected_extension_without_owned_page_is_not_reported_as_disconnected() {
+        let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"saved","accountKey":"digest"}})).unwrap();
+        let v=setup_view(&c,Err(ProviderError::new("OPENCLI_OWNED_PAGE_REQUIRED",connection_error_message("OPENCLI_OWNED_PAGE_REQUIRED"))));
+        assert_eq!(v["status"],"waiting_page");
+        assert_eq!(v["clients"],1);
+        assert_eq!(v["usableClients"],0,"connection does not prove page/auth/generation readiness");
+        assert_eq!(v["configured"],true);
+        assert!(v["message"].as_str().unwrap().contains("后台打开工作页"));
+        assert!(!v.to_string().contains("accountKey"));
+        let disconnected=setup_view(&c,Err(ProviderError::new("OPENCLI_BROWSER_NOT_CONNECTED",connection_error_message("OPENCLI_BROWSER_NOT_CONNECTED"))));
+        assert_eq!(disconnected["status"],"waiting_browser");
+        assert_eq!(disconnected["clients"],0);
+        assert_eq!(disconnected["usableClients"],0);
+        for code in ["BROWSER_NETWORK_UNAVAILABLE","AUTH_REQUIRED","BROWSER_CHECK_REQUIRED","CHATGPT_PAGE_LOADING","ACCOUNT_CHANGED","BROWSER_KIND_MISMATCH"] {
+            let gated=setup_view(&c,Err(ProviderError::new(code,connection_error_message(code))));
+            assert_eq!(gated["clients"],1,"{code} requires a connected extension and a page response");
+            assert_eq!(gated["usableClients"],0,"{code} must still block generation readiness");
+            assert_ne!(gated["status"],"ready");
+        }
+    }
+    #[test]
     fn recovery_routes_to_original_opencli_and_holds_any_possible_send() {
         let t=tempfile::tempdir().unwrap();
         let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","stateRoot":t.path(),"runner":t.path().join("missing.mjs"),"runtimeSha256":"a".repeat(64)}})).unwrap();
@@ -380,6 +428,14 @@ mod tests {
     }
     #[test] fn ready_status_matches_shared_ui_fixture(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();let v=setup_view(&c,Ok(json!({"ready":true})));let fixture:Value=serde_json::from_str(include_str!("../../../src/fixtures/web-image-status.json")).unwrap();for(key,value)in fixture.as_object().unwrap(){assert_eq!(&v[key],value,"public UI field {key}");}}
     #[test] fn setup_status_matches_frontend_contract_in_ready_waiting_and_busy_states(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"synthetic"}})).unwrap();for result in [Ok(json!({"ready":true})),Err(ProviderError::new("AUTH_REQUIRED","请登录")),Err(ProviderError::new("BRIDGE_BUSY","请等待"))]{let v=setup_view(&c,result);assert_eq!(v["schemaVersion"],"chrome-setup/v1");assert_eq!(v["configured"],true);assert_eq!(v["installed"],true);assert!(v["clients"].as_u64().unwrap()>=v["usableClients"].as_u64().unwrap());assert!(v.get("version").is_none());assert!(!v.to_string().contains("accountKey"));}}
+    #[test] fn account_load_failure_preserves_extension_connection_without_claiming_logout_or_busy(){
+        let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"synthetic","accountKey":"private-account","browserKind":"chrome"}})).unwrap();
+        let code="CHATGPT_ACCOUNT_LOAD_FAILED";let error=ProviderError::new(code,connection_error_message(code));
+        assert!(!error.auth_required);assert!(!error.submission_unknown);
+        let status=setup_view(&c,Err(error));assert_eq!(status["clients"],1);assert_eq!(status["usableClients"],0);assert_eq!(status["configured"],true);
+        assert_eq!(status["status"],"waiting_browser");assert_eq!(status["errorCode"],code);assert_eq!(status["browserKind"],"chrome");
+        assert!(s(&status,"message").contains("重试"));assert!(!status.to_string().contains("private-account"));
+    }
     #[test] fn legacy_snapshots_do_not_switch_transport(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome"})).unwrap();assert!(!enabled(&c));let raw=serde_json::to_value(&c).unwrap();assert!(raw.get("browserTransport").is_none());}
     #[test] fn frozen_transport_roundtrips_unchanged(){let raw=json!({"kind":"chrome","browserTransport":{"transport":"opencli/v1","profile":"bound","stateRoot":"synthetic","accountKey":"original"}});let c:ProviderConfig=serde_json::from_value(raw.clone()).unwrap();assert!(enabled(&c));assert_eq!(serde_json::to_value(c).unwrap()["browserTransport"],raw["browserTransport"]);}
     #[test] fn video_is_rejected_before_invoking_any_component(){let c:ProviderConfig=serde_json::from_value(json!({"kind":"chrome"})).unwrap();let r:GenerationRequest=serde_json::from_value(json!({"requestId":"synthetic","kind":"video","model":"x","prompt":"x","ratio":"16:9","resolution":"native","references":[],"options":{}})).unwrap();assert_eq!(prepare(&c,&r).unwrap_err().code,"IMAGE_ONLY");}

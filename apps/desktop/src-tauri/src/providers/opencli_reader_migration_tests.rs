@@ -56,12 +56,14 @@ fn response(request: &GenerationRequest) -> Value {
 #[test]
 fn reader_policy_allows_only_the_reviewed_old_and_current_pin_pairs() {
     assert_eq!(READ_ONLY_READER_MIGRATIONS, &[
-        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
-        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
-        ("d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
-        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
-        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
-        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6", "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057"),
+        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
     ]);
     for (from,to) in READ_ONLY_READER_MIGRATIONS {assert!(read_only_reader_migration_allowed(from,to));}
     assert!(!read_only_reader_migration_allowed(&"f".repeat(64),COMPILED_RUNTIME_PIN.trim()));
@@ -255,4 +257,28 @@ fn reader_audit_never_overwrites_an_existing_provider_proof_or_migration_field()
         let error=query_with_reader(&c,&r,"query",ReaderPolicy{compiled_pin:&new.pin,migrations:&pairs},||vec![new.runner.clone()],|_,operation,_|{assert_eq!(operation,"query");Ok(reply.clone())}).unwrap_err();
         assert_eq!(error.code,"OPENCLI_PACKET");assert_eq!(json!(c),before);
     }
+}
+
+#[test]
+fn original_preflight_reader_audits_survive_account_failure_reader_upgrade() {
+    let prior="c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057";
+    for (source,_) in &READ_ONLY_READER_MIGRATIONS[..6] {
+        assert!(read_only_reader_audit_allowed(source,prior));
+        assert!(!read_only_reader_migration_allowed(source,prior));
+    }
+    assert!(read_only_reader_migration_allowed(prior,COMPILED_RUNTIME_PIN.trim()));
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),prior));
+    assert!(!read_only_reader_audit_allowed(prior,prior));
+}
+
+#[test]
+fn account_failure_reader_audits_survive_passive_dom_recovery_upgrade() {
+    let prior="6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2";
+    for (source,_) in &READ_ONLY_READER_MIGRATIONS[..7] {
+        assert!(read_only_reader_audit_allowed(source,prior));
+        assert!(!read_only_reader_migration_allowed(source,prior));
+    }
+    assert!(read_only_reader_migration_allowed(prior,COMPILED_RUNTIME_PIN.trim()));
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),prior));
+    assert!(!read_only_reader_audit_allowed(prior,prior));
 }
