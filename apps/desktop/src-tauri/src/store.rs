@@ -49,6 +49,26 @@ pub fn hash_file(path: &Path) -> Result<(String, u64)> {
 pub struct Store {
     pub root: PathBuf,
 }
+
+fn open_database(path: &Path, flags: rusqlite::OpenFlags) -> Result<Connection> {
+    #[cfg(windows)]
+    {
+        // SQLite's Win32 calls do not add the extended path prefix for journal,
+        // WAL, or SHM files. Even a database shorter than MAX_PATH can fail when
+        // a sidecar suffix crosses it. Keep the public project path unchanged;
+        // resolve only the native database path and retain normal file locking.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let native = fs::canonicalize(parent)
+            .map_err(|e| e.to_string())?
+            .join(path.file_name().ok_or("数据库路径缺少文件名")?);
+        Connection::open_with_flags_and_vfs(native, flags, "win32-longpath").map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Connection::open_with_flags(path, flags).map_err(|e| e.to_string())
+    }
+}
+
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -137,7 +157,7 @@ impl Store {
         Ok(this)
     }
     pub fn conn(&self) -> Result<Connection> {
-        let c = Connection::open(self.root.join("project.sqlite")).map_err(|e| e.to_string())?;
+        let c = open_database(&self.root.join("project.sqlite"), rusqlite::OpenFlags::default()).map_err(|e| e.to_string())?;
         c.busy_timeout(Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         c.pragma_update(None, "foreign_keys", "ON")
@@ -1304,8 +1324,8 @@ impl Store {
     /// a fully bound legacy preparation can be excluded; malformed/unknown
     /// transports and every unresolved OpenCLI request still hold this lane.
     pub fn chrome_image_blocker_scoped(root: &Path, project_id: &str, except_job: &str, opencli: bool) -> Result<Option<String>> {
-        let connection = Connection::open_with_flags(
-            root.join("project.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        let connection = open_database(
+            &root.join("project.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ).map_err(|e| format!("无法核对 Chrome 原任务：{e}"))?;
         connection.busy_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?;
         let actual: String = connection.query_row("SELECT id FROM project LIMIT 1", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -1719,7 +1739,7 @@ impl Store {
             fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
         let source = self.conn()?;
-        let mut dest = Connection::open(target).map_err(|e| e.to_string())?;
+        let mut dest = open_database(target, rusqlite::OpenFlags::default()).map_err(|e| e.to_string())?;
         rusqlite::backup::Backup::new(&source, &mut dest)
             .map_err(|e| e.to_string())?
             .run_to_completion(32, Duration::from_millis(5), None)
@@ -2580,6 +2600,10 @@ pub fn atomic_json(path: &Path, value: &Value) -> Result<()> {
         Ok(())
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "store_windows_path_tests.rs"]
+mod windows_path_tests;
 
 #[cfg(test)]
 mod tests {
