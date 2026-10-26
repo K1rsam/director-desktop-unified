@@ -90,6 +90,8 @@ function ownedTerminalJournal(saved, proof) {
   // ownedPreSendJournal remains current-only, so old unknowns cannot be settled.
   return (proof.runtimeSha256===fs.readFileSync(new URL('./runtime.sha256',import.meta.url),'utf8').trim()
       && proof.composerAdapterSha256===composerAdapterSha256)
+    || (['5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab','aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557','21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59'].includes(proof.runtimeSha256)
+      && proof.composerAdapterSha256==='34c8b2f90ab81e15dab5df56e5c21a89b2be1c1b9393cc4527bfa34c8a6b3766')
     || (proof.runtimeSha256==='f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70'
       && proof.composerAdapterSha256==='0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65')
     || (['54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0','afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6','c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057','6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2'].includes(proof.runtimeSha256)
@@ -97,8 +99,9 @@ function ownedTerminalJournal(saved, proof) {
 }
 export function ownedNewPagePreflight(observed, expected) {
   const held=reason=>({ok:false,reason});
-  if(expected?.newPageVerified!==true || !expected.page || observed.page!==expected.page
-      || (observed.ownerToken!=null&&observed.ownerToken!==expected.requestId))return held('not_owned_new_page');
+  const reused=expected?.reusedEmptyPageVerified===true&&typeof expected.previousRequestId==='string';
+  if((expected?.newPageVerified!==true&&!reused) || !expected.page || observed.page!==expected.page
+      || (observed.ownerToken!=null&&observed.ownerToken!==expected.requestId&&!(reused&&observed.ownerToken===expected.previousRequestId)))return held('not_owned_new_page');
   if(!['https://chatgpt.com/','https://chatgpt.com/new'].includes(observed.url))return held('not_new_conversation_url');
   if(observed.userCount!==0||observed.assistantCount!==0)return held('existing_conversation');
   if(observed.generating!==false)return held('page_generating');
@@ -107,19 +110,21 @@ export function ownedNewPagePreflight(observed, expected) {
   if(!expected.accountKey||observed.accountKey!==expected.accountKey)return held('account_changed');
   if(observed.logical?.ok!==true||typeof observed.logical.text!=='string')return held('logical_text_unrecognized');
   if(observed.logical.text==='')return{ok:true,mode:'empty'};
-  if(typeof expected.prompt==='string'&&expected.prompt&&observed.logical.text===expected.prompt)return{ok:true,mode:'exact_prompt_draft'};
+  if(!reused&&typeof expected.prompt==='string'&&expected.prompt&&observed.logical.text===expected.prompt)return{ok:true,mode:'exact_prompt_draft'};
   return held('different_draft');
 }
 export function ownedNewPagePreflightCode() {
   return `(()=>{const logicalComposerText=${logicalComposerText.toString()};const visible=n=>n instanceof HTMLElement&&n.getClientRects().length>0&&!n.closest('[hidden],[aria-hidden="true"]')&&getComputedStyle(n).display!=='none'&&getComputedStyle(n).visibility!=='hidden';const nodes=[...new Set([...document.querySelectorAll('#prompt-textarea,[data-testid="prompt-textarea"],[contenteditable="true"][role="textbox"]')])].filter(visible);const c=nodes.length===1?nodes[0]:null;return{url:location.href,userCount:document.querySelectorAll('[data-turn=user],[data-message-author-role=user],.bg-user-message').length,assistantCount:document.querySelectorAll('[data-message-author-role=assistant]').length,generating:${activeCode},visibleComposers:nodes.length,embeddedChips:c?c.querySelectorAll('[contenteditable="false"]').length:null,ownerToken:c?c.getAttribute('data-director-owned-composer'):null,logical:c?logicalComposerText(c):{ok:false}};})()`;
 }
-export async function verifyOwnedNewPagePreflight(page,saved,loc,newPageVerified,identity=browserIdentity) {
-  const expected={newPageVerified,page:saved.page,requestId:saved.requestId,accountKey:saved.accountKey,prompt:saved.prompt};
+export async function verifyOwnedNewPagePreflight(page,saved,loc,newPageVerified,identity=browserIdentity,reuse=null) {
+  const expected={newPageVerified,page:saved.page,requestId:saved.requestId,accountKey:saved.accountKey,prompt:saved.prompt,
+    reusedEmptyPageVerified:reuse?.version==='opencli-reused-empty-page/v1',previousRequestId:reuse?.previousRequestId};
   for(let i=0;i<15;i++) {
     const observed={...await page.evaluate(ownedNewPagePreflightCode()),page:page.getActivePage()};
     if(observed.visibleComposers===1)observed.accountKey=(await identity(page)).accountKey;
     const validation=ownedNewPagePreflight(observed,expected);
     saved.preSendValidation={version:'owned-new-page-preflight/v1',page:observed.page,newPageVerified,url:observed.url,
+      pageOrigin:expected.reusedEmptyPageVerified?'proven_not_submitted_empty_page':'new_tab',
       userCount:observed.userCount,assistantCount:observed.assistantCount,generating:observed.generating,visibleComposers:observed.visibleComposers,embeddedChips:observed.embeddedChips,
       accountVerified:observed.accountKey===expected.accountKey,logicalRecognized:observed.logical?.ok===true,
       logicalUtf16:typeof observed.logical?.text==='string'?observed.logical.text.length:null,
@@ -137,6 +142,18 @@ function noOwnedProofSendMarkers(value, depth=0) {
   if(value&&typeof value==='object')return Object.entries(value).every(([key,item])=>!['sentAt','sendConfirmed','sendIntent','conversationUrl'].includes(key)&&noOwnedProofSendMarkers(item,depth+1));
   return true;
 }
+export function notSubmittedMessage(code) {
+  const reason={BROWSER_CHECK_REQUIRED:'ChatGPT 网站检查暂时未通过；原页恢复后可继续制作，无需修改提示词。',
+    BROWSER_NETWORK_UNAVAILABLE:'网页网络暂时不可用；网络恢复后可继续制作。',
+    CHATGPT_PAGE_LOADING:'网页尚未加载完成；原页就绪后可继续制作。',
+    CHATGPT_ACCOUNT_LOAD_FAILED:'网页账户暂时未加载完成；账户恢复后可继续制作。',
+    AUTH_REQUIRED:'网页需要登录；恢复原账户后可继续制作。',ACCOUNT_CHANGED:'网页账户与冻结账户不同；恢复原账户后可继续制作。',
+    EMPTY_PREFLIGHT:'专属空白工作页尚未准备完成；原页就绪后可继续制作。',
+    COMPOSER_NOT_READY:'网页输入框尚未就绪；原页恢复后可继续制作。',
+    COMPOSER_TEXT_UNCONFIRMED:'网页未能完整确认已准备的提示词；原文与失败记录均保留。',
+    SEND_BUTTON_NOT_READY:'网页发送按钮尚未就绪；原页恢复后可继续制作。'}[code];
+  return '未提交：'+(reason||'网页准备中断；原失败记录保留。')+' 已核实本程序没有调用发送。';
+}
 function notSubmittedResult(request,saved,loc) {
   const proof={...saved.notSubmittedProof,journalAfterSha256:sha(fs.readFileSync(loc.file))};
   if (proof.version==='opencli-owned-pre-send-not-submitted/v2') {
@@ -145,7 +162,7 @@ function notSubmittedResult(request,saved,loc) {
         || proof.sendMarkerAbsent!==true || proof.sendConfirmedAbsent!==true || proof.conversationUrlAbsent!==true
         || proof.clickCalls!==0 || !/^[a-f0-9]{64}$/.test(proof.runtimeSha256||'') || !/^[a-f0-9]{64}$/.test(proof.journalBeforeSha256||'')
         || proof.journalBeforeSha256===proof.journalAfterSha256 || proof.checks?.length!==2 || !proof.checks.every(c=>ownedCheckValid(c,saved))) throw error('OWNED_NO_CLICK_UNPROVEN');
-    return {taskId:request.requestId,status:'failed',resultUrls:[],error:'未提交：提示词或发送按钮准备未通过，已核实本程序没有调用发送；原记录保留。',raw:{transport:'opencli/v1',requestHash:saved.requestHash,opencliNotSubmitted:proof,taskSettlement:{id:request.requestId,status:'failed',reason:'not_submitted'}}};
+    return {taskId:request.requestId,status:'failed',resultUrls:[],error:notSubmittedMessage(saved.error),raw:{transport:'opencli/v1',requestHash:saved.requestHash,preSendFailureCode:typeof saved.error==='string'&&/^[A-Z_]{1,80}$/.test(saved.error)?saved.error:'PRE_SEND_INTERRUPTED',opencliNotSubmitted:proof,taskSettlement:{id:request.requestId,status:'failed',reason:'not_submitted'}}};
   }
   if (!preSendJournal(saved) || saved.status!=='not_submitted' || saved.requestId!==request.requestId || requestHash(saved.request)!==saved.requestHash || proof.requestId!==request.requestId || proof.requestHash!==saved.requestHash
       || proof.version!=='opencli-pre-send-not-submitted/v1' || !/^[a-f0-9]{64}$/.test(proof.runtimeSha256||'') || !/^[a-f0-9]{64}$/.test(proof.journalBeforeSha256||'') || proof.journalBeforeSha256===proof.journalAfterSha256
@@ -321,6 +338,44 @@ export function activeOwner(loc, requestId) {
     notSubmittedResult(saved.request,saved,{file:previous});
   }
 }
+// A public retry may reuse only its exact, proven no-click empty work page.
+// This function only reads the old journal and browser; it never opens a tab,
+// fills a composer, invokes send, mutates the old record or changes UI focus.
+export async function reuseProvenEmptyPage(config,request,page,identity=browserIdentity) {
+  const previousId=request.options?.retryOfRequestId;
+  if(previousId===undefined)return null;
+  if(typeof previousId!=='string'||!/^[a-zA-Z0-9_-]{1,100}$/.test(previousId)||previousId===request.requestId)throw error('INVALID_RETRY_IDENTITY');
+  if(!path.isAbsolute(config.stateRoot)||fs.lstatSync(config.stateRoot).isSymbolicLink())throw error('INVALID_STATE_PATH');
+  const root=fs.realpathSync(config.stateRoot),dir=path.join(root,previousId),file=path.join(dir,'request.json');
+  if(!fs.existsSync(file))return null;
+  if(fs.lstatSync(dir).isSymbolicLink()||fs.lstatSync(file).isSymbolicLink()||path.dirname(fs.realpathSync(file))!==dir)throw error('INVALID_STATE_PATH');
+  const bytes=fs.readFileSync(file),saved=JSON.parse(bytes),proof=saved.notSubmittedProof;
+  if(saved.requestId!==previousId||proof?.version!=='opencli-owned-pre-send-not-submitted/v2')throw error('OWNED_NO_CLICK_UNPROVEN');
+  notSubmittedResult(saved.request,saved,{file});
+  if(saved.profile!==config.profile)throw error('RETRY_PROFILE_CHANGED');
+  if(!config.accountKey||saved.accountKey!==config.accountKey)throw error('ACCOUNT_CHANGED');
+  const archiveName=`owned-pre-send-${proof.journalBeforeSha256}.json`,archive=path.join(dir,archiveName);
+  if(proof.journalBeforeArchive!==archiveName||!fs.existsSync(archive)||fs.lstatSync(archive).isSymbolicLink()
+      ||sha(fs.readFileSync(archive))!==proof.journalBeforeSha256)throw error('OWNED_NO_CLICK_UNPROVEN');
+  const tabs=await page.tabs();if(tabs.filter(tab=>tab.page===saved.page).length!==1)return null;
+  page.setActivePage(saved.page);
+  const checks=[];
+  for(let i=0;i<2;i++) {
+    const observed={...await page.evaluate(ownedNewPagePreflightCode()),page:page.getActivePage(),accountKey:(await identity(page)).accountKey};
+    if(observed.accountKey!==saved.accountKey)throw error('ACCOUNT_CHANGED');
+    if(!fs.readFileSync(file).equals(bytes))throw error('RETRY_JOURNAL_CHANGED');
+    const gate=ownedNewPagePreflight(observed,{reusedEmptyPageVerified:true,previousRequestId:previousId,page:saved.page,requestId:request.requestId,accountKey:saved.accountKey});
+    if(!gate.ok||gate.mode!=='empty')return null;
+    checks.push({page:observed.page,url:observed.url,userCount:observed.userCount,assistantCount:observed.assistantCount,
+      generating:observed.generating,visibleComposers:observed.visibleComposers,embeddedChips:observed.embeddedChips,
+      ownerToken:observed.ownerToken,accountVerified:true,logicalEmpty:true});
+  }
+  return {version:'opencli-reused-empty-page/v1',page:saved.page,previousRequestId:previousId,previousRequestHash:saved.requestHash,
+    previousJournalSha256:sha(bytes),clickCalls:0,checks};
+}
+function verifyRetryJournalUnchanged(loc,reuse) {
+  if(reuse&&sha(fs.readFileSync(path.join(loc.root,reuse.previousRequestId,'request.json')))!==reuse.previousJournalSha256)throw error('RETRY_JOURNAL_CHANGED');
+}
 async function submit(config, request) {
   validateRequest(request); const loc = paths(config, request.requestId), hash = requestHash(request);
   // Exclusive journal is the durable at-most-once send gate, even after process death.
@@ -329,13 +384,18 @@ async function submit(config, request) {
   // Rust holds the shared OS command lease; it releases automatically after a crash.
   // Only this brief local lock is removed; active.json deliberately survives unknown work.
   let saved = { version: 'opencli-task/v1', requestId: request.requestId, requestHash: hash, request, profile: ready.profile, accountKey: ready.accountKey, prompt: webImagePrompt(request), status: 'preparing', createdAt: new Date().toISOString(), page: null, conversationUrl: null, ownedSend:{version:OWNED_SEND_PROTOCOL,adapterSha256:composerAdapterSha256,token:request.requestId} };
-  let p;
+  const p=session(ready.profile);
+  const reusedEmptyPage=await reuseProvenEmptyPage({...config,profile:ready.profile,accountKey:ready.accountKey},request,p);
   try {
     activeOwner(loc, request.requestId);
     fs.writeFileSync(loc.file, JSON.stringify(saved), { flag: 'wx', mode: 0o600 }); atomic(loc.active, { requestId: request.requestId, profile: ready.profile });
-    p = session(ready.profile); const priorPages=new Set((await p.tabs()).map(tab=>tab.page));
-    saved.page = await p.newTab('https://chatgpt.com/new'); atomic(loc.file, saved); if (!saved.page) throw error('TAB_OPEN_UNKNOWN', true);
-    p.setActivePage(saved.page);await verifyOwnedNewPagePreflight(p,saved,loc,!priorPages.has(saved.page));
+    const priorPages=new Set((await p.tabs()).map(tab=>tab.page));
+    saved.page = reusedEmptyPage?.page||await p.newTab('https://chatgpt.com/new');
+    if(reusedEmptyPage)saved.reusedEmptyPage=reusedEmptyPage;
+    atomic(loc.file, saved); if (!saved.page) throw error('TAB_OPEN_UNKNOWN', true);
+    verifyRetryJournalUnchanged(loc,reusedEmptyPage);
+    p.setActivePage(saved.page);await verifyOwnedNewPagePreflight(p,saved,loc,!reusedEmptyPage&&!priorPages.has(saved.page),browserIdentity,reusedEmptyPage);
+    verifyRetryJournalUnchanged(loc,reusedEmptyPage);
     if (request.references.length) { const refs = [...request.references].sort((a,b) => a.order - b.order); const upload = await uploadChatGPTImages({setFileInput:()=>attachReferenceFiles(p,refs,request.requestId),evaluate:p.evaluate.bind(p),sleep:p.sleep.bind(p)},refs.map(r => r.path)); if (!upload?.ok) throw error('REFERENCE_UPLOAD_UNCONFIRMED', true); }
     await submitOwnedComposer(p,saved,loc);
     atomic(loc.file, saved); return { taskId: request.requestId, status: 'processing', resultUrls: [], raw: { transport: 'opencli/v1', requestHash: hash } };
@@ -381,6 +441,35 @@ export function recordPassiveObservation(config,saved,loc,state,journalBefore) {
 }
 // Runs only inside the bound page. Credentials stay inside the browser and only
 // a verified original image is returned. No conversation API or send endpoint.
+export function ownedOriginalFileReference(img) {
+  // Resource timing entries can be evicted or cleared while the original blob
+  // remains displayed. Read only the rendered image's own component ancestry,
+  // never a global conversation store or arbitrary file ID elsewhere on page.
+  const boundary=img.closest('[data-testid="generated-image-gallery"]')||img.closest('button[data-testid="generated-image-preview"]');
+  const keys=Object.keys(img).filter(k=>k.startsWith('__reactFiber'));
+  if(!boundary||keys.length===0)return null;
+  if(keys.length!==1)throw Error('ORIGINAL_FILE_BINDING_UNCONFIRMED');
+  const references=new Set();let fiber=img[keys[0]];
+  for(let depth=0;depth<12&&fiber;depth++,fiber=fiber.return) {
+    const node=fiber.stateNode;
+    if(node?.nodeType===1&&node!==img&&!boundary.contains(node))break;
+    const p=fiber.memoizedProps,source=p?.image?.src;
+    if(typeof source!=='string'||!source.startsWith('sediment://'))continue;
+    if(!/^sediment:\/\/file_[a-z0-9]+$/.test(source)||p.fullSrc!==source||p.src!==source)throw Error('ORIGINAL_FILE_BINDING_UNCONFIRMED');
+    references.add(source.slice('sediment://'.length));
+  }
+  if(references.size>1)throw Error('ORIGINAL_FILE_BINDING_UNCONFIRMED');
+  return references.size===1?[...references][0]:null;
+}
+export function originalReadError(cause) {
+  const message=String(cause?.message||'');
+  const codes=['BROWSER_CHECK_REQUIRED','AUTH_REQUIRED','ACCOUNT_CHANGED','ORIGINAL_GENERATION_ACTIVE',
+    'ORIGINAL_PROMPT_UNCONFIRMED','ORIGINAL_IMAGE_UNCONFIRMED','ORIGINAL_PREVIEW_UNAVAILABLE',
+    'ORIGINAL_FILE_IDENTITY','ORIGINAL_FILE_BINDING_UNCONFIRMED','ORIGINAL_FILE_HOST',
+    'ORIGINAL_FILE_AMBIGUOUS','ORIGINAL_IMAGE_CHANGED'];
+  const code=codes.find(code=>cause?.code===code||new RegExp('\\b'+code+'\\b').test(message));
+  return error(code||'OPENCLI_ORIGINAL_READ_FAILED');
+}
 export async function readOwnedOriginalImage(expected,conversationUrl,expectedAccount) {
   const inspect=()=>{
     const state=readOwnedConversationDom(expected);
@@ -389,20 +478,20 @@ export async function readOwnedOriginalImage(expected,conversationUrl,expectedAc
     if(state.imageCandidates!==1||state.images.length!==1||state.selectors>1)throw Error('ORIGINAL_IMAGE_UNCONFIRMED');
     return state.images[0];
   };
-  const img=inspect(),source=img.currentSrc||img.src;
+  const img=inspect(),source=img.currentSrc||img.src,boundFile=ownedOriginalFileReference(img);
   const fetchRead=(url,options={})=>fetch(url,{...options,signal:AbortSignal.timeout(8000)});
   const hash=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(b=>b.toString(16).padStart(2,'0')).join('');
   const previewReply=await fetchRead(source);if(!previewReply.ok)throw Error('ORIGINAL_PREVIEW_UNAVAILABLE');
   const preview=await previewReply.arrayBuffer(),wanted=await hash(preview);
-  const urls=[...new Map(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>{
+  const urls=boundFile?[new URL('/backend-api/files/download/'+boundFile,location.origin).href]:[...new Map(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>{
     try{const parsed=new URL(u);return parsed.origin===location.origin&&/^\/backend-api\/files\/download\/file_[a-z0-9]+$/.test(parsed.pathname);}catch{return false;}
   }).map(u=>[new URL(u).pathname,u])).values()];
   if(!urls.length||urls.length>12)throw Error('ORIGINAL_FILE_IDENTITY');
-  const auth=await fetchRead('/api/auth/session',{credentials:'include'});if(!auth.ok)throw Error('AUTH_REQUIRED');
+  const auth=await fetchRead('/api/auth/session',{credentials:'include'});if(auth.status===403)throw Error('BROWSER_CHECK_REQUIRED');if(!auth.ok)throw Error('AUTH_REQUIRED');
   const session=await auth.json();if(!session.accessToken||typeof session.user?.id!=='string'||!session.user.id)throw Error('AUTH_REQUIRED');
   if(!/^[a-f0-9]{64}$/.test(expectedAccount||'')||await hash(new TextEncoder().encode(session.user.id))!==expectedAccount)throw Error('ACCOUNT_CHANGED');
   const matches=await Promise.all(urls.map(async u=>{
-    const m=await fetchRead(u,{credentials:'include',headers:{Authorization:'Bearer '+session.accessToken}});if(!m.ok)return null;
+    const m=await fetchRead(u,{credentials:'include',headers:{Authorization:'Bearer '+session.accessToken}});if(m.status===403)throw Error('BROWSER_CHECK_REQUIRED');if(!m.ok)return null;
     const v=await m.json();if(typeof v.download_url!=='string')return null;
     const x=new URL(v.download_url);
     if(x.protocol!=='https:'||!['chatgpt.com','files.oaiusercontent.com'].some(h=>x.hostname===h||x.hostname.endsWith('.'+h)))throw Error('ORIGINAL_FILE_HOST');
@@ -413,11 +502,11 @@ export async function readOwnedOriginalImage(expected,conversationUrl,expectedAc
     return{sha256:digest,bytes:b.byteLength,mime:blob.type,fileId:new URL(u).pathname.split('/').pop(),dataUrl};
   }));
   const match=matches.filter(Boolean);if(match.length!==1)throw Error('ORIGINAL_FILE_AMBIGUOUS');
-  const finalImage=inspect();if((finalImage.currentSrc||finalImage.src)!==source)throw Error('ORIGINAL_IMAGE_CHANGED');
+  const finalImage=inspect();if((finalImage.currentSrc||finalImage.src)!==source||ownedOriginalFileReference(finalImage)!==boundFile)throw Error('ORIGINAL_IMAGE_CHANGED');
   return match[0];
 }
 export function originalImageReadCode(prompt,conversationUrl,expectedAccount) {
-  return `(async()=>{const readOwnedConversationDom=${readOwnedConversationDom.toString()};const generationActive=()=>(${activeCode});const readOwnedOriginalImage=${readOwnedOriginalImage.toString()};return readOwnedOriginalImage(${JSON.stringify(prompt)},${JSON.stringify(conversationUrl)},${JSON.stringify(expectedAccount)});})()`;
+  return `(async()=>{const readOwnedConversationDom=${readOwnedConversationDom.toString()};const generationActive=()=>(${activeCode});const ownedOriginalFileReference=${ownedOriginalFileReference.toString()};const readOwnedOriginalImage=${readOwnedOriginalImage.toString()};return readOwnedOriginalImage(${JSON.stringify(prompt)},${JSON.stringify(conversationUrl)},${JSON.stringify(expectedAccount)});})()`;
 }
 async function query(config, request) {
   validateRequest(request,false); const loc = paths(config, request.requestId);
@@ -443,7 +532,7 @@ async function query(config, request) {
   if (state.generating || state.count===0) return { taskId:request.requestId,status:'processing',resultUrls:[],raw:{transport:'opencli/v1',conversationUrl:saved.conversationUrl,observedImages:state.count} };
   // Re-read the exact conversation/prompt and its unique generated image in the
   // same evaluation as original-byte matching; never download an arbitrary blob.
-  const asset=await p.evaluate(originalImageReadCode(saved.prompt,saved.conversationUrl,saved.accountKey));
+  let asset;try{asset=await p.evaluate(originalImageReadCode(saved.prompt,saved.conversationUrl,saved.accountKey));}catch(cause){throw originalReadError(cause);}
   const bytes = Buffer.from(asset.dataUrl.replace(/^data:[^;]+;base64,/,''), 'base64');
   if (asset.mime !== 'image/png' || sha(bytes) !== asset.sha256 || bytes.length !== asset.bytes || bytes.subarray(0,8).toString('hex') !== '89504e470d0a1a0a') throw error('ORIGINAL_BYTES_INVALID');
   const file = path.join(loc.dir, asset.sha256 + '.png'); if (!fs.existsSync(file)) fs.writeFileSync(file, bytes, { flag:'wx', mode:0o600 });

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash,webcrypto} from 'node:crypto';
 import {ownedConversationStateCode,observeOwnedSubmission,OWNED_SEND_PROTOCOL} from './composer-transport.mjs';
-import {activeCode,originalImageReadCode,recordPassiveObservation} from './bridge.mjs';
+import {activeCode,originalImageReadCode,recordPassiveObservation,ownedOriginalFileReference,originalReadError} from './bridge.mjs';
 const url='https://chatgpt.com/c/1234-abcd',prompt='Generate one image only. exact\n完整正文\n保留全部字符';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 // Minimal DOM with real containment/document-order semantics. No browser,
@@ -54,6 +54,39 @@ function fixture({nested=true,collapse=true,gallery=true}={}){
 const state=f=>vm.runInNewContext(ownedConversationStateCode(prompt,activeCode),f.context);
 test('nested user selectors and Show more UI preserve the exact logical prompt',()=>{
   const f=fixture(),s=state(f);assert.equal(s.userCount,1);assert.equal(s.promptMatched,true);assert.equal(s.count,1);assert.equal(s.imageCandidates,1);assert.notEqual(f.bubble.textContent,prompt);
+});
+
+test('a hidden stale SPA main does not hide the unique rendered owned conversation',()=>{
+  const f=fixture(),stale=fixture();stale.main.hiddenRects=true;stale.text.childNodes[0].data='old unrelated prompt';f.document.append(stale.main);
+  const s=state(f);assert.equal(s.userCount,1);assert.equal(s.promptMatched,true);assert.equal(s.count,1);assert.equal(s.imageCandidates,1);
+  f.text.childNodes[0].data+=' ';assert.equal(state(f).promptMatched,false);
+});
+
+test('display, visibility and hidden ancestors exclude stale mains without guessing',()=>{
+  for(const style of [{display:'none',visibility:'visible'},{display:'block',visibility:'hidden'},{display:'block',visibility:'collapse'}]){
+    const f=fixture(),stale=fixture();f.document.append(stale.main);f.context.getComputedStyle=n=>n===stale.main?style:{display:'block',visibility:'visible'};
+    assert.equal(state(f).promptMatched,true);assert.equal(state(f).count,1);
+  }
+  for(const attrs of [{hidden:''},{'aria-hidden':'true'}]){
+    const f=fixture(),stale=fixture();f.document.append(e('section',attrs,[stale.main]));assert.equal(state(f).promptMatched,true);assert.equal(state(f).count,1);
+  }
+});
+
+test('two rendered mains are ambiguous even when only one matches the prompt',()=>{
+  const f=fixture(),other=fixture();other.text.childNodes[0].data='unrelated prompt';f.document.append(other.main);
+  const s=state(f);assert.equal(s.userCount,0);assert.equal(s.promptMatched,false);assert.equal(s.count,0);
+});
+
+test('background document and a boxless ancestor do not discard a rendered main',()=>{
+  const f=fixture();f.document.visibilityState='hidden';f.document.hidden=true;
+  f.document.childNodes=[];const wrapper=e('div',{},[f.main]);wrapper.hiddenRects=true;f.document.append(wrapper);
+  f.context.getComputedStyle=n=>({display:n===wrapper?'contents':'block',visibility:'visible'});
+  const s=state(f);assert.equal(s.userCount,1);assert.equal(s.promptMatched,true);assert.equal(s.count,1);
+});
+
+test('zero rendered mains and unfamiliar role-only containers stay unreadable',()=>{
+  const f=fixture();f.main.hiddenRects=true;assert.equal(state(f).promptMatched,false);assert.equal(state(f).count,0);
+  const g=fixture();g.main.tagName='DIV';g.main.attrs.role='main';assert.equal(state(g).promptMatched,false);assert.equal(state(g).count,0);
 });
 test('new role-less bubble and preview-only image are recognized without assistant roles',()=>{
   const s=state(fixture({nested:false,gallery:false}));assert.equal(s.userCount,1);assert.equal(s.promptMatched,true);assert.equal(s.count,1);
@@ -129,4 +162,53 @@ test('wrong intent, wrong original page, changed conversation or journal cannot 
 
 test('original byte read rechecks the frozen account before official file access',async()=>{
   const f=fixture(),c=originalContext(f);await assert.rejects(vm.runInNewContext(originalImageReadCode(prompt,url,hash('other-account')),c.context),/ACCOUNT_CHANGED/);assert.equal(c.calls.some(u=>u.includes('/files/download/')),false);
+});
+
+function componentBinding(f,ids=['file_one']) {
+  let fiber={stateNode:f.img,memoizedProps:{src:f.img.src},return:null};f.img.__reactFiberFixture=fiber;
+  for(const id of ids){const source='sediment://'+id;fiber.return={memoizedProps:{image:{src:source},fullSrc:source,src:source},return:null};fiber=fiber.return;}
+  return fiber;
+}
+
+test('original read uses only the rendered owned main and remains read-only in a background tab',async()=>{
+  const f=fixture(),stale=fixture();stale.main.hiddenRects=true;f.document.append(stale.main);f.document.hidden=true;f.document.visibilityState='hidden';
+  const c=originalContext(f);componentBinding(f);c.context.performance.getEntriesByType=()=>[];
+  const result=await vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context);
+  assert.equal(result.fileId,'file_one');assert.equal(result.sha256,hash(c.bytes));assert.equal(c.calls.length,4);
+});
+test('original recovery uses exact rendered-image binding after resource timing eviction',async()=>{
+  const f=fixture(),c=originalContext(f);componentBinding(f);c.context.performance.getEntriesByType=()=>[];
+  const result=await vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context);
+  assert.equal(result.fileId,'file_one');assert.equal(result.sha256,hash(c.bytes));assert.equal(c.calls.length,4);
+});
+test('image binding takes precedence over unrelated resource timing file records',async()=>{
+  const f=fixture(),c=originalContext(f,{multiple:true});componentBinding(f);const result=await vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context);
+  assert.equal(result.fileId,'file_one');assert.equal(c.calls.some(u=>u.includes('file_two')),false);
+});
+test('contradictory component sources or multiple file identities fail before fetching',async()=>{
+  for(const mutate of [f=>componentBinding(f,['file_one','file_two']),f=>{componentBinding(f).memoizedProps.fullSrc='sediment://file_other';},f=>componentBinding(f,['file_../escape'])]){
+    const f=fixture(),c=originalContext(f);mutate(f);await assert.rejects(vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context),/ORIGINAL_FILE_BINDING_UNCONFIRMED/);assert.equal(c.calls.length,0);
+  }
+});
+test('component traversal cannot inherit a file from outside the owned gallery',()=>{
+  const f=fixture(),tail=componentBinding(f,[]);tail.return={stateNode:f.main,memoizedProps:{image:{src:'sediment://file_other'},fullSrc:'sediment://file_other',src:'sediment://file_other'}};
+  assert.equal(ownedOriginalFileReference(f.img),null);
+});
+test('original hash and final bound identity remain mandatory with a component reference',async()=>{
+  const f=fixture(),c=originalContext(f,{wrong:true});componentBinding(f);c.context.performance.getEntriesByType=()=>[];
+  await assert.rejects(vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context),/ORIGINAL_FILE_AMBIGUOUS/);
+  const g=fixture(),d=originalContext(g);const tail=componentBinding(g);const read=d.context.fetch;
+  d.context.fetch=async(u,options)=>{const response=await read(u,options);if(u.startsWith('https://files.oaiusercontent.com/')){tail.memoizedProps={image:{src:'sediment://file_other'},fullSrc:'sediment://file_other',src:'sediment://file_other'};}return response;};
+  await assert.rejects(vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),d.context),/ORIGINAL_IMAGE_CHANGED/);
+});
+test('read-only browser evaluation errors preserve exact safe download codes',()=>{
+  assert.equal(originalReadError({code:'operation_error',message:'Evaluation failed: ORIGINAL_FILE_IDENTITY'}).code,'ORIGINAL_FILE_IDENTITY');
+  assert.equal(originalReadError({code:'operation_error',message:'Error: ORIGINAL_FILE_BINDING_UNCONFIRMED'}).code,'ORIGINAL_FILE_BINDING_UNCONFIRMED');
+  const redacted=originalReadError({code:'operation_error',message:'private inaccessible content'});assert.equal(redacted.code,'OPENCLI_ORIGINAL_READ_FAILED');assert.equal(JSON.stringify(redacted).includes('private'),false);
+});
+test('a download-stage website challenge stays a challenge and makes no file request',async()=>{
+  const f=fixture(),c=originalContext(f);componentBinding(f);const read=c.context.fetch;
+  c.context.fetch=async(u,options)=>u==='/api/auth/session'?{ok:false,status:403}:read(u,options);
+  await assert.rejects(vm.runInNewContext(originalImageReadCode(prompt,url,hash('synthetic-user')),c.context),/BROWSER_CHECK_REQUIRED/);
+  assert.equal(c.calls.some(u=>u.includes('/files/download/')),false);
 });

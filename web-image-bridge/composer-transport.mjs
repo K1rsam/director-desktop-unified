@@ -80,8 +80,15 @@ export async function clickOwnedComposer(page, text, gate, intent) {
 // (ellipsis / Show more). Only the known plain-text body is the sent prompt;
 // never trim, substring-match, or remove characters from that body.
 export function readOwnedConversationDom(expected) {
-  const mains=[...document.querySelectorAll('main')];
   const empty={url:location.href,userCount:0,promptMatched:false,images:[],imageCandidates:0,selectors:0};
+  // SPA navigation can retain an old, unrendered main beside the live thread.
+  // Select exactly one rendered main, independently of tab visibility. A
+  // background tab is still readable; two live mains remain ambiguous.
+  const mains=[...document.querySelectorAll('main')].filter(n=>{
+    if(n.getClientRects().length===0||n.closest('[hidden],[aria-hidden="true"]'))return false;
+    const style=getComputedStyle(n);
+    return style.display!=='none'&&!['hidden','collapse'].includes(style.visibility);
+  });
   if(mains.length!==1)return empty;
   const main=mains[0],userSelector='[data-message-author-role="user"],[data-turn="user"],.bg-user-message';
   const matches=[...main.querySelectorAll(userSelector)];
