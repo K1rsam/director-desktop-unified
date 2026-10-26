@@ -74,7 +74,9 @@ try {
   assert.ok(completedProgress.includes('已整理 10 / 10 集')); assert.ok(completedProgress.includes('全剧已整理'));
   const { AssetPanel } = await server.ssrLoadModule('/src/AssetPanel.tsx');
   const assets = renderToStaticMarkup(React.createElement(AssetPanel, props));
-  assert.ok(assets.includes('当前目录仅覆盖已整理的 第7集')); assert.ok(assets.includes('请到第一阶段整理全剧制作基础'));
+  assert.ok(assets.includes('当前目录仅覆盖已整理的 第7集'));
+  assert.ok(assets.includes('源范围仍待补齐；已交付的分镜资产可独立继续配图。'));
+  assert.ok(!assets.includes('请到第一阶段整理全剧制作基础'));
   assert.equal(networkRequests, 0); assert.equal(requests.length, 2);
   console.log(JSON.stringify({ passed: 7, hookTransforms, hookMockGuardsVerified: true, refIdentityVerified: true, method: 'Actual Stage1 React interactions and Stage1/2/progress server rendering with actual policy guard', networkRequests, mutations: '2 isolated mock calls, no backend or media access' }, null, 2));
 } finally { await server.close(); delete globalThis.__scopeHooks; }
