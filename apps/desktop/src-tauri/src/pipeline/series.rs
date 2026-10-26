@@ -50,6 +50,8 @@ mod frame_render;
 pub(crate) use frame_render::validate_projection as validate_frame_render_projection;
 #[path = "series_review_scope.rs"]
 mod review_scope;
+#[path = "series_controller_review.rs"]
+pub(crate) mod controller_review;
 pub(crate) use review_scope::revalidate_review_entry_scope_response;
 #[cfg(test)]
 #[path = "series_tests.rs"]
@@ -62,6 +64,8 @@ pub(crate) use tests::repair_plan_tests::series_repair_replay_fixture;
 pub(crate) use tests::seed_engine_series_fixture;
 #[cfg(test)]
 pub(crate) use tests::series_review_entry_replay_fixture;
+#[cfg(test)]
+pub(crate) use tests::controller_review_tests::{series_controller_fixture,series_controller_delivery_fixture};
 #[cfg(test)]
 pub(crate) use tests::supplement_tests::correction_tests::series_normal_revision_fixture;
 #[cfg(test)]
@@ -1226,13 +1230,16 @@ async fn episode(
     .await?;
     let mut review = Value::Null;
     let mut last_issues = String::new();
+    let controller = controller_review::for_episode(input, &episode.id);
     for iteration in 0..=MAX_REPAIRS {
+        let review_controller = controller.filter(|c| c["firstReviewIteration"].as_u64().is_some_and(|n| iteration as u64 > n));
         let mut values = base.clone();
         values.extend([
             ("plan", candidate["plan"].clone()),
             ("selection", candidate["selection"].clone()),
             ("draft", candidate["draft"].clone()),
         ]);
+        if let Some(context) = review_controller { controller_review::add(&mut values, context); }
         let mut req = request(
             "reviewer",
             "seriesReview",
@@ -1240,17 +1247,22 @@ async fn episode(
             &iteration.to_string(),
             input,
             values,
-            review_schema(),
+            controller_review::schema(review_controller),
             model,
             reasoning,
         )?;
         req.input["candidateSha256"] = json!(hash(&candidate));
+        if let Some(context) = review_controller { controller_review::attach(&mut req, context); }
         let (result, receipt) = call(executor, req, |raw| {
-            validate_review(raw, &candidate, source, episode, entry)
+            controller_review::validate_review_context(raw, &candidate, source, episode, entry, review_controller)
         })
         .await?;
         receipts.push(receipt.clone());
         review = result;
+        if let Some(context) = controller.filter(|c| c["firstReviewIteration"] == iteration) {
+            let origin: TextRequest = serde_json::from_value(receipt["request"].clone()).map_err(|e| e.to_string())?;
+            controller_review::validate_context(context, &origin, &receipt["raw"], input)?;
+        }
         if review["conclusion"] == "pass" {
             break;
         }
@@ -1266,7 +1278,9 @@ async fn episode(
             ("draft", candidate["draft"].clone()),
             ("issues", review["issues"].clone()),
         ]);
-        let repair = request(
+        let repair_controller = controller.filter(|c| c["firstReviewIteration"].as_u64().is_some_and(|n| iteration as u64 >= n));
+        if let Some(context) = repair_controller { controller_review::add(&mut values, context); }
+        let mut repair = request(
             "repair",
             "seriesRepair",
             &episode.id,
@@ -1277,6 +1291,17 @@ async fn episode(
             model,
             reasoning,
         )?;
+        if let Some(context) = repair_controller {
+            controller_review::attach(&mut repair, context);
+            let effective = controller_review::effective_issues(&repair, &receipt, input)?;
+            // Rebuild the content-addressed packet; the old review stays exact.
+            let mut values = base.clone();
+            values.extend([("plan", candidate["plan"].clone()), ("selection", candidate["selection"].clone()),
+                ("draft", candidate["draft"].clone()), ("issues", effective)]);
+            controller_review::add(&mut values, context);
+            repair.input["packet"] = packet("repair", &episode.id, input, values)?;
+        }
+        let effective_issues = packet_value(&repair.input["packet"], "issues")?.clone();
         let projected = frame_render::project(&repair, input, &receipt)?;
         let repair = executor
             .prepare_series_frame_render(repair, projected, receipt)
@@ -1289,7 +1314,7 @@ async fn episode(
             &cards,
             input,
             &mut receipts,
-            Some((&candidate, &review["issues"])),
+            Some((&candidate, &effective_issues)),
             None,
             supplement_proof.get("episodeSupply"),
         )
@@ -1312,6 +1337,7 @@ async fn episode(
     used.sort();
     let adoption = json!({"version":"desktop-series-adoption/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"bundleSha256":hash(&bundle),"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"]),"rulePackSha256":rules::pack_hash()?,"roleReceipts":receipts,"review":{"candidateSha256":hash(&candidate),"requestSha256":review_receipt["requestSha256"],"resultSha256":review_receipt["rawSha256"],"status":"passed"},"steps":{"sync":{"usedAssetIds":used,"designsSha256":hash(&json!(cards))},"check":{"sourceSha256":source.sha256,"candidateSha256":hash(&candidate)},"export":{"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"])},"verify":{"parserVersion":crate::lingmo_parser::PARSER_VERSION,"status":"passed"}},"evidenceBoundary":"local contracts and independent model review; not platform import or media acceptance"});
     let mut adoption = adoption;
+    if let Some(context) = controller { adoption[controller_review::FIELD] = context.clone(); }
     if !supplement_proof.is_null() {
         let field = if supplement_proof["version"] == supply_correction::VERSION {
             "supplyContractCorrection"
@@ -1427,6 +1453,7 @@ pub fn validate_delivery(input: &Value, delivery: &Value) -> Result<(), String> 
         .as_array()
         .ok_or("SERIES_ADOPTION_ROLE_RECEIPTS_MISSING")?;
     frame_render::validate_adoption(input, delivery)?;
+    controller_review::validate_adoption(input, delivery)?;
     let mut identities = HashSet::new();
     let mut found = HashSet::new();
     let mut review = None;
@@ -1472,12 +1499,13 @@ pub fn validate_delivery(input: &Value, delivery: &Value) -> Result<(), String> 
         return Err("SERIES_REQUIRED_ROLES_MISSING".into());
     }
     let review = review.ok_or("SERIES_REVIEW_RECEIPT_MISSING")?;
-    let result = validate_review(
+    let result = controller_review::validate_review_context(
         &review["raw"],
         &candidate,
         &source,
         episode,
         &bundle["entry"],
+        receipt.get(controller_review::FIELD),
     )?;
     if result["conclusion"] != "pass"
         || delivery["review"] != result
@@ -1524,6 +1552,17 @@ pub async fn run(
     model: &str,
     reasoning: &str,
 ) -> Result<Value, String> {
+    let mut effective_input = input.clone();
+    // An explicit durable supplement is an execution overlay, not a rewrite of
+    // the original workflow snapshot or its episode selection.
+    if let Some(context) = executor.series_controller_review_context().await? {
+        if input.get(controller_review::FIELD).is_some_and(|old|old!=&context) {
+            return Err(controller_review::HELD.into());
+        }
+        effective_input[controller_review::FIELD] = context;
+    }
+    let input = &effective_input;
+    let controller_stop_required = executor.series_controller_review_stop_required().await?;
     validate_profile(input)?;
     if model.trim().is_empty()
         || !["low", "medium", "high", "xhigh", "max", "ultra"].contains(&reasoning)
@@ -1556,7 +1595,14 @@ pub async fn run(
         .cloned()
         .unwrap_or(Value::Null);
     let mut unavailable: Option<String> = None;
+    let mut controller_stopped = false;
     for episode in source.episodes.iter().filter(|e| selected.contains(&e.id)) {
+        if controller_stopped {
+            blocked.push(json!({"episodeId":episode.id,"status":"waiting_controller",
+                "reason":"已完成指定单集返修并停下；后续集数未调用，原范围与预算保留。",
+                "dependsOn":input[controller_review::FIELD]["stopAfterEpisodeId"]}));
+            continue;
+        }
         if let Some(prior) = &unavailable {
             blocked.push(json!({"episodeId":episode.id,"status":"waiting_dependency","dependsOn":prior,"reason":"前集真实尾态尚未完成，保留原任务与已完成结果。"}));
             continue;
@@ -1593,6 +1639,7 @@ pub async fn run(
                         .cloned(),
                 );
                 deliveries.push(delivery);
+                controller_stopped = controller_stop_required && input[controller_review::FIELD]["stopAfterEpisodeId"] == episode.id;
             }
             Err(reason) => {
                 blocked.push(json!({"episodeId":episode.id,"status":"blocked","reason":reason}));

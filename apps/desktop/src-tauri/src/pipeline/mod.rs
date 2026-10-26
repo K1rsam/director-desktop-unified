@@ -89,6 +89,13 @@ pub trait TextExecutor: Send + Sync {
     async fn series_supply_correction_context(&self, _origin: &TextRequest, _origin_raw: &Value) -> Result<Option<Value>, String> {
         Ok(None)
     }
+    /// Explicit, immutable controller findings for the original workflow only.
+    async fn series_controller_review_context(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    async fn series_controller_review_stop_required(&self) -> Result<bool, String> {
+        Ok(true)
+    }
     fn input_transport_characters(&self, request: &TextRequest) -> Result<usize, String> {
         let wire = compile_storyboard_dispatch_transport(request)?;
         let (input, schema) = wire

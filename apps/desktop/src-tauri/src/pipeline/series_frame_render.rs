@@ -178,19 +178,20 @@ pub(super) fn project(
     if receipt != &role_receipt(&review, &receipt["raw"])?
         || review.stage != "seriesReview"
         || review.skill != "series-reviewer"
-        || review.schema != review_schema()
+        || review.schema != controller_review::schema(controller_review::marker(&review))
         || review.model != legacy.model
         || review.reasoning != legacy.reasoning
         || review.input["executionRoleId"] != format!("{}/reviewer/{}", episode.id, iteration - 1)
         || review.input["candidateSha256"] != hash(&before)
         || candidate(&review)? != before
-        || packet_value(&legacy.input["packet"], "issues")? != &receipt["raw"]["issues"]
-        || validate_review(
+        || packet_value(&legacy.input["packet"], "issues")? != &controller_review::effective_issues(legacy, receipt, input)?
+        || controller_review::validate_review_context(
             &receipt["raw"],
             &before,
             &source,
             episode,
             packet_value(&review.input["packet"], "entry")?,
+            controller_review::marker(&review),
         )?["conclusion"]
             != "revise"
     {

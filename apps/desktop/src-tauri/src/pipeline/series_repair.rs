@@ -151,6 +151,7 @@ pub(super) fn validate_scoped_candidate(
         validate_candidate_with_supply(&candidate, source, episode, assets, input, episode_supply)?;
     if let Some((previous, issues)) = scope {
         assert_local_repair(previous, &checked, issues)?;
+        super::controller_review::assert_shots(request, previous, &checked)?;
     }
     Ok(checked)
 }

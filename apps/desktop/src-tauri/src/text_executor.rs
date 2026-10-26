@@ -5144,6 +5144,12 @@ impl TextExecutor for SavedTextExecutor {
     async fn series_supply_correction_context(&self, origin:&TextRequest, origin_raw:&Value)->Result<Option<Value>> {
         self.saved_series_supply_correction_context(origin,origin_raw)
     }
+    async fn series_controller_review_context(&self)->Result<Option<Value>> {
+        self.saved_series_controller_review()
+    }
+    async fn series_controller_review_stop_required(&self)->Result<bool> {
+        self.series_controller_stop_required()
+    }
     async fn series_supplement_identity_context(&self, origin:&TextRequest, origin_raw:&Value, known_catalogue:&Value, desired_contract:&str)->Result<Value> {
         self.freeze_series_supplement_identity_context(origin,origin_raw,known_catalogue,desired_contract)
     }
@@ -13948,6 +13954,8 @@ fn main() {
 mod finish_assets;
 #[path = "text_executor_series_frame_render.rs"]
 mod series_frame_render;
+#[path = "text_executor_series_controller_review.rs"]
+mod series_controller_review;
 
 #[cfg(test)]
 #[path = "text_executor_sdk_receipt_tests.rs"]

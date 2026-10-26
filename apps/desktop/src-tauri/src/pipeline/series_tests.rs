@@ -7,6 +7,8 @@ pub(crate) mod frame_render_tests;
 pub(crate) mod repair_plan_tests;
 #[path = "series_supplement_tests.rs"]
 pub(crate) mod supplement_tests;
+#[path = "series_controller_review_tests.rs"]
+pub(crate) mod controller_review_tests;
 
 #[test]
 fn dialogue_diagnostics_use_absolute_source_ranges_and_never_rewrite_the_raw() {

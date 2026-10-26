@@ -3403,6 +3403,11 @@ impl Engine {
                 || job["snapshot"]["input"]["workflowProfile"]!=crate::asset_graph::PROFILE) {
             return Err("供料合同纠正仅适用于同一条新分镜原流程，未新建任务".into());
         }
+        if request.get("controllerReviewSupplement").is_some()
+            && (s(request,"action")!="workflows.resume" || job["entityId"]!="storyboard.run"
+                || job["snapshot"]["input"]["workflowProfile"]!=crate::asset_graph::PROFILE) {
+            return Err("主控审稿补充仅适用于同一条新版分镜原流程，未新建任务".into());
+        }
         if job["snapshot"]["stage2Context"]["workflowProfile"]==crate::asset_graph::PROFILE {
             if s(&job,"kind")!="workflow" || !["failed","interrupted","partially_blocked","blocked"].contains(&s(&job,"status")){return Err("请选择中断的原提示词流程".into());}
             let lease=self.acquire_pipeline(&store)?;
@@ -3471,6 +3476,13 @@ impl Engine {
         if let Some(authorization)=request.get("supplyContractCorrection") {
             SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
                 .authorize_series_supply_correction(authorization)?;
+        }
+        if let Some(authorization)=request.get("controllerReviewSupplement") {
+            SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
+                .authorize_series_controller_review(authorization)?;
+        } else if s(request,"action")=="workflows.resume" && snapshot["input"]["workflowProfile"]==crate::asset_graph::PROFILE {
+            SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
+                .continue_completed_controller_review()?;
         }
         if s(request, "action") == "storyboard.decision.resolve" {
             let waiting = &job["result"]["waitingDecision"];
