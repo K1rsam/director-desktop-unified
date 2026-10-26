@@ -4540,6 +4540,8 @@ mod scoped_shot_replay;
 mod sdk_foundation_replay;
 #[path = "text_executor_sdk_supervisor_handoff.rs"]
 mod sdk_supervisor_handoff;
+#[path = "text_executor_sdk_account_handoff.rs"]
+mod sdk_account_handoff;
 #[path = "text_executor_sdk_local_recovery.rs"]
 mod sdk_local_recovery;
 #[path = "text_executor_sdk_schema_recovery.rs"]
@@ -11835,6 +11837,7 @@ impl SavedTextExecutor {
         let mut c=self.store.conn()?;
         let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let binding=self.sdk_pre_dispatch_binding(request,snapshot,&tx)?;
+        self.sdk_schema_current_account_allocation_bound(snapshot)?;
         self.sdk_supply_correction_dispatch_bound(request,snapshot,&tx,None)?;
         let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND provider='codex_sdk' AND snapshot=?1) OR EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?2 AND node_key=?3)",params![snapshot.to_string(),self.workflow_id,step_key(request)],|r|r.get(0)).map_err(|e|e.to_string())?;
         if occupied{return Err(SDK_PRE_DISPATCH_HELD.into());}
@@ -11967,11 +11970,16 @@ impl SavedTextExecutor {
         let _evidence_scope = sdk_evidence_cache::scope();
         #[cfg(test)]
         let _profile = validation_profile::enter("sdk_raw", s(job, "id"));
-        use crate::text_transport::{AttemptState, FrozenAttempt};
         self.sdk_handoff_job_bound(job, snapshot)?;
+        self.sdk_schema_job_bound(job, snapshot)?;
+        self.sdk_raw_local(job, snapshot)
+    }
+    /// The local half of raw validation. Account ancestry is checked by a
+    /// bounded synchronous worklist; it must not recursively replay the chain.
+    fn sdk_raw_local(&self, job: &Value, snapshot: &Value) -> Result<Value> {
+        use crate::text_transport::{AttemptState, FrozenAttempt};
         self.sdk_local_recovery_bound(job)?;
         self.sdk_schema_recovery_bound(job)?;
-        self.sdk_schema_job_bound(job, snapshot)?;
         self.sdk_input_envelope_bound(job,snapshot)?;
         let fail = || {
             "SDK_RAW_BINDING_MISMATCH: 原请求、原始文本、事件、回执或执行身份不一致；证据与预算保留"

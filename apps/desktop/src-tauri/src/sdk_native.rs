@@ -258,6 +258,33 @@ pub(super) async fn prepare_local_recovery_handoff(settings: &Value) -> Result<S
     verify_local_recovery_bytes(&old, &new, &resource_hashes)?;
     Ok(SupervisorHandoff { identity: new, resource_hashes })
 }
+/// Called only for a proven unallocated logical node. Even with the same EXE,
+/// resolve performs the current logged-in account/model read-only check.
+pub(super) async fn prepare_current_account_handoff(settings: &Value,schema: bool) -> Result<SupervisorHandoff> {
+    let old=receipt_identity(settings)?;
+    let resolved=resolve(settings).await?;
+    let new=identity(&resolved)?;
+    let hashes=handoff_resource_hashes(Path::new(s(&new,"resourceDirectory")))?;
+    verify_current_account_handoff_bytes(&old,&new,&hashes,schema)?;
+    Ok(SupervisorHandoff{identity:new,resource_hashes:hashes})
+}
+pub(super) fn verify_current_account_handoff_bytes(old:&Value,new:&Value,hashes:&Value,schema:bool)->Result<()> {
+    let mode=if schema {"schema"} else if old["bridgeSha256"]==LOCAL_PATH_BRIDGE_SHA {"local"} else {"supervisor"};
+    if !current_account_receipt_identity_bound(old,new,mode) { return Err("SDK_CURRENT_ACCOUNT_IDENTITY_CHANGED".into()); }
+    let mut normalized=old.clone();
+    normalized["accountFingerprint"]=new["accountFingerprint"].clone();
+    if schema { return verify_schema_rejection_bytes(&normalized,new,hashes); }
+    if old["bridgeSha256"]==LOCAL_PATH_BRIDGE_SHA { return verify_local_recovery_bytes(&normalized,new,hashes); }
+    if normalized!=*new { return verify_supervisor_handoff_bytes(&normalized,new,hashes); }
+    serde_json::from_value::<SdkIdentity>(new.clone()).map_err(|e|e.to_string())?.validate()?;
+    if handoff_resource_hashes(Path::new(s(new,"resourceDirectory")))?!=*hashes {
+        return Err("SDK_CURRENT_ACCOUNT_COMPONENTS_CHANGED".into());
+    }
+    for (path,sha) in [("nodeExecutable","nodeSha256"),("runtimeExecutable","runtimeSha256"),("supervisorExecutable","supervisorSha256")] {
+        if crate::store::hash_file(Path::new(s(new,path)))?.0!=s(new,sha) {return Err("SDK_CURRENT_ACCOUNT_COMPONENTS_CHANGED".into());}
+    }
+    Ok(())
+}
 pub(super) fn verify_local_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
     serde_json::from_value::<SdkIdentity>(new.clone()).map_err(|e|e.to_string())?.validate()?;
     if !local_recovery_identity_bound(old, new)

@@ -265,6 +265,28 @@ pub(crate) fn verify_supervisor_handoff_bytes(old: &Value, new: &Value, hashes: 
     native::verify_supervisor_handoff_bytes(old, new, hashes)
 }
 
+/// A new node's explicit current-account policy is separate from every frozen
+/// v1 receipt. Only accountFingerprint is normalized before the old component
+/// contract; no existing request gains this permission by being read.
+pub(crate) fn current_account_receipt_identity_bound(old: &Value, new: &Value, mode: &str) -> bool {
+    let (Ok(a), Ok(b)) = (serde_json::from_value::<SdkIdentity>(old.clone()), serde_json::from_value::<SdkIdentity>(new.clone())) else { return false; };
+    if a.version != "official-sdk-identity/v2" || a.validate_receipt().is_err() || b.validate_receipt().is_err() { return false; }
+    let mut normalized = old.clone();
+    normalized["accountFingerprint"] = new["accountFingerprint"].clone();
+    match mode {
+        "schema" => schema_rejection_receipt_identity_bound(&normalized,new),
+        "local" => local_recovery_identity_bound(&normalized,new),
+        "supervisor" => normalized == *new || supervisor_handoff_receipt_identity_bound(&normalized,new),
+        _ => false,
+    }
+}
+pub(crate) async fn prepare_current_account_handoff(settings: &Value, schema: bool) -> Result<SupervisorHandoff> {
+    native::prepare_current_account_handoff(settings,schema).await
+}
+pub(crate) fn verify_current_account_handoff_bytes(old: &Value,new: &Value,hashes: &Value,schema: bool) -> Result<()> {
+    native::verify_current_account_handoff_bytes(old,new,hashes,schema)
+}
+
 pub(crate) async fn add_native_readiness(settings: &Value, value: &mut Value) {
     native::add_readiness(settings, value).await;
 }

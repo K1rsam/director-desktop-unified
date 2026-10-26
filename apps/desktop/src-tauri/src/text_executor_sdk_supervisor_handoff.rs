@@ -4,6 +4,7 @@ use super::*;
 use crate::text_transport::FrozenAttempt;
 
 const POLICY: &str = "sdk-new-node-supervisor-handoff/v1";
+const ACCOUNT_POLICY: &str = "sdk-new-node-current-account/v2";
 const FIRST_NODE_POLICY: &str = "sdk-first-node-supervisor-handoff/v1";
 const LOCAL_RECOVERY_POLICY: &str = "sdk-new-node-local-recovery-handoff/v1";
 const REJECTED_PLAN_POLICY: &str = "sdk-rejected-plan-repair-handoff/v1";
@@ -27,12 +28,18 @@ fn seal(mut proof: Value) -> Value {
     proof["sha256"] = json!(hash(&proof));
     proof
 }
+fn base_policy(proof: &Value) -> &str {
+    if proof["policy"] == ACCOUNT_POLICY { s(&proof["accountAuthorization"], "basePolicy") }
+    else { s(proof, "policy") }
+}
 fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool {
     let proof = &snapshot[FIELD];
     let Some(fields) = proof.as_object() else {
         return false;
     };
-    if fields.len() != 14 {
+    let account = proof["policy"] == ACCOUNT_POLICY;
+    let base = base_policy(proof);
+    if fields.len() != if account {15} else {14} {
         return false;
     }
     let mut unsigned = proof.clone();
@@ -44,7 +51,7 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
     let Ok(request) = serde_json::from_value::<TextRequest>(snapshot.clone()) else {
         return false;
     };
-    (proof["policy"] == POLICY || proof["policy"] == LOCAL_RECOVERY_POLICY || proof["policy"] == FIRST_NODE_POLICY || proof["policy"] == REJECTED_PLAN_POLICY)
+    [POLICY,LOCAL_RECOVERY_POLICY,FIRST_NODE_POLICY,REJECTED_PLAN_POLICY].contains(&base)
         && proof["sha256"] == hash(&unsigned)
         && proof["workflowId"] == run
         && proof["nodeKey"] == key
@@ -59,7 +66,11 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
         && settings["textProvider"] == "codex_sdk"
         && settings["textModel"] == request.model
         && settings["reasoning"] == request.reasoning
-        && if proof["policy"] == LOCAL_RECOVERY_POLICY {
+        && if account {
+            sdk_account_handoff::shape_bound(&proof["accountAuthorization"],settings,&snapshot["executorIdentity"],&request,base)
+                && (proof["accountAuthorization"]["previousNode"].is_null() == (base==FIRST_NODE_POLICY))
+                && crate::text_sdk::current_account_receipt_identity_bound(&proof["originalIdentity"],&snapshot["executorIdentity"],if base==LOCAL_RECOVERY_POLICY {"local"}else{"supervisor"})
+        } else if base == LOCAL_RECOVERY_POLICY {
             crate::text_sdk::local_recovery_identity_bound(&proof["originalIdentity"], &snapshot["executorIdentity"])
         } else { crate::text_sdk::supervisor_handoff_receipt_identity_bound(&proof["originalIdentity"], &snapshot["executorIdentity"]) }
         && proof["resourceHashes"].as_object().is_some_and(|h| {
@@ -69,9 +80,9 @@ fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool
                         .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                 })
         })
-        && if proof["policy"] == FIRST_NODE_POLICY {
+        && if base == FIRST_NODE_POLICY {
             proof["predecessor"] == first_node_evidence(run)
-        } else if proof["policy"] == REJECTED_PLAN_POLICY {
+        } else if base == REJECTED_PLAN_POLICY {
             request.stage == "storyboardPlan" && request.skill == "episode-emotion-planner"
                 && request.input["planRepair"]["version"] == "rejected-plan-repair/v1"
                 && proof["predecessor"].as_object().is_some_and(|p|p.len()==16)
@@ -162,7 +173,7 @@ fn predecessor(
     ))
 }
 fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value, snapshot: &Value) -> Result<bool> {
-    if proof["policy"] == FIRST_NODE_POLICY {
+    if base_policy(proof) == FIRST_NODE_POLICY {
         // The absence proof is checked before reservation. After reservation,
         // bind the original first step, allowing later steps without re-sending.
         return c.query_row(
@@ -170,7 +181,7 @@ fn predecessor_bound(store: &Store, c: &rusqlite::Connection, proof: &Value, sna
             params![s(proof,"workflowId"),s(proof,"nodeKey")], |r| r.get(0),
         ).map_err(|e|e.to_string());
     }
-    if proof["policy"] == REJECTED_PLAN_POLICY {
+    if base_policy(proof) == REJECTED_PLAN_POLICY {
         return Ok(rejected_plan::predecessor(store,c,s(proof,"workflowId"),snapshot)? == proof["predecessor"]);
     }
     Ok(predecessor(
@@ -189,7 +200,7 @@ fn first_node_evidence(run: &str) -> Value {
 
 fn first_node_absent(store: &Store, c: &rusqlite::Connection, run: &str) -> Result<()> {
     let occupied: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1) OR EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND (json_extract(prepared,'$.sdkOriginWorkflowId')=?1 OR json_extract(snapshot,'$.sdkSupervisorHandoff.workflowId')=?1))",
+        "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1) OR EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND (json_extract(prepared,'$.sdkOriginWorkflowId')=?1 OR json_extract(snapshot,'$.sdkSupervisorHandoff.workflowId')=?1 OR json_extract(snapshot,'$.sdkSchemaContinuation.workflowId')=?1 OR json_extract(snapshot,'$.sdkSchemaRejectionRetry.workflowId')=?1))",
         [run], |r|r.get(0),
     ).map_err(|e|e.to_string())?;
     if occupied { return Err(HELD.into()); }
@@ -235,7 +246,11 @@ fn no_node_or_attempt(
     for row in rows {
         let prior: Value =
             serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        if domain(&prior)? == expected {
+        // Strip known wrappers only to reject an occupied domain. This is not
+        // an acceptance path for any historical proof.
+        let mut occupied_domain=domain(&prior)?;
+        if let Some(fields)=occupied_domain.as_object_mut() {fields.remove("sdkSchemaRejectionRetry");fields.remove("sdkSchemaContinuation");}
+        if occupied_domain == expected {
             return Err(HELD.into());
         }
     }
@@ -294,7 +309,7 @@ impl SavedTextExecutor {
         self.sdk_handoff_job_bound(&previous_job,&previous_job["snapshot"])?;
         self.sdk_raw(&previous_job,&previous_job["snapshot"])?;
         if local_recovery && self.sdk_local_recovery_bound(&previous_job)?.is_none()
-            && previous_job["snapshot"][FIELD]["policy"]!=LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
+            && base_policy(&previous_job["snapshot"][FIELD])!=LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
         Ok((if local_recovery {LOCAL_RECOVERY_POLICY}else{POLICY},prior))
     }
 
@@ -341,6 +356,9 @@ impl SavedTextExecutor {
             || created.as_deref() != Some(saved[FIELD].to_string().as_str())
         {
             return Err(HELD.into());
+        }
+        if saved[FIELD]["policy"]==ACCOUNT_POLICY {
+            self.sdk_current_account_authorization_bound(&saved,&saved[FIELD]["accountAuthorization"],base_policy(&saved[FIELD]))?;
         }
         Ok(Some(saved))
     }
@@ -403,16 +421,20 @@ impl SavedTextExecutor {
             &step_key(request),
             original,
         )?;
-        let local_recovery = original["executorIdentity"]["bridgeSha256"] == crate::text_sdk::LOCAL_PATH_BRIDGE_SHA;
-        let Some(verified) = (if local_recovery {
-            Some(crate::text_sdk::prepare_local_recovery_handoff(&self.settings).await?)
-        } else { crate::text_sdk::prepare_supervisor_handoff(&self.settings).await? })
-        else {
-            return Ok(original.clone());
-        };
         self.sdk_parent_binding()?;
         self.sdk_request_policy(request)?;
+        self.check_sdk_unresolved_hold()?;
+        let reference=self.sdk_current_account_reference()?;
+        let mut runtime_settings=self.settings.clone();
+        if let Some((previous,_))=&reference {runtime_settings["textSdkIdentity"]=previous.clone();}
+        let verified=crate::text_sdk::prepare_current_account_handoff(&runtime_settings,false).await?;
+        let local_recovery = original["executorIdentity"]["bridgeSha256"] == crate::text_sdk::LOCAL_PATH_BRIDGE_SHA;
+        // Even when the supervisor is unchanged, the current account/model
+        // check above must complete. Returning to A after B needs its own proof.
+        let changed_account=self.sdk_current_account_authorization(request,&verified.identity,reference.as_ref(),POLICY).is_some();
+        if verified.identity==original["executorIdentity"] && !changed_account {return Ok(original.clone());}
         let (policy,prior)=self.sdk_handoff_predecessor(original,local_recovery)?;
+        let authorization=self.sdk_current_account_authorization(request,&verified.identity,reference.as_ref(),policy);
         let c = self.store.conn()?;
         let original_parent: String = c
             .query_row(
@@ -430,6 +452,11 @@ impl SavedTextExecutor {
             "effectiveIdentitySha256":hash(&snapshot["executorIdentity"]),"resourceHashes":verified.resource_hashes,
             "predecessor":prior,"modelCalls":0,"accountModelChecked":true}),
         );
+        if let Some(authorization)=authorization {
+            let mut proof=snapshot[FIELD].clone();proof.as_object_mut().unwrap().remove("sha256");
+            proof["policy"]=json!(ACCOUNT_POLICY);proof["accountAuthorization"]=authorization;
+            snapshot[FIELD]=seal(proof);
+        }
         if !proof_valid(&snapshot, &self.settings, run, &step_key(request)) {
             return Err(HELD.into());
         }
@@ -461,20 +488,24 @@ impl Store {
         let tx = c
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if proof["policy"]==ACCOUNT_POLICY { executor.check_sdk_unresolved_hold()?; }
         if !parent_bound(&tx, proof, original_settings)? {
             return Err(HELD.into());
         }
-        if proof["policy"]==FIRST_NODE_POLICY {
+        if base_policy(proof)==FIRST_NODE_POLICY {
             first_node_absent(self,&tx,run)?;
         } else if !predecessor_bound(self,&tx,proof,snapshot)? { return Err(HELD.into()); }
-        if proof["policy"] == LOCAL_RECOVERY_POLICY {
+        if base_policy(proof) == LOCAL_RECOVERY_POLICY {
             let prior = executor.sdk_job(s(&proof["predecessor"],"jobId"))?;
             executor.sdk_raw(&prior,&prior["snapshot"])?;
             if executor.sdk_local_recovery_bound(&prior)?.is_none()
-                && prior["snapshot"][FIELD]["policy"] != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
+                && base_policy(&prior["snapshot"][FIELD]) != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
         }
         no_node_or_attempt(self, &tx, run, &key, snapshot)?;
-        if proof["policy"] == LOCAL_RECOVERY_POLICY {
+        if proof["policy"] == ACCOUNT_POLICY {
+            let previous=executor.sdk_current_account_authorization_bound(snapshot,&proof["accountAuthorization"],base_policy(proof))?;
+            crate::text_sdk::verify_current_account_handoff_bytes(&previous,&snapshot["executorIdentity"],&proof["resourceHashes"],false)?;
+        } else if base_policy(proof) == LOCAL_RECOVERY_POLICY {
             crate::text_sdk::verify_local_recovery_bytes(&proof["originalIdentity"], &snapshot["executorIdentity"], &proof["resourceHashes"])?;
         } else { crate::text_sdk::verify_supervisor_handoff_bytes(&proof["originalIdentity"], &snapshot["executorIdentity"], &proof["resourceHashes"])?; }
         let job = id();
@@ -496,6 +527,7 @@ mod tests {
     use crate::text_transport::{AttemptState, Backend};
     use sha2::{Digest, Sha256};
     include!("text_executor_sdk_rejected_plan_handoff_tests.rs");
+    include!("text_executor_sdk_account_handoff_tests.rs");
 
     fn resource_names() -> [&'static str; 9] {
         [

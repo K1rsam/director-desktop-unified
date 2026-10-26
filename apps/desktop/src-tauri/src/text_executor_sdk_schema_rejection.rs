@@ -7,6 +7,7 @@ const RETRY: &str = "sdkSchemaRejectionRetry";
 const CONTINUE: &str = "sdkSchemaContinuation";
 const POLICY: &str = "sdk-schema-refusal-successor/v1";
 const CONTINUATION: &str = "sdk-schema-refusal-continuation/v1";
+const ACCOUNT_CONTINUATION: &str = "sdk-current-account-continuation/v2";
 const DOMAIN_REPAIR: &str = "series-domain-repair/v1";
 #[path = "text_executor_sdk_series_supplement.rs"]
 mod series_supplement;
@@ -47,12 +48,21 @@ fn request_hash(request:&TextRequest)->Result<String> {
     Ok(crate::pipeline::digest(&serde_json::to_string(request).map_err(|_|HELD)?))
 }
 fn proof_basic(proof: &Value, snapshot: &Value, settings: &Value, run: &str, key: &str, policy: &str) -> bool {
-    proof["version"]==policy && proof["sha256"]==unsigned_hash(proof)
+    let account=policy==CONTINUATION && proof["version"]==ACCOUNT_CONTINUATION;
+    let identity_bound=if account {
+        serde_json::from_value::<TextRequest>(snapshot.clone()).is_ok_and(|request|
+            proof.as_object().is_some_and(|fields|fields.len()==11)
+            && !proof["accountAuthorization"]["previousNode"].is_null()
+            && sdk_account_handoff::shape_bound(&proof["accountAuthorization"],settings,&snapshot["executorIdentity"],&request,CONTINUATION)
+            && crate::text_sdk::current_account_receipt_identity_bound(&settings["textSdkIdentity"],&snapshot["executorIdentity"],"schema"))
+    }else{proof.get("accountAuthorization").is_none()
+        && crate::text_sdk::schema_rejection_receipt_identity_bound(&settings["textSdkIdentity"],&snapshot["executorIdentity"])};
+    (proof["version"]==policy || account) && proof["sha256"]==unsigned_hash(proof)
         && proof["workflowId"]==run && proof["nodeKey"]==key
         && proof["domainRequestSha256"]==domain(snapshot).map(|v|hash(&v)).unwrap_or_default()
         && proof["originalSettingsSha256"]==hash(settings)
         && proof["effectiveIdentitySha256"]==hash(&snapshot["executorIdentity"])
-        && crate::text_sdk::schema_rejection_receipt_identity_bound(&settings["textSdkIdentity"],&snapshot["executorIdentity"])
+        && identity_bound
 }
 impl SavedTextExecutor {
     fn sdk_schema_origin_evidence(&self, job: &Value, request: &TextRequest) -> Result<Value> {
@@ -273,7 +283,21 @@ impl SavedTextExecutor {
             // Compare digests before recursively checking a historical anchor;
             // forged self/cyclic references cannot recurse through fake hashes.
             || anchor_summary(&self.sdk_job(s(&proof["anchor"],"jobId"))?)!=proof["anchor"]
-            || self.sdk_schema_anchor_for(s(&proof["anchor"],"jobId"),Some(&request))?!=proof["anchor"] {return Err(HELD.into());}Ok(())
+            || self.sdk_schema_anchor_for(s(&proof["anchor"],"jobId"),Some(&request))?!=proof["anchor"] {return Err(HELD.into());}
+        if proof["version"]==ACCOUNT_CONTINUATION {
+            self.sdk_current_account_authorization_bound(snapshot,&proof["accountAuthorization"],CONTINUATION)?;
+        }
+        Ok(())
+    }
+    pub(super) fn sdk_schema_current_account_allocation_bound(&self,snapshot:&Value)->Result<()> {
+        if snapshot[CONTINUE]["version"]!=ACCOUNT_CONTINUATION {return Ok(());}
+        self.check_sdk_unresolved_hold()?;
+        self.sdk_schema_continuation_bound(snapshot)?;
+        // Preparation and dispatch check installed bytes. This allocation guard
+        // rebinds only the local immutable proof; it adds no third account probe.
+        let previous=self.sdk_current_account_authorization_bound(snapshot,&snapshot[CONTINUE]["accountAuthorization"],CONTINUATION)?;
+        if !crate::text_sdk::current_account_receipt_identity_bound(&previous,&snapshot["executorIdentity"],"schema") {return Err(HELD.into());}
+        Ok(())
     }
     fn sdk_schema_continuation_job(&self,request:&TextRequest)->Result<Option<String>> {
         let Some(run)=self.workflow_id.as_deref() else{return Ok(None);};
@@ -311,14 +335,21 @@ impl SavedTextExecutor {
         // successor's frozen package is the runtime reference. Do not require
         // the mutable pre-upgrade source
         // resource directory to remain installed forever.
+        let reference=self.sdk_current_account_reference()?.ok_or(HELD)?;
         let mut runtime_settings=self.settings.clone();
-        runtime_settings["textSdkIdentity"]=self.sdk_job(&job)?["snapshot"]["executorIdentity"].clone();
-        let verified=crate::text_sdk::prepare_schema_rejection_handoff(&runtime_settings).await?;
+        runtime_settings["textSdkIdentity"]=reference.0.clone();
+        let verified=crate::text_sdk::prepare_current_account_handoff(&runtime_settings,true).await?;
+        let authorization=self.sdk_current_account_authorization(request,&verified.identity,Some(&reference),CONTINUATION);
         let mut snapshot=original.clone();snapshot["executorIdentity"]=verified.identity;
         snapshot[CONTINUE]=sealed(json!({"version":CONTINUATION,"workflowId":run,"nodeKey":step_key(request),
             "domainRequestSha256":hash(&domain(original)?),"originalSettingsSha256":hash(&self.settings),
             "parentSnapshotSha256":parent(&self.store.conn()?,run,&self.settings)?,
             "effectiveIdentitySha256":hash(&snapshot["executorIdentity"]),"resourceHashes":verified.resource_hashes,"anchor":anchor}));
+        if let Some(authorization)=authorization {
+            let mut proof=snapshot[CONTINUE].clone();proof.as_object_mut().unwrap().remove("sha256");
+            proof["version"]=json!(ACCOUNT_CONTINUATION);proof["accountAuthorization"]=authorization;
+            snapshot[CONTINUE]=sealed(proof);
+        }
         self.sdk_schema_continuation_bound(&snapshot)?;Ok(Some(snapshot))
     }
 }
@@ -326,6 +357,7 @@ impl SavedTextExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("text_executor_sdk_account_schema_tests.rs");
     fn fixture()->(tempfile::TempDir,SavedTextExecutor,TextRequest,Value,Value) {
         fixture_request(TextRequest{stage:"seriesAuthor".into(),skill:"synthetic".into(),model:"gpt-6.1-sol".into(),reasoning:"medium".into(),input:json!({"sourceSha256":"synthetic"}),schema:json!({"type":"object","properties":{"assets":{"type":"array","items":{"type":"string"},"uniqueItems":true}}}),rule_snapshot:json!({})})
     }

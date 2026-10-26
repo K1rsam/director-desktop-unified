@@ -63,10 +63,10 @@ impl Drop for Span {
         });
     }
 }
-fn begin() {
+pub(super) fn begin() {
     PROFILE.with(|p| assert!(p.replace(Some(State::default())).is_none()));
 }
-fn finish() -> Value {
+pub(super) fn finish() -> Value {
     let state = PROFILE.with(|p| p.take().unwrap());
     assert!(state.stack.is_empty());
     json!({"maxDepth":state.max_depth,"calls":state.counts.into_iter().map(|((name,identity),count)|
