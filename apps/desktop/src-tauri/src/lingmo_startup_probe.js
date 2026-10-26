@@ -6,9 +6,12 @@
   const request = request => invoke('desktop_request', { request });
   const wait = async (condition, label) => { for(let i=0;i<300;i++){if(condition())return;await new Promise(resolve=>setTimeout(resolve,50));}throw Error(label); };
   const button = text => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text);
+  const expectedStages=['剧本策划','分镜创作','提示词与图片','配图与视频'];
+  const stageButton=name=>[...document.querySelectorAll('.stage-nav button')].find(b=>b.querySelector('strong')?.textContent===name);
   const change = (element, value) => { Object.getOwnPropertyDescriptor(element.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype,'value').set.call(element,value);element.dispatchEvent(new Event('change',{bubbles:true}));element.dispatchEvent(new Event('input',{bubbles:true})); };
   try {
     await wait(()=>document.querySelector('.project-card'),'project view');
+    if(JSON.stringify([...document.querySelectorAll('.stage-nav button strong')].map(node=>node.textContent))!==JSON.stringify(expectedStages))throw Error('current four-stage navigation');
     const projectsBefore = await request({action:'projects.list'});
     const homeImport=document.querySelector('.lingmo-home-import button');
     if(!homeImport || [...document.querySelectorAll('.stage-nav button')].some(b=>!b.disabled))throw Error('home import requires a selected project');
@@ -21,6 +24,7 @@
     const imported=await request({action:'lingmo.create_project',path:window.__lingmoVerificationInput,expectedSha256:preview.markdownSha256,previewToken:preview.previewToken});
     const pid=imported.project.id, call=req=>request({...req,projectId:pid});
     const reopened=projectsBefore.some(project=>project.id===pid);
+    const savedPage=localStorage.getItem('director.project-page.v1:'+pid);
     const importMs=performance.now()-t0;
     if(imported.jobs.length || imported.source!==null)throw Error('import touched generation/source');
     if(imported.units.some(u=>u.origin==='imported-storyboard'&&(u.prompt||u.shots||u.mentions)))throw Error('workspace eagerly returned full drafts');
@@ -29,9 +33,11 @@
     [...document.querySelectorAll('.sidebar-link')].find(b=>b.textContent.includes('所有项目')).click();
     await wait(()=>[...document.querySelectorAll('.project-card')].some(c=>c.dataset.projectId===pid),'created project');
     [...document.querySelectorAll('.project-card')].find(c=>c.dataset.projectId===pid).querySelector('.project-card-open').click();
-    await wait(()=>[...document.querySelectorAll('.stage-nav button')].some(b=>!b.disabled && b.textContent.includes('单元视频')),'stage navigation enabled after project load');
-    await wait(()=>[...document.querySelectorAll('.stage-nav button')].some(b=>b.classList.contains('selected') && b.textContent.includes('单元视频')),'imported project reopens directly in Stage 4');
-    [...document.querySelectorAll('.stage-nav button')].find(b=>b.textContent.includes('单元视频')).click();
+    await wait(()=>stageButton('配图与视频') && !stageButton('配图与视频').disabled,'stage navigation enabled after project load');
+    const expectedOpeningStage=savedPage==='images'?'提示词与图片':'配图与视频';
+    await wait(()=>stageButton(expectedOpeningStage)?.classList.contains('selected'),'imported project preserves the actual saved work page');
+    if(reopened && savedPage!=='images')throw Error('previous hidden run did not persist the image work page');
+    stageButton('配图与视频').click();
     const displayStart=performance.now();
     await wait(()=>document.querySelectorAll('.lingmo-scene-assets .lingmo-asset-card').length && document.querySelectorAll('.lingmo-token').length,'first scene assets/tags');
     const firstDisplayMs=performance.now()-displayStart;
@@ -90,7 +96,26 @@
     await wait(()=>sceneSelect()?.options.length===1 && sceneSelect()?.selectedOptions[0]?.textContent.includes('150-1') && lastLocations.every(asset=>document.querySelector('.lingmo-scene-assets')?.textContent.includes(asset.name)),'episode 150 one scene two locations');
     const switchMs=performance.now()-switchStart;
     if(last.units.at(-1).duration!==4 || last.units.at(-1).actualDurationSeconds!==2.7)throw Error('decimal timeline');
-    const final=await call({action:'workspace.get'});if(final.jobs.length)throw Error('unexpected generation');
-    await invoke('startup_verification_report',{report:{ok:true,homeImportWithoutProject:true,globalProjectImport:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,wholeDocumentMaterialsVerified:true,localFolder,workspaceRefreshesVerified:workspaceReads,sceneRemovals,sceneNodesRetained:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
+    // Exercise actual menu navigation and persisted project opening, without
+    // calling image/text production or replacing React/IPC implementations.
+    stageButton('提示词与图片').click();
+    await wait(()=>document.querySelector('.asset-workspace') && localStorage.getItem('director.project-page.v1:'+pid)==='images','MD image work page');
+    const writePrompts=document.querySelector('.asset-workspace .stage-intro button[data-execution-action="images.design"]');
+    if(!writePrompts || writePrompts.textContent.trim()!=='编写全部提示词' || !writePrompts.disabled)throw Error('MD prompt entry or offline generation guard missing');
+    if(!document.querySelector('.asset-workspace .stage-intro')?.textContent.includes('518 项正式图片'))throw Error('MD image scope was not projected into Stage 3');
+    const reopenAt=async name=>{
+      [...document.querySelectorAll('.sidebar-link')].find(b=>b.textContent.includes('所有项目')).click();
+      await wait(()=>[...document.querySelectorAll('.project-card')].some(c=>c.dataset.projectId===pid),'saved MD project in library');
+      [...document.querySelectorAll('.project-card')].find(c=>c.dataset.projectId===pid).querySelector('.project-card-open').click();
+      await wait(()=>stageButton(name)?.classList.contains('selected'),'reopen at '+name);
+    };
+    await reopenAt('提示词与图片');
+    stageButton('配图与视频').click();
+    await wait(()=>localStorage.getItem('director.project-page.v1:'+pid)==='videos' && document.querySelector('.units-page'),'persist Stage 4 work page');
+    await reopenAt('配图与视频');
+    stageButton('提示词与图片').click();
+    await wait(()=>document.querySelector('.asset-workspace') && localStorage.getItem('director.project-page.v1:'+pid)==='images','leave image page for process restart');
+    const final=await call({action:'workspace.get'});if(final.jobs.length || final.source!==null)throw Error('unexpected generation or invented source');
+    await invoke('startup_verification_report',{report:{ok:true,fourStageMenuVerified:true,mdStage3EntryVerified:true,mdStage4EntryVerified:true,projectWorkPageReopenVerified:true,saveReopenPageVerified:reopened&&savedPage==='images',homeImportWithoutProject:true,globalProjectImport:true,lingmoFullSample:true,saveReopenVerified:reopened,frontendRendered:true,ipcRoundTrip:true,counts:expected,markdownSha256:doc.id,importMs,firstDisplayMs,switchMs,lazySceneLoading:true,lastSceneTwoLocations:true,wholeDocumentMaterialsVerified:true,localFolder,workspaceRefreshesVerified:workspaceReads,sceneRemovals,sceneNodesRetained:true,sourceUntouched:true,generationRequestsSent:0,generationJobs:0}});
   } catch(error) {await invoke('startup_verification_report',{report:{ok:false,error:String(error),assetCards:document.querySelectorAll('.lingmo-asset-card').length,assetTags:document.querySelectorAll('.lingmo-token').length,sceneSelectors:document.querySelectorAll('.lingmo-navigation select').length,sceneLoading:!!document.querySelector('.lingmo-loading'),generationRequestsSent:0}});}
 })();

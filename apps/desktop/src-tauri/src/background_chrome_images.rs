@@ -388,7 +388,21 @@ fn selected_step_with_paused_queries(engine:&Arc<Engine>,r:&Request,store:&Store
         }
         if job["nextAttemptAt"].as_i64().unwrap_or(0)>chrono::Utc::now().timestamp() {continue;}
         let known=!s(&job,"providerTaskId").is_empty();
-        let (config,account)=engine.generation_config(store,&job)?;
+        let (config,account)=match engine.generation_config(store,&job) {
+            Ok(value)=>value,
+            Err(_) if state=="submission_unknown"=>{
+                if tasks::stop_opencli_unknown_read(store,key,"FROZEN_CONFIG_UNAVAILABLE")? {return Ok(true);}
+                continue;
+            }
+            Err(error)=>return Err(error),
+        };
+        if state=="submission_unknown" {
+            if tasks::opencli_unknown_due(store,&job)? {
+                persist_report(r,journal,store,"running",Some(key))?;
+                return tasks::run_opencli_unknown_read(store,key,&config,&account,engine.channels.as_ref());
+            }
+            continue;
+        }
         let recover_prepare=!known && ["failed","recovery_paused","preparing","auth_required"].contains(&state)
             && tasks::chrome_prepare_recovery_eligible(store,&job,&config)?;
         let generate=!known && ["queued","ready"].contains(&state);
@@ -491,14 +505,15 @@ fn run_owned_with_cleanup_budget(engine:Arc<Engine>,r:&Request,cleanup_budget:Du
         let recoverable=jobs.iter().filter(|j|["failed","recovery_paused","preparing","auth_required"].contains(&s(j,"status")))
             .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::chrome_prepare_recovery_eligible(&store,j,&cfg)))
             .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
-        let refreshable=jobs.iter().filter(|j|!paused_queries.contains(&format!("prepared:{}",s(j,"id"))))
+        let refreshable=jobs.iter().filter(|j|j["status"]=="failed" && !paused_queries.contains(&format!("prepared:{}",s(j,"id"))))
             .map(|j|engine.generation_config(&store,j).and_then(|(cfg,_)|tasks::prepared_runtime_refresh_eligible(&store,j,&cfg)))
             .collect::<Result<Vec<_>>>()?.into_iter().any(|eligible|eligible);
-        let runnable=recoverable || refreshable || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
+        let unknown_read_pending=jobs.iter().map(|j|tasks::opencli_unknown_pending(&store,j)).collect::<Result<Vec<_>>>()?.into_iter().any(|pending|pending);
+        let runnable=recoverable || refreshable || unknown_read_pending || jobs.iter().any(|j|["queued","ready","submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status")));
         let unknown=jobs.iter().any(|j|["submission_unknown","auth_required","recovery_paused"].contains(&s(j,"status")));
         let known_pending=jobs.iter().any(|j|!s(j,"providerTaskId").is_empty() && (["submitted","processing","succeeded","query_failed","download_failed"].contains(&s(j,"status"))
             || j["status"]=="recovery_paused" && !paused_queries.contains(s(j,"id"))));
-        if !progressed && (!runnable || unknown && !known_pending && !recoverable) {
+        if !progressed && (!runnable || unknown && !known_pending && !recoverable && !unknown_read_pending) {
             persist_report(r,&journal,&store,"held",None)?;return Ok(2);
         }
         persist_report(r,&journal,&store,"running",None)?;

@@ -263,13 +263,19 @@ fn legacy_build_json_readiness_preserves_original_job_and_settings_and_uses_only
     assert!(!report.to_string().contains("PRIVATE_SENTINEL"));
     assert_eq!(store.job(&job).unwrap(), before_job);
     assert_eq!(store.settings().unwrap(), before_settings);
-    assert_eq!(fs::read_to_string(dir.path().join("dreamina-build-json-calls.txt")).unwrap(),
-        "version\n--help\nmultimodal2video -h\ntext2video -h\ntext2image -h\nimage2image -h\nuser_credit\n");
+    let log=fs::read_to_string(dir.path().join("dreamina-build-json-calls.txt")).unwrap();
+    let calls:Vec<_>=log.lines().collect();
+    assert_eq!(calls.len(),7,"{log}");
+    assert_eq!(&calls[..2],["version","--help"]);
+    // Independent local help probes run concurrently. The account probe must
+    // still come after all four supported protocols have been established.
+    let mut help=calls[2..6].to_vec();help.sort_unstable();
+    assert_eq!(help,["image2image -h","multimodal2video -h","text2image -h","text2video -h"]);
+    assert_eq!(calls[6],"user_credit");
 }
 #[test]
 fn legacy_build_json_requires_matching_commit_and_old_command_help_before_account_probe() {
-    for (kind, expected) in [("dreamina-build-json-mismatch", "version\n"),
-        ("dreamina-build-json-wrong-help", "version\n--help\nmultimodal2video -h\n")] {
+    for kind in ["dreamina-build-json-mismatch", "dreamina-build-json-wrong-help"] {
         let dir = tempfile::tempdir().unwrap();
         let path = native_fixture(dir.path(), kind);
         let engine = enabled_engine(dir.path().join("home"));
@@ -278,7 +284,17 @@ fn legacy_build_json_requires_matching_commit_and_old_command_help_before_accoun
         assert_eq!(report["protocol"]["state"], "unsupported", "{report}");
         assert_eq!(report["authentication"]["state"], "not_checked");
         assert_eq!(report["generation"]["calls"], 0);
-        assert_eq!(fs::read_to_string(dir.path().join(format!("{kind}-calls.txt"))).unwrap(), expected);
+        let log=fs::read_to_string(dir.path().join(format!("{kind}-calls.txt"))).unwrap();
+        if kind=="dreamina-build-json-mismatch" {assert_eq!(log,"version\n");}
+        else {
+            let calls:Vec<_>=log.lines().collect();
+            assert_eq!(calls.len(),6,"{log}");
+            assert_eq!(&calls[..2],["version","--help"]);
+            let mut help=calls[2..].to_vec();help.sort_unstable();
+            assert_eq!(help,["image2image -h","multimodal2video -h","text2image -h","text2video -h"]);
+        }
+        assert!(!log.contains("user_credit"),"unsupported help cannot probe the account: {log}");
+        assert!(!log.contains("FORBIDDEN"),"{log}");
         assert!(engine.store(s(&project, "id")).unwrap().jobs().unwrap().is_empty());
     }
 }

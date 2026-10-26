@@ -580,6 +580,9 @@ pub async fn run_asset_design(
     model: &str,
     reasoning: &str,
 ) -> Result<Value, String> {
+    if super::asset_workflow::enabled(input)? {
+        return super::asset_workflow::run_asset_prompts(input, executor, model, reasoning).await;
+    }
     inline_delta_enabled(input)?;
     let design_evidence_enabled = design_evidence::enabled(input)?;
     let incremental_comparisons = super::asset_design_contract::incremental_comparisons(input)?;

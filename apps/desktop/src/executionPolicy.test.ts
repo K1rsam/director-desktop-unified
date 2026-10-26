@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { actionBlockReason, assertOfflineAction, classifyAction, CREDENTIAL_SETTING_KEYS, dispatchOfflineRequest, OFFLINE_EXECUTION_POLICY, validateExecutionPolicy } from './executionPolicy.ts';
 import { rustStandardActionCatalogue } from './test-support/rustExecutionPolicy.ts';
 
+test('explicit unknown visual restart is SDK inference and remains blocked in offline mode', () => {
+  assert.equal(classifyAction('images.reviewCapability.restartUnknown'), 'generation');
+  assert.throws(() => assertOfflineAction({ action: 'images.reviewCapability.restartUnknown' }));
+  assert.equal(classifyAction('images.reviewReconcile'), 'local_write');
+});
+
 test('the complete native Rust action catalogue installs without disabling SDK or Dreamina authorization', async () => {
   const { installExecutionPolicy, hasSdkExecutionCapability } = await import('./executionPolicy.ts');
   const allowedActions = rustStandardActionCatalogue();

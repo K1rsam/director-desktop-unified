@@ -107,6 +107,9 @@ const STARTUP_PROBE: &str = r#"
   const progress = async checkpoint => {
     try { await invoke('startup_verification_progress', {checkpoint}); } catch { /* best-effort fixed metadata only */ }
   };
+  const expectedStages=['剧本策划','分镜创作','提示词与图片','配图与视频'];
+  const stageButton=name=>[...document.querySelectorAll('.stage-nav button')].find(button=>button.querySelector('strong')?.textContent===name);
+  const waitUi=async (condition,label)=>{for(let i=0;i<150;i++){if(condition())return;await new Promise(resolve=>setTimeout(resolve,50));}throw Error(label);};
   try {
     await progress('started');
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -114,6 +117,7 @@ const STARTUP_PROBE: &str = r#"
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     if (!document.querySelector('.project-card')) throw new Error('React project view did not render');
+    if(JSON.stringify([...document.querySelectorAll('.stage-nav button strong')].map(node=>node.textContent))!==JSON.stringify(expectedStages))throw Error('Current four-stage navigation mismatch');
     const projects = await invoke('desktop_request', {request:{action:'projects.list'}});
     // A second launch against this same isolated home verifies persisted data.
     // The first launch leaves precisely these two projects after lifecycle tests.
@@ -131,10 +135,14 @@ const STARTUP_PROBE: &str = r#"
       const card=[...document.querySelectorAll('.project-card')].find(card=>card.dataset.projectId===savedProject.id);
       if(!card) throw new Error('Saved project did not appear in the native library');
       card.querySelector('.project-card-open').click();
+      await waitUi(()=>stageButton('提示词与图片')?.classList.contains('selected') && document.querySelector('.asset-workspace'),'Saved image work page did not survive process restart');
+      stageButton('剧本策划').click();
       for(let attempt=0;attempt<100 && !document.querySelector('.production-source-document')?.textContent.includes('甲：保存后重开。');attempt++) await new Promise(resolve=>setTimeout(resolve,50));
       if(!document.querySelector('.production-source-document')?.textContent.includes('甲：保存后重开。')) throw new Error('Saved source did not render after restart');
+      stageButton('提示词与图片').click();
+      await waitUi(()=>document.querySelector('.asset-workspace') && localStorage.getItem('director.project-page.v1:'+savedProject.id)==='images','Restored work page did not remain saved');
       await progress('completed');
-      await invoke('startup_verification_report',{report:{ok:true,saveReopenVerified:true,frontendRendered:true,ipcRoundTrip:true,sqliteRead:true,assetProtocol:true,projectId:savedProject.id,mediaSha256:media.sha256,projectCount:projects.length,generationRequestsSent:0,generationJobs:0}});
+      await invoke('startup_verification_report',{report:{ok:true,saveReopenVerified:true,saveReopenPageVerified:true,fourStageMenuVerified:true,frontendRendered:true,ipcRoundTrip:true,sqliteRead:true,assetProtocol:true,projectId:savedProject.id,mediaSha256:media.sha256,projectCount:projects.length,generationRequestsSent:0,generationJobs:0}});
       return;
     }
     if (projects.length !== 1) throw new Error('Isolated project registry did not round trip');
@@ -151,7 +159,7 @@ const STARTUP_PROBE: &str = r#"
     await progress('asset_protocol');
     document.querySelector('.project-card-open').click();
     for (let attempt=0; attempt<100 && !document.querySelector('.stage-nav button:not(:disabled)'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
-    const foundationButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('剧本与基础'));
+    const foundationButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('剧本策划'));
     foundationButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.stage-one-workbench'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     if (!document.querySelector('[aria-label="集场目录"]') || !document.querySelector('[aria-label="制作基础内容"]') || !document.querySelector('.production-source-document')?.textContent.includes('甲：走吧。')) throw new Error('Stage 1 locked source workbench did not render');
@@ -167,21 +175,22 @@ const STARTUP_PROBE: &str = r#"
     for (let attempt=0; attempt<100 && document.querySelector('.production-reading-heading h3')?.textContent!=='背景资料'; attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     if (!document.querySelector('.production-source-document')?.textContent.includes('【人物关系】') || document.querySelector('.production-source-document')?.textContent.includes('甲：走吧。')) throw new Error('Background readback mixes production body or lost original context');
     await progress('source_review');
-    const storyboardButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('分镜提示词'));
+    const storyboardButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('分镜创作'));
     if (!storyboardButton) throw new Error('Storyboard navigation is missing');
     storyboardButton.click();
     for (let attempt=0; attempt<100; attempt++) {
-      if ([...document.querySelectorAll('.stage-three-workbench button')].some(button=>button.textContent.includes('生成分镜提示词') && button.disabled) && !document.querySelector('.video-production-panel')) break;
+      if ([...document.querySelectorAll('.stage-three-workbench button')].some(button=>button.textContent.includes('一键创作分镜') && button.disabled) && !document.querySelector('.video-production-panel')) break;
       await new Promise(resolve=>setTimeout(resolve,50));
     }
-    const creationButton=[...document.querySelectorAll('button')].find(button=>button.textContent.includes('生成分镜提示词'));
+    const creationButton=[...document.querySelectorAll('button')].find(button=>button.textContent.includes('一键创作分镜'));
     if (!creationButton || !creationButton.disabled || !document.querySelector('.production-range-label')?.textContent.includes('创作范围') || document.querySelector('.video-production-panel')) throw new Error('Offline Stage 3 must render its range but disable generation');
     const policy = await invoke('desktop_request',{request:{action:'getExecutionPolicy'}});
     if(policy.liveExecutionAllowed !== false || policy.stage3CreativePackStatus !== 'inactive') throw new Error('Offline execution policy is not enforced');
     let blockedGeneration = false;
     try { await invoke('desktop_request',{request:{action:'storyboard.run',projectId:projects[0].id}}); } catch(error) { blockedGeneration = String(error).includes('OFFLINE_EXECUTION_BLOCKED'); }
     if(!blockedGeneration) throw new Error('Raw IPC bypassed the offline generation gate');
-    if (!document.querySelector('.text-execution-summary')?.textContent.includes('Codex CLI')) throw new Error('Stage text executor identity did not render');
+    const expectedTextChannel=workspace.settings.textProvider==='api'?'文本 API':workspace.settings.textProvider==='codex_sdk'?'Codex SDK':'Codex CLI';
+    if (!document.querySelector('.text-execution-summary')?.textContent.includes(expectedTextChannel)) throw new Error('Stage text executor identity did not render');
     await progress('stage_three');
     const settingsButton=[...document.querySelectorAll('.sidebar-link')].find(button=>button.textContent.includes('软件设置'));
     if (!settingsButton) throw new Error('Settings navigation is missing');
@@ -221,7 +230,7 @@ const STARTUP_PROBE: &str = r#"
     const deleted=removed.deletedAssets.find(asset=>asset.id===before.id);
     const restored=await call({action:'assets.restore',assetId:before.id,expectedVersion:deleted.version});
     if (!restored.assets.some(asset=>asset.id===before.id && asset.adoptedMediaId===media.id) || restored.deletedAssets.some(asset=>asset.id===before.id)) throw new Error('Restoration changed asset or image identity');
-    const imageButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('图片资产'));
+    const imageButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('提示词与图片'));
     if (!imageButton) throw new Error('Image navigation is missing after leaving software settings');
     imageButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.asset-workspace'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
@@ -240,7 +249,7 @@ const STARTUP_PROBE: &str = r#"
     await progress('asset_lifecycle');
     const episode=workspace.source.episodes[0].id, scene=workspace.source.scenes[0].id, row=workspace.source.rows.find(row=>row.kind==='body' && row.episodeId===episode && row.sceneId===scene).id;
     await call({action:'units.save',unit:{id:'probe-unit',episodeId:episode,sceneId:scene,sourceRefs:[row],title:'离线配图验证',prompt:'推门进入 {{asset:probe-asset:base}}',duration:12,assetRefs:[{assetId:before.id,variantId:'base',role:'人物',order:1}]}});
-    const videoButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('单元视频'));
+    const videoButton=[...document.querySelectorAll('.stage-nav button')].find(button=>button.textContent.includes('配图与视频'));
     videoButton.click();
     for (let attempt=0; attempt<100 && !document.querySelector('.units-page'); attempt++) await new Promise(resolve=>setTimeout(resolve,50));
     refreshButton.click();
@@ -340,9 +349,11 @@ const STARTUP_PROBE: &str = r#"
     await saveCall({action:'media.adopt',assetId:'reopen-asset',variantId:'base',mediaId:saved.media[0].id});
     const savedEpisode=saved.source.episodes[0].id,savedScene=saved.source.scenes[0].id,savedRow=saved.source.rows.find(row=>row.kind==='body' && row.episodeId===savedEpisode && row.sceneId===savedScene).id;
     await saveCall({action:'units.save',unit:{id:'reopen-unit',episodeId:savedEpisode,sceneId:savedScene,sourceRefs:[savedRow],title:'保存后重开验证',prompt:'{{asset:reopen-asset:base}} 保存',duration:5,assetRefs:[{assetId:'reopen-asset',variantId:'base',role:'人物',order:1}]}});
+    stageButton('提示词与图片').click();
+    await waitUi(()=>document.querySelector('.asset-workspace') && localStorage.getItem('director.project-page.v1:'+secondLibraryCreated.id)==='images','Image work page was not persisted through normal navigation');
     await progress('inline_create');
     await progress('completed');
-    await invoke('startup_verification_report', {report:{ok:true, frontendRendered:true, ipcRoundTrip:true, sqliteRead:true, assetProtocol:true, accountPanelRendered:true, stage1LockedSourceRendered:true, sourceStructureReviewRendered:true, backgroundSourceRendered:true, stage3OfflineCreationBlocked:true, rawIpcGenerationBlocked:true, textCliSettingsRendered:true, textExecutionSummaryRendered:true, assetUsageRoundTrip:true, assetDeleteRestoreRoundTrip:true, imageRetainedAfterRestore:true, nativeAssetEditorOpened:true, nativeUnitAssetEditorOpened:true, projectArchiveRestoreDeleteUiRoundTrip:true, unarchivedProjectDeleteRejected:true, archivedWorkspaceClosed:true, sourceAndMediaRetainedAfterRestore:true, projectFileRetentionDisclosed:true, projectRemovedFromRegistry:true, libraryInlineCreateRoundTrip:true, libraryInlineEnterCreateRoundTrip:true, stageOneCreationEntryAbsent:true, sharedDefaultRoot:true, createdProjectIds:[libraryCreated.id,secondLibraryCreated.id], projectRoot:workspace.project.rootPath, originalMediaPath:media.path, rules:workspace.rules.map(rule=>({id:rule.id,version:rule.version})), generationRequestsSent:0, projectId:pid, mediaSha256:media.sha256, generationJobs:finalWorkspace.jobs.length, width:innerWidth, height:innerHeight}});
+    await invoke('startup_verification_report', {report:{ok:true, fourStageMenuVerified:true,workPagePersisted:true, frontendRendered:true, ipcRoundTrip:true, sqliteRead:true, assetProtocol:true, accountPanelRendered:true, stage1LockedSourceRendered:true, sourceStructureReviewRendered:true, backgroundSourceRendered:true, stage3OfflineCreationBlocked:true, rawIpcGenerationBlocked:true, textCliSettingsRendered:true, textExecutionSummaryRendered:true, assetUsageRoundTrip:true, assetDeleteRestoreRoundTrip:true, imageRetainedAfterRestore:true, nativeAssetEditorOpened:true, nativeUnitAssetEditorOpened:true, projectArchiveRestoreDeleteUiRoundTrip:true, unarchivedProjectDeleteRejected:true, archivedWorkspaceClosed:true, sourceAndMediaRetainedAfterRestore:true, projectFileRetentionDisclosed:true, projectRemovedFromRegistry:true, libraryInlineCreateRoundTrip:true, libraryInlineEnterCreateRoundTrip:true, stageOneCreationEntryAbsent:true, sharedDefaultRoot:true, createdProjectIds:[libraryCreated.id,secondLibraryCreated.id], projectRoot:workspace.project.rootPath, originalMediaPath:media.path, rules:workspace.rules.map(rule=>({id:rule.id,version:rule.version})), generationRequestsSent:0, projectId:pid, mediaSha256:media.sha256, generationJobs:finalWorkspace.jobs.length, width:innerWidth, height:innerHeight}});
   } catch (error) {
     await progress('failed');
     await invoke('startup_verification_report', {report:{ok:false,error:String(error),pageTitle:document.querySelector('.topbar h1')?.textContent,assetControlsRendered:!!document.querySelector('.asset-management-actions'),unitControlsRendered:!!document.querySelector('.unit-reference-grid')}});
@@ -373,6 +384,9 @@ async fn desktop_request(
     result
 }
 fn main() {
+    if director_core::visual_review::run_runtime_wrapper().expect("SDK 视觉审核子进程校验失败") {
+        return;
+    }
     if director_core::text_sdk::run_runtime_wrapper().expect("SDK 执行子进程校验失败") {
         return;
     }

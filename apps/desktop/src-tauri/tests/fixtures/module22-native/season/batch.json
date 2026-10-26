@@ -1,0 +1,68 @@
+{
+  "version": "series-image-batch-v1",
+  "queueHash": "59065420fa9f27354e56c60599aa698d26ae36b92301d8924fcc23b7647d7e63",
+  "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+  "productionScopeHash": "784f61d1b4c1a785ae33c513047ea97f95c764e505fc5724f3f1c77ca81e0768",
+  "tasks": [
+    {
+      "itemId": "A0002@1",
+      "taskId": "IMG-f4a7f05b00e09716d75e533d",
+      "assetId": "A0002",
+      "assetRevision": 1,
+      "designHash": "dfb2cc59b5bb931a2d1708394f145de466aed5db5eca4d9f866b3016d67c8096",
+      "filename": "场景-门厅.png",
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ]
+    },
+    {
+      "itemId": "A0001@1",
+      "taskId": "IMG-6be67572db0ec2d5579432ea",
+      "assetId": "A0001",
+      "assetRevision": 1,
+      "designHash": "258e3c0cac77826d0099dae94d0be2adc16de036d550688918c73abb327308b7",
+      "filename": "角色-值守者面罩.png",
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ]
+    },
+    {
+      "itemId": "A0004@1",
+      "taskId": "IMG-584a6af498d7efa9e39942b1",
+      "assetId": "A0004",
+      "assetRevision": 1,
+      "designHash": "eecccc2a0df744b292fb841feac16e7bbd0a9336790735beafb635acd7158511",
+      "filename": "道具-铜钥匙.png",
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ]
+    },
+    {
+      "itemId": "A0003@1",
+      "taskId": "IMG-1e1480995329e419a58e25b2",
+      "assetId": "A0003",
+      "assetRevision": 1,
+      "designHash": "5c8a17aa65c0ae4931b7a98932a810c272906d36616af599f9896e595bd62730",
+      "filename": "场景-走廊.png",
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-2",
+          "purpose": "Actual adopted image binding"
+        }
+      ]
+    }
+  ]
+}

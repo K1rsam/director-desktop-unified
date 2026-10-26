@@ -58,6 +58,9 @@ fn asset_design_progress_plan(stage: &str, context: &Value) -> Option<Value> {
     if stage != "images.design" { return None; }
     let assets = context["assets"].as_array()?;
     let selected = context.pointer("/selection/assetIds")?.as_array()?;
+    if context["workflowProfile"]==crate::asset_graph::PROFILE {
+        return Some(json!({"version":"asset-prompt-progress/v1","workflowProfile":context["workflowProfile"],"sourceKind":context["sourceKind"],"designAssetIds":selected,"inlineAssetIds":[],"totalAssets":selected.len(),"requestedAssetIds":selected}));
+    }
     let mut wanted = selected.iter().map(|id| id.as_str().map(str::to_owned)).collect::<Option<HashSet<_>>>()?;
     // SQLite json_extract exposes a JSON boolean as SQL integer in this
     // display-only projection. Either true representation must hide the target.
@@ -811,7 +814,7 @@ impl Store {
             return Ok(vec![]);
         }
         let c = self.conn()?;
-        let mut q=c.prepare("SELECT id,COALESCE(json_extract(snapshot,'$.stage'),entity_id),state,result,CASE WHEN json_extract(snapshot,'$.stage')='images.design' AND json_extract(snapshot,'$.runnerVersion')='stage2-runner/v1' THEN json_object('assets',json_extract(snapshot,'$.stage2Context.assets'),'selection',json_extract(snapshot,'$.stage2Context.selection'),'imageProductionPolicy',json_extract(snapshot,'$.stage2Context.imageProductionPolicy'),'automaticDesign',json_extract(snapshot,'$.stage2Context.automaticDesign')) END FROM jobs WHERE kind='workflow' AND json_extract(snapshot,'$.runnerVersion') IN ('desktop-runner/v1','stage2-runner/v1') ORDER BY created_at DESC,rowid DESC LIMIT 12").map_err(|e|e.to_string())?;
+        let mut q=c.prepare("SELECT id,COALESCE(json_extract(snapshot,'$.stage'),entity_id),state,result,CASE WHEN json_extract(snapshot,'$.stage')='images.design' AND json_extract(snapshot,'$.runnerVersion')='stage2-runner/v1' THEN json_object('workflowProfile',json_extract(snapshot,'$.stage2Context.workflowProfile'),'sourceKind',json_extract(snapshot,'$.stage2Context.imageSource.sourceKind'),'assets',json_extract(snapshot,'$.stage2Context.assets'),'selection',json_extract(snapshot,'$.stage2Context.selection'),'imageProductionPolicy',json_extract(snapshot,'$.stage2Context.imageProductionPolicy'),'automaticDesign',json_extract(snapshot,'$.stage2Context.automaticDesign')) END FROM jobs WHERE kind='workflow' AND json_extract(snapshot,'$.runnerVersion') IN ('desktop-runner/v1','stage2-runner/v1') ORDER BY created_at DESC,rowid DESC LIMIT 12").map_err(|e|e.to_string())?;
         let runs = q
             .query_map([], |r| {
                 Ok((
@@ -858,8 +861,8 @@ impl Store {
             let result = result
                 .and_then(|v| serde_json::from_str::<Value>(&v).ok())
                 .unwrap_or(Value::Null);
-            let design_plan = design_context.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|context| asset_design_progress_plan(&stage, &context));
-            values.push(json!({"workflowId":id,"stage":stage,"status":status,"assetDesignPlan":design_plan,"completedSteps":nodes.iter().filter(|n|n["status"]=="accepted").count(),"totalSteps":nodes.len(),"nodes":nodes,"waitingDecision":result["waitingDecision"],"blocked":result["blocked"],"publishedEpisodeIds":result["updatedEpisodeIds"]}));
+            let design_plan = design_context.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|context| asset_design_progress_plan(&stage, &context)).unwrap_or(Value::Null);
+            values.push(json!({"workflowId":id,"stage":stage,"status":status,"workflowProfile":design_plan["workflowProfile"],"sourceKind":design_plan["sourceKind"],"assetDesignPlan":design_plan,"completedSteps":nodes.iter().filter(|n|n["status"]=="accepted").count(),"totalSteps":nodes.len(),"nodes":nodes,"waitingDecision":result["waitingDecision"],"blocked":result["blocked"],"publishedEpisodeIds":result["updatedEpisodeIds"]}));
         }
         Ok(values)
     }
@@ -919,7 +922,20 @@ impl Store {
         if foundation_version.is_some_and(|v| v != old_version) {
             return Err("制作基础已经更新，请刷新后再保存方向".into());
         }
-        let mut foundation=raw.unwrap_or(json!({"schemaVersion":"foundation/v1","episodes":[],"assets":[],"facts":[],"issues":[],"overview":"","direction":""}));
+        let mut foundation = match raw {
+            Some(value) => value,
+            None => {
+                // A confirmed direction is a valid first-stage seed. Bind it
+                // to the actual locked source in the same version/CAS transaction.
+                let source_sha: String = tx.query_row(
+                    "SELECT sha256 FROM sources WHERE version=?1",
+                    [current_source],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                json!({"schemaVersion":"foundation/v1","sourceSha256":source_sha,
+                    "episodes":[],"assets":[],"facts":[],"issues":[],"overview":"","direction":""})
+            }
+        };
         foundation["productionDirection"] = json!(direction.trim());
         foundation["directionConfirmed"] = json!(true);
         write_foundation(&tx, foundation, current_source)?;
@@ -1470,6 +1486,11 @@ impl Store {
             }
         }
         let episodes: HashSet<_> = units.iter().map(|u| s(u, "episodeId").to_owned()).collect();
+        if crate::pipeline::series::uses_profile(input)? {
+            let run=run.ok_or("新分镜采用必须绑定原流程")?;
+            verify_series_receipts(&tx,run,output)?;
+            crate::series_store::persist(&tx,input,output,run)?;
+        }
         let replaced: HashSet<_> = output["replacedUnitIds"]
             .as_array()
             .filter(|v| !v.is_empty())
@@ -1694,6 +1715,11 @@ impl Store {
             }
             drop(q);
             next_guard["units"] = json!(versions);
+            if crate::pipeline::series::uses_profile(input)? {
+                let mut q=tx.prepare("SELECT id,version FROM assets WHERE COALESCE(json_extract(data,'$.deletedAt'),'')=''").map_err(|e|e.to_string())?;
+                let versions=q.query_map([],|r|Ok((r.get::<_,String>(0)?,json!(r.get::<_,i64>(1)?)))).map_err(|e|e.to_string())?.collect::<std::result::Result<serde_json::Map<String,Value>,_>>().map_err(|e|e.to_string())?;
+                next_guard["assets"]=json!(versions);
+            }
             let raw: Option<String> = tx
                 .query_row("SELECT prepared FROM jobs WHERE id=?1", [run], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
@@ -1715,7 +1741,7 @@ impl Store {
                     .filter(|unit| s(unit, "episodeId") == episode)
                     .map(|unit| s(unit, "id").to_owned())
                     .collect();
-                for field in ["units", "plans"] {
+                for field in ["units", "plans", "seriesDeliveries"] {
                     let mut entries: Vec<_> = result[field]
                         .as_array()
                         .into_iter()
@@ -1780,6 +1806,7 @@ impl Store {
                 }
                 result["updatedEpisodeIds"] = json!(ids);
                 result["sourceSha256"] = output["sourceSha256"].clone();
+                if let Some(profile)=output.get("workflowProfile") {result["workflowProfile"]=profile.clone();}
                 result["schemaVersion"] = json!("storyboard-delivery/v1");
                 result["scope"] = json!("episodes");
                 result["status"] = json!("running");
@@ -1824,6 +1851,54 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 }
+pub(crate) fn verify_series_receipts(c:&Connection,run:&str,output:&Value)->Result<()> {
+    let mut q=c.prepare("SELECT node_key FROM workflow_steps WHERE workflow_id=?1 AND stage LIKE 'series%'").map_err(|e|e.to_string())?;
+    let nodes=q.query_map([run],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    for delivery in output["seriesDeliveries"].as_array().ok_or("缺少逐集同版交付")? {
+        let supply=crate::series_store::supply_proof(delivery)?;
+        let origin = &supply["origin"];
+        if !origin.is_null() {
+            let mut matched = 0;
+            for node in &nodes {
+                if let Some(step) = progress_step(c, run, node)? {
+                    if step.status == "rejected" && step.domain_hash == origin["requestSha256"]
+                        && serde_json::to_value(&step.request).map_err(|e|e.to_string())? == origin["request"]
+                        && step.request.stage == "seriesAuthor" && step.error == origin["reason"]
+                        && step.request.input["executionRoleId"] == origin["executionRoleId"]
+                        && step.raw == origin["raw"] && step.event["requestHash"] == step.hash
+                        && step.event["value"] == origin["raw"] { matched += 1; }
+                }
+            }
+            if matched != 1 { return Err("补料原作者未绑定唯一已拒绝原任务；未采用复制或未知回包".into()); }
+        }
+        let mut role_receipts:Vec<&Value>=delivery["adoptionReceipt"]["roleReceipts"].as_array().ok_or("缺少独立岗位回执")?.iter().collect();
+        if supply["version"]=="series-supply-contract-correction/v1" {
+            let context=&supply["context"];
+            let prepared:String=c.query_row("SELECT prepared FROM jobs WHERE id=?1 AND kind='workflow' AND entity_id='storyboard.run'",[run],|r|r.get(0)).map_err(|_|"合同纠正缺少原流程授权")?;
+            let prepared:Value=serde_json::from_str(&prepared).map_err(|_|"合同纠正授权无法读取")?;
+            if context["workflowId"]!=run || prepared["seriesSupplyContractCorrections"][s(context,"originRequestSha256")]!=*context {
+                return Err("合同纠正未绑定原流程冻结授权，未采用".into());
+            }
+            let proofs:i64=c.query_row("SELECT count(*) FROM events WHERE job_id=?1 AND type='series_supply_contract_correction_authorized' AND json_extract(data,'$.originRequestSha256')=?2 AND json_extract(data,'$.contextSha256')=?3 AND json_extract(data,'$.authorizationRequest.acknowledgeAdditionalTextUsage')=1",params![run,s(context,"originRequestSha256"),crate::pipeline::digest(&context.to_string())],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if proofs!=1{return Err("合同纠正没有唯一的额外文字用量授权，未采用".into());}
+            role_receipts.extend(context["legacyReceipts"].as_array().ok_or("合同纠正缺少原链岗位回执")?.iter());
+        }
+        for receipt in role_receipts {
+            let mut matched=0;
+            for node in &nodes {
+                if let Some(step)=progress_step(c,run,node)? {
+                    if step.status=="accepted" && step.domain_hash==receipt["requestSha256"]
+                        && step.request.input["executionRoleId"]==receipt["executionRoleId"]
+                        && step.result==receipt["raw"] && step.raw==receipt["raw"]
+                        && step.event["requestHash"]==step.hash && step.event["value"]==receipt["raw"] {matched+=1;}
+                }
+            }
+            if matched!=1 {return Err("分镜岗位成果未绑定唯一已接收且验收的原任务；未采用复制结果".into());}
+        }
+    }
+    Ok(())
+}
+
 pub fn guard_from_input(input: &Value) -> Value {
     let assets: BTreeMap<_, _> = input["assets"]
         .as_array()
@@ -2064,6 +2139,13 @@ fn step_title(stage: &str) -> &str {
         "storyboardPlan" => "情绪与事件规划",
         "storyboardCreate" => "完整单元主创",
         "storyboardFinish" => "关联范围整编",
+        "seriesDesign" => "完整资产文字设计",
+        "seriesDesignReview" => "独立核对完整设计",
+        "seriesAuthor" => "统筹与完整主创",
+        "seriesFinisher" => "整集整编",
+        "seriesReview" => "独立读稿审核",
+        "seriesRepair" => "按审核意见修订",
+        "assetPrompt" => "编写图片提示词",
         _ => "整理制作内容",
     }
 }

@@ -55,7 +55,7 @@ test('identity and design parents do not become pixel dependencies; only explici
   assert.deepEqual(imageWaitingNames(workspace, child), ['身份母版'], 'a downloaded candidate does not satisfy adoption');
   parent.adoptedMediaId = 'candidate';
   assert.deepEqual(imageWaitingNames(workspace, child), []);
-  for (const imageStatus of ['needs_review', 'stale', 'rejected', 'invalid']) {
+  for (const imageStatus of ['needs_review', 'stale', 'rejected', 'invalid', 'needs_repair', 'unknown', 'submission_unknown', 'candidate', 'pending_review']) {
     parent.imageStatus = imageStatus;
     assert.deepEqual(imageWaitingNames(workspace, child), ['身份母版'], imageStatus + ' cannot satisfy an actual media dependency');
   }
@@ -176,17 +176,19 @@ test('adopted placeholder pixels do not count as finished images or satisfy chil
 
 test('retained review and invalid images stay viewable without inflating usable adoption counts', () => {
   const workspace = fixture();
-  const statuses = ['adopted', 'needs_review', 'stale', 'rejected', 'invalid', 'needs_repair'];
+  const statuses = ['adopted', 'needs_review', 'stale', 'rejected', 'invalid', 'needs_repair', 'unknown', 'submission_unknown', 'candidate', 'pending_review'];
   workspace.assets = statuses.map((imageStatus, i) => ({ id: `a${i}`, name: imageStatus, kind: 'CH', variantId: 'v', prompt: '保留文字', adoptedMediaId: `m${i}`, imageStatus }));
   workspace.media = statuses.map((_, i) => ({ id: `m${i}`, assetId: `a${i}`, variantId: 'v', kind: 'image', path: `retained-${i}.png` }));
   const before = structuredClone(workspace);
-  assert.deepEqual(imageProductionCounts(workspace), { total: 6, prompts: 6, adopted: 1, candidates: 6, waiting: 0, needsReview: 2, invalid: 3 });
+  assert.deepEqual(imageProductionCounts(workspace), { total: 10, prompts: 10, adopted: 1, candidates: 10, waiting: 0, needsReview: 2, invalid: 3 });
   workspace.assets.forEach((asset, i) => {
     assert.equal(realAdoptedImage(workspace, asset)?.id, `m${i}`, 'old media remains viewable');
     assert.equal(usableAdoptedImage(workspace, asset)?.id, i ? undefined : 'm0');
   });
   assert.equal(assetImageStatus(workspace, workspace.assets[3]), '待修');
   assert.equal(assetImageStatus(workspace, workspace.assets[4]), '图片无效');
+  assert.equal(assetImageStatus(workspace, workspace.assets[6]), '原结果待核对');
+  assert.equal(assetImageStatus(workspace, workspace.assets[8]), '候选待选');
   assert.deepEqual(workspace, before, 'counting never rewrites an adoption or old media');
 });
 

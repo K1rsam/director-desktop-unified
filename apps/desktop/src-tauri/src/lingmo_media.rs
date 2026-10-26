@@ -53,13 +53,21 @@ fn put_metadata(store: &Store, key: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 fn assets(store: &Store, document: &str) -> Result<Vec<Value>> {
-    lingmo_import::document(store, document)?;
+    let doc=lingmo_import::document(store, document)?;
     let prefix = format!("lingmo-{document}-asset-");
+    let mut ids=HashSet::new();
+    for scene in values(&doc,"scenes") {for id in values(&scene,"assetIds") {if let Some(id)=id.as_str(){ids.insert(id.to_owned());}}}
+    if let Some(mapping)=metadata(store,&format!("lingmo.asset-identities:{document}"))? {
+        if mapping["schemaVersion"]!="lingmo-asset-identities/v1" || mapping["documentSha256"]!=document {
+            return Err("本分镜的资产接续映射身份不符，未猜测扫描范围".into());
+        }
+        for binding in values(&mapping,"bindings") {if !s(&binding,"assetId").is_empty(){ids.insert(s(&binding,"assetId").to_owned());}}
+    }
     Ok(store
         .values("assets")?
         .into_iter()
         .filter(|a| {
-            s(a, "id").starts_with(&prefix)
+            (s(a, "id").starts_with(&prefix) || ids.contains(s(a,"id")))
                 && s(a, "origin") == "imported-storyboard"
                 && s(a, "deletedAt").is_empty()
         })

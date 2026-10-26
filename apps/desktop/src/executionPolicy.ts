@@ -51,6 +51,7 @@ const LOCAL_READ_ACTIONS = new Set([
   'units.get', 'units.versions.list', 'foundation.choices.list', 'assets.get', 'assets.usage', 'jobs.detail', 'storyboard.refinement.continuity.preview',
 ]);
 const LOCAL_WRITE_ACTIONS = new Set([
+  'images.reviewDelegation.set', 'images.reviewReconcile',
   'lingmo.import', 'lingmo.create_project', 'lingmo.media.commit', 'images.exportPrompts', 'images.exportCurrent', 'images.registerReference', 'storyboard.exportDelivery',
   'projects.create', 'projects.archive', 'projects.restore', 'projects.delete',
   'legacy.import', 'project.import', 'project.export', 'units.version.restore', 'units.save',
@@ -60,6 +61,7 @@ const LOCAL_WRITE_ACTIONS = new Set([
   'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',
 ]);
 const GENERATION_ACTIONS = new Set([
+  'images.reviewCapability', 'images.reviewCapability.restartUnknown', 'images.reviewCandidate',
   'foundation.run', 'foundation.choices.apply', 'images.design', 'images.produce', 'images.run',
   'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',
 ]);

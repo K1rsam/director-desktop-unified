@@ -117,6 +117,29 @@ impl FrozenAttempt {
         }).to_string());
         Ok(attempt)
     }
+    /// v4 changes only the provider schema compiler. Domain constraints remain
+    /// in the frozen request and all v2/v3 byte identities stay reproducible.
+    pub fn prepare_sdk_strict_schema(
+        attempt_id: &str, workflow_id: &str, logical_node_id: &str,
+        request: TextRequest, runtime_identity: &Value,
+    ) -> Result<Self> {
+        let mut attempt = Self::prepare_sdk_rules_first(attempt_id, workflow_id,
+            logical_node_id, request, runtime_identity)?;
+        attempt.version = "text-attempt/v4".into();
+        attempt.compiled_input_format = Some("rules-first-json-strict/v2".into());
+        attempt.attempt_envelope_hash = digest(&json!({
+            "version":"attempt-identity/v3", "attemptId":attempt_id,
+            "workflowId":workflow_id, "logicalNodeId":logical_node_id,
+            "semanticRequestHash":attempt.semantic_request_hash,
+            "executionFingerprint":attempt.execution_fingerprint,
+            "compiledInputFormat":attempt.compiled_input_format,
+        }).to_string());
+        Ok(attempt)
+    }
+    pub fn sdk_bridge_uses_strict_schema(inspect: &Value) -> bool {
+        inspect["capabilities"]["compiledInputFormats"].as_array()
+            .is_some_and(|formats| formats.iter().any(|format| format == "rules-first-json-strict/v2"))
+    }
     pub fn sdk_bridge_uses_rules_first(inspect: &Value) -> bool {
         inspect["capabilities"]["compiledInputFormats"].as_array()
             .is_some_and(|formats| formats.iter().any(|format| format == "rules-first-json/v1"))
@@ -126,7 +149,9 @@ impl FrozenAttempt {
         attempt_id: &str, workflow_id: &str, logical_node_id: &str,
         request: TextRequest, runtime_identity: &Value, inspect: &Value,
     ) -> Result<Self> {
-        if Self::sdk_bridge_uses_rules_first(inspect) {
+        if Self::sdk_bridge_uses_strict_schema(inspect) {
+            Self::prepare_sdk_strict_schema(attempt_id, workflow_id, logical_node_id, request, runtime_identity)
+        } else if Self::sdk_bridge_uses_rules_first(inspect) {
             Self::prepare_sdk_rules_first(attempt_id, workflow_id, logical_node_id, request, runtime_identity)
         } else {
             Self::prepare(attempt_id, workflow_id, logical_node_id, Backend::CodexSdk, request, runtime_identity)
@@ -142,11 +167,16 @@ impl FrozenAttempt {
         )
     }
     pub fn load(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        let _profile = crate::text_executor::validation_profile::enter("FrozenAttempt::load", path.parent().and_then(|p|p.file_name()).and_then(|s|s.to_str()).unwrap_or("unknown"));
         if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 4_194_304 {
             return Err("冻结执行磁盘封套超出容量，不加载或重发".into());
         }
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        if bytes.len() > 4_194_304 { return Err("冻结执行磁盘封套超出容量，不加载或重发".into()); }
+        if let Some(value) = crate::text_executor::sdk_evidence_cache::attempt(path, &bytes) { return Ok(value); }
         let record: Value =
-            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            serde_json::from_slice(&bytes)
                 .map_err(|e| e.to_string())?;
         if record["format"] != "frozen-attempt-envelope/v1"
             || record["sha256"] != digest(&record["payload"].to_string())
@@ -159,6 +189,7 @@ impl FrozenAttempt {
             return Err("SDK_COMPILED_FORMAT_UNSUPPORTED: v2原冻结包不得注入编译格式字段".into());
         }
         value.validate_identity()?;
+        crate::text_executor::sdk_evidence_cache::remember_attempt(path, bytes, &value);
         Ok(value)
     }
     pub fn validate_identity(&self) -> Result<()> {
@@ -168,6 +199,9 @@ impl FrozenAttempt {
                 &self.runtime_identity)?,
             Some("rules-first-json/v1") if self.backend == Backend::CodexSdk =>
                 Self::prepare_sdk_rules_first(&self.attempt_id, &self.workflow_id,
+                    &self.logical_node_id, self.request.clone(), &self.runtime_identity)?,
+            Some("rules-first-json-strict/v2") if self.backend == Backend::CodexSdk =>
+                Self::prepare_sdk_strict_schema(&self.attempt_id, &self.workflow_id,
                     &self.logical_node_id, self.request.clone(), &self.runtime_identity)?,
             _ => return Err("SDK_COMPILED_FORMAT_UNSUPPORTED: 未知冻结编译格式，未派发或重编原请求".into()),
         };
@@ -251,6 +285,7 @@ impl FrozenAttempt {
         self.state = match event.kind {
             ObservationKind::Started => AttemptState::Observed,
             ObservationKind::Completed => AttemptState::Completed,
+            ObservationKind::Rejected => AttemptState::Rejected,
             ObservationKind::SubmissionUnknown => AttemptState::SubmissionUnknown,
             ObservationKind::Stopped => AttemptState::Stopped,
         };
@@ -272,6 +307,7 @@ impl FrozenAttempt {
 pub enum ObservationKind {
     Started,
     Completed,
+    Rejected,
     SubmissionUnknown,
     Stopped,
 }

@@ -26,6 +26,9 @@ mod chrome_prepared_refresh;
 pub(crate) use chrome_prepared_refresh::{prepared_runtime_refresh_eligible,refresh_prepared_runtime};
 #[path="tasks_chrome_conversation.rs"]
 mod chrome_conversation;
+#[path="tasks_opencli_unknown.rs"]
+mod opencli_unknown;
+pub(crate) use opencli_unknown::{opencli_unknown_due,opencli_unknown_jobs,opencli_unknown_pending,run_opencli_unknown_read,stop_opencli_unknown_read};
 
 pub trait Channels: Send + Sync {
     fn capabilities(&self, c: &ProviderConfig) -> ProviderResult<Capabilities>;
@@ -251,6 +254,10 @@ fn prepare_generation(
     }
     if let Err(e) = binding::validate_generation_snapshot(store, &j["snapshot"]) {
         store.claim_job_fields(key, &state, "stale", &json!({"error":e}))?;
+        return Ok(None);
+    }
+    if let Err(error)=crate::asset_composite::validate_snapshot(&j["snapshot"]) {
+        store.claim_job_fields(key,&state,"blocked",&json!({"error":error}))?;
         return Ok(None);
     }
     if state == "queued" || recovering {
@@ -574,6 +581,15 @@ fn persist_query_result(
     result: &QueryResult,
     already_downloaded: bool,
 ) -> Result<&'static str> {
+    persist_query_result_with_budget(store,key,result,already_downloaded,false)
+}
+fn persist_query_result_with_budget(
+    store: &Store,
+    key: &str,
+    result: &QueryResult,
+    already_downloaded: bool,
+    preserve_retry_budgets: bool,
+) -> Result<&'static str> {
     let (state, message) = if already_downloaded {
         ("downloaded", None)
     } else {
@@ -597,7 +613,16 @@ fn persist_query_result(
         }
     };
     let error = message.map(str::to_owned).or_else(|| result.error.clone());
-    store.update_job(key, state, &json!({"providerTaskId":result.task_id,"result":result,"error":error}))?;
+    let mut fields=json!({"providerTaskId":result.task_id,"result":result,"error":error});
+    if preserve_retry_budgets {
+        let original=store.job(key)?;
+        // Store::update_state normally resets counters on confirmed states.
+        // Explicit fields are applied in that same transaction before commit;
+        // preserving them only in the later scheduling UPDATE is too late.
+        fields["queryAttempts"]=original["queryAttempts"].clone();
+        fields["downloadAttempts"]=original["downloadAttempts"].clone();
+    }
+    store.update_job(key, state, &fields)?;
     if state == "query_failed" {
         store.retry_job(
             key,
@@ -608,8 +633,8 @@ fn persist_query_result(
         store
             .conn()?
             .execute(
-                "UPDATE jobs SET query_attempts=0,next_attempt_at=?1 WHERE id=?2",
-                rusqlite::params![chrono::Utc::now().timestamp() + 10, key],
+                "UPDATE jobs SET query_attempts=CASE WHEN ?3 THEN query_attempts ELSE 0 END,next_attempt_at=?1 WHERE id=?2",
+                rusqlite::params![chrono::Utc::now().timestamp() + 10, key,preserve_retry_budgets],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -663,6 +688,7 @@ pub fn download_result(
     }
     store.update_job(key, "downloading", &json!({"result":result}))?;
     let mut media_ids: Vec<String> = Vec::new();
+    let mut composite_results = Vec::new();
     let staging = store.root.join("downloads");
     if let Err(error) = std::fs::create_dir_all(&staging) {
         store.retry_job(key, "download", &format!("无法创建本地下载目录：{error}"))?;
@@ -689,6 +715,17 @@ pub fn download_result(
                         return Ok(());
                     }
                 };
+                let m = if s(&job,"kind")=="image" && crate::asset_composite::requires_composition(&job["snapshot"]) {
+                    let lower=store.verify_media(&m)?;
+                    let output=staging.join(format!("{key}-{i}-identity-composite.png"));
+                    let mut composed=crate::asset_composite::compose_downloaded(&job["snapshot"],&lower,&output)?;
+                    composed["lowerMediaId"]=m["id"].clone();
+                    let candidate=if composed["status"]=="composited_candidate" {store.import_media(&output,"image",None,None)?}else{m};
+                    composed["candidateMediaId"]=candidate["id"].clone();
+                    store.event(key,"identity_composition",&composed)?;
+                    composite_results.push(composed);
+                    candidate
+                } else {m};
                 if let Err(error) = store.attach_download_result(key, s(&m, "id")) {
                     store.retry_job(key, "download", &format!("下载结果尚未可靠关联：{error}"))?;
                     return Ok(());
@@ -710,7 +747,7 @@ pub fn download_result(
             }
         }
     }
-    store.complete_download(key,&json!({"taskId":result.task_id,"resultUrls":result.result_urls,"mediaIds":media_ids,"actualCost":result.actual_cost,"raw":result.raw}),&media_ids)?;
+    store.complete_download(key,&json!({"taskId":result.task_id,"resultUrls":result.result_urls,"mediaIds":media_ids,"actualCost":result.actual_cost,"raw":result.raw,"identityComposition":composite_results}),&media_ids)?;
     if cfg.kind == "chrome" {
         // Persist the independent cleanup intent before the side effect. A busy
         // page or restart cannot strand it or re-enter generation/download.
@@ -826,17 +863,24 @@ pub fn reconcile(
     if s(&j, "accountId") != account {
         return Err("请恢复原账户后核对".into());
     }
-    match channels.reconcile(cfg, s(&j["snapshot"], "requestId")) {
+    let queried=if cfg.kind=="chrome" && providers::opencli::enabled(cfg) {
+        opencli_unknown::query_bound_original(store,key,cfg,account,channels)
+    } else {channels.reconcile(cfg,s(&j["snapshot"],"requestId"))};
+    match queried {
         Ok(r) => {
             if r.task_id.is_empty() || r.status == "unknown" {
                 return Err("未能确定原任务，请在渠道记录中人工核对".into());
+            }
+            if providers::opencli::enabled(cfg) && r.status=="auth_required" {
+                return Err("请恢复原网页账户后核对；未知提交和原请求继续保留".into());
             }
             if !s(&j,"providerTaskId").is_empty() && s(&j,"providerTaskId") != r.task_id {
                 return Err("渠道核对返回的任务身份与原任务不一致，未采用结果".into());
             }
             // Reconciliation is a query. Preserve terminal failures, expiry and
             // missing-output recovery exactly as a normal original-task query.
-            persist_query_result(store,key,&r,false).map(|_|())
+            if providers::opencli::enabled(cfg) {opencli_unknown::preserve_original_outcome(store,key,&j)?;}
+            persist_query_result_with_budget(store,key,&r,false,providers::opencli::enabled(cfg)).map(|_|())
         }
         Err(e) => Err(e.message),
     }

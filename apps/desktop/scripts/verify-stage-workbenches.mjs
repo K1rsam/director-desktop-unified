@@ -28,7 +28,7 @@ class HookHost {
   useEffect(callback, dependencies) { const index = this.cursor++, old = this.cells[index]; if (!old || dependencies.some((value, index) => value !== old[index])) this.effects.push(callback); this.cells[index] = dependencies; }
   render(Component, values) { this.cursor = 0; this.effects = []; globalThis.__productionHooks = this; return Component(values); }
 }
-const server = await createServer({ logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true }, appType: 'custom' });
+const server = await createServer({ logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, hmr: false }, appType: 'custom' });
 try {
   const { Stage1Panel } = await server.ssrLoadModule('/src/Stage1Panel.tsx'), { Stage3Panel } = await server.ssrLoadModule('/src/Stage3Panel.tsx');
   const policy = await installSyntheticExecutionPolicy(server,
@@ -36,17 +36,24 @@ try {
   await test('Offline permissions keep text generation disabled while preserving the workspace view', () => {
     try {
       policy.offline();
-      assert.equal(disabled(renderToStaticMarkup(React.createElement(Stage3Panel, props)), '生成分镜提示词'), true);
+      assert.equal(disabled(renderToStaticMarkup(React.createElement(Stage3Panel, props)), '一键创作分镜'), true);
       assert.equal(disabled(renderToStaticMarkup(React.createElement(Stage1Panel, props)), '整理全剧制作基础'), true);
       assert.equal(calls.length, 0); assert.equal(networkRequests, 0);
     } finally { policy.standard(); }
   });
   const { CreativeRules } = await server.ssrLoadModule('/src/CreativeRules.tsx');
   const historicalRules = Array.from({ length: 29 }, (_, index) => ({ id: `synthetic-history-${index}`, version: '1.0.0' }));
-  await test('Active rules view separates the original 22 paths and full hashes from the supplied historical registry', () => {
-    const html = renderToStaticMarkup(React.createElement(CreativeRules, { rules: historicalRules }));
-    assert.ok(html.includes('3008 原规则与 Rust 兼容适配'));
-    assert.ok(html.includes('本版本原件 22 份')); assert.ok(html.includes('桌面通用与历史规则 · 29 份'));
+  const currentRules = [
+    { id: 'synthetic-series-storyboard-director', title: 'Synthetic series 6.7.2', version: '6.7.2', sha256: 'a'.repeat(64) },
+    { id: 'synthetic-assets112', title: 'Synthetic asset 1.1.2', version: '1.1.2', sha256: 'b'.repeat(64) },
+  ];
+  await test('Active rules view separates current series672/assets112 snapshots from all historical 3008 paths and full hashes', () => {
+    const html = renderToStaticMarkup(React.createElement(CreativeRules, { rules: [...currentRules, ...historicalRules] }));
+    assert.ok(html.includes('创作规则与版本'));
+    assert.ok(html.includes('第二阶段完成完整设计、分镜主创、整集整编和独立审稿；第三阶段编写图片提示词与管理采用图。'));
+    assert.ok(html.includes('当前新工作流规则 · 2 份'));
+    assert.ok(html.includes('历史 3008 冻结原件 22 份')); assert.ok(html.includes('桌面通用与历史规则 · 31 份'));
+    for (const rule of currentRules) { assert.ok(html.includes(rule.title)); assert.ok(html.includes(rule.version)); assert.ok(html.includes(`title="${rule.sha256}"`)); }
     assert.ok(html.includes('mac-3008-compatible-rust/v1'));
     assert.ok(html.includes('离线接线验证不代表新旧成稿质量对比已完成'));
     for (const file of creativeManifest.files) {
@@ -54,28 +61,35 @@ try {
       assert.ok(html.includes(`title="${file.sha256}"`), file.path);
     }
   });
+  await test('Missing current rule inventory is explicit rather than relabeling historical rules as active series rules', () => {
+    const html = renderToStaticMarkup(React.createElement(CreativeRules, { rules: historicalRules }));
+    assert.ok(html.includes('当前新工作流规则 · 0 份'));
+    assert.ok(html.includes('规则清单以核心实际加载结果为准；尚未返回新版清单。'));
+    assert.ok(html.includes('桌面通用与历史规则 · 29 份'));
+  });
   await test('Offline rules view preserves all original fingerprints and explains the current execution restriction', () => {
     try {
       policy.offline();
-      const html = renderToStaticMarkup(React.createElement(CreativeRules, { rules: historicalRules }));
-      assert.ok(html.includes('当前执行模式未开放第三阶段'));
-      assert.ok(!html.includes('第三阶段使用 3008 原规则'));
+      const html = renderToStaticMarkup(React.createElement(CreativeRules, { rules: [...currentRules, ...historicalRules] }));
+      assert.ok(html.includes('当前执行模式未开放分镜创作；已有稿件与历史规则保留。'));
+      assert.ok(!html.includes('第二阶段完成完整设计、分镜主创、整集整编和独立审稿；第三阶段编写图片提示词与管理采用图。'));
+      for (const rule of currentRules) assert.ok(html.includes(`title="${rule.sha256}"`));
       for (const file of creativeManifest.files) assert.ok(html.includes(`title="${file.sha256}"`));
       assert.equal(networkRequests, 0); assert.equal(calls.length, 0);
     } finally { policy.standard(); }
   });
   await test('Stage 1 uses source/direction/assets/issues tabs and real episode/scene navigation', () => { const html = renderToStaticMarkup(React.createElement(Stage1Panel, props)); for (const label of ['原文与集场', '制作方向', '资产目录', '核对与记录', '集场目录', '第一集', '第二集']) assert.ok(html.includes(label), label); assert.ok(html.includes('小王：“先走，别回头😀。”')); assert.ok(!html.includes('textModel')); });
   await test('Stage 1 blocks creation for unresolved source scope', () => { const html = renderToStaticMarkup(React.createElement(Stage1Panel, { ...props, workspace: { ...base, source: { ...base.source, diagnostics: [{ code: 'BOUNDARY_UNCONFIRMED', rowIds: ['row-1'], message: '原文范围未定', blocking: true }] } } })); assert.ok(disabled(html, '整理全剧制作基础')); assert.ok(html.includes('确认这段用途')); assert.ok(!html.includes('明确原文的集场范围')); assert.ok(!html.includes('确认依据')); });
-  await test('Stage 3 is wide text and exposes prompt/shots/source/history without video parameters', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, props)); for (const label of ['完整提示词', '镜表', '来源与连续性', '版本历史', '复制全文', '编辑文字', '重做单元']) assert.ok(html.includes(label), label); assert.ok(html.includes('完整单元正文。')); assert.ok(!html.includes('视频模型')); assert.ok(!html.includes('准备所选素材')); });
-  await test('Zero-unit Stage 3 can create selected source episodes without images or video model', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, units: [], assets: [], settings: {} } })); assert.equal(disabled(html, '生成分镜提示词'), false); assert.ok(html.includes('即使没有图片或既有单元')); });
-  await test('No-source and read-only modes disable actual generation', () => { const noSource = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, source: null, units: [] } })); assert.equal(disabled(noSource, '生成分镜提示词'), true); const readonly = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, writable: false })); assert.equal(disabled(readonly, '编辑文字'), true); assert.equal(disabled(readonly, '重做单元'), true); });
+  await test('Stage 2 is wide text and exposes prompt/shots/source/history without video parameters', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, props)); for (const label of ['完整提示词', '镜表', '来源与连续性', '版本历史', '复制全文', '编辑文字', '重做单元']) assert.ok(html.includes(label), label); assert.ok(html.includes('完整单元正文。')); assert.ok(!html.includes('视频模型')); assert.ok(!html.includes('准备所选素材')); });
+  await test('Zero-unit Stage 2 can create selected source episodes without images or video model', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, units: [], assets: [], settings: {} } })); assert.equal(disabled(html, '一键创作分镜'), false); assert.ok(html.includes('即使没有图片或既有单元')); });
+  await test('No-source and read-only modes disable actual generation', () => { const noSource = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, source: null, units: [] } })); assert.equal(disabled(noSource, '一键创作分镜'), true); const readonly = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, writable: false })); assert.equal(disabled(readonly, '编辑文字'), true); assert.equal(disabled(readonly, '重做单元'), true); });
   await test('Manual prompt overrides are explicitly distinguished from original shot structure', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, units: [{ ...unit, promptOverride: true }] } })); assert.ok(html.includes('镜表仍保留原结构')); });
   await test('An affected successor displays continuity review beside unchanged prompt', () => { const html = renderToStaticMarkup(React.createElement(Stage3Panel, { ...props, workspace: { ...base, units: [{ ...unit, continuityStale: true }] } })); assert.ok(html.includes('前置单元状态已变化，请重做此单元，核对连续状态。')); assert.ok(html.includes('完整单元正文。')); assert.ok(html.indexOf('前置单元状态已变化') < html.indexOf('完整单元正文。')); const current = renderToStaticMarkup(React.createElement(Stage3Panel, props)); assert.ok(!current.includes('前置单元状态已变化')); });
 } finally { await server.close(); }
 
 globalThis.__productionRead = async payload => { reads.push(payload); if (payload.action === 'units.get') return unit; if (payload.action === 'units.versions.list') return { versions: [{ version: 1, data: { ...unit, version: 1, prompt: '历史完整正文' }, createdAt: '2026-10-04T00:00:00Z' }, { version: 3, data: unit }] }; if (payload.action === 'jobs.detail') return { id: 'flow-1', result: { waitingDecision: { candidates: [{ id: 'choice-1', title: '原文情绪机会', recommended: true, proposal: '保留原文因果' }] } } }; throw new Error(`Unexpected read ${payload.action}`); };
 Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async value => notices.push(value) } }, configurable: true });
-const replay = await createServer({ logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true }, appType: 'custom', plugins: [{ name: 'isolated-production-hooks', enforce: 'pre', transform(code, id) { if (/\/src\/(Stage1Panel|Stage3Panel|WorkflowProgress|StoryboardRefinement)\.tsx$/.test(id.replaceAll('\\', '/').split('?')[0])) return code.replaceAll("from 'react'", "from '/@production-hooks'"); }, resolveId(id, importer) { if (id === '/@production-hooks') return '\0production-hooks'; if (id === './api' && /\/(Stage1Panel|Stage3Panel|WorkflowProgress|StoryboardRefinement)\.tsx$/.test((importer || '').replaceAll('\\', '/'))) return '\0production-api'; }, load(id) { if (id === '\0production-hooks') return ['useState', 'useRef', 'useMemo', 'useEffect'].map(name => `export function ${name}(...args) { return globalThis.__productionHooks.${name}(...args); }`).join('\n'); if (id === '\0production-api') return 'export async function request(input) { return globalThis.__productionRead(input); } export async function choose() { throw new Error("Native chooser is not used in this verification"); }'; } }] });
+const replay = await createServer({ logLevel: 'error', optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, hmr: false }, appType: 'custom', plugins: [{ name: 'isolated-production-hooks', enforce: 'pre', transform(code, id) { if (/\/src\/(Stage1Panel|Stage3Panel|WorkflowProgress|StoryboardRefinement)\.tsx$/.test(id.replaceAll('\\', '/').split('?')[0])) return code.replaceAll("from 'react'", "from '/@production-hooks'"); }, resolveId(id, importer) { if (id === '/@production-hooks') return '\0production-hooks'; if (id === './api' && /\/(Stage1Panel|Stage3Panel|WorkflowProgress|StoryboardRefinement)\.tsx$/.test((importer || '').replaceAll('\\', '/'))) return '\0production-api'; }, load(id) { if (id === '\0production-hooks') return ['useState', 'useRef', 'useMemo', 'useEffect'].map(name => `export function ${name}(...args) { return globalThis.__productionHooks.${name}(...args); }`).join('\n'); if (id === '\0production-api') return 'export async function request(input) { return globalThis.__productionRead(input); } export async function choose() { throw new Error("Native chooser is not used in this verification"); }'; } }] });
 const event = { preventDefault() {} }, settle = async () => { await new Promise(resolve => setImmediate(resolve)); };
 try {
   const { Stage1Panel } = await replay.ssrLoadModule('/src/Stage1Panel.tsx'), { Stage3Panel } = await replay.ssrLoadModule('/src/Stage3Panel.tsx'), { WorkflowProgress } = await replay.ssrLoadModule('/src/WorkflowProgress.tsx');
@@ -133,7 +147,22 @@ try {
   await test('Confirmed direction saves separately from proposal with source/foundation CAS', async () => { const item = setup(Stage1Panel); button(item.render(), '制作方向').onClick(); const tree = item.render(); assert.equal(input(tree, '已确认制作方向').value, '已确认真人方向'); assert.ok(text(tree).includes('模型提案')); input(tree, '已确认制作方向').onChange({ target: { value: '手动确认方向' } }); await form(item.render()).onSubmit(event); assert.deepEqual(calls[0], { action: 'production.direction.save', payload: { direction: '手动确认方向', expectedSourceVersion: 2, expectedFoundationVersion: 4 } }); });
   await test('First direction confirmation preserves explicit zero-version CAS', async () => { const item = setup(Stage1Panel, { workspace: { ...base, foundation: null } }); button(item.render(), '制作方向').onClick(); input(item.render(), '已确认制作方向').onChange({ target: { value: '首次确认方向' } }); await form(item.render()).onSubmit(event); assert.equal(calls[0].payload.expectedFoundationVersion, 0); });
   await test('Fact readback materializes current source rows, never copies stored quotes as evidence', () => { const item = setup(Stage1Panel); button(item.render(), '资产目录').onClick(); button(item.render(), '事实回读').onClick(); const tree = item.render(); assert.ok(text(tree).includes('小王：“先走，别回头😀。”')); assert.ok(!text(tree).includes('不能用这段存量文字')); });
-  await test('Stage 3 zero-unit start uses source selection and no media submit actions', async () => { const item = setup(Stage3Panel, { workspace: { ...base, units: [], assets: [] } }); input(item.render(), '创作范围', 'select').onChange({ target: { value: 'ep-2' } }); button(item.render(), '生成分镜提示词').onClick(); await settle(); assert.deepEqual(calls[0], { action: 'storyboard.run', payload: { options: { selection: { episodeIds: ['ep-2'] } }, episodeIds: ['ep-2'] } }); });
+  await test('Stage 2 zero-unit start uses source selection and no media submit actions', async () => { const item = setup(Stage3Panel, { workspace: { ...base, units: [], assets: [] } }); input(item.render(), '创作范围', 'select').onChange({ target: { value: 'ep-2' } }); button(item.render(), '一键创作分镜').onClick(); await settle(); assert.deepEqual(calls, [{ action: 'storyboard.run', payload: { workflowProfile: 'desktop-series672-assets112/v1', options: { selection: { episodeIds: ['ep-2'] } }, episodeIds: ['ep-2'] } }]); });
+  const frozenLegacyRun = { id: 'frozen-legacy-storyboard', kind: 'workflow', entityId: 'storyboard.run', provider: 'local', status: 'interrupted', snapshot: { stage: 'storyboard.run', runnerVersion: 'desktop-runner/v1', input: { source: { version: base.source.version, sha256: base.source.sha256 }, selection: { episodeIds: ['ep-1', 'ep-2'] } } } };
+  await test('Stage 2 continuation keeps the original frozen routing instead of upgrading a historical request', async () => {
+    const item = setup(Stage3Panel, { workspace: { ...base, jobs: [frozenLegacyRun] } });
+    button(item.render(), '继续原分镜流程').onClick(); await settle();
+    assert.deepEqual(calls, [{ action: 'storyboard.run', payload: { options: { selection: { episodeIds: ['ep-1', 'ep-2'] } }, episodeIds: ['ep-1', 'ep-2'] } }]);
+    assert.equal(Object.hasOwn(calls[0].payload, 'workflowProfile'), false);
+  });
+  await test('Stage 2 UNKNOWN keeps original submission and refuses programmatic duplicate starts', async () => {
+    const item = setup(Stage3Panel, { workspace: { ...base, jobs: [{ ...frozenLegacyRun, status: 'submission_unknown', submissionUnknown: true }] } });
+    const tree = item.render(), start = button(tree, '保留原分镜任务');
+    assert.equal(start.disabled, true);
+    assert.ok(text(tree).includes('原提交仍未知时不会另建或重发'));
+    start.onClick(); await settle();
+    assert.deepEqual(calls, []);
+  });
   await test('Complete prompt copy preserves newline, punctuation and source dialogue', async () => { const item = setup(Stage3Panel); const before = notices.length; button(item.render(), '复制全文').onClick(); await settle(); assert.equal(notices[before], unit.prompt); assert.equal(calls.length, 0); });
   await test('Text editor saves CAS version and preserves source/asset/shot structure', async () => { const item = setup(Stage3Panel); button(item.render(), '编辑文字').onClick(); await settle(); input(item.render(), '完整提示词').onChange({ target: { value: '手改完整正文\n原话仍保留。' } }); await form(item.render()).onSubmit(event); const saved = calls[0]; assert.equal(saved.action, 'units.save'); assert.equal(saved.payload.unit.expectedVersion, 3); assert.equal(saved.payload.unit.promptOverride, true); assert.deepEqual(saved.payload.unit.sourceRefs, unit.sourceRefs); assert.deepEqual(saved.payload.unit.assetRefs, unit.assetRefs); assert.deepEqual(saved.payload.unit.shots, unit.shots); });
   await test('Unit regeneration sends exact unit/version and explicit instruction', async () => { const item = setup(Stage3Panel); button(item.render(), '重做单元').onClick(); input(item.render(), '修改要求').onChange({ target: { value: ' 保留持伞末态，加强转身动作。 ' } }); await form(item.render()).onSubmit(event); assert.deepEqual(calls[0], { action: 'units.regenerate', payload: { unitId: unit.id, instruction: '保留持伞末态，加强转身动作。', expectedVersion: 3 } }); });
@@ -179,7 +208,7 @@ try {
     assert.ok(value.includes('资产整理 · 第1–10集 · 本批 1（当前规划 1 批）')); assert.ok(value.includes('已完成 1 批资产整理')); assert.equal(descendants(setup(WorkflowProgress, { workspace, stage: 'foundation' }).render()).filter(node => node.type?.name === 'Badge' && text(node) === '本批完成').length, 1);
   });
   await test('Partial progress resumes its own projected run and excludes other-run errors', async () => { const workspace = { ...base, jobs: [{ id: 'other-flow', kind: 'workflow', status: 'failed', provider: 'local', createdAt: '2026-10-01T00:00:00Z', error: '不属于当前流程的错误', snapshot: { stage: 'storyboard.run' } }, { id: 'flow-1', kind: 'workflow', status: 'partially_blocked', provider: 'local', createdAt: '2026-10-06T00:00:00Z', snapshot: { stage: 'storyboard.run' } }], workflowProgress: [{ workflowId: 'flow-1', stage: 'storyboard.run', status: 'partially_blocked', nodes: [] }] }; const item = setup(WorkflowProgress, { workspace, stage: 'storyboard' }); assert.ok(!text(item.render()).includes('不属于当前流程的错误')); await button(item.render(), '继续原流程').onClick(); await settle(); assert.deepEqual(calls[0], { action: 'workflows.resume', payload: { workflowId: 'flow-1' } }); });
-  await test('Single-unit regeneration shares storyboard progress and blocks duplicate starts', () => { const workspace = { ...base, jobs: [{ id: 'rev-1', kind: 'workflow', status: 'running', provider: 'local', entityId: 'units.regenerate', snapshot: { stage: 'units.regenerate' } }], workflowProgress: [{ workflowId: 'rev-1', stage: 'units.regenerate', status: 'running', nodes: [] }] }; const item = setup(Stage3Panel, { workspace }); assert.equal(button(item.render(), '正在创作提示词').disabled, true); assert.equal(button(item.render(), '重做单元').disabled, true); const progress = setup(WorkflowProgress, { workspace, stage: 'storyboard' }); assert.ok(text(progress.render()).includes('分镜文字进度')); });
+  await test('Single-unit regeneration shares storyboard progress and blocks duplicate starts', () => { const workspace = { ...base, jobs: [{ id: 'rev-1', kind: 'workflow', status: 'running', provider: 'local', entityId: 'units.regenerate', snapshot: { stage: 'units.regenerate' } }], workflowProgress: [{ workflowId: 'rev-1', stage: 'units.regenerate', status: 'running', nodes: [] }] }; const item = setup(Stage3Panel, { workspace }); assert.equal(button(item.render(), '本项目正在制作').disabled, true); assert.equal(button(item.render(), '重做单元').disabled, true); const progress = setup(WorkflowProgress, { workspace, stage: 'storyboard' }); assert.ok(text(progress.render()).includes('分镜文字进度')); });
   await test('Decision selection sends only current candidate IDs and permits empty choice', async () => { const workspace = { ...base, workflowProgress: [{ workflowId: 'flow-1', stage: 'storyboard', status: 'waiting_decision' }] }; const item = setup(WorkflowProgress, { workspace, stage: 'storyboard' }); button(item.render(), '选择创作机会').onClick(); await settle(); const check = descendants(item.render()).find(node => node.type === 'input' && node.props.type === 'checkbox'); assert.ok(check); check.props.onChange({ target: { checked: false } }); await button(item.render(), '保存选择并继续').onClick(); await settle(); assert.deepEqual(calls[0], { action: 'storyboard.decision.resolve', payload: { workflowId: 'flow-1', selectedIds: [] } }); });
 } finally { await replay.close(); delete globalThis.__productionHooks; delete globalThis.__productionRead; }
 assert.equal(networkRequests, 0);

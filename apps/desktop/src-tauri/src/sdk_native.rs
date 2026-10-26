@@ -276,6 +276,35 @@ pub(super) async fn prepare_schema_recovery_handoff(settings: &Value) -> Result<
     verify_schema_recovery_bytes(&old,&new,&hashes)?;
     Ok(SupervisorHandoff{identity:new,resource_hashes:hashes})
 }
+pub(super) async fn prepare_schema_rejection_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    let old = receipt_identity(settings)?;
+    let resolved = resolve(settings).await?;
+    let new = identity(&resolved)?;
+    let hashes = handoff_resource_hashes(Path::new(s(&new,"resourceDirectory")))?;
+    verify_schema_rejection_bytes(&old,&new,&hashes)?;
+    Ok(SupervisorHandoff { identity:new, resource_hashes:hashes })
+}
+pub(super) fn verify_schema_rejection_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    serde_json::from_value::<SdkIdentity>(new.clone()).map_err(|e|e.to_string())?.validate()?;
+    if !schema_rejection_identity_bound(old,new) || handoff_resource_hashes(Path::new(s(new,"resourceDirectory")))? != *hashes {
+        return Err("SDK_SCHEMA_REJECTION_IDENTITY_CHANGED".into());
+    }
+    let previous = handoff_resource_hashes(Path::new(s(old,"resourceDirectory")))?;
+    // The transport implementation changes; SDK/runtime/auth policy stays pinned.
+    for (name,value) in hashes.as_object().ok_or("SDK_SCHEMA_REJECTION_RESOURCES")? {
+        if name != "src/bridge.mjs" && previous[name] != *value { return Err("SDK_SCHEMA_REJECTION_RESOURCE_CHANGED".into()); }
+    }
+    for frozen in [old,new] {
+        for (path,sha) in [("nodeExecutable","nodeSha256"),("runtimeExecutable","runtimeSha256"),("supervisorExecutable","supervisorSha256")] {
+            if crate::store::hash_file(Path::new(s(frozen,path)))?.0 != s(frozen,sha) { return Err("SDK_SCHEMA_REJECTION_BYTES_CHANGED".into()); }
+        }
+        let root=Path::new(s(frozen,"resourceDirectory"));
+        let source = ["src/main.mjs","src/bridge.mjs","src/native-runtime.mjs"].iter().map(|path|std::fs::read_to_string(root.join(path)).map_err(|e|e.to_string())).collect::<Result<Vec<_>>>()?.join("");
+        if digest(&source) != s(frozen,"bridgeSha256") { return Err("SDK_SCHEMA_REJECTION_BRIDGE_CHANGED".into()); }
+    }
+    if hashes["node_modules/@openai/codex-sdk/dist/index.js"] != SDK_IMPLEMENTATION_SHA { return Err("SDK_SCHEMA_REJECTION_SDK_CHANGED".into()); }
+    Ok(())
+}
 pub(super) fn verify_schema_recovery_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
     if !schema_recovery_identity_bound(old,new) || handoff_resource_hashes(Path::new(s(old,"resourceDirectory")))?!=*hashes
         || handoff_resource_hashes(Path::new(s(new,"resourceDirectory")))?!=*hashes {return Err("SDK_SCHEMA_RECOVERY_IDENTITY_CHANGED".into());}
@@ -331,15 +360,27 @@ pub(super) fn config(settings: &Value, root: &Path) -> Result<Config> {
         fixture: None,
         deadline: Duration::from_secs(900),
         identity,
+        input_frame_recovery:None,
     })
 }
 pub(super) fn verify_config(config: &Config) -> Result<()> {
     let native = context()?;
+    verify_config_in_context(config,native)
+}
+fn verify_config_in_context(config:&Config,native:&NativeContext)->Result<()> {
     let frozen: SdkIdentity =
         serde_json::from_value(config.identity.clone()).map_err(|e| e.to_string())?;
     frozen.validate()?;
-    if frozen.supervisor_executable.as_deref() != Some(native.supervisor.to_string_lossy().as_ref())
-        || frozen.supervisor_sha256.as_deref() != Some(native.supervisor_sha.as_str())
+    let current=frozen.supervisor_executable.as_deref()==Some(native.supervisor.to_string_lossy().as_ref())
+        && frozen.supervisor_sha256.as_deref()==Some(native.supervisor_sha.as_str());
+    let original=config.input_frame_recovery.as_ref().is_some_and(|proof|proof.identity()==&config.identity);
+    let supervisor=Path::new(frozen.supervisor_executable.as_deref().unwrap());
+    // Ordinary dispatches still require today's supervisor. Only a capability
+    // issued by the exact pre-write recovery verifier can retain the old one.
+    if (!current && !original)
+        || std::fs::symlink_metadata(supervisor).map_err(|e|e.to_string())?.is_symlink()
+        || !std::fs::symlink_metadata(supervisor).map_err(|e|e.to_string())?.is_file()
+        || crate::store::hash_file(supervisor)?.0!=frozen.supervisor_sha256.as_deref().unwrap()
         || crate::store::hash_file(Path::new(frozen.runtime_executable.as_deref().unwrap()))?.0
             != frozen.runtime_sha256.as_deref().unwrap()
         || crate::store::hash_file(&native.supervisor)?.0 != native.supervisor_sha
@@ -1014,21 +1055,21 @@ mod jobs {
     }
 }
 #[cfg(windows)]
-pub(super) use jobs::ProcessJob;
+pub(crate) use jobs::ProcessJob;
 #[cfg(not(windows))]
-pub(super) struct ProcessJob;
+pub(crate) struct ProcessJob;
 #[cfg(not(windows))]
 impl ProcessJob {
     pub(super) fn attach_tokio(_: &tokio::process::Child) -> Result<Self> {
         Err("SDK_NATIVE_PLATFORM_UNVERIFIED".into())
     }
-    fn attach_std(_: &std::process::Child) -> Result<Self> {
+    pub(crate) fn attach_std(_: &std::process::Child) -> Result<Self> {
         Err("SDK_NATIVE_PLATFORM_UNVERIFIED".into())
     }
-    pub(super) fn stop(&self) -> Result<Value> {
+    pub(crate) fn stop(&self) -> Result<Value> {
         Err("SDK_NATIVE_PLATFORM_UNVERIFIED".into())
     }
-    pub(super) fn start(&self) -> Result<()> {
+    pub(crate) fn start(&self) -> Result<()> {
         Err("SDK_NATIVE_PLATFORM_UNVERIFIED".into())
     }
 }
@@ -1160,6 +1201,28 @@ mod tests {
         }
         assert!(valid_model("gpt-6.1-sol"));
         assert!(!valid_reasoning("medium\"\nfeatures.shell_tool=true"));
+    }
+    #[test]
+    fn sdk_large_input_native_recovery_keeps_original_supervisor_across_client_upgrade_only_for_verified_attempt() {
+        let files=tempfile::tempdir().unwrap();let mut frozen=plan(files.path()).identity;
+        let old=files.path().join("frozen-v7-supervisor.exe");let current=files.path().join("current-v8-supervisor.exe");let runtime=files.path().join("frozen-runtime.exe");
+        for (path,bytes) in [(&old,b"synthetic original supervisor".as_slice()),(&current,b"synthetic upgraded client".as_slice()),(&runtime,b"synthetic original runtime".as_slice())] {std::fs::write(path,bytes).unwrap();}
+        frozen.supervisor_executable=Some(old.to_string_lossy().into());frozen.supervisor_sha256=Some(crate::store::hash_file(&old).unwrap().0);
+        frozen.runtime_executable=Some(runtime.to_string_lossy().into());frozen.runtime_sha256=Some(crate::store::hash_file(&runtime).unwrap().0);
+        frozen.runtime_identity=format!("official-codex-runtime/{}/{}",frozen.runtime_package_version,frozen.runtime_sha256.as_deref().unwrap());frozen.validate().unwrap();
+        let identity=json!(frozen);let settings=json!({"textProvider":"codex_sdk","textModel":"gpt-6.1-sol","reasoning":"medium","textSdkIdentity":identity});
+        let (_project,permit,attempt)=crate::text_executor::test_input_frame_recovery_permit(settings);
+        let native=NativeContext{resources:files.path().into(),supervisor:current.clone(),supervisor_sha:crate::store::hash_file(&current).unwrap().0};
+        let mut config=Config{node:PathBuf::from(s(&identity,"nodeExecutable")),bridge:files.path().join("src/main.mjs"),state:files.path().join("sdk-worker"),fixture:None,deadline:Duration::from_secs(900),identity:identity.clone(),input_frame_recovery:None};
+        assert!(verify_config_in_context(&config,&native).unwrap_err().contains("SDK_NATIVE_RUNTIME_CHANGED"),"ordinary paths remain strict");
+        config.input_frame_recovery=Some(permit);verify_config_in_context(&config,&native).unwrap();config.verify_attempt_scope(&attempt).unwrap();
+        assert_eq!(config.identity,identity,"frozen identity, account and rules are never rewritten");
+        let mut different=attempt.clone();different.attempt_id="another-unknown".into();assert!(config.verify_attempt_scope(&different).is_err());
+        let mut other=config.clone();other.identity["accountFingerprint"]=json!("f".repeat(64));assert!(verify_config_in_context(&other,&native).is_err());
+        std::fs::write(&old,b"replaced old supervisor").unwrap();assert!(verify_config_in_context(&config,&native).is_err(),"original SHA must still match at spawn");
+        std::fs::write(&old,b"synthetic original supervisor").unwrap();verify_config_in_context(&config,&native).unwrap();
+        std::fs::write(&runtime,b"replaced runtime").unwrap();assert!(verify_config_in_context(&config,&native).is_err());
+        assert!(!config.state.exists(),"proof and byte verification never create workers or model calls");
     }
     #[test]
     fn sdk_native_runtime_relay_bounds_hidden_sdk_stderr_and_unterminated_lines() {

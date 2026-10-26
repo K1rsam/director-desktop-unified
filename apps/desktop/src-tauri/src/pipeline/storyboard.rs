@@ -57,7 +57,7 @@ fn boundary_schema() -> Value {
     )
 }
 
-fn plan_schema(
+pub(super) fn plan_schema(
     rows: &[SourceRow],
     context: &[SourceRow],
     scenes: &[SourceScene],
@@ -858,7 +858,7 @@ pub(crate) fn validate_planner_repair_request_bound(
     Ok(())
 }
 
-fn materialize_validated_plan(value:&mut Value,rows:&[SourceRow],context:&[SourceRow],scenes:&[SourceScene])->Result<(),String> {
+pub(super) fn materialize_validated_plan(value:&mut Value,rows:&[SourceRow],context:&[SourceRow],scenes:&[SourceScene])->Result<(),String> {
     if let Err(reason)=validate_plan(value,rows,context,scenes) {
         if reason!="工作包必须依源顺序覆盖正文恰好一次" {return Err(reason);}
         original::normalize_package_source_order(value,rows)?;
@@ -2334,6 +2334,9 @@ pub async fn run_storyboard(
     model: &str,
     reasoning: &str,
 ) -> Result<Value, String> {
+    if super::series::uses_profile(input)? {
+        return super::series::run(input, executor, model, reasoning).await;
+    }
     // Runtime decisions/history are not the parent's frozen byte identity.
     // This complete packet is only a projection/proof argument, never a role input.
     let frozen_finish_assets = input.get("frozenFinisherAssetContext").unwrap_or(input);
@@ -4044,6 +4047,9 @@ async fn repair_author_scope(
 /// Whole-episode publication proof, independently checked again at the store
 /// boundary. Evidence from one author/transport fragment cannot satisfy it.
 pub(crate) fn validate_episode_delivery(input: &Value, output: &Value) -> Result<(), String> {
+    if super::series::uses_profile(input)? {
+        return super::series::validate_episode_delivery(input, output);
+    }
     if output["schemaVersion"] != "complete-episode-delivery/v1"
         || output["scope"] != "episodes"
         || output["status"] != "running"

@@ -3,10 +3,15 @@ pub mod asset_visual_facts;
 pub(crate) mod asset_visual_source_reparse;
 pub(crate) mod asset_coverage;
 pub mod asset_design_contract;
+pub mod asset_workflow;
+pub mod series;
 pub mod asset_production_context;
 mod assets;
 pub mod foundation_delivery;
 pub(crate) mod foundation_wire;
+#[cfg(test)]
+#[path = "foundation_direction_seed_tests.rs"]
+mod foundation_direction_seed_tests;
 mod scene_edits;
 mod source;
 mod storyboard;
@@ -74,6 +79,16 @@ pub trait TextExecutor: Send + Sync {
     async fn prepare_transport_request(&self, request: TextRequest) -> Result<TextRequest, String> {
         Ok(request)
     }
+    /// Freeze existing current/historical image identities before the one
+    /// source-bound supplement. This does not create assets or reserve numbers.
+    async fn series_supplement_identity_context(&self, _origin: &TextRequest, _origin_raw: &Value, _known_catalogue: &Value, _desired_contract: &str) -> Result<Value, String> {
+        Err("SERIES_SUPPLEMENT_IDENTITY_CONTEXT_UNAVAILABLE".into())
+    }
+    /// Only an explicitly audited, durably authorized legacy supply-contract
+    /// correction may return a context. A normal revise never opens this budget.
+    async fn series_supply_correction_context(&self, _origin: &TextRequest, _origin_raw: &Value) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     fn input_transport_characters(&self, request: &TextRequest) -> Result<usize, String> {
         let wire = compile_storyboard_dispatch_transport(request)?;
         let (input, schema) = wire
@@ -90,6 +105,16 @@ pub trait TextExecutor: Send + Sync {
         &self,
         _legacy: TextRequest,
         projected: TextRequest,
+    ) -> Result<TextRequest, String> {
+        Ok(projected)
+    }
+    /// Upgrade only an unallocated local review repair. Persisted executors
+    /// preserve either exact frozen request even when its result is unknown.
+    async fn prepare_series_frame_render(
+        &self,
+        _legacy: TextRequest,
+        projected: TextRequest,
+        _review_receipt: Value,
     ) -> Result<TextRequest, String> {
         Ok(projected)
     }
@@ -882,11 +907,38 @@ fn materialize_foundation(
     proposal.facts = safe;
     Ok(())
 }
+/// The old direction-save endpoint wrote this exact empty seed without a SHA.
+/// Recover only its non-creative shape and matching frozen source version. A
+/// complete imported/generated foundation never gets its missing provenance
+/// filled in, and the saved snapshot is not rewritten during this projection.
+fn legacy_direction_seed(source: &LockedSource, context: &Value) -> bool {
+    let foundation = &context["foundation"];
+    let Some(fields) = foundation.as_object() else { return false; };
+    let source_version = context["sourceVersion"].as_i64()
+        .or_else(|| context["source"]["version"].as_i64());
+    context.get("source").filter(|value| !value.is_null()).is_none_or(|value| value["sha256"] == source.sha256)
+        && source_version.is_some_and(|version| version > 0
+        && foundation["sourceVersion"] == version
+        && context["source"]["version"].as_i64().is_none_or(|v| v == version))
+        && foundation["version"].as_i64().is_some_and(|v| v > 0)
+        && foundation["schemaVersion"] == "foundation/v1"
+        && foundation.get("sourceSha256").is_none()
+        && foundation["directionConfirmed"] == true
+        && foundation["productionDirection"].is_string()
+        && foundation["overview"] == ""
+        && foundation["direction"] == ""
+        && ["episodes", "assets", "facts", "issues"].iter().all(|field| foundation[*field] == json!([]))
+        && fields.keys().all(|field| ["schemaVersion", "episodes", "assets", "facts", "issues",
+            "overview", "direction", "productionDirection", "directionConfirmed", "sourceVersion", "version"].contains(&field.as_str()))
+}
+
 fn existing_foundation(
     source: &LockedSource,
     context: &Value,
 ) -> Result<FoundationProposal, String> {
-    let mut p = if context.get("foundation").is_some_and(Value::is_object) {
+    let mut p = if legacy_direction_seed(source, context) {
+        empty_foundation(source)
+    } else if context.get("foundation").is_some_and(Value::is_object) {
         serde_json::from_value::<FoundationProposal>(context["foundation"].clone())
             .map_err(|e| format!("既有制作基础须先按来源契约导入：{e}"))?
     } else {
@@ -1381,7 +1433,10 @@ pub async fn run_foundation(
 pub fn flatten_foundation_assets(proposal: &FoundationProposal) -> Vec<Value> {
     proposal.assets.iter().flat_map(|asset|asset.variants.iter().map(move |variant|{
         let scope=effective_scope(variant);
-        let mut row=json!({"id":variant.asset_row_id.clone().unwrap_or_else(||format!("{}:{}",asset.id,variant.id)),"identityId":asset.id,"baseAssetId":asset.id,"variantId":variant.id,"name":format!("{}｜{}",asset.name,variant.name),"kind":asset.kind,"description":variant.description,"sourceRefs":variant.source_refs,"scope":scope,"applicability":{"episodes":scope.scenes.iter().map(|a|a.episode_id.clone()).collect::<std::collections::BTreeSet<_>>(),"scenes":scope.scenes.iter().map(|a|a.scene_id.clone()).collect::<std::collections::BTreeSet<_>>()},"sourceVariantId":variant.source_variant_id});
+        // The base variant can already carry the full identity name. Only
+        // exact equality is redundant; overlaps and state names are meaningful.
+        let name=if asset.name==variant.name {asset.name.clone()} else {format!("{}｜{}",asset.name,variant.name)};
+        let mut row=json!({"id":variant.asset_row_id.clone().unwrap_or_else(||format!("{}:{}",asset.id,variant.id)),"identityId":asset.id,"baseAssetId":asset.id,"variantId":variant.id,"name":name,"kind":asset.kind,"description":variant.description,"sourceRefs":variant.source_refs,"scope":scope,"applicability":{"episodes":scope.scenes.iter().map(|a|a.episode_id.clone()).collect::<std::collections::BTreeSet<_>>(),"scenes":scope.scenes.iter().map(|a|a.scene_id.clone()).collect::<std::collections::BTreeSet<_>>()},"sourceVariantId":variant.source_variant_id});
         if !asset.aliases.is_empty() {row["aliases"]=json!(asset.aliases);}
         for metadata in [&asset.metadata,&variant.metadata] {
             for key in ["role","relationNote","preparation","note","prompt","catalogName","usageEpisodes","sourceRefsPurpose","sourceScope"] {
@@ -1412,6 +1467,35 @@ fn production_metadata(row: &Value) -> serde_json::Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foundation_flatten_deduplicates_only_exact_identity_and_variant_names() {
+        let source = prepare_source("第一集\n场景：合成人物甲卧室\n△她走进卧室。\n").unwrap();
+        let mut foundation = empty_foundation(&source);
+        let names = ["合成人物甲卧室", "合成人物甲卧室｜夜", "夜", "合成人物甲卧室 "];
+        foundation.assets.push(FoundationAsset {
+            id: "bedroom".into(), name: "合成人物甲卧室".into(), kind: "SC".into(),
+            aliases: vec![], description: String::new(), source_refs: vec![],
+            variants: names.iter().enumerate().map(|(index, name)| FoundationVariant {
+                id: format!("variant-{index}"), name: (*name).into(), description: String::new(),
+                source_variant_id: None, source_refs: vec![], applicability: vec![],
+                scope: FoundationScope::default(), asset_row_id: Some(format!("frozen-row-{index}")),
+                metadata: Default::default(),
+            }).collect(), metadata: Default::default(),
+        });
+        let original = serde_json::to_value(&foundation).unwrap();
+        let rows = flatten_foundation_assets(&foundation);
+        let expected = ["合成人物甲卧室", "合成人物甲卧室｜合成人物甲卧室｜夜", "合成人物甲卧室｜夜", "合成人物甲卧室｜合成人物甲卧室 "];
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["name"], expected[index]);
+            assert_eq!(row["id"], format!("frozen-row-{index}"));
+            assert_eq!(row["variantId"], format!("variant-{index}"));
+        }
+        assert_eq!(serde_json::to_value(&foundation).unwrap(), original, "flatten never edits the source design or frozen identity registry");
+        foundation.assets[0].name = "合成人物乙｜淡水龟".into();
+        foundation.assets[0].variants[0].name = "合成人物乙｜淡水龟".into();
+        assert_eq!(flatten_foundation_assets(&foundation)[0]["name"], "合成人物乙｜淡水龟");
+    }
 
     struct ScopeHandoffDesigner {
         requests: std::sync::Mutex<Vec<Value>>,

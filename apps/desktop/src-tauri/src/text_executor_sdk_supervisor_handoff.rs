@@ -385,6 +385,9 @@ impl SavedTextExecutor {
         request: &TextRequest,
         original: &Value,
     ) -> Result<Value> {
+        if let Some(snapshot) = self.sdk_schema_continuation_snapshot(request, original).await? {
+            return Ok(snapshot);
+        }
         if original["executorIdentity"]["version"] != "official-sdk-identity/v2"
             || original.get(FIELD).is_some()
         {

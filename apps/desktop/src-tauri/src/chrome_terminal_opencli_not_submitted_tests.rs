@@ -42,6 +42,11 @@ fn opencli_owned_prior_exact_no_click_terminal_survives_upgrade_but_never_conver
         ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70","0183767038c20ddebf218ddd297b2cf166aceee4d99bb7c03b7f73d7d3654e65"),
         ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
         ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
+        ("c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
+        ("6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2","5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b"),
+        ("5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab","34c8b2f90ab81e15dab5df56e5c21a89b2be1c1b9393cc4527bfa34c8a6b3766"),
+        ("aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557","34c8b2f90ab81e15dab5df56e5c21a89b2be1c1b9393cc4527bfa34c8a6b3766"),
+        ("21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59","34c8b2f90ab81e15dab5df56e5c21a89b2be1c1b9393cc4527bfa34c8a6b3766"),
     ] {
     let mut job=owned_fixture();
     job["snapshot"]["providerConfig"]["browserTransport"]["runtimeSha256"]=json!(prior);
@@ -77,6 +82,48 @@ fn opencli_owned_no_click_partial_composer_requires_frozen_protocol_and_exact_ad
     ] {let mut job=original.clone();*job.pointer_mut(pointer).unwrap()=value;assert!(!settled_job(&job),"{pointer}");}
     let mut legacy=original.clone();legacy["result"]["raw"]["opencliNotSubmitted"]["version"]=json!("opencli-pre-send-not-submitted/v1");assert!(!settled_job(&legacy));
     for key in ["sentAt","sendConfirmed","conversationUrl","sendIntent"] {let mut job=original.clone();job["result"]["raw"][key]=Value::Null;assert!(!settled_job(&job),"{key}");}
+}
+
+#[test]
+fn opencli_new_query_reader_preserves_original_or_reviewed_intermediate_no_click_proof() {
+    let original_pin="6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2";
+    let earlier_pin="54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0";
+    let reader_pin="aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557";
+    let adapter="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b";
+    for frozen_pin in [original_pin,earlier_pin] {
+        let mut job=owned_fixture();
+        job["snapshot"]["providerConfig"]["browserTransport"]["runtimeSha256"]=json!(frozen_pin);
+        job["prepared"]["wire"]["composerAdapterSha256"]=json!(adapter);
+        let proof=&mut job["result"]["raw"]["opencliNotSubmitted"];
+        proof["runtimeSha256"]=json!(original_pin);
+        proof["composerAdapterSha256"]=json!(adapter);
+        job["result"]["raw"]["readerMigration"]=json!({"schemaVersion":"opencli-readonly-reader-migration/v1",
+            "operation":"query","bridgeOperation":"query","readOnly":true,"resubmitted":false,"frozenConfigUnchanged":true,
+            "fromRuntimeSha256":frozen_pin,"toRuntimeSha256":reader_pin,"fromRunnerSha256":"d".repeat(64),"toRunnerSha256":"e".repeat(64),
+            "fromManifestSha256":"f".repeat(64),"toManifestSha256":"1".repeat(64),
+            "frozenConfigSha256":crate::pipeline::digest(&job["snapshot"]["providerConfig"].to_string()),
+            "generationRequestSha256":crate::pipeline::digest(&job["prepared"]["request"].to_string())});
+        let before=job.clone();
+        assert!(settled_job(&job),"retained proof from {frozen_pin}");
+        assert_eq!(job,before,"settlement cannot rewrite the frozen proof or request");
+        for (pointer,value) in [
+            ("/status",json!("submission_unknown")),
+            ("/result/raw/opencliNotSubmitted/clickCalls",json!(1)),
+            ("/result/raw/opencliNotSubmitted/checks/0/userCount",json!(1)),
+            ("/result/raw/opencliNotSubmitted/runtimeSha256",json!("0".repeat(64))),
+            ("/result/raw/readerMigration/toRuntimeSha256",json!("0".repeat(64))),
+            ("/result/raw/readerMigration/fromRuntimeSha256",json!("0".repeat(64))),
+            ("/result/raw/readerMigration/bridgeOperation",json!("submit")),
+            ("/result/raw/readerMigration/resubmitted",json!(true)),
+            ("/result/raw/readerMigration/frozenConfigSha256",json!("0".repeat(64))),
+            ("/result/raw/readerMigration/generationRequestSha256",json!("0".repeat(64))),
+        ] {
+            let mut bad=job.clone();*bad.pointer_mut(pointer).unwrap()=value;
+            assert!(!settled_job(&bad),"{pointer}");
+        }
+        let mut send=job.clone();send["result"]["raw"]["sendIntent"]=Value::Null;
+        assert!(!settled_job(&send));
+    }
 }
 
 fn migrated_fixture() -> Value {

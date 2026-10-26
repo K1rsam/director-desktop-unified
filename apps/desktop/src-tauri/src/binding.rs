@@ -1,6 +1,20 @@
 use crate::store::{hash_file, id, s, Result, Store};
 use serde_json::{json, Value};
 
+const VIDEO_ASSET_LIFECYCLE_CONTRACT: &str = "video-asset-lifecycle/v1";
+
+/// Review state is independent of asset/content versions. Only the semantic
+/// assets actually used by this unit, and the actual image donor, are gated.
+fn validate_video_asset_lifecycle(asset: &Value, consumes_image: bool) -> Result<()> {
+    if crate::asset_graph::design_review_blocked(asset) {
+        return Err(format!("资产 {} 的设计待复核，请先核对后重新准备", s(asset, "id")));
+    }
+    if consumes_image && crate::asset_graph::image_adoption_blocked(asset) {
+        return Err(format!("资产 {} 的采用图片待复核，请先核对后重新准备", s(asset, "id")));
+    }
+    Ok(())
+}
+
 /// A positive whole-second carrier, allowing only the same 1e-6 numerical
 /// tolerance as the original storyboard capacity checker. This does not ceil
 /// a real fractional duration, change shots/voice windows or add screen time.
@@ -109,13 +123,24 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
             problems.push(json!({"code":"CAPACITY_REVISION_REQUIRED","message":"该单元仍有时长或素材容量问题，请修订关联单元","details":issues}));
         }
     }
+    let supplied_scopes = match store.series_supplied_unit_scopes(unit) {
+        Ok(scopes) => scopes,
+        Err(message) => {
+            problems.push(json!({"code":"SERIES_SUPPLY_SCOPE_UNVERIFIED","message":message}));
+            Default::default()
+        }
+    };
+    // New preparation must see retained negative image reviews even when an
+    // older asset row still says adopted. Keep the raw lookup below so deleted
+    // assets retain their precise error, and do not retrofit frozen snapshots.
+    let review_guards = store.persisted_image_review_guards(&store.conn()?, None)?;
     for (order, r) in refs.iter().enumerate() {
         let aid = s(r, "assetId");
         if aid.is_empty() {
             problems.push(json!({"code":"MISSING_ASSET_ID","order":order,"message":"引用缺少assetId，不能按姓名自动配图"}));
             continue;
         }
-        let a = match store.get("assets", aid) {
+        let mut a = match store.get("assets", aid) {
             Ok(a) => a,
             Err(e) => {
                 problems.push(json!({"code":"MISSING_ASSET","assetId":aid,"message":e}));
@@ -125,6 +150,11 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         if crate::store::asset_deleted(&a) {
             problems.push(json!({"code":"ASSET_DELETED","assetId":aid,"message":"此资产已删除，请在单元配图中替换，或到图片资产恢复"}));
             continue;
+        }
+        Store::project_image_review_guard(&mut a, &review_guards);
+        if let Some(projection) = supplied_scopes.get(aid) {
+            a["applicability"] = projection["applicability"].clone();
+            a["scope"] = projection["scope"].clone();
         }
         if a["scope"]["kind"] == "UNRESOLVED" {
             problems.push(json!({"code":"ASSET_SCOPE_UNRESOLVED","assetId":aid,"message":"此形象的适用集场尚未明确，请先处理制作基础中的相关问题"}));
@@ -201,6 +231,10 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         if a.pointer("/preparation/mode").and_then(Value::as_str) == Some("AUDIO") {
             continue;
         }
+        if let Err(message) = validate_video_asset_lifecycle(&a, false) {
+            problems.push(json!({"code":"ASSET_DESIGN_REVIEW_REQUIRED","assetId":aid,"message":message}));
+            continue;
+        }
         // Source-owned text interfaces are INLINE props without an image
         // ancestor. They remain explicit semantic references in the snapshot;
         // their complete instructions are compiled as text, not a phantom image.
@@ -215,7 +249,7 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
             inline_references.push(json!({"assetId":aid,"variantId":variant,"assetVersion":a["version"],"kind":"inline-text","name":a["name"],"description":a["description"],"preparation":a["preparation"],"sourceRefs":a["sourceRefs"],"usage":r.get("use").or(r.get("usage")).cloned().unwrap_or(json!("prop"))}));
             continue;
         }
-        let image_asset = match image_material_asset(store, &a) {
+        let image_asset = match image_material_asset(store, &a, true) {
             Ok(value) => value,
             Err(message) => {
                 problems.push(
@@ -330,6 +364,7 @@ pub fn bind(store: &Store, unit: &Value, provider: &str, model: &str) -> Result<
         .map(|duration| json!(duration))
         .unwrap_or_else(|| unit["duration"].clone());
     let mut snapshot = json!({"requestId":id(),"kind":"video","provider":provider,"model":model,"unitId":unit["id"],"unitVersion":unit["version"],"episodeId":unit["episodeId"],"sourceVersion":source["version"],"sourcePrompt":unit["prompt"],"sourcePromptSha256":crate::pipeline::digest(s(unit,"prompt")),"prompt":prompt,"duration":wire_duration,"ratio":store.settings()?["ratio"],"resolution":store.settings()?.get("videoResolution").cloned().unwrap_or(json!("720p")),"references":media,"inlineReferences":inline_references,"problems":problems,"ruleSnapshot":crate::pipeline::rule_snapshot("unit-video-production")?,"options":options});
+    snapshot["assetLifecycleContract"] = json!(VIDEO_ASSET_LIFECYCLE_CONTRACT);
     if imported {
         for field in ["origin", "importSource", "mentions", "audioAssetRefs"] {
             snapshot[field] = unit[field].clone();
@@ -368,6 +403,7 @@ fn bind_imported_media(
         return Err("占位素材不能进入制作，请先补充并采用真实素材".into());
     }
     let kind = s(&media, "kind");
+    validate_video_asset_lifecycle(asset, kind == "image")?;
     if !matches!(kind, "image" | "audio" | "video")
         || (s(asset, "lingmoType") == "SE" && kind != "audio")
     {
@@ -475,6 +511,13 @@ pub(crate) fn compile_bound_prompt(
 }
 
 pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
+    // A new preparation opts into this contract. Historic frozen snapshots
+    // retain their original validation and UNKNOWN/reconciliation behaviour.
+    let review_lifecycle = match snapshot.get("assetLifecycleContract") {
+        None | Some(Value::Null) => false,
+        Some(value) if value == VIDEO_ASSET_LIFECYCLE_CONTRACT => true,
+        Some(_) => return Err("未知资产复核合同，请重新准备".into()),
+    };
     let unit = store.get("units", s(snapshot, "unitId"))?;
     if unit["version"] != snapshot["unitVersion"] {
         return Err("分镜版本已变化，请重新准备".into());
@@ -516,6 +559,9 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
         let mut identities = std::collections::HashSet::new();
         for reference in references {
             let asset = store.active_asset(s(reference, "assetId"))?;
+            if review_lifecycle {
+                validate_video_asset_lifecycle(&asset, false)?;
+            }
             if s(reference, "kind") != "inline-text"
                 || !identities.insert((s(reference, "assetId"), s(reference, "variantId")))
                 || asset["version"] != reference["assetVersion"]
@@ -537,7 +583,7 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
             {
                 return Err("单元语义形象版本已变化，请重新准备".into());
             }
-            let material = image_material_asset(store, &asset)?;
+            let material = image_material_asset(store, &asset, review_lifecycle)?;
             if s(&material, "id") != s(r, "assetId")
                 || s(&material, "variantId") != s(r, "variantId")
             {
@@ -563,6 +609,9 @@ pub fn validate_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
         }
         if !s(r, "assetId").is_empty() {
             let a = store.active_asset(s(r, "assetId"))?;
+            if review_lifecycle {
+                validate_video_asset_lifecycle(&a, s(r, "kind") == "image")?;
+            }
             let current_binding = if s(r, "bindingSource") == "unit-media-ref" {
                 s(&unit, "origin") == "imported-storyboard"
                     && s(&a, "variantId") == s(r, "variantId")
@@ -602,7 +651,7 @@ fn inline_text_material(store: &Store, asset: &Value) -> Result<bool> {
             .is_none())
 }
 
-fn image_material_asset(store: &Store, asset: &Value) -> Result<Value> {
+fn image_material_asset(store: &Store, asset: &Value, review_lifecycle: bool) -> Result<Value> {
     let assets = store.values("assets")?;
     let mut current = asset.clone();
     let mut visited = std::collections::HashSet::new();
@@ -613,6 +662,9 @@ fn image_material_asset(store: &Store, asset: &Value) -> Result<Value> {
         if crate::store::asset_deleted(&current) {
             return Err("参考图片的来源资产已删除".into());
         }
+        if review_lifecycle {
+            validate_video_asset_lifecycle(&current, false)?;
+        }
         match current.pointer("/preparation/mode").and_then(Value::as_str) {
             Some("UNRESOLVED") => return Err("素材制作方式尚未明确".into()),
             Some("AUDIO") => return Err("纯声音资产不能用作图片素材来源".into()),
@@ -621,13 +673,21 @@ fn image_material_asset(store: &Store, asset: &Value) -> Result<Value> {
                     .adopted(s(&current, "id"), s(&current, "variantId"))?
                     .is_some()
                 {
+                    if review_lifecycle {
+                        validate_video_asset_lifecycle(&current, true)?;
+                    }
                     return Ok(current);
                 }
                 let parent = crate::pipeline::resolve_asset_dependency(&assets, &current)?
                     .ok_or("沿用图片的形象没有明确来源，请指定基础形象")?;
                 current = store.active_asset(&parent)?;
             }
-            _ => return Ok(current),
+            _ => {
+                if review_lifecycle {
+                    validate_video_asset_lifecycle(&current, true)?;
+                }
+                return Ok(current);
+            }
         }
     }
 }
@@ -706,6 +766,7 @@ pub fn validate_generation_snapshot(store: &Store, snapshot: &Value) -> Result<(
     if s(snapshot, "kind") == "video" {
         validate_snapshot(store, snapshot)?;
     } else if s(snapshot, "kind") == "image" {
+        crate::module22::validate_image_snapshot(store, snapshot)?;
         let asset = store.active_asset(s(snapshot, "assetId"))?;
         if asset["version"] != snapshot["assetVersion"] {
             return Err("图片设计版本已变化，请重新准备".into());
@@ -719,9 +780,39 @@ pub fn validate_generation_snapshot(store: &Store, snapshot: &Value) -> Result<(
             return Err("冻结图片来源设计语义版本已变化，请重新准备".into());
         }
         let gate = json!({"source":store.source()?,"foundation":store.foundation()?,"assets":assets,"selection":{"assetIds":[asset["id"]]}});
-        crate::pipeline::validate_asset_visual_gate(&gate, &asset)?;
-        if crate::pipeline::asset_visual_facts::cached_visual_check_required(&gate)? {
-            return Err("视觉状态待核对，已有提示词不能绕过未归属或不适用裁决".into());
+        if snapshot["workflowProfile"] == crate::asset_graph::PROFILE {
+            if let Some(source)=snapshot.get("promptSource") {
+                crate::asset_workflow_store::validate_prompt_source(store,source)?;
+            }
+            if snapshot["referenceRequirements"] != asset["referenceRequirements"] {
+                return Err("冻结媒体需求已变化，未提交旧图片请求".into());
+            }
+            let actual = crate::asset_graph::media_references(store, &assets, &asset)?
+                .ok_or("仍缺已采用母图")?;
+            let frozen = snapshot["references"]
+                .as_array()
+                .ok_or("图片依赖快照缺失")?;
+            if actual.len() != frozen.len()
+                || actual.iter().any(|a| {
+                    !frozen.iter().any(|f| {
+                        ["assetId", "variantId", "mediaId", "sha256"]
+                            .iter()
+                            .all(|key| a[*key] == f[*key])
+                    })
+                })
+            {
+                return Err("真实参考绑定与冻结请求不一致".into());
+            }
+            if asset["promptStatus"] == "needs_review"
+                || asset["imagePrompt"]["status"] == "needs_review"
+            {
+                return Err("提示词依据变化，未派发旧提示词".into());
+            }
+        } else {
+            crate::pipeline::validate_asset_visual_gate(&gate, &asset)?;
+            if crate::pipeline::asset_visual_facts::cached_visual_check_required(&gate)? {
+                return Err("视觉状态待核对，已有提示词不能绕过未归属或不适用裁决".into());
+            }
         }
         if !snapshot["sourceVersion"].is_null()
             && store.source()?["version"] != snapshot["sourceVersion"]
@@ -764,6 +855,10 @@ fn same_path(path: &std::path::Path, other: &str) -> bool {
 #[cfg(test)]
 #[path = "lingmo_binding_tests.rs"]
 mod lingmo_binding_tests;
+
+#[cfg(test)]
+#[path = "video_asset_lifecycle_tests.rs"]
+mod video_asset_lifecycle_tests;
 
 #[cfg(test)]
 mod image_semantic_tests {

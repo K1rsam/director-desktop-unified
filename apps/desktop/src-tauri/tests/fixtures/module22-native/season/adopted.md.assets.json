@@ -1,0 +1,124 @@
+{
+  "version": "lingmo-v7-assets-v1",
+  "exportProfile": "lingmo-v7",
+  "testFixture": false,
+  "bundleSha256": "43359f5cc2601d83a0b4a70a01e254d21d51e847042aa7d433b0ad9fab378fd2",
+  "markdownSha256": "08ca2fe78934fd1f4ef1ffd6b94d026b52c09339754a395656d69c43b090bc28",
+  "productionScope": {
+    "version": "series-season-scope-v1",
+    "id": "synthetic-season",
+    "revision": 1,
+    "seasonNumber": 1,
+    "status": "locked",
+    "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+    "readingScope": [
+      {
+        "number": 1,
+        "sceneIds": [
+          "1-1",
+          "1-2"
+        ]
+      }
+    ],
+    "episodes": [
+      {
+        "number": 1,
+        "sceneIds": [
+          "1-1",
+          "1-2"
+        ]
+      }
+    ],
+    "target": {
+      "minSeconds": 7200,
+      "maxSeconds": 9000,
+      "planningSeconds": 8100
+    },
+    "ending": {
+      "episode": 1,
+      "sceneId": "1-2",
+      "sourceRef": "synthetic:L4",
+      "closure": "Synthetic scope contract",
+      "hook": "Synthetic hook",
+      "estimate": {
+        "minSeconds": 8000,
+        "maxSeconds": 8200,
+        "basis": "Synthetic test only"
+      }
+    },
+    "confirmation": {
+      "kind": "delegated",
+      "basis": "Offline synthetic test; not production authorization"
+    }
+  },
+  "scopeHash": "784f61d1b4c1a785ae33c513047ea97f95c764e505fc5724f3f1c77ca81e0768",
+  "seasonDelivery": "preview",
+  "assets": [
+    {
+      "id": "A0002",
+      "assetRevision": 1,
+      "name": "门厅",
+      "type": "SC",
+      "token": "门厅SC",
+      "filename": "场景-门厅.png",
+      "placeholderOrdinal": 1
+    },
+    {
+      "id": "A0003",
+      "assetRevision": 1,
+      "name": "走廊",
+      "type": "SC",
+      "token": "走廊SC",
+      "filename": "场景-走廊.png",
+      "placeholderOrdinal": 2
+    },
+    {
+      "id": "A0001",
+      "assetRevision": 1,
+      "name": "值守者面罩",
+      "type": "CH",
+      "token": "值守者面罩CH",
+      "filename": "角色-值守者面罩.png",
+      "placeholderOrdinal": 0
+    },
+    {
+      "id": "A0004",
+      "assetRevision": 1,
+      "name": "铜钥匙",
+      "type": "PR",
+      "token": "铜钥匙PR",
+      "filename": "道具-铜钥匙.png",
+      "placeholderOrdinal": 3
+    }
+  ],
+  "units": [
+    {
+      "episode": 1,
+      "sceneId": "1-1",
+      "unitId": "U1",
+      "fragment": 1,
+      "actualSeconds": 6,
+      "containerSeconds": 6,
+      "imageTokens": [
+        "门厅SC",
+        "值守者面罩CH",
+        "铜钥匙PR"
+      ],
+      "bodySha256": "124ce3ef7fa23cbd48973cbef3187504b077a1cdedaef8060311ea489bbe9ac4",
+      "bodyWithoutTokensSha256": "52058dc652db979960580ca75553146baeb78d870cb2c7af320ae3a19bc6438b"
+    },
+    {
+      "episode": 1,
+      "sceneId": "1-2",
+      "unitId": "U2",
+      "fragment": 1,
+      "actualSeconds": 4,
+      "containerSeconds": 4,
+      "imageTokens": [
+        "走廊SC"
+      ],
+      "bodySha256": "5f41c27ff1ac7730f249d3679c2e55fa6002fe202e824862917395ae8d5cf375",
+      "bodyWithoutTokensSha256": "7a3e333fd709fbd3663827c252203563be32f30cd9417bd9f4acbb5101256db5"
+    }
+  ]
+}

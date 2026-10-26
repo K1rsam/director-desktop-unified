@@ -32,7 +32,8 @@ export function imageReviewState(asset: Asset): 'review' | 'invalid' | undefined
 /** Keep the retained current image viewable, while completion and new references
  * only use an adoption whose image has not been invalidated. */
 export function usableAdoptedImage(workspace: Workspace, asset: Asset) {
-  return imageReviewState(asset) ? undefined : realAdoptedImage(workspace, asset);
+  const pending = ['unknown', 'submission_unknown', 'candidate', 'pending_review'].includes(text(asset.imageStatus));
+  return imageReviewState(asset) || pending ? undefined : realAdoptedImage(workspace, asset);
 }
 /** Recheck the retained image against its original frozen references; this is
  * never a quality approval or permission to submit another generation. */
@@ -76,7 +77,7 @@ export function assetImageStatus(workspace: Workspace, asset: Asset): string {
   const waiting = imageWaitingNames(workspace, asset), waitingLayout = waiting.some(name => name.endsWith('（锁脸区域待登记）'));
   if (imageClassificationPending(asset)) return '类别待核对';
   if (status === 'approved' || status === 'adopted') return realAdoptedImage(workspace, asset) ? '正式采用' : images.current?.placeholder === true ? '占位待补图' : status === 'approved' ? '合格待选' : '待核对当前图';
-  const labels: Record<string, string> = { waiting_reference: '等待参考', waiting_dependency: '等待参考', waitingAdoption: '等待参考', queued: '排队中', running: '生成中', submitted: '生成中', candidate: '候选待选', needs_repair: '待修', rejected: '待修', invalid: '图片无效', qualified: '合格待选', needs_review: '待复核', stale: '待复核', submission_unknown: '原结果待核对' };
+  const labels: Record<string, string> = { waiting_reference: '等待参考', waiting_dependency: '等待参考', waitingAdoption: '等待参考', queued: '排队中', running: '生成中', submitted: '生成中', candidate: '候选待选', pending_review: '候选待选', needs_repair: '待修', rejected: '待修', invalid: '图片无效', qualified: '合格待选', needs_review: '待复核', stale: '待复核', unknown: '原结果待核对', submission_unknown: '原结果待核对' };
   if (labels[status] && !(waitingLayout && ['waiting_reference', 'waiting_dependency', 'waitingAdoption'].includes(status))) return labels[status];
   if (images.current) return images.current.placeholder === true ? '占位待补图' : '当前采用图';
   if (waitingLayout) return '锁脸区域待登记';

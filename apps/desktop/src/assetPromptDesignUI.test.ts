@@ -298,10 +298,9 @@ test('明确母图等待不挡全量写词；就绪按钮只提交独立项且�
 test('没有真实视觉能力时不能从设置伪造委托审核采用', async () => {
   const ui = await view({ imageReady: true });
   Object.assign(ui.workspace.settings, { imageAdoptionPolicy: 'delegated-review' });
-  const policy = nodes(ui.render()).find(node => node.type === 'label' && node.props.className?.includes('asset-review-policy'));
-  const control = nodes(policy).find(node => node.type === 'input');
-  assert.ok(control); assert.equal(control.props.checked, false); assert.equal(control.props.disabled, true);
-  control.props.onChange({ target: { checked: true } }); await new Promise(done => setImmediate(done)); assert.equal(ui.calls.length, 0);
+  const review = nodes(ui.render()).find(node => node.type?.name === 'ImageReviewControl');
+  assert.ok(review); assert.equal(review.props.workspace, ui.workspace);
+  assert.equal(ui.calls.length, 0);
   await ui.click('生成图片');
   assert.equal(ui.calls.find(call => call.action === 'images.run')!.payload.imageAdoptionPolicy, 'manual');
 });

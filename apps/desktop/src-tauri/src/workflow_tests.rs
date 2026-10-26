@@ -1257,6 +1257,9 @@ fn explicit_direction_is_versioned_and_rejects_stale_editor() {
         store.foundation().unwrap()["productionDirection"],
         "克制表演"
     );
+    assert_eq!(store.foundation().unwrap()["sourceSha256"], store.source().unwrap()["sha256"]);
+    assert_eq!(store.foundation().unwrap()["sourceVersion"], source_version);
+    serde_json::from_value::<pipeline::FoundationProposal>(store.foundation().unwrap()).unwrap();
     assert!(store
         .save_production_direction("旧编辑器的方向", source_version, Some(0))
         .is_err());

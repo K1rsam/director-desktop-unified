@@ -46,7 +46,7 @@ try {
       const html = render(base);
       disabled(html, '准备所选素材', true);
       disabled(html, '生成所选视频', true);
-      disabled(render(base, { mode: 'prompts' }), '生成分镜提示词', true);
+      disabled(render(base, { mode: 'storyboard' }), '一键创作分镜', true);
       assert.equal(networkRequests, 0); assert.equal(unexpectedSsrMutations, 0);
     } finally { policy.standard(); }
   });
@@ -88,7 +88,8 @@ try {
     const html = render({ ...base, units: [] });
     disabled(html, '准备所选素材', true);
     disabled(html, '生成所选视频', true);
-    assert.ok(html.includes('先完成第三阶段'));
+    assert.ok(html.includes('可直接导入现成分镜 MD，或完成第二阶段创作。'));
+    assert.ok(!html.includes('先完成第三阶段'));
     assert.ok(html.includes('尚未有分镜单元'));
   });
   await test('Invalid saved size is retained and blocks both actions without downgrade', () => {
@@ -117,9 +118,9 @@ try {
     assert.equal(field.disabled, model.resolutions.length === 1);
     assert.deepEqual(new Set(select(html, '画面比例').values), new Set(ratios));
   });
-  await test('Stage 3 remains a text workflow independent of video model settings', () => {
+  await test('Stage 2 remains a text workflow independent of video model settings', () => {
     const html = render({ ...base, providers: [], settings: {}, units: [] }, { mode: 'storyboard' });
-    disabled(html, '生成分镜提示词', false);
+    disabled(html, '一键创作分镜', false);
     for (const forbidden of ['video-production-panel', '准备所选素材', '视频模型', '视频尺寸', '核实模型', '保存参数']) assert.ok(!html.includes(forbidden), forbidden);
   });
   await test('Reference labels follow the asset current ID, not a global adopted flag', () => {
@@ -246,7 +247,7 @@ try {
     assert.ok(!textOf(complete).includes('正在自动检查渠道'));
     assert.equal(action(complete, '准备所选素材').disabled, false);
   });
-  await test('Stage 3 never executes video bootstrap effects', () => {
+  await test('Stage 2 never executes video bootstrap effects', () => {
     const item = setup(); item.values.mode = 'storyboard'; item.render(); item.host.flushEffects();
     assert.equal(item.calls.length, 0);
   });

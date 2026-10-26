@@ -13,6 +13,12 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "readiness.check",
     "textSdk.status",
     "images.previewPrompt",
+    "images.exportPrompts",
+    "images.exportCurrent",
+    "storyboard.exportDelivery",
+    "images.registerReference",
+    "images.reviewDelegation.set",
+    "images.reviewReconcile",
     "projects.list",
     "projects.create",
     "projects.archive",
@@ -45,6 +51,8 @@ pub const OFFLINE_ACTIONS: &[&str] = &[
     "assets.get",
     "assets.usage",
     "assets.save",
+    "assets.imagePrompt.save",
+    "assets.identityLayout.save",
     "assets.delete",
     "assets.restore",
     "jobs.detail",
@@ -68,6 +76,7 @@ pub const STANDARD_ACTIONS: &[&str] = &[
     "chrome.connect", "chrome.check", "chrome.open", "chrome.bind",
     "chrome.managed.start", "chrome.managed.login", "chrome.managed.recover",
     "runtime.prepare",
+    "images.reviewCapability", "images.reviewCapability.restartUnknown", "images.reviewCandidate",
     "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
     "workflows.resume", "providers.refresh", "videos.preflight", "videos.prepare", "videos.submit",
     "jobs.query", "jobs.download", "jobs.reconcile", "textCli.status", "textCli.login",
@@ -80,7 +89,7 @@ pub fn check_standard(request: &Value) -> Result<(), String> {
     let action = request["action"].as_str().unwrap_or("");
     if STAGE3_ACTIONS.contains(&action) {
         return if creative_runtime_ready() { Ok(()) }
-        else { Err("STAGE3_ADAPTER_PENDING: 最新 3008 创作运行装配尚未接入；已有分镜和历史保留，未调用模型。".into()) };
+        else { Err("STAGE3_ADAPTER_PENDING: 分镜执行器尚未就绪；已有分镜和历史保留，未调用模型。".into()) };
     }
     if OFFLINE_ACTIONS.contains(&action) || STANDARD_ACTIONS.contains(&action) { return Ok(()); }
     Err(format!("STANDARD_ACTION_UNSUPPORTED: {action} 尚未实现"))
@@ -92,9 +101,9 @@ pub fn standard_report() -> Value {
     json!({"version":"execution-policy/v3","mode":"standard_native","liveExecutionAllowed":true,
         "stage3CreativePackStatus":if creative_runtime_ready(){"verified_active"}else{"inactive"},
         "allowedActions":actions,"credentialBackend":crate::platform::credential_backend_status(),
-        "reasons":["第一阶段制作和第二阶段提示词设计使用所选真实文字渠道。",
+        "reasons":["剧本策划、分镜创作和资产提示词使用全局设置中选择的文字渠道；编写提示词不会自动生成图片。",
             "图片及视频沿用已实现渠道的账户、模型、费用确认和未知提交保护；即梦画布生成桥尚未接入。",
-            if creative_runtime_ready() { "第三阶段使用已验证接线的 3008 规则与 Rust 兼容适配；真实成稿质量以项目验收为准。" } else { "最新 3008 第三阶段尚待运行适配。" }],
+            if creative_runtime_ready() { "新分镜任务采用 series v6.7.2，资产提示词采用 V1.1.2；历史任务按冻结规则恢复，成稿质量按实际结果验收。" } else { "分镜执行器尚未就绪。" }],
         "textBackends":[{"id":"codex_cli","status":"enabled"},{"id":"codex_sdk","status":if crate::text_sdk::native_execution_enabled(){"explicit_selection_when_ready"}else{"offline_contract_only"}}],
         "localAcceptance":{"backend":"codex_cli","model":"gpt-6.1-sol","reasoning":"medium"}})
 }
@@ -102,7 +111,7 @@ pub fn report() -> Value {
     json!({"version":"execution-policy/v1", "mode":"offline_prepare_only",
         "liveExecutionAllowed":false, "stage3CreativePackStatus":"inactive",
         "allowedActions":OFFLINE_ACTIONS,
-        "reasons":["真实生成保持关闭；本机只读连接检查须由用户单独点击，云端与隔离探针不读取宿主账户。", "第三阶段原件已核对一致，运行适配仍待验证。"],
+        "reasons":["真实生成保持关闭；本机只读连接检查须由用户单独点击，云端与隔离探针不读取宿主账户。", "此入口仅验证本地工程，不代表模型生成或图片质量已通过。"],
         "textBackends":[{"id":"codex_cli","status":"preserved_not_enabled"},{"id":"codex_sdk","status":"offline_contract_only"}],
         "localAcceptance":{"backend":"codex_cli","model":"gpt-6.1-sol","reasoning":"medium"}})
 }

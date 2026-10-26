@@ -1,0 +1,20 @@
+{
+  "version": "desktop-module22-file-map/v1",
+  "sourceOriginal": "source-original.txt",
+  "sourceText": "source-original.txt",
+  "registryDirectory": "registry",
+  "initialRegistry": "registry/v000001.json",
+  "imageQueue": "image-queue.json",
+  "bundle": "bundle.json",
+  "sourceLock": "source-lock.json",
+  "markdown": "adopted.md",
+  "catalog": "adopted.md.assets.json",
+  "consumptionReceipt": "consumption.json",
+  "consumptionRegistry": "registry/v000001.json",
+  "direction": "direction.md",
+  "directionVersion": "synthetic-1",
+  "visualStyle": "项目已定的冷色写实表现，材质与人物比例保持连续。",
+  "relocations": {
+    "D:\\EDY\\Documents\\CL\\director-desktop-integration-20261008\\apps\\desktop\\src-tauri\\tests\\fixtures\\module22-native\\season\\registry\\v000001.json": "registry/v000001.json"
+  }
+}

@@ -416,6 +416,11 @@ pub fn production_direction(input: &Value) -> Value {
 }
 /// Explicit per-asset composition wins; the project CH override never leaks to other kinds.
 pub fn image_presentation(settings: &Value, asset: &Value) -> Value {
+    if asset["workflowProfile"] == super::asset_workflow::PROFILE
+        || asset["imagePrompt"]["version"] == super::asset_workflow::PROMPT_VERSION
+    {
+        return super::asset_workflow::image_presentation(asset);
+    }
     let own = &asset["imagePresentation"];
     let project = &settings["imagePresentation"];
     let explicit = first([
@@ -484,6 +489,13 @@ pub fn asset_semantics(asset: &Value) -> Value {
         "ratio",
     ] {
         result[key] = asset[key].clone();
+    }
+    // Old semantic receipts remain byte-identical. New identity/design/media
+    // relationships are distinct inputs; generated prompt prose is not a fact.
+    if asset["workflowProfile"] == super::asset_workflow::PROFILE {
+        for key in ["workflowProfile", "adoptedDesign", "designDependencies", "referenceRequirements", "imageTask", "sourceFacts", "subjectForm", "uses"] {
+            result[key] = asset[key].clone();
+        }
     }
     result
 }

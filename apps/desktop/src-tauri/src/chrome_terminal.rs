@@ -79,12 +79,18 @@ fn opencli_reader_bound(job:&Value,proof:&Value)->bool {
     let frozen=&config["browserTransport"]["runtimeSha256"];
     if !opencli_sha(frozen)||!opencli_sha(&proof["runtimeSha256"]) {return false;}
     let Some(audit)=raw.get("readerMigration") else{return proof["runtimeSha256"]==*frozen;};
-    // This is the existing query-only provider audit, not a new execution
-    // identity. Its destination must be an exact reviewed reader generation.
+    // A newer query reader may return an already terminal proof unchanged.
+    // The proof's author and the current reader are separate identities: an
+    // audited read must not invalidate the frozen no-send receipt it retained.
+    // Intermediate proof authors still require both exact reviewed edges.
+    let retained_proof=proof["runtimeSha256"]==*frozen
+        ||proof["runtimeSha256"]==audit["toRuntimeSha256"]
+        ||(crate::providers::opencli::read_only_reader_audit_allowed(s(&config["browserTransport"],"runtimeSha256"),s(proof,"runtimeSha256"))
+            &&crate::providers::opencli::read_only_reader_audit_allowed(s(proof,"runtimeSha256"),s(audit,"toRuntimeSha256")));
     audit["schemaVersion"]=="opencli-readonly-reader-migration/v1"
         &&["query","reconcile"].contains(&s(audit,"operation"))&&audit["bridgeOperation"]=="query"
         &&audit["readOnly"]==true&&audit["resubmitted"]==false&&audit["frozenConfigUnchanged"]==true
-        &&audit["fromRuntimeSha256"]==*frozen&&audit["toRuntimeSha256"]==proof["runtimeSha256"]
+        &&audit["fromRuntimeSha256"]==*frozen&&retained_proof
         &&audit["fromRuntimeSha256"]!=audit["toRuntimeSha256"]
         &&crate::providers::opencli::read_only_reader_audit_allowed(s(audit,"fromRuntimeSha256"),s(audit,"toRuntimeSha256"))
         &&["fromRunnerSha256","toRunnerSha256","fromManifestSha256","toManifestSha256"].iter().all(|key|opencli_sha(&audit[key]))
@@ -104,6 +110,13 @@ fn opencli_owned_adapter_bound(proof:&Value)->bool {
             &&adapter=="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b")
         ||(pin=="afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6"
             &&adapter=="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b")
+        ||(["c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+            "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2"].contains(&pin)
+            &&adapter=="5c850d49dba9164a61b499565be9eb21833da724aa6aad6f91a67ddbe86b717b")
+        ||(["5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+            "aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557",
+            "21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59"].contains(&pin)
+            &&adapter=="34c8b2f90ab81e15dab5df56e5c21a89b2be1c1b9393cc4527bfa34c8a6b3766")
 }
 
 fn opencli_not_submitted_valid(job:&Value,task:&str)->bool {

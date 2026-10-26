@@ -1,0 +1,34 @@
+{
+  "version": "series-image-request-v1",
+  "baseRevision": 1,
+  "uses": [
+    {
+      "assetId": "A0002",
+      "assetRevision": 1,
+      "episode": 1,
+      "sceneId": "1-1",
+      "purpose": "Actual adopted image binding"
+    },
+    {
+      "assetId": "A0001",
+      "assetRevision": 1,
+      "episode": 1,
+      "sceneId": "1-1",
+      "purpose": "Actual adopted image binding"
+    },
+    {
+      "assetId": "A0004",
+      "assetRevision": 1,
+      "episode": 1,
+      "sceneId": "1-1",
+      "purpose": "Actual adopted image binding"
+    },
+    {
+      "assetId": "A0003",
+      "assetRevision": 1,
+      "episode": 1,
+      "sceneId": "1-2",
+      "purpose": "Actual adopted image binding"
+    }
+  ]
+}

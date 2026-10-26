@@ -32,6 +32,10 @@ mod unit_save_guard;
 mod lingmo_project;
 #[path = "engine_refinement_identity.rs"]
 mod refinement_identity;
+#[path = "engine_asset_workflow.rs"]
+mod asset_workflow_engine;
+#[path = "engine_visual_review.rs"]
+mod visual_review_engine;
 #[cfg(test)]
 #[path = "engine_refinement_continuity_tests.rs"]
 mod refinement_continuity_tests;
@@ -1121,6 +1125,9 @@ impl Engine {
             .map(|r| json!({"id":r.id,"version":r.version,"sha256":r.sha256}))
             .collect();
         let mut display_settings=self.effective_settings(store)?;
+        if display_settings["imageAdoptionPolicy"]=="delegated-review"&&store.visual_review_delegation()?["enabled"]!=true{
+            display_settings["imageAdoptionPolicy"]=json!("manual");
+        }
         // Match the execution gate without exposing credential references or
         // hashes. Global Chrome/BH identities need no user-entered account label.
         let credential_status: serde_json::Map<String, Value> = ["bh", "chrome"]
@@ -1130,7 +1137,7 @@ impl Engine {
         if let Some(object)=display_settings.as_object_mut(){object.remove(crate::app_settings::SCOPE);}
         if self.standard_native {if let Some(global)=crate::app_settings::load(&self.home)? {for (_,entry) in global["catalogs"].as_object().into_iter().flatten(){let cap=entry["capabilities"].clone();providers.retain(|p|p["provider"]!=cap["provider"]);providers.push(cap);}}}
         Ok(
-            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report,"lingmoDocuments":crate::lingmo_import::documents(store)?}),
+            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report,"lingmoDocuments":crate::lingmo_import::documents(store)?,"imageProductionScope":store.image_production_scope()?,"imageReviewCapability":self.visual_review_capability(store,&display_settings)?,"imageReviewDelegation":store.visual_review_delegation()?}),
         )
     }
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }
@@ -1311,15 +1318,24 @@ impl Engine {
                 if s(&request, "instruction").trim().is_empty() {
                     return Err("请填写此单元的修改要求".into());
                 }
+                if unit["timingProfile"]=="lingmo-v7-nanoseconds/v1" {
+                    return Err("新版分镜的整集精修入口尚未开放；可编辑文字，原采用稿保留，不调用旧版规则重写".into());
+                }
                 let run = json!({"action":"storyboard.run","projectId":request["projectId"],"episodeIds":[unit["episodeId"]],"unitIds":[unit["id"]],"revisionInstruction":request["instruction"]});
                 self.spawn_production(store.clone(), run)?;
             }
             "images.previewPrompt" => {
                 let asset = store.active_asset(s(&request,"assetId"))?;
+                if crate::asset_graph::modern(&asset) { return pipeline::asset_workflow::compile_preview(&asset); }
                 let settings = store.settings()?;
                 let presentation = pipeline::asset_design_contract::image_presentation(&settings,&asset);
                 return Ok(json!({"prompt":pipeline::asset_design_contract::compile_image_prompt(s(&asset,"prompt"),pipeline::asset_design_contract::project_visual_style(&settings),&presentation),"promptCompilerVersion":pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION,"promptBody":asset["prompt"],"imagePresentation":presentation,"assetVersion":asset["version"]}));
             }
+            "images.exportPrompts" => return store.export_image_prompts(&request),
+            "images.exportCurrent" => return store.export_current_images(&request),
+            "storyboard.exportDelivery" => return store.export_series_delivery(&request),
+            "images.registerReference" => return store.register_image_reference(&request),
+            "assets.identityLayout.save" => {store.save_identity_layout(&request)?;},
             "assets.get" => return store.get("assets", s(&request, "assetId")),
             "assets.usage" => return store.asset_usage(s(&request, "assetId")),
             "jobs.detail" => {
@@ -1382,6 +1398,9 @@ impl Engine {
                 )?;
                 store.event("", "legacy_import", &report)?;
                 store.conn()?.execute("INSERT INTO metadata VALUES('last_import_report',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[report.to_string()]).map_err(|e|e.to_string())?;
+            }
+            "assets.imagePrompt.save" => {
+                store.save_image_prompt(&request,&self.effective_settings(&store)?)?;
             }
             "assets.save" => {
                 let original = store
@@ -1632,6 +1651,20 @@ impl Engine {
                 let report = self.queue_videos(&store, &request, true)?;
                 let mut workspace = self.workspace(&store, None)?;
                 workspace["videoQueueReport"] = report;
+                return Ok(workspace);
+            }
+            "images.reviewCapability" | "images.reviewCapability.restartUnknown" | "images.reviewCandidate" => {
+                self.spawn_visual_review(store.clone(),request.clone())?;
+            }
+            "images.reviewDelegation.set" => {
+                let enabled=request["enabled"].as_bool().ok_or("请明确开启或关闭委托审图")?;
+                store.set_visual_review_delegation(enabled,&self.effective_settings(&store)?)?;
+            }
+            "images.reviewReconcile" => {
+                let _guard=self.acquire_keys(project_worker_keys(&store,vec!["channel:sdk-visual-review".into(),format!("pipeline:{}",s(&store.project()?,"id"))])?)?;
+                let result=crate::visual_review::reconcile(&store,&self.effective_settings(&store)?,&request)?;
+                let mut workspace=self.workspace(&store,None)?;
+                workspace["imageReviewReconciliation"]=result;
                 return Ok(workspace);
             }
             "images.run" => {
@@ -1903,6 +1936,7 @@ impl Engine {
             self.refresh_due_dreamina(&store)?;
             self.refresh_due_catalogs(&store)?;
             self.unblock_image_dependencies(&store)?;
+            self.schedule_opencli_unknown_reads(&store)?;
             let mut jobs = store.pending_jobs()?;
             let query_next = self
                 .media_query_next
@@ -2081,6 +2115,7 @@ impl Engine {
                 // the other class. Existing due/backoff checks remain above.
             }
             self.schedule_browser_tab_cleanup(&store)?;
+            self.schedule_visual_reviews(&store)?;
         }
         Ok(())
     }
@@ -2150,6 +2185,24 @@ impl Engine {
                 // durable entries are available on the next scheduler pass.
                 break;
             }
+        }
+        Ok(())
+    }
+    fn schedule_opencli_unknown_reads(self: &Arc<Self>, store: &Store) -> Result<()> {
+        if self.active.lock().map_err(|e|e.to_string())?.contains("channel:chrome") {return Ok(());}
+        for job in tasks::opencli_unknown_jobs(store)? {
+            let key=s(&job,"id").to_owned();
+            let (config,account)=match self.generation_config(store,&job) {
+                Ok(value)=>value,
+                Err(_)=>{tasks::stop_opencli_unknown_read(store,&key,"FROZEN_CONFIG_UNAVAILABLE")?;continue;}
+            };
+            let st=store.clone();let channels=self.channels.clone();
+            let locks=project_worker_keys(store,vec!["channel:chrome".into(),format!("job:{key}")])?;
+            if self.spawn_exclusive_keys(locks,move || {
+                // The original-page query itself verifies the real logged-in account.
+                // No status probe, preparation, upload or submit is reachable here.
+                tasks::run_opencli_unknown_read(&st,&key,&config,&account,channels.as_ref()).map(|_|())
+            }).is_ok() {break;}
         }
         Ok(())
     }
@@ -2353,6 +2406,10 @@ impl Engine {
                 continue;
             }
             let dependency_check: Result<bool> = (|| {
+                if j["snapshot"]["workflowProfile"]==crate::asset_graph::PROFILE {
+                    if j["snapshot"]["referenceRequirements"]!=a["referenceRequirements"] {return Err("等待期间参考需求已变化，原请求保留".into());}
+                    return Ok(image_references(store,&assets,&a)?.is_some());
+                }
                 if j["snapshot"]["sourceChain"].is_array() && json!(pipeline::asset_design_contract::source_chain(&assets,&a)?) != j["snapshot"]["sourceChain"] {
                     return Err("等待期间指定来源设计已变化，保留冻结请求，请重新制作关联图片".into());
                 }
@@ -2404,6 +2461,11 @@ impl Engine {
                 Ok(Some(refs)) => {
                     let mut snapshot = j["snapshot"].clone();
                     snapshot["references"] = json!(refs);
+                    if snapshot["workflowProfile"]==crate::asset_graph::PROFILE {snapshot["referenceBindings"]=snapshot["references"].clone();}
+                    if let Err(error)=crate::asset_identity_layout::freeze(store,&mut snapshot) {
+                        store.update_job(s(j,"id"),"blocked",&json!({"error":error}))?;
+                        continue;
+                    }
                     store.conn()?.execute("UPDATE jobs SET snapshot=?1 WHERE id=?2 AND state='waiting_dependency'",rusqlite::params![snapshot.to_string(),s(j,"id")]).map_err(|e|e.to_string())?;
                     store.claim_job(s(j, "id"), "waiting_dependency", "queued")?;
                 }
@@ -2936,7 +2998,9 @@ impl Engine {
             }
             cached_account
         };
-        let selected = r["assetIds"].as_array();
+        let new_workflow=r["workflowProfile"]==crate::asset_graph::PROFILE;
+        let image_scope=store.image_production_scope()?;
+        let selected = r["assetIds"].as_array().or_else(||if new_workflow {image_scope["assetIds"].as_array()}else{None});
         if selected.is_some_and(|ids| {
             ids.iter()
                 .any(|id| id.as_str().is_none_or(|id| id.trim().is_empty()))
@@ -2945,7 +3009,7 @@ impl Engine {
         }
         let assets = store.values("assets")?;
         let gate_input = json!({"source":store.source()?,"foundation":store.foundation()?,"assets":assets,"selection":{"assetIds":r["assetIds"]}});
-        let visual_blocked = pipeline::asset_visual_facts::cached_visual_check_asset_ids(&gate_input)?;
+        let visual_blocked = if new_workflow {Vec::new()}else{pipeline::asset_visual_facts::cached_visual_check_asset_ids(&gate_input)?};
         let policy = r["imageProductionPolicy"]
             .as_str()
             .filter(|p| ["automatic", "trialReview"].contains(p))
@@ -2955,7 +3019,16 @@ impl Engine {
         if review && !approved && r["trial"].as_bool() != Some(true) {
             return Err("请先生成少量试稿并确认画风，再启动批量生成".into());
         }
-        let (order, closure_errors) = image_closure(store, &assets, selected);
+        let (order, closure_errors) = if new_workflow {
+            let selection=selected.cloned().unwrap_or_default();
+            for id in &selection {
+                if !image_scope["assetIds"].as_array().is_some_and(|ids|ids.contains(id))
+                    && !image_scope["referenceOnlyIds"].as_array().is_some_and(|ids|ids.contains(id)) {
+                    return Err("所选图片超出正式范围；必要参考母版须先显式登记".into());
+                }
+            }
+            crate::asset_graph::explicit_order(&assets,&selection)
+        }else{image_closure(store, &assets, selected)};
         let mut selected_count = 0;
         for asset in assets.iter().filter(|a| order.contains(&s(a, "id").to_owned())) {
             if selected.map(|ids| ids.contains(&asset["id"])).unwrap_or(true)
@@ -2978,6 +3051,7 @@ impl Engine {
         let mut blocked = Vec::new();
         let mut queued = Vec::new();
         let mut reused = Vec::new();
+        let mut module22_context = crate::module22::ImageBatchContext::new(store);
         for issue in closure_errors {
             errors.push(format!("{}: {}", s(&issue, "assetId"), s(&issue, "reason")));
             blocked.push(issue);
@@ -3023,8 +3097,16 @@ impl Engine {
                 if visual_blocked.iter().any(|id|id==s(a,"id")) {
                     return Err("视觉状态尚未归属或本批不适用裁决已失效，请先重新核对设计依据；已有提示词不能绕过".into());
                 }
-                pipeline::validate_asset_visual_gate(&gate_input, a)?;
-                if s(a, "prompt").is_empty() {
+                if !new_workflow {pipeline::validate_asset_visual_gate(&gate_input, a)?;}
+                if new_workflow && !a["referenceRequirements"].is_array() && !s(a,"sourceAssetId").is_empty() {
+                    return Err("旧派生资产的媒体依赖尚未核对，请先编写新流程提示词；不会凭父标签直接派图".into());
+                }
+                let prompt_body=pipeline::asset_workflow::prompt_text(a);
+                if new_workflow && (a["promptStatus"]=="needs_review" || a["imagePrompt"]["status"]=="needs_review") {
+                    return Err("提示词依据已变化，需复核后生成；未提交图片请求".into());
+                }
+                if new_workflow {crate::asset_workflow_store::validate_prompt_source(store,&a["imagePrompt"])?;}
+                if prompt_body.is_empty() {
                     return Err("资产缺少图片设计提示词".into());
                 }
                 let (mut refs, mut state) = match image_references(store, &assets, a) {
@@ -3042,7 +3124,7 @@ impl Engine {
                         .adopted(&dependency, s(source, "variantId"))?
                         .is_some()
                     {
-                        if let Some(job) = dependency_jobs.get(&dependency) {
+                        if let Some(job) = dependency_jobs.get(&dependency).filter(|_|!new_workflow) {
                             if !dependency_job_ids.contains(job) {
                                 dependency_job_ids.push(job.clone());
                             }
@@ -3066,7 +3148,7 @@ impl Engine {
                             break;
                         }
                     }
-                    if !has_source {
+                    if !has_source && !new_workflow {
                         return Err(format!("来源形象「{}」没有当前图片且未能排入生成队列；请查看该形象的失败原因", s(source, "name")));
                     }
                 }
@@ -3074,16 +3156,39 @@ impl Engine {
                     refs.clear();
                     state = "waiting_dependency";
                 }
+                if new_workflow && r["onlyReady"] == true && state == "waiting_dependency" {
+                    return Err("等待真实参考母图采用；本次只生成就绪图片，未创建生成任务".into());
+                }
                 let style = pipeline::asset_design_contract::project_visual_style(settings);
-                let presentation = pipeline::asset_design_contract::image_presentation(settings, a);
+                let presentation = if crate::asset_graph::modern(a){pipeline::asset_workflow::image_presentation(a)}else{pipeline::asset_design_contract::image_presentation(settings, a)};
                 // The web channel returns website-native files; a saved CLI/API
                 // size is not a pixel-size option for this provider. Resolve only
                 // new snapshots, keeping the saved settings and old jobs intact.
                 let resolution = if provider == "chrome" { json!("native") }
                     else { settings.get("imageResolution").cloned().unwrap_or(json!("2K")) };
-                let prompt = pipeline::asset_design_contract::compile_image_prompt(s(a, "prompt"), style, &presentation);
-                let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":pipeline::asset_design_contract::source_chain(&assets,a)?,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":resolution,"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
+                let prompt = if crate::asset_graph::modern(a){prompt_body.to_owned()}else{pipeline::asset_design_contract::compile_image_prompt(prompt_body, style, &presentation)};
+                let source_chain=if new_workflow{Value::Null}else{json!(pipeline::asset_design_contract::source_chain(&assets,a)?)};
+                let mut snapshot = json!({"requestId":id(),"kind":"image","provider":provider,"model":model,"prompt":prompt,"promptBody":a["prompt"],"visualStyle":style,"imagePresentation":presentation,"frozenSettings":settings,"providerConfig":config,"designReceipt":a["design"]["designReceipt"],"designContext":a["design"]["frozenContext"],"sourceChain":source_chain,"imageProductionPolicy":policy,"assetId":a["id"],"assetVersion":a["version"],"variantId":a["variantId"],"sourceVersion":store.source()?["version"],"sourceVariantId":a["sourceVariantId"],"ratio":presentation["ratio"],"resolution":resolution,"references":refs,"dependencyJobIds":dependency_job_ids,"options":{},"autoSubmit":true,"ruleSnapshot":pipeline::rule_snapshot("asset-image-production")?});
                 snapshot["promptCompilerVersion"] = json!(pipeline::asset_design_contract::IMAGE_PROMPT_COMPILER_VERSION);
+                if new_workflow {
+                    snapshot["workflowProfile"]=json!(crate::asset_graph::PROFILE);
+                    snapshot["promptBody"]=json!(prompt_body);
+                    snapshot["sourceChain"]=Value::Null;
+                    snapshot["referenceRequirements"]=a["referenceRequirements"].clone();
+                    snapshot["referenceBindings"]=json!(refs);
+                    let visual_review=crate::visual_review::frozen_adoption_policy(store,settings)?;
+                    snapshot["imageAdoptionPolicy"]=visual_review["policy"].clone();
+                    snapshot["visualReviewDelegation"]=visual_review;
+                    snapshot["ruleSnapshot"]=pipeline::asset_workflow::rule_snapshot(a);
+                    snapshot["promptCompilerVersion"]=json!(pipeline::asset_workflow::PROMPT_VERSION);
+                    snapshot["identityComposite"]=a["identityComposite"].clone();
+                    if a["imagePrompt"].get("sourceBindingContract").is_some() {
+                        snapshot["promptSource"]=json!({"sourceBindingContract":a["imagePrompt"]["sourceBindingContract"],
+                            "sourceUnitBindings":a["imagePrompt"]["sourceUnitBindings"],"sourceKind":a["imagePrompt"]["sourceKind"],
+                            "sourceSha256":a["imagePrompt"]["sourceSha256"],"sourceBasisSha256":a["imagePrompt"]["sourceBasisSha256"]});
+                    }
+                    if state=="queued" {crate::asset_identity_layout::freeze(store,&mut snapshot)?;}
+                }
                 if let Some(binding) = r.get("backgroundChromeBinding") {
                     if provider != "chrome" { return Err("后台图片入口仅允许 Chrome".into()); }
                     snapshot["backgroundChromeBinding"] = binding.clone();
@@ -3091,7 +3196,14 @@ impl Engine {
                 if let Some(previous)=jobs.iter().find(|j|j["entityId"]==a["id"]&&crate::chrome_terminal::settled_job(j)) {
                     snapshot["retryOfJobId"]=previous["id"].clone();
                     snapshot["retryOfRequestId"]=previous["providerTaskId"].clone();
+                    if provider=="chrome" && snapshot["providerConfig"]["browserTransport"]["transport"]=="opencli/v1"
+                        && previous["result"]["raw"]["opencliNotSubmitted"]["clickCalls"]==0 {
+                        // New explicit retry only. The old frozen request and
+                        // its proven no-send journal remain unchanged.
+                        snapshot["options"]["retryOfRequestId"]=previous["providerTaskId"].clone();
+                    }
                 }
+                crate::module22::freeze_image_batch_with_context(store, a, &mut snapshot, &mut module22_context)?;
                 store.add_job("image", s(a, "id"), provider, &account, &snapshot, state)
             })();
             match result {
@@ -3110,7 +3222,7 @@ impl Engine {
         if !errors.is_empty() {
             store.event("", "batch_blocked", &json!(errors))?;
         }
-        if queued.is_empty() && reused.is_empty() && !blocked.is_empty() {
+        if !new_workflow && queued.is_empty() && reused.is_empty() && !blocked.is_empty() {
             return Err(errors.join("；"));
         }
         // One-click Stage2 also enters this frozen-settings path directly.
@@ -3217,7 +3329,14 @@ impl Engine {
         crate::text_executor::check_cli_unknown_hold(&store)?;
         // Only a genuinely new writer/refinement gets the scene contract. The
         // resume returns above and saved-snapshot recovery keep their exact input.
-        if matches!(stage, "storyboard.run" | "storyboard.refine") {
+        if stage=="storyboard.run" && pipeline::series::uses_profile(&input)? {
+            // Reserve stable identities only after ruling out frozen recovery
+            // and taking the project lease. Refresh versions before CAS.
+            store.ensure_series_asset_identities()?;
+            input=production_input_for_new_workflow_with_capabilities(&store,&request,planning.as_ref())?;
+            if prepare_series_continuation(&store,&mut input)? {return Ok(());}
+        }
+        if matches!(stage, "storyboard.run" | "storyboard.refine") && !pipeline::series::uses_profile(&input)? {
             pipeline::freeze_scene_input_profile(&mut input)?;
             pipeline::storyboard_sound_events::freeze_new(&mut input)?;
             pipeline::asset_coverage::freeze_new(&mut input)?;
@@ -3247,10 +3366,10 @@ impl Engine {
                 }
             }
         }
-        if stage == "storyboard.run" {
-            input["storyboardMethod"] = json!("authors-then-editor/v2");
+        if stage == "storyboard.run" && pipeline::series::uses_profile(&input)? {
+            input["storyboardMethod"] = json!("series-full-episode/v1");
         }
-        let rules = if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
+        let rules = if pipeline::series::uses_profile(&input)? { json!(pipeline::series::rule_snapshots()?) } else if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
         let guard = crate::workflow::guard_from_input(&input);
         store.ensure_workflow_storage()?;
         {
@@ -3279,6 +3398,16 @@ impl Engine {
     fn resume_production(self: &Arc<Self>, store: Store, request: &Value) -> Result<()> {
         let id = s(request, "workflowId");
         let job = store.job(id)?;
+        if request.get("supplyContractCorrection").is_some()
+            && (s(request,"action")!="workflows.resume" || job["entityId"]!="storyboard.run"
+                || job["snapshot"]["input"]["workflowProfile"]!=crate::asset_graph::PROFILE) {
+            return Err("供料合同纠正仅适用于同一条新分镜原流程，未新建任务".into());
+        }
+        if job["snapshot"]["stage2Context"]["workflowProfile"]==crate::asset_graph::PROFILE {
+            if s(&job,"kind")!="workflow" || !["failed","interrupted","partially_blocked","blocked"].contains(&s(&job,"status")){return Err("请选择中断的原提示词流程".into());}
+            let lease=self.acquire_pipeline(&store)?;
+            return self.execute_image_workflow_v1(store,id.to_owned(),job["snapshot"].clone(),lease);
+        }
         if job["snapshot"]["stage"]=="images.design" {
             if s(request,"action")!="workflows.resume" || s(&job,"kind")!="workflow" || !["failed","interrupted","partially_blocked","blocked"].contains(&s(&job,"status")) {
                 return Err("请选择中断的原资产文字设计流程".into());
@@ -3339,6 +3468,10 @@ impl Engine {
         refinement_identity::prepare_resume(&store,id)?;
         let rule_migration =
             workflow_resume_rule_audit(&job, &production_rules_for_snapshot(&snapshot)?)?;
+        if let Some(authorization)=request.get("supplyContractCorrection") {
+            SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
+                .authorize_series_supply_correction(authorization)?;
+        }
         if s(request, "action") == "storyboard.decision.resolve" {
             let waiting = &job["result"]["waitingDecision"];
             let episode = s(waiting, "episodeId");
@@ -3451,7 +3584,7 @@ impl Engine {
                     input["frozenFinisherAssetContext"]=record["snapshot"]["input"].clone();
                     let mut output=pipeline::run_storyboard(&input,&exec,model,reasoning).await?;
                     output["planningProfile"]=input["capabilities"].clone();output["selection"]=input["selection"].clone();
-                    if output["units"].as_array().is_some_and(|u|!u.is_empty()) {
+                    if !pipeline::series::uses_profile(&input)? && output["units"].as_array().is_some_and(|u|!u.is_empty()) {
                         let latest=store.job(&run)?;
                         let publication_guard=latest["prepared"].get("publicationGuard").unwrap_or(&snapshot["guard"]).clone();
                         store.publish_storyboard(&publication_guard,&output,&input,Some(&run))?;
@@ -3475,6 +3608,9 @@ impl Engine {
     }
     fn reserve_asset_stage_owned(self: &Arc<Self>, store: Store, mut r: Value, pipeline_lease: ActiveGuard) -> Result<()> {
         crate::text_executor::check_cli_unknown_hold(&store)?;
+        if r.get("imageResumeOrigin").is_none() {
+            return self.reserve_image_workflow_v1(store,r,pipeline_lease);
+        }
         let stage = s(&r, "action").to_owned();
         let all_assets = store.values("assets")?;
         let (wanted, _) = image_closure(&store, &all_assets, r["assetIds"].as_array());
@@ -3606,6 +3742,9 @@ impl Engine {
         self.execute_asset_stage_owned(store,job,snapshot,pipeline_lease)
     }
     fn execute_asset_stage_owned(self:&Arc<Self>,store:Store,job:String,snapshot:Value,lease:ActiveGuard)->Result<()> {
+        if snapshot["stage2Context"]["workflowProfile"]==crate::asset_graph::PROFILE {
+            return self.execute_image_workflow_v1(store,job,snapshot,lease);
+        }
         let stage=s(&snapshot,"stage").to_string();
         let r=snapshot["request"].clone();
         let execution_settings=snapshot["settings"].clone();
@@ -4670,6 +4809,7 @@ fn bundled_dreamina() -> Option<PathBuf> {
 }
 
 fn image_dependency_ids(assets: &[Value], asset: &Value) -> Result<Vec<String>> {
+    if crate::asset_graph::modern(asset) {return crate::asset_graph::dependencies(assets,asset);}
     let mut ids = Vec::new();
     if let Some(refs) = asset["design"]["referenceAssetIds"].as_array() {
         for r in refs {
@@ -4696,6 +4836,7 @@ fn image_dependency_ids(assets: &[Value], asset: &Value) -> Result<Vec<String>> 
     Ok(ids)
 }
 fn image_references(store: &Store, assets: &[Value], asset: &Value) -> Result<Option<Vec<Value>>> {
+    if crate::asset_graph::modern(asset) {return crate::asset_graph::media_references(store,assets,asset);}
     let ids = image_dependency_ids(assets, asset)?;
     let mut refs = Vec::new();
     let mut missing = false;
@@ -4706,7 +4847,7 @@ fn image_references(store: &Store, assets: &[Value], asset: &Value) -> Result<Op
             .ok_or("图片依赖不存在")?;
         // A manually chosen INLINE image remains an explicit real material.
         // Otherwise INLINE reuses its registered ancestor, never a fabricated image.
-        let chain = if store.adopted(key, s(a, "variantId"))?.is_some() {
+        let chain = if crate::asset_graph::modern(asset) || store.adopted(key, s(a, "variantId"))?.is_some() {
             vec![a]
         } else {
             image_reference_chain(assets, a)?
@@ -4740,7 +4881,7 @@ fn image_references(store: &Store, assets: &[Value], asset: &Value) -> Result<Op
                     }
                 }
             } else {
-                refs.push(json!({"mediaId":mid,"kind":"image","path":path,"relativePath":m["relativePath"],"sha256":m["sha256"],"order":refs.len(),"usage":"source","assetId":material["id"],"assetVersion":material["version"],"variantId":material["variantId"],"semanticBindings":semantic}));
+                refs.push(json!({"mediaId":mid,"kind":"image","path":path,"relativePath":m["relativePath"],"sha256":m["sha256"],"contentHash":m["sha256"],"mediaRevision":m.get("version").cloned().unwrap_or(json!(1)),"order":refs.len(),"usage":"source","assetId":material["id"],"assetVersion":material["version"],"variantId":material["variantId"],"semanticBindings":semantic,"requirements":asset["referenceRequirements"].as_array().into_iter().flatten().filter(|r|r["targetAssetId"]==material["id"]).cloned().collect::<Vec<_>>(),"adoptionBasis":"current-adoption-record"}));
             }
         } else {
             missing = true
@@ -5056,6 +5197,9 @@ fn production_rules(stage: &str) -> Value {
 // A previously started run keeps its actual rules and requests. It may finish or
 // resume its accepted steps; a new run uses the restored F2 → Q1 method.
 fn production_rules_for_snapshot(snapshot: &Value) -> Result<Value> {
+    if pipeline::series::uses_profile(&snapshot["input"])? {
+        return Ok(json!(pipeline::series::rule_snapshots()?));
+    }
     if pipeline::stage3_pack::uses_profile(&snapshot["input"])? {
         let mut checked = json!({});
         pipeline::stage3_pack::attach_profile(&mut checked, &snapshot["input"])?;
@@ -5845,6 +5989,9 @@ fn refinement_input(store: &Store, request: &Value) -> Result<Value> {
 fn refinement_input_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
     let episode = s(request, "episodeId");
     if episode.is_empty() { return Err("请先选择要精修的单集".into()); }
+    if store.series_deliveries()?.iter().any(|d|d["episodeId"]==episode) {
+        return Err("新版分镜的整集精修入口尚未开放；保留原采用稿，不调用旧版规则".into());
+    }
     let mut input = production_input_with_capabilities(store, &json!({"action":"storyboard.run","episodeIds":[episode]}),capabilities)?;
     let units: Vec<Value> = input["existingUnits"].as_array().into_iter().flatten()
         .filter(|unit| s(unit,"episodeId")==episode && unit["retired"]!=true).map(|unit|unit["id"].clone()).collect();
@@ -5902,8 +6049,7 @@ fn production_input_with_capabilities(store: &Store, request: &Value,capabilitie
         input["storyboardAssetInputProfile"] = json!("asset-production-card/v2");
         input[pipeline::REPETITION_TRANSPORT_PROFILE_FIELD] = json!(pipeline::REPETITION_TRANSPORT_PROFILE);
         input[pipeline::CONTEXT_INPUT_PROFILE_FIELD] = json!(pipeline::CONTEXT_INPUT_PROFILE);
-        input[pipeline::storyboard_dependencies::PROFILE_FIELD] =
-            json!(pipeline::storyboard_dependencies::PROFILE);
+        input[pipeline::storyboard_dependencies::PROFILE_FIELD] = json!(pipeline::storyboard_dependencies::PROFILE);
         if let Some(ids) = request["unitIds"].as_array() {
             input["revisionContexts"] =
                 json!(accepted_storyboard_revision_contexts(store, &input, ids)?);
@@ -5912,6 +6058,25 @@ fn production_input_with_capabilities(store: &Store, request: &Value,capabilitie
     }
     Ok(input)
 }
+/// Reuse adopted episodes without copying role receipts or reserving new work.
+/// Called under the production lease, after stable identity allocation.
+fn prepare_series_continuation(store: &Store, input: &mut Value) -> Result<bool> {
+    let reused=store.reusable_series_episode_ids(input)?;
+    if reused.is_empty() {return Ok(false);}
+    let pending:Vec<_>=input["selection"]["episodeIds"].as_array().ok_or("缺少制作集数")?.iter().filter(|id|!reused.iter().any(|e|id.as_str()==Some(e))).cloned().collect();
+    store.event("","series_adopted_episodes_reused",&json!({"episodeIds":reused,"newEpisodeIds":pending,"newRoleReceiptsCreated":false}))?;
+    if pending.is_empty(){return Ok(true);}
+    let deliveries=store.series_deliveries()?;
+    let prior=deliveries.iter().find(|d|d["episodeId"].as_str()==reused.last().map(String::as_str)).ok_or("复用集交付记录缺失")?;
+    let tail=prior["bundle"]["draft"]["units"].as_array().and_then(|u|u.last()).ok_or("复用集缺少真实尾态")?;
+    // Reuse already verified the adopted body. The next CAS guard also needs
+    // the current persisted version; the immutable bundle has no DB version.
+    input["previousBoundary"]=store.get("units",s(tail,"id"))?;
+    input["selection"]["episodeIds"]=json!(pending);
+    input["reusedEpisodeIds"]=json!(reused);
+    Ok(false)
+}
+
 /// Only an actual new Stage3 writer receives this read-only projection. The
 /// refinement reader and every saved recovery snapshot use production_input.
 #[cfg(test)]
@@ -5919,6 +6084,12 @@ fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<V
     production_input_for_new_workflow_with_capabilities(store,request,None)
 }
 fn production_input_for_new_workflow_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
+    if request["unitIds"].as_array().is_some_and(|ids|!ids.is_empty()) {
+        for id in request["unitIds"].as_array().unwrap() {
+            if store.get("units",id.as_str().unwrap_or(""))?["timingProfile"]=="lingmo-v7-nanoseconds/v1" {return Err("新版单元必须通过绑定整集采用稿的精修入口，未调用旧版规则".into());}
+        }
+        return production_input_with_capabilities(store,request,capabilities);
+    }
     let mut input = production_input_with_capabilities(store, request,capabilities)?;
     if s(request, "action") == "storyboard.run" {
         pipeline::asset_use_binding::freeze_new(&mut input)?;
@@ -5926,6 +6097,15 @@ fn production_input_for_new_workflow_with_capabilities(store: &Store, request: &
         input["foundation"] = projection.foundation;
         input["foundationReasonProjection"] = projection.diagnostic;
         pipeline::asset_design_contract::apply_scope_reasons_to_new_asset_context(&mut input)?;
+        // Only this new-work reservation changes the creative contract. The
+        // shared input builder still supports original refinement/recovery.
+        for key in ["storyboardRulePackProfile","storyboardCreativeProfile","storyboardCarrierProfile"] {
+            input.as_object_mut().unwrap().remove(key);
+        }
+        input["productionScope"]=json!({"version":"desktop-production-scope/v1","status":"locked","sourceSha256":input["source"]["sha256"],"episodeIds":input["source"]["episodes"].as_array().into_iter().flatten().map(|e|e["id"].clone()).collect::<Vec<_>>(),"basis":"locked-desktop-source-scope;selection-is-execution-subset"});
+        input["settings"]["confirmedDirection"]=input["foundation"]["productionDirection"].clone();
+        if input["settings"]["fantasyMode"].is_null() {input["settings"]["fantasyMode"]=json!("off");}
+        pipeline::series::mark_input(&mut input)?;
     }
     Ok(input)
 }
@@ -7061,6 +7241,9 @@ mod task_record_tests;
 #[path = "engine_refinement_cas_tests.rs"]
 mod refinement_cas_tests;
 #[cfg(test)]
+#[path = "engine_series_start_tests.rs"]
+mod series_start_tests;
+#[cfg(test)]
 #[path = "engine_cli_unknown_tests.rs"]
 mod cli_unknown_tests;
 
@@ -7077,6 +7260,7 @@ mod production_input_transport_tests {
         let place = json!({"episodeId":source["episodes"][0]["id"],"sceneId":source["scenes"][0]["id"]});
         store.save_asset(json!({"id":"p-base","baseAssetId":"p","identityId":"p","variantId":"base","name":"甲","kind":"CH","sourceRefs":[source["rows"][2]["id"]],"scope":{"kind":"SCENES","scenes":[place],"reason":null},"applicability":{"episodes":[source["episodes"][0]["id"]],"scenes":[source["scenes"][0]["id"]]}})).unwrap();
         store.save_foundation(json!({"schemaVersion":"foundation/v1","sourceSha256":source["sha256"],"overview":"","direction":"","episodes":[],"facts":[],"issues":[],"assets":[{"id":"p","name":"甲","kind":"CH","description":"主体制作说明","aliases":[],"sourceRefs":[source["rows"][2]["id"]],"variants":[{"id":"base","assetRowId":"p-base","name":"基础","description":"","sourceVariantId":null,"sourceRefs":[source["rows"][2]["id"]],"applicability":[place],"scope":{"kind":"SCENES","scenes":[place],"reason":"本场明确出场。"}}]}]})).unwrap();
+        store.ensure_series_asset_identities().unwrap();
         let raw_assets = store.values("assets").unwrap();
         let raw_foundation = store.foundation().unwrap();
         let request = json!({"action":"storyboard.run","episodeId":source["episodes"][0]["id"]});

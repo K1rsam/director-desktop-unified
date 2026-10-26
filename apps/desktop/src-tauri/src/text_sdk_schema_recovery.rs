@@ -44,7 +44,7 @@ pub(crate) fn schema_runtime_inventory(runtime: &Path) -> Result<Value> {
 pub(crate) fn schema_recovery_identity_bound(old: &Value, new: &Value) -> bool {
     let (Ok(a),Ok(b))=(serde_json::from_value::<SdkIdentity>(old.clone()),serde_json::from_value::<SdkIdentity>(new.clone())) else{return false;};
     if a.bridge_sha256!=SCHEMA_FAILED_BRIDGE_SHA || b.bridge_sha256!=SCHEMA_FAILED_BRIDGE_SHA
-        || compiled_native_bridge_sha()!=SCHEMA_FAILED_BRIDGE_SHA || a.validate().is_err() || b.validate().is_err() {return false;}
+        || a.validate_receipt().is_err() || b.validate_receipt().is_err() {return false;}
     let mut expected=old.clone();for field in ["supervisorExecutable","supervisorSha256","resourceDirectory"] {expected[field]=new[field].clone();}
     expected==*new
 }

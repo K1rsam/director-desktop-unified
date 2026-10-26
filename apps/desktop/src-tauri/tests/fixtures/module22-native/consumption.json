@@ -1,0 +1,53 @@
+{
+  "version": "series-asset-consumption-v1",
+  "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+  "bundleSha256": "723f82d6c44e6cedd3d4e044c7cf1e92e8377955c0ed3a6b1959e5779fc12f2a",
+  "registrySnapshot": "D:\\EDY\\Documents\\CL\\director-desktop-integration-20261008\\apps\\desktop\\src-tauri\\tests\\fixtures\\module22-native\\registry\\v000001.json",
+  "registrySha256": "dfebf60f4c5e82ac0da82beb049990783c70e9f5381732a0b120e0b243a480c5",
+  "id": "a5a67358-e26f-425b-941a-84082acfd412",
+  "currentRevision": 1,
+  "bundleRevision": 1,
+  "assets": [
+    "A0002",
+    "A0001",
+    "A0004",
+    "A0003"
+  ],
+  "uses": [
+    {
+      "episode": 1,
+      "sceneId": "1-1",
+      "unitId": "U1",
+      "assetId": "A0002",
+      "assetRevision": 1,
+      "key": "门厅SC"
+    },
+    {
+      "episode": 1,
+      "sceneId": "1-1",
+      "unitId": "U1",
+      "assetId": "A0001",
+      "assetRevision": 1,
+      "key": "值守者·面罩CH"
+    },
+    {
+      "episode": 1,
+      "sceneId": "1-1",
+      "unitId": "U1",
+      "assetId": "A0004",
+      "assetRevision": 1,
+      "key": "铜钥匙PR"
+    },
+    {
+      "episode": 1,
+      "sceneId": "1-2",
+      "unitId": "U2",
+      "assetId": "A0003",
+      "assetRevision": 1,
+      "key": "走廊SC"
+    }
+  ],
+  "closedRequests": [],
+  "pendingOutsideScope": [],
+  "proof": "已声明的总库、文字卡、版本与使用坐标一致；正文漏项和来源语义仍须内容复核"
+}

@@ -1,0 +1,72 @@
+{
+  "synthetic": true,
+  "receipt": {
+    "ok": true,
+    "legacy": false,
+    "queueHash": "59065420fa9f27354e56c60599aa698d26ae36b92301d8924fcc23b7647d7e63",
+    "productionScopeHash": "784f61d1b4c1a785ae33c513047ea97f95c764e505fc5724f3f1c77ca81e0768",
+    "tasks": 4,
+    "imageApproval": false,
+    "proof": "仅核显式批次与本季范围、源hash、设计版本及文件名；不代表图像质量、用户采用或生图授权"
+  },
+  "cases": [
+    {
+      "target": "batch",
+      "pointer": "/tasks/0/taskId",
+      "value": "IMG-fake",
+      "expectedOk": false,
+      "code": "IMAGE_TASK_BINDING"
+    },
+    {
+      "target": "batch",
+      "pointer": "/tasks/0/uses/0/purpose",
+      "value": "not approved",
+      "expectedOk": false,
+      "code": "IMAGE_TASK_USES"
+    },
+    {
+      "target": "batch",
+      "pointer": "/productionScopeHash",
+      "remove": true,
+      "expectedOk": false,
+      "code": "IMAGE_SCOPE_HASH"
+    },
+    {
+      "target": "registry",
+      "pointer": "/productionScope",
+      "remove": true,
+      "expectedOk": false,
+      "code": "IMAGE_SCOPE_BINDING"
+    },
+    {
+      "target": "registry",
+      "pointer": "/productionScope/status",
+      "value": "proposed",
+      "expectedOk": false,
+      "code": "SEASON_NOT_LOCKED"
+    },
+    {
+      "target": "registry",
+      "pointer": "/assets/0/design/state",
+      "value": "STALE",
+      "expectedOk": false,
+      "code": "IMAGE_DESIGN_STALE"
+    },
+    {
+      "target": "registry",
+      "pointer": "/assets/4/revision",
+      "value": 2,
+      "expectedOk": false,
+      "code": "IMAGE_DESIGN_DEPENDENCY"
+    },
+    {
+      "target": "queue",
+      "pointer": "/items/0/filename",
+      "value": "different.png",
+      "expectedOk": false,
+      "code": "IMAGE_QUEUE_HASH"
+    }
+  ],
+  "imageSubmissions": 0,
+  "videoSubmissions": 0
+}

@@ -17,7 +17,7 @@ export const resourceFiles = Object.freeze([
   'node_modules/@openai/codex-sdk/package.json',
   'node_modules/@openai/codex-sdk/dist/index.js',
   'node_modules/@openai/codex-sdk/LICENSE',
-  'src/main.mjs', 'src/native-runtime.mjs',
+  'src/main.mjs', 'src/native-runtime.mjs', 'src/visual-review.mjs',
 ]);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function safeDirectory(directory, root) {

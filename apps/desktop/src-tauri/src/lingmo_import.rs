@@ -30,7 +30,14 @@ fn read_text(path: &Path) -> Result<String> {
     }
     String::from_utf8(bytes).map_err(|e| format!("请使用UTF-8编码的MD/目录：{e}"))
 }
-fn read_input(request: &Value) -> Result<(Value, Value, String)> {
+fn read_input(
+    request: &Value,
+) -> Result<(
+    Value,
+    Value,
+    String,
+    Option<crate::lingmo_package::VerifiedPackage>,
+)> {
     let text = if let Some(text) = request["text"].as_str() {
         if text.len() as u64 > MAX_BYTES {
             return Err("文本过大".into());
@@ -56,8 +63,30 @@ fn read_input(request: &Value) -> Result<(Value, Value, String)> {
         .map(|path| read_text(Path::new(path)).and_then(parse))
         .transpose()?
         .unwrap_or(Value::Null);
-    let parsed = lingmo_parser::parse(&text, (!catalog.is_null()).then_some(&catalog))?;
-    Ok((parsed, catalog, filename))
+    let package = crate::lingmo_package::discover(request, &text, &catalog)?;
+    let catalog = if catalog.is_null() { package.as_ref().map(|p|p.value["catalog"].clone()).unwrap_or(catalog) } else { catalog };
+    let mut parsed = lingmo_parser::parse(&text, (!catalog.is_null()).then_some(&catalog))?;
+    parsed["handoff"] = if let Some(package) = &package {
+        json!({"sourceKind":"external-package","completePackageVerified":true,"proof":package.proof()})
+    } else {
+        json!({"sourceKind":"imported-md","completePackageVerified":false,
+            "level":if parsed["catalogMatched"]==true{"md-and-catalog"}else{"md-only"}})
+    };
+    if package.is_none() && (catalog.get("productionScope").is_some() || catalog.get("scopeHash").is_some() || request.get("module22Mapping").is_some() || !s(request,"module22Root").is_empty()) {
+        parsed["handoff"]["scopeRestriction"] = json!("native-season-or-package-evidence-required");
+    }
+    Ok((parsed, catalog, filename, package))
+}
+fn preview_token(parsed: &Value, catalog: &Value) -> String {
+    let base = format!("{}:{}", s(parsed, "markdownSha256"), catalog);
+    if parsed["handoff"]["completePackageVerified"] == true {
+        digest(&format!(
+            "{base}:{}",
+            s(&parsed["handoff"]["proof"], "packageFingerprint")
+        ))
+    } else {
+        digest(&base)
+    }
 }
 fn metadata(store: &Store, key: &str) -> Result<Value> {
     let raw: Option<String> = store
@@ -90,13 +119,9 @@ pub fn preview_file(request: &Value) -> Result<Value> {
         return Err("请选择本机分镜MD文件".into());
     }
     let start = Instant::now();
-    let (parsed, catalog, filename) = read_input(request)?;
+    let (parsed, catalog, filename, _) = read_input(request)?;
     let mut output = summary(&parsed, &filename);
-    output["previewToken"] = json!(digest(&format!(
-        "{}:{}",
-        s(&parsed, "markdownSha256"),
-        catalog
-    )));
+    output["previewToken"] = json!(preview_token(&parsed, &catalog));
     output["parseMilliseconds"] = json!(start.elapsed().as_secs_f64() * 1000.0);
     output["generationSubmissions"] = json!(0);
     Ok(output)
@@ -130,13 +155,9 @@ pub fn validate_project_input(request: &Value) -> Result<Value> {
 }
 pub fn preview(store: &Store, request: &Value) -> Result<Value> {
     let start = Instant::now();
-    let (parsed, catalog, filename) = read_input(request)?;
+    let (parsed, catalog, filename, _) = read_input(request)?;
     let mut summary = summary(&parsed, &filename);
-    summary["previewToken"] = json!(digest(&format!(
-        "{}:{}",
-        s(&parsed, "markdownSha256"),
-        catalog
-    )));
+    summary["previewToken"] = json!(preview_token(&parsed, &catalog));
     summary["parseMilliseconds"] = json!(start.elapsed().as_secs_f64() * 1000.0);
     let prior: Vec<_> = documents(store)?
         .into_iter()
@@ -198,6 +219,7 @@ fn summary(parsed: &Value, filename: &str) -> Value {
         "diagnostics",
         "episodes",
         "scenes",
+        "handoff",
     ] {
         v[key] = parsed[key].clone();
     }
@@ -205,16 +227,16 @@ fn summary(parsed: &Value, filename: &str) -> Value {
 }
 pub fn import(store: &Store, request: &Value) -> Result<Value> {
     let start = Instant::now();
-    let (mut parsed, catalog, filename) = read_input(request)?;
+    let (mut parsed, catalog, filename, package) = read_input(request)?;
     let parse_ms = start.elapsed().as_secs_f64() * 1000.0;
     let sha = s(&parsed, "markdownSha256").to_owned();
     if s(request, "expectedSha256") != sha {
         return Err("预览后MD内容已变化，请重新预览后导入".into());
     }
     if !s(request, "previewToken").is_empty()
-        && s(request, "previewToken") != digest(&format!("{sha}:{catalog}"))
+        && s(request, "previewToken") != preview_token(&parsed, &catalog)
     {
-        return Err("预览后资产目录已变化，请重新预览".into());
+        return Err("预览后资产目录或完整接续包已变化，请重新预览".into());
     }
     if array(&parsed, "units").is_empty() {
         return Err("未识别到有效片段，未写入项目".into());
@@ -240,6 +262,10 @@ pub fn import(store: &Store, request: &Value) -> Result<Value> {
     }
     let mut doc = summary(&parsed, &filename);
     doc["importedAt"] = json!(now());
+    let package_pointer = package
+        .as_ref()
+        .map(|p| crate::lingmo_package::prepare_storage(store, p))
+        .transpose()?;
     if !duplicate {
         let mut connection = store.conn()?;
         let tx = connection
@@ -256,12 +282,31 @@ pub fn import(store: &Store, request: &Value) -> Result<Value> {
         {
             return Err("该导入已由另一窗口保存，请刷新".into());
         }
+        let preserved = crate::lingmo_continuation::continue_assets(&tx, &mut parsed, &catalog)?;
+        if let Some(package) = &package {
+            crate::lingmo_continuation::attach_package(
+                &tx,
+                &mut parsed,
+                &catalog,
+                &package.value,
+                &preserved,
+            )?;
+        }
+        doc = summary(&parsed, &filename);
+        doc["importedAt"] = json!(now());
         for asset in array(&parsed, "assets") {
-            save_asset_tx(&tx, asset)?;
+            if !preserved.contains(s(&asset, "id")) {
+                save_asset_tx(&tx, asset)?;
+            }
         }
         let mut origins = serde_json::Map::new();
         for mut unit in array(&parsed, "units") {
             unit["importSource"]["documentId"] = json!(sha);
+            if package.is_some() {
+                unit["importSource"]["sourceKind"] = json!("external-package");
+                unit["importSource"]["packageFingerprint"] =
+                    parsed["handoff"]["proof"]["packageFingerprint"].clone();
+            }
             unit["sourceRefs"] = json!([]);
             origins.insert(s(&unit,"id").to_owned(),json!({"importSource":unit["importSource"],"episodeId":unit["episodeId"],"sceneId":unit["sceneId"],"fragmentNumber":unit["fragmentNumber"],"promptSha256":digest(s(&unit,"prompt"))}));
             save_unit_tx(&tx, unit)?;
@@ -280,6 +325,9 @@ pub fn import(store: &Store, request: &Value) -> Result<Value> {
             )
             .map_err(|e| e.to_string())?;
         }
+        if let Some(pointer) = &package_pointer {
+            crate::lingmo_package::save_pointer(&tx, &sha, pointer)?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
     } else {
         doc = document(store, &sha)?;
@@ -290,6 +338,21 @@ pub fn import(store: &Store, request: &Value) -> Result<Value> {
                 "此MD已导入，但资产目录不同；原身份和编辑已保留，请使用原同版目录补图".into(),
             );
         }
+        let mut connection = store.conn()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        crate::lingmo_continuation::restore_assets(&tx, &mut parsed, &catalog)?;
+        if let Some(pointer) = &package_pointer {
+            crate::lingmo_package::save_pointer(&tx, &sha, pointer)?;
+            // Package-level evidence can be added to an old exact MD/catalog
+            // import without re-saving asset rows, units or frozen requests.
+            doc["handoff"] = parsed["handoff"].clone();
+            tx.execute(
+                "UPDATE metadata SET value=?1 WHERE key=?2",
+                params![doc.to_string(), format!("{PREFIX}{sha}")],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
     }
     // Text is committed as a single transaction. Optional media is independently
     // resumable; a bad/missing image cannot destroy an otherwise valid document.
@@ -299,7 +362,7 @@ pub fn import(store: &Store, request: &Value) -> Result<Value> {
         |message| json!({"failures":[{"message":message}],"textImportPreserved":true}),
     );
     Ok(
-        json!({"documentId":sha,"duplicate":duplicate,"counts":doc["counts"],"media":media_report,"parseMilliseconds":parse_ms,"textImportMilliseconds":text_ms,"mediaImportMilliseconds":start.elapsed().as_secs_f64()*1000.0-text_ms,"milliseconds":start.elapsed().as_secs_f64()*1000.0,"generationSubmissions":0}),
+        json!({"documentId":sha,"duplicate":duplicate,"counts":doc["counts"],"handoff":doc["handoff"],"media":media_report,"parseMilliseconds":parse_ms,"textImportMilliseconds":text_ms,"mediaImportMilliseconds":start.elapsed().as_secs_f64()*1000.0-text_ms,"milliseconds":start.elapsed().as_secs_f64()*1000.0,"generationSubmissions":0}),
     )
 }
 pub fn scene(store: &Store, document_id: &str, scene_id: &str) -> Result<Value> {
@@ -380,7 +443,7 @@ pub fn save_unit(store: &Store, original: &Value, mut unit: Value) -> Result<Val
         "storyboardCreativeProfile",
     ] {
         if unit.get(key) != original.get(key) {
-            return Err("外部成稿不能改写锁定原文或第三阶段来源".into());
+            return Err("外部成稿不能改写锁定原文或分镜来源".into());
         }
     }
     if unit["expectedVersion"].as_i64() != original["version"].as_i64() {
@@ -517,10 +580,17 @@ fn import_images(store: &Store, request: &Value, parsed: &Value) -> Result<Value
             )?;
             // White placeholder bytes remain non-production even if the package
             // label is absent; never auto-approve a blank image as finished art.
-            let placeholder = match media["placeholderSource"].as_str().filter(|v| *v == "image-pixels/v1").and(media["placeholder"].as_bool()) {
+            let placeholder = match media["placeholderSource"]
+                .as_str()
+                .filter(|v| *v == "image-pixels/v1")
+                .and(media["placeholder"].as_bool())
+            {
                 Some(value) => value,
-                None => image::open(&canonical).map_err(|e| e.to_string())?
-                    .to_rgba8().pixels().all(|p| p[3] == 0 || p.0[..3].iter().all(|v| *v >= 250)),
+                None => image::open(&canonical)
+                    .map_err(|e| e.to_string())?
+                    .to_rgba8()
+                    .pixels()
+                    .all(|p| p[3] == 0 || p.0[..3].iter().all(|v| *v >= 250)),
             };
             if placeholder {
                 media["placeholder"] = json!(true);

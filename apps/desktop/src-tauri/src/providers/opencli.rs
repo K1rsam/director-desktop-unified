@@ -8,28 +8,37 @@ const COMPILED_RUNTIME_PIN: &str = include_str!("../../../../../web-image-bridge
 // Future runtimes must explicitly review their compatibility before adding a pair.
 const READ_ONLY_READER_MIGRATIONS: &[(&str, &str)] = &[(
     "054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
-    "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 ), (
     "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
+), (
     "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
+), (
+    "aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
+), (
+    "21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59",
+    "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751",
 )];
 
 pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
@@ -41,6 +50,36 @@ pub(crate) fn read_only_reader_migration_allowed(from: &str, to: &str) -> bool {
 // They are not in reader_policy and cannot select or execute an old reader.
 pub(crate) fn read_only_reader_audit_allowed(from: &str, to: &str) -> bool {
     read_only_reader_migration_allowed(from,to)
+        || (to=="21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+                "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+                "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+                "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2",
+                "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab",
+                "aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557"].contains(&from))
+        || (to=="aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+                "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+                "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+                "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2",
+                "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"].contains(&from))
+        || (to=="5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"
+            && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
+                "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
+                "d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8",
+                "f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70",
+                "54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0",
+                "afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6",
+                "c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057",
+                "6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2"].contains(&from))
         || (to=="6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2"
             && ["054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2",
                 "48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3",
@@ -305,6 +344,12 @@ fn connection_error_message(code:&str)->&'static str {
         "OPENCLI_BROWSER_NOT_CONNECTED"=>"未找到所选浏览器的可用连接，请打开该浏览器、登录 ChatGPT 并确认已安装组件。",
         "LOCAL_SERVICE_UNAVAILABLE"=>"本机连接服务暂时不可用，请点击“连接并检查”恢复。",
         "OPENCLI_OWNED_PAGE_REQUIRED"=>"浏览器组件已连接，尚未建立专属工作页。点击“连接并检查”即可在后台打开工作页并核对原登录账户，无需重载扩展。",
+        "ORIGINAL_FILE_IDENTITY" | "ORIGINAL_FILE_BINDING_UNCONFIRMED"=>"图片已返回，但原图文件身份尚未确认；保留原会话等待核验，不会重新生成。",
+        "ORIGINAL_FILE_AMBIGUOUS" | "ORIGINAL_BYTES_INVALID"=>"下载内容与原会话图片未能精确对应；已保留原任务，不会把其它图片入库或重新生成。",
+        "SENT_PROMPT_UNCONFIRMED"=>"已尝试发送，尚未确认网页回执；请继续核对原任务，系统不会再次发送。",
+        "ORIGINAL_IMAGE_CHANGED" | "ORIGINAL_PROMPT_UNCONFIRMED" | "ORIGINAL_IMAGE_UNCONFIRMED"=>"尚未确认原会话的提示词或图片对应关系，暂未入库；原任务已保留，不会重新发送。",
+        "ORIGINAL_PREVIEW_UNAVAILABLE" | "OPENCLI_ORIGINAL_READ_FAILED"=>"原图读取暂未完成，请恢复网页网络后继续查询原任务；不会重新生成。",
+        "ORIGINAL_GENERATION_ACTIVE"=>"网页仍在生成原任务的图片，请等待完成；不会重复发送。",
         "OWNED_NO_CLICK_UNPROVEN"=>"旧网页任务的未发送证明未通过校验，已保留原任务；未提交新的图片生成。",
         _=>"网页连接检查未完成，请重试检查；已有图片任务不会重新发送。",
     }

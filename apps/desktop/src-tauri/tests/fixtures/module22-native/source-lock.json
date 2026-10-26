@@ -1,0 +1,68 @@
+{
+  "version": "series-source-lock-v1",
+  "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+  "episodes": [
+    {
+      "number": 1,
+      "source": {
+        "key": "E01",
+        "title": "合成闭门样例",
+        "sourceRows": [
+          {
+            "id": "E01:R1",
+            "text": "△门厅内，值守者戴面罩，站在门左侧，右手握着铜钥匙。",
+            "kind": "action"
+          },
+          {
+            "id": "E01:R2",
+            "text": "值守者：门还没开，先别摘下面罩。",
+            "kind": "dialogue"
+          },
+          {
+            "id": "E01:R3",
+            "text": "△空走廊，冷白灯亮着。",
+            "kind": "action"
+          },
+          {
+            "id": "E01:R4",
+            "text": "系统音：门锁正常。",
+            "kind": "dialogue"
+          }
+        ],
+        "contextRows": [],
+        "context": "",
+        "assets": [],
+        "dialogue": [
+          {
+            "id": "E01:R2:D1",
+            "speaker": "值守者",
+            "quote": "门还没开，先别摘下面罩。",
+            "cue": "",
+            "kind": "speech",
+            "channel": "现场对白",
+            "rowId": "E01:R2",
+            "originalChannel": "现场对白",
+            "sourceIds": [
+              "E01:R2"
+            ]
+          },
+          {
+            "id": "E01:R4:D2",
+            "speaker": "系统音",
+            "quote": "门锁正常。",
+            "cue": "",
+            "kind": "speech",
+            "channel": "系统音",
+            "rowId": "E01:R4",
+            "originalChannel": "系统音",
+            "sourceIds": [
+              "E01:R4"
+            ]
+          }
+        ],
+        "entryFacts": [],
+        "diagnostics": []
+      }
+    }
+  ]
+}

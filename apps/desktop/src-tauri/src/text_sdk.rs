@@ -29,6 +29,17 @@ mod native;
 #[path = "text_sdk_passive.rs"]
 mod passive;
 pub(crate) use passive::historical_receipt;
+#[path = "text_sdk_schema_rejection.rs"]
+mod schema_rejection;
+pub(crate) use schema_rejection::{schema_rejection_evidence, schema_rejection_identity_bound, schema_rejection_receipt_identity_bound};
+#[cfg(test)]
+pub(crate) use schema_rejection::{test_refusal_files, test_refusal_identity};
+pub(crate) async fn prepare_schema_rejection_handoff(settings: &Value) -> Result<SupervisorHandoff> {
+    native::prepare_schema_rejection_handoff(settings).await
+}
+pub(crate) fn verify_schema_rejection_bytes(old: &Value, new: &Value, hashes: &Value) -> Result<()> {
+    native::verify_schema_rejection_bytes(old, new, hashes)
+}
 #[path = "text_sdk_local_recovery.rs"]
 mod local_recovery;
 pub(crate) use local_recovery::{local_preparation_evidence, local_recovery_identity_bound, recovered_receipt_bound, LOCAL_PATH_BRIDGE_SHA};
@@ -55,7 +66,31 @@ pub(crate) fn verify_schema_recovery_bytes(old: &Value, new: &Value, hashes: &Va
 const SCHEMA_CONTROLLER: &str = include_str!("../../../../sdk-bridge/src/schema-preparation-controller.mjs");
 pub(crate) fn schema_controller_sha256() -> String {digest(SCHEMA_CONTROLLER)}
 pub use native::{enable_native_execution, native_execution_enabled, run_runtime_wrapper};
+pub(crate) use native::ProcessJob;
 const FRAME_LIMIT: usize = 1_048_576;
+pub(crate) const LARGE_INPUT_LIMIT:usize=4_194_304;
+const LARGE_INPUT_CONTROLLER:&str=include_str!("../../../../sdk-bridge/src/large-input-controller.mjs");
+pub(crate) fn large_input_descriptor()->Value {
+    json!({"version":"sdk-large-input-controller/v1","controllerSha256":digest(LARGE_INPUT_CONTROLLER),"inputFrameBytes":LARGE_INPUT_LIMIT,"outputFrameBytes":FRAME_LIMIT})
+}
+fn execute_params(attempt:&FrozenAttempt)->Result<Value> {
+    let compiled=crate::text_executor::compile_sdk_attempt_input(attempt)?;
+    Ok(json!({"attempt":attempt,"compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,
+        "compiledPromptSha256":digest(&compiled.prompt),"compiledSchemaSha256":digest(&compiled.schema)}))
+}
+/// Deterministic local preflight. No process, account, job or dispatch marker.
+pub(crate) fn execute_input_envelope(attempt:&FrozenAttempt)->Result<Option<Value>> {
+    attempt.validate_identity()?;
+    let params=execute_params(attempt)?;
+    if s(&params,"compiledPrompt").len()>FRAME_LIMIT {
+        return Err("SDK_PROMPT_LIMIT_BEFORE_DISPATCH: 完整提示词超过原冻结运行器的1MiB输入上限；未派发".into());
+    }
+    // Reserve the longest possible request counter, not just today's rust_2.
+    let frame=json!({"protocolVersion":PROTOCOL,"requestId":"rust_18446744073709551615","attemptId":attempt.attempt_id,"method":"execute","params":params});
+    let bytes=serde_json::to_vec(&frame).map_err(|e|e.to_string())?.len();
+    if bytes>LARGE_INPUT_LIMIT{return Err(format!("SDK_INPUT_ENVELOPE_LIMIT_BEFORE_DISPATCH: 完整执行包 {bytes} 字节超过本地上限 {LARGE_INPUT_LIMIT}；未派发"));}
+    Ok((bytes>FRAME_LIMIT).then(||json!({"descriptor":large_input_descriptor(),"paramsSha256":digest(&params.to_string()),"paramsBytes":params.to_string().len(),"maximumFrameBytes":bytes})))
+}
 const EVENT_LIMIT: usize = 2048;
 const JOURNAL_LIMIT: usize = 16_777_216;
 const STDERR_LIMIT: usize = 1_048_576;
@@ -350,8 +385,20 @@ pub(crate) struct Config {
     fixture: Option<String>,
     deadline: Duration,
     identity: Value,
+    input_frame_recovery:Option<crate::text_executor::VerifiedInputFrameRecovery>,
 }
 impl Config {
+    pub(crate) fn from_verified_input_frame_recovery(
+        settings:&Value,root:&Path,permit:crate::text_executor::VerifiedInputFrameRecovery,
+    )->Result<Self> {
+        let mut config=Self::from_frozen_identity(settings,permit.identity(),root)?;
+        config.input_frame_recovery=Some(permit);
+        Ok(config)
+    }
+    fn verify_attempt_scope(&self,attempt:&FrozenAttempt)->Result<()> {
+        if let Some(permit)=&self.input_frame_recovery {permit.verify_attempt(attempt)?;}
+        Ok(())
+    }
     pub(crate) fn from_frozen_identity(
         original_settings: &Value,
         frozen_identity: &Value,
@@ -379,6 +426,7 @@ impl Config {
                     settings["sdkFixtureDeadlineMs"].as_u64().unwrap_or(10_000),
                 ),
                 identity,
+                input_frame_recovery:None,
             });
         }
         let _ = (root, identity);
@@ -517,12 +565,13 @@ struct Worker {
     stderr_evidence: Arc<Mutex<StderrEvidence>>,
     next_id: u64,
     native_job: Option<native::ProcessJob>,
+    input_frame_limit: usize,
 }
 impl Worker {
     async fn spawn(config: &Config) -> Result<Self> {
-        Self::spawn_entry(config,false).await
+        Self::spawn_entry(config,false,false).await
     }
-    async fn spawn_entry(config: &Config, schema_recovery: bool) -> Result<Self> {
+    async fn spawn_entry(config: &Config, schema_recovery: bool, large_input:bool) -> Result<Self> {
         config.verify()?;
         std::fs::create_dir_all(&config.state).map_err(|e| e.to_string())?;
         let entry = if schema_recovery {
@@ -537,7 +586,25 @@ impl Worker {
             let m=std::fs::symlink_metadata(&file).map_err(|e|e.to_string())?;
             if !m.is_file() || m.is_symlink() || crate::store::hash_file(&file)?.0!=schema_controller_sha256() {return Err("SDK_SCHEMA_CONTROLLER_CHANGED".into());}
             file
+        } else if large_input {
+            use std::io::Write;
+            let metadata=std::fs::symlink_metadata(&config.state).map_err(|e|e.to_string())?;
+            if !metadata.is_dir() || metadata.is_symlink(){return Err("SDK_INPUT_CONTROLLER_DIRECTORY".into());}
+            let sha=digest(LARGE_INPUT_CONTROLLER);let file=config.state.join(format!("large-input-controller-{sha}.mjs"));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+                Ok(mut handle)=>{handle.write_all(LARGE_INPUT_CONTROLLER.as_bytes()).map_err(|e|e.to_string())?;handle.sync_all().map_err(|e|e.to_string())?;},
+                Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e.to_string()),
+            }
+            let m=std::fs::symlink_metadata(&file).map_err(|e|e.to_string())?;
+            if !m.is_file() || m.is_symlink() || crate::store::hash_file(&file)?.0!=sha{return Err("SDK_INPUT_CONTROLLER_CHANGED".into());}
+            file
         } else {config.bridge.clone()};
+        // Test builds use the real bounded pipe/bridge and a synthetic SDK child.
+        // Production never selects an offline large-input entry.
+        #[cfg(test)]
+        let entry=if large_input && config.fixture.is_some() {
+            std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../sdk-bridge/test/large-input-fixture.mjs")).map_err(|e|e.to_string())?
+        } else {entry};
         // No inherited NODE_OPTIONS, HOME, credential, proxy, PATH or config variables.
         let mut command = tokio::process::Command::new(&config.node);
         command
@@ -612,13 +679,14 @@ impl Worker {
             stderr_evidence,
             next_id: 0,
             native_job,
+            input_frame_limit:if large_input {LARGE_INPUT_LIMIT}else{FRAME_LIMIT},
         })
     }
     async fn send(&mut self, method: &str, attempt: Option<&str>, params: Value) -> Result<String> {
         self.next_id += 1;
         let id = format!("rust_{}", self.next_id);
         let mut bytes=serde_json::to_vec(&json!({"protocolVersion":PROTOCOL,"requestId":id,"attemptId":attempt,"method":method,"params":params})).map_err(|e|e.to_string())?;
-        if bytes.len() > FRAME_LIMIT {
+        if bytes.len() > self.input_frame_limit {
             return Err("SDK_FRAME_LIMIT".into());
         }
         bytes.push(b'\n');
@@ -688,6 +756,7 @@ pub(crate) struct OfficialSdkTransport {
     active_attempt: Mutex<Option<String>>,
     cancel_requested: AtomicBool,
     cancel_notify: tokio::sync::Notify,
+    large_input:AtomicBool,
 }
 impl OfficialSdkTransport {
     pub(crate) fn new(config: Config, observer: Observer) -> Self {
@@ -698,6 +767,7 @@ impl OfficialSdkTransport {
             active_attempt: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
             cancel_notify: tokio::sync::Notify::new(),
+            large_input:AtomicBool::new(false),
         }
     }
     pub(crate) fn set_observer(&mut self, observer: Observer) {
@@ -705,9 +775,31 @@ impl OfficialSdkTransport {
     }
     async fn connect(&self, worker: &mut Option<Worker>) -> Result<()> {
         if worker.is_none() {
-            *worker = Some(Worker::spawn(&self.config).await?);
+            *worker = Some(if self.large_input.load(Ordering::SeqCst) {Worker::spawn_entry(&self.config,false,true).await?}else{Worker::spawn(&self.config).await?});
         }
         Ok(())
+    }
+    pub(crate) async fn configure_execute_envelope(&self,attempt:&FrozenAttempt)->Result<Option<Value>> {
+        self.config.verify_attempt_scope(attempt)?;
+        let envelope=execute_input_envelope(attempt)?;
+        if envelope.is_none(){return Ok(None);}
+        if self.active_attempt.lock().map_err(|e|e.to_string())?.is_some(){return Err("SDK_WORKER_OCCUPIED".into());}
+        if !self.large_input.swap(true,Ordering::SeqCst) {
+            // The previous connection has only inspected local capability.
+            // Do not attribute its shutdown to the model attempt.
+            if let Some(mut old)=self.worker.lock().await.take(){old.close().await?;}
+        }
+        let checked=self.inspect().await?;
+        if checked["inputEnvelope"]!=large_input_descriptor(){return Err("SDK_INPUT_CONTROLLER_IDENTITY".into());}
+        Ok(envelope)
+    }
+    /// The capability probe creates a real worker lock. Release it even when
+    /// inspection fails, before revalidating historical evidence or reserving.
+    pub(crate) async fn probe_execute_envelope(&self,attempt:&FrozenAttempt)->Result<Option<Value>> {
+        let selected=self.configure_execute_envelope(attempt).await;
+        let closed=self.close().await;
+        closed?;
+        selected
     }
     pub(crate) async fn close(&self) -> Result<()> {
         if let Some(mut worker) = self.worker.lock().await.take() {
@@ -773,6 +865,8 @@ impl OfficialSdkTransport {
             sequence,
             kind: if receipt["state"] == "transport_completed" {
                 ObservationKind::Completed
+            } else if receipt["state"] == "transport_rejected" {
+                ObservationKind::Rejected
             } else {
                 ObservationKind::SubmissionUnknown
             },
@@ -791,13 +885,14 @@ impl OfficialSdkTransport {
     }
     async fn execute_method(&self, attempt: &FrozenAttempt, recovery: Option<&Value>) -> Result<Observation> {
         attempt.validate_identity()?;
+        self.config.verify_attempt_scope(attempt)?;
         let schema_recovery=recovery.is_some_and(|r|r["proof"]["version"]==schema_recovery::SCHEMA_RECOVERY_VERSION);
         if attempt.backend != Backend::CodexSdk || if schema_recovery { !schema_recovery_identity_bound(&attempt.runtime_identity,&self.config.identity) }
             else if recovery.is_some() { !local_recovery_identity_bound(&attempt.runtime_identity, &self.config.identity) } else { attempt.runtime_identity != self.config.identity }
         {
             return Err("SDK_ATTEMPT_IDENTITY".into());
         }
-        let compiled = crate::text_executor::compile_sdk_attempt_input(attempt)?;
+        let input_envelope=if recovery.is_none(){self.configure_execute_envelope(attempt).await?}else{None};
         {
             let mut active = self.active_attempt.lock().map_err(|e| e.to_string())?;
             if active.is_some() {
@@ -808,7 +903,7 @@ impl OfficialSdkTransport {
         let mut worker = self.worker.lock().await;
         if schema_recovery {
             if worker.is_some(){return Err("SDK_SCHEMA_CONTROLLER_ALREADY_CONNECTED".into());}
-            *worker=Some(Worker::spawn_entry(&self.config,true).await?);
+            *worker=Some(Worker::spawn_entry(&self.config,true,false).await?);
         } else {self.connect(&mut worker).await?;}
         let worker = worker.as_mut().unwrap();
         let (method, params) = if schema_recovery {
@@ -816,9 +911,9 @@ impl OfficialSdkTransport {
         } else if let Some(proof) = recovery {
             (if proof["version"] == "sdk-wrapper-preparation-repair/v1" {"repair-wrapper-preparation"} else {"recover-local-preparation"}, json!({"proof":proof}))
         } else {
-            ("execute", json!({"attempt":attempt,"compiledPrompt":compiled.prompt,"compiledSchema":compiled.schema,
-                "compiledPromptSha256":digest(&compiled.prompt),"compiledSchemaSha256":digest(&compiled.schema)}))
+            ("execute", execute_params(attempt)?)
         };
+        if let Some(envelope)=&input_envelope {(self.observer)("sdk_input_envelope_selected",envelope)?;}
         let id=worker.send(method,Some(&attempt.attempt_id),params).await?;
         let deadline = tokio::time::Instant::now() + self.config.deadline;
         let mut last_sdk = 0;
@@ -847,6 +942,7 @@ impl OfficialSdkTransport {
                                 s(&event["error"], "message")
                             ));
                         }
+                        if input_envelope.is_some() && event["result"]["inputEnvelope"]!=large_input_descriptor(){return Err("SDK_INPUT_CONTROLLER_ACK_IDENTITY".into());}
                         ack = true;
                         (self.observer)("sdk_dispatch_receipt", &event)?;
                     }
@@ -915,6 +1011,7 @@ impl TextTransport for OfficialSdkTransport {
     }
     async fn reconcile(&self, attempt: &FrozenAttempt) -> Result<Observation> {
         attempt.validate_identity()?;
+        self.config.verify_attempt_scope(attempt)?;
         let mut worker = self.worker.lock().await;
         if self.connect(&mut worker).await.is_err() {
             return Ok(self.unknown(attempt));
@@ -982,6 +1079,7 @@ impl TextTransport for OfficialSdkTransport {
     }
     async fn cancel(&self, attempt: &FrozenAttempt) -> Result<Observation> {
         attempt.validate_identity()?;
+        self.config.verify_attempt_scope(attempt)?;
         if self
             .active_attempt
             .lock()

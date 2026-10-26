@@ -9,6 +9,9 @@ use tempfile::TempDir;
 
 const WAIT: Duration = Duration::from_secs(8);
 
+#[path = "image_scheduler_modern_tests.rs"]
+mod modern;
+
 #[test]
 fn failed_chrome_original_task_cannot_be_bypassed_by_batch_or_provider_switch() {
     let f = Fixture::new();
@@ -426,7 +429,9 @@ impl Fixture {
         while !condition() {
             assert!(
                 start.elapsed() < WAIT,
-                "bounded offline scheduler condition did not become true"
+                "bounded offline scheduler condition did not become true after {:?}: {}",
+                start.elapsed(),
+                self.scheduler_diagnostics()
             );
             thread::sleep(Duration::from_millis(5));
         }
@@ -434,7 +439,8 @@ impl Fixture {
     fn drain(&self) {
         assert!(
             self.engine.await_channel_shutdown(WAIT.as_secs()),
-            "offline workers did not release their owned slots"
+            "offline workers did not release their owned slots: {}",
+            self.scheduler_diagnostics()
         );
     }
     fn raw(&self, key: &str) -> (String, Option<String>, Option<String>) {
@@ -480,11 +486,32 @@ impl Fixture {
         while !condition() {
             assert!(
                 started.elapsed() < WAIT,
-                "bounded fake chain did not advance"
+                "bounded fake chain did not advance after {:?}: {}",
+                started.elapsed(),
+                self.scheduler_diagnostics()
             );
             self.engine.tick().unwrap();
             thread::sleep(Duration::from_millis(5));
         }
+    }
+    fn scheduler_diagnostics(&self) -> Value {
+        let jobs = self.store.jobs().map(|jobs| {
+            jobs.into_iter()
+                .map(|job| {
+                    json!({"id":job["id"],"assetId":job["entityId"],
+                "state":job["status"],"taskId":job["providerTaskId"],"error":job["error"],
+                "nextAttemptAt":job["nextAttemptAt"],"queryAttempts":job["queryAttempts"],
+                "downloadAttempts":job["downloadAttempts"]})
+                })
+                .collect::<Vec<_>>()
+        });
+        let lanes = {
+            let counts = self.channels.counts.lock().unwrap();
+            json!({"active":counts.active,"submits":counts.submits,"queries":counts.queries,"downloads":counts.downloads})
+        };
+        json!({"jobs":jobs.unwrap_or_else(|error|vec![json!({"readError":error})]),
+            "lanes":lanes,"reservations":self.engine.active.lock().unwrap().clone(),
+            "now":chrono::Utc::now().timestamp()})
     }
 }
 impl Drop for Fixture {
@@ -1435,11 +1462,40 @@ fn trial_review_counts_missing_ancestors_of_a_selected_leaf_against_the_three_im
     assert_eq!(report["blockedCount"], 0);
     let jobs = f.successful_job_map();
     assert_eq!(jobs.len(), 3);
-    f.pump(|| {
-        jobs.values()
-            .all(|job| f.store.job(s(job, "id")).unwrap()["status"] == "downloaded")
-    });
-    f.drain();
+    // This assertion exercises a three-image serial dependency chain, not an
+    // eight-second end-to-end performance requirement. Give each real worker
+    // its existing bounded WAIT and require the exact durable transition at
+    // every tick, as the eleven-layer acceptance test above does. A skipped,
+    // failed or stuck operation still fails; suite-wide CPU/I/O contention can
+    // no longer consume a single shared deadline for all nine operations.
+    for (depth, name) in chain.iter().take(3).enumerate() {
+        let key = s(&jobs[name], "id");
+        let before = f.store.job(key).unwrap();
+        assert_eq!(
+            before["status"],
+            if depth == 0 {
+                "queued"
+            } else {
+                "waiting_dependency"
+            }
+        );
+        for expected in ["submitted", "succeeded", "downloaded"] {
+            f.engine.tick().unwrap();
+            f.drain();
+            assert_eq!(
+                f.store.job(key).unwrap()["status"],
+                expected,
+                "trial chain depth {depth} did not reach {expected}: {}",
+                f.scheduler_diagnostics()
+            );
+        }
+        assert_eq!(
+            f.channels
+                .submit_count(s(&jobs[name]["snapshot"], "requestId")),
+            1,
+            "a trial image must never be resubmitted while its child waits"
+        );
+    }
     assert_eq!(f.channels.total_submits(), 3);
     for name in chain.iter().take(3) {
         assert!(f.store.adopted(name, name).unwrap().is_some());

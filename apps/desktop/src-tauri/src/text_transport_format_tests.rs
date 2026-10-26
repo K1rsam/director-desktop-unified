@@ -68,11 +68,46 @@ fn sdk_input_format_old_bridge_keeps_v2_and_new_bridge_explicitly_selects_v3() {
         (json!({"capabilities":{"execute":"offline_fixture_only"}}), "text-attempt/v2"),
         (json!({"capabilities":{"compiledInputFormats":["legacy-json/v1"]}}), "text-attempt/v2"),
         (json!({"capabilities":{"compiledInputFormats":["legacy-json/v1","rules-first-json/v1"]}}), "text-attempt/v3"),
+        (json!({"capabilities":{"compiledInputFormats":["legacy-json/v1","rules-first-json/v1","rules-first-json-strict/v2"]}}), "text-attempt/v4"),
     ] {
         let value = FrozenAttempt::prepare_sdk_for_bridge("attempt_fixture", "workflow_fixture", "node_fixture", request(), &json!({"synthetic":true}), &inspect).unwrap();
         assert_eq!(value.version, version);
         if version == "text-attempt/v2" { assert_eq!(serde_json::to_value(value).unwrap(), serde_json::to_value(legacy()).unwrap()); }
     }
+}
+
+#[test]
+fn sdk_strict_v4_removes_only_provider_unique_items_and_preserves_domain_and_history() {
+    let mut request=request();
+    request.schema=json!({"type":"object","properties":{
+        "uniqueItems":{"type":"boolean"},
+        "assets":{"type":"array","uniqueItems":true,"minItems":1,"maxItems":30,"items":{"type":"object","properties":{
+            "values":{"anyOf":[{"type":"array","items":{"type":"string"},"uniqueItems":true},{"type":"null"}]}
+        }}},
+        "literal":{"type":"string","enum":["uniqueItems"]}
+    },"$defs":{"binding":{"type":"array","items":{"type":"string"},"uniqueItems":true}}});
+    let legacy=FrozenAttempt::prepare_sdk_rules_first("a","w","n",request.clone(),&json!({"synthetic":true})).unwrap();
+    let next=FrozenAttempt::prepare_sdk_strict_schema("a","w","n",request.clone(),&json!({"synthetic":true})).unwrap();
+    let old=compile_sdk_attempt_input(&legacy).unwrap();let new=compile_sdk_attempt_input(&next).unwrap();
+    assert_eq!(old.prompt,new.prompt);
+    assert_eq!(legacy.semantic_request_hash,next.semantic_request_hash);
+    assert_eq!(legacy.execution_fingerprint,next.execution_fingerprint);
+    assert_ne!(legacy.attempt_envelope_hash,next.attempt_envelope_hash);
+    assert_eq!(serde_json::to_value(&next.request).unwrap(),serde_json::to_value(&request).unwrap());
+    let schema:Value=serde_json::from_str(&new.schema).unwrap();
+    assert_eq!(schema["properties"]["uniqueItems"]["anyOf"][0]["type"],"boolean");
+    assert_eq!(schema["properties"]["assets"]["anyOf"][0]["maxItems"],30);
+    assert!(schema["properties"]["assets"]["anyOf"][0].get("uniqueItems").is_none());
+    assert!(schema["$defs"]["binding"].get("uniqueItems").is_none());
+    assert!(new.schema.contains("\"uniqueItems\":{\"anyOf\""),"a property named uniqueItems is data, not an unsupported keyword");
+    assert!(old.schema.contains("\"uniqueItems\":true"));
+    assert_eq!(compile_sdk_attempt_input(&legacy).unwrap().schema,old.schema);
+    let temp=tempfile::tempdir().unwrap();let file=temp.path().join("new.json");next.persist(&file).unwrap();
+    let before=std::fs::read(&file).unwrap();let reopened=FrozenAttempt::load(&file).unwrap();
+    assert_eq!(compile_sdk_attempt_input(&reopened).unwrap().schema,new.schema);reopened.persist(&file).unwrap();assert_eq!(std::fs::read(file).unwrap(),before);
+    let assets=vec![json!({"id":"a","variantId":"base","kind":"character"})];
+    let draft=json!({"units":[{"imageBindings":["a","a"],"assetRefs":[{"assetId":"a","variantId":"base","use":"character"}]}]});
+    assert_eq!(crate::pipeline::series::export::validate_image_bindings(&draft,&assets).unwrap_err(),"SERIES_DUPLICATE_IMAGE_BINDING");
 }
 
 #[test]

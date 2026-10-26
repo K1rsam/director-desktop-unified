@@ -1,0 +1,272 @@
+{
+  "version": "series-image-queue-v1",
+  "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+  "assetRegistry": {
+    "id": "1ab177d9-ff3f-4a08-880a-7c3f04f7ef29",
+    "revision": 1,
+    "snapshot": "v000001.json",
+    "sha256": "28af889fa7a7bd4b74529dd536a0ebd75a3a8cf0d238e75cfe5bd20dcd3c20cc"
+  },
+  "items": [
+    {
+      "itemId": "A0002@1",
+      "taskId": "IMG-f4a7f05b00e09716d75e533d",
+      "assetId": "A0002",
+      "assetRevision": 1,
+      "name": "门厅",
+      "key": "门厅SC",
+      "type": "SC",
+      "filename": "场景-门厅.png",
+      "designHash": "dfb2cc59b5bb931a2d1708394f145de466aed5db5eca4d9f866b3016d67c8096",
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 门厅",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 门厅",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "dependencies": [],
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ],
+      "approval": "design-and-uses-approved",
+      "imageState": "not-generated"
+    },
+    {
+      "itemId": "A0001@1",
+      "taskId": "IMG-6be67572db0ec2d5579432ea",
+      "assetId": "A0001",
+      "assetRevision": 1,
+      "name": "值守者·面罩",
+      "key": "值守者·面罩CH",
+      "type": "CH",
+      "filename": "角色-值守者面罩.png",
+      "designHash": "258e3c0cac77826d0099dae94d0be2adc16de036d550688918c73abb327308b7",
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 值守者·面罩",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 值守者·面罩",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        },
+        "dependencies": [
+          {
+            "assetId": "A0005",
+            "assetRevision": 1,
+            "purpose": "Only adopted text identity; no implicit image"
+          }
+        ]
+      },
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "dependencies": [
+        {
+          "assetId": "A0005",
+          "assetRevision": 1,
+          "purpose": "Only adopted text identity; no implicit image",
+          "designHash": "c2af8cbb7fe8de1116b740e40927d939da088dd1ae837786a28edcda0a35aac5",
+          "designState": "TEXT_ADOPTED"
+        }
+      ],
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ],
+      "approval": "design-and-uses-approved",
+      "imageState": "not-generated"
+    },
+    {
+      "itemId": "A0004@1",
+      "taskId": "IMG-584a6af498d7efa9e39942b1",
+      "assetId": "A0004",
+      "assetRevision": 1,
+      "name": "铜钥匙",
+      "key": "铜钥匙PR",
+      "type": "PR",
+      "filename": "道具-铜钥匙.png",
+      "designHash": "eecccc2a0df744b292fb841feac16e7bbd0a9336790735beafb635acd7158511",
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 铜钥匙",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 铜钥匙",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "dependencies": [],
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-1",
+          "purpose": "Actual adopted image binding"
+        }
+      ],
+      "approval": "design-and-uses-approved",
+      "imageState": "not-generated"
+    },
+    {
+      "itemId": "A0003@1",
+      "taskId": "IMG-1e1480995329e419a58e25b2",
+      "assetId": "A0003",
+      "assetRevision": 1,
+      "name": "走廊",
+      "key": "走廊SC",
+      "type": "SC",
+      "filename": "场景-走廊.png",
+      "designHash": "5c8a17aa65c0ae4931b7a98932a810c272906d36616af599f9896e595bd62730",
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 走廊",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 走廊",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "dependencies": [],
+      "uses": [
+        {
+          "episode": 1,
+          "sceneId": "1-2",
+          "purpose": "Actual adopted image binding"
+        }
+      ],
+      "approval": "design-and-uses-approved",
+      "imageState": "not-generated"
+    }
+  ],
+  "productionScope": {
+    "version": "series-season-scope-v1",
+    "id": "synthetic-season",
+    "revision": 1,
+    "seasonNumber": 1,
+    "status": "locked",
+    "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+    "readingScope": [
+      {
+        "number": 1,
+        "sceneIds": [
+          "1-1",
+          "1-2"
+        ]
+      }
+    ],
+    "episodes": [
+      {
+        "number": 1,
+        "sceneIds": [
+          "1-1",
+          "1-2"
+        ]
+      }
+    ],
+    "target": {
+      "minSeconds": 7200,
+      "maxSeconds": 9000,
+      "planningSeconds": 8100
+    },
+    "ending": {
+      "episode": 1,
+      "sceneId": "1-2",
+      "sourceRef": "synthetic:L4",
+      "closure": "Synthetic scope contract",
+      "hook": "Synthetic hook",
+      "estimate": {
+        "minSeconds": 8000,
+        "maxSeconds": 8200,
+        "basis": "Synthetic test only"
+      }
+    },
+    "confirmation": {
+      "kind": "delegated",
+      "basis": "Offline synthetic test; not production authorization"
+    }
+  },
+  "productionScopeHash": "784f61d1b4c1a785ae33c513047ea97f95c764e505fc5724f3f1c77ca81e0768",
+  "queueHash": "59065420fa9f27354e56c60599aa698d26ae36b92301d8924fcc23b7647d7e63"
+}

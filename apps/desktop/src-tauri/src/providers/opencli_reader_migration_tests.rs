@@ -56,14 +56,17 @@ fn response(request: &GenerationRequest) -> Value {
 #[test]
 fn reader_policy_allows_only_the_reviewed_old_and_current_pin_pairs() {
     assert_eq!(READ_ONLY_READER_MIGRATIONS, &[
-        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
-        ("6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2", "5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab"),
+        ("054b657069bc97f82f0cbe7587d59af32adc8f3b2e328c77fb7a22e423fac5d2", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("48315b72fa8f6ea412c1549bca00c8b3d60ed32d7ceedd9c3d9808dbd5923df3", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("d12cc432a530091340ca288f1b4bf2f202ce803d04b265aa39a1c844ee718ac8", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("f35f97fdbfd3f40d9882b275c8cf13310488a162323f7598ab3557377b039e70", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("54e83e4190239ff9e248082c44008961b0675d9880bb584de026ede24b3c7ec0", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("afeca4bb4a1f8e59c9850e983882f05593721a2cee019c7a80ca216bf7d817c6", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("c3d1031294a0a4f1f9a2bf5ca2320797e3e2efaa77c37dcc7c079c05b68c9057", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("6b85411ff480f21dd3a36a0f26a33f2761a73d591cc810f58ff7beb0710d1aa2", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
+        ("21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59", "2353a25a01d259500c76d26123846aca51d88e865d7dc6874c23cb3b5f9dd751"),
     ]);
     for (from,to) in READ_ONLY_READER_MIGRATIONS {assert!(read_only_reader_migration_allowed(from,to));}
     assert!(!read_only_reader_migration_allowed(&"f".repeat(64),COMPILED_RUNTIME_PIN.trim()));
@@ -281,4 +284,50 @@ fn account_failure_reader_audits_survive_passive_dom_recovery_upgrade() {
     assert!(read_only_reader_migration_allowed(prior,COMPILED_RUNTIME_PIN.trim()));
     assert!(!read_only_reader_audit_allowed(&"f".repeat(64),prior));
     assert!(!read_only_reader_audit_allowed(prior,prior));
+}
+
+#[test]
+fn passive_reader_audits_survive_exact_original_file_reader_upgrade() {
+    let prior="5cee68750aef037cb816505a0e584efc5fb778eb1ab2aa1aca5b72c9964082ab";
+    for (source,_) in &READ_ONLY_READER_MIGRATIONS[..8] {
+        assert!(read_only_reader_audit_allowed(source,prior));
+        assert!(!read_only_reader_migration_allowed(source,prior));
+    }
+    assert!(read_only_reader_migration_allowed(prior,COMPILED_RUNTIME_PIN.trim()));
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),prior));
+    assert!(!read_only_reader_audit_allowed(prior,prior));
+}
+#[test]
+fn original_download_failures_explain_recovery_without_resending() {
+    for code in ["ORIGINAL_FILE_IDENTITY","ORIGINAL_FILE_BINDING_UNCONFIRMED","ORIGINAL_FILE_AMBIGUOUS","ORIGINAL_IMAGE_CHANGED","OPENCLI_ORIGINAL_READ_FAILED"] {
+        let message=connection_error_message(code);
+        assert!(!message.contains("连接检查未完成"));
+        assert!(message.contains("不会"));
+    }
+}
+
+#[test]
+fn reader_exact_original_download_audit_survives_retry_page_upgrade() {
+    let previous="aa52310e33e542642b5c07293206dcb8849e4727b89716ac3434534437214557";
+    for (source,_) in &READ_ONLY_READER_MIGRATIONS[..9] {
+        assert!(read_only_reader_audit_allowed(source,previous));
+        assert!(!read_only_reader_migration_allowed(source,previous));
+    }
+    assert!(!read_only_reader_audit_allowed(previous,previous));
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),previous));
+    assert!(!read_only_reader_audit_allowed("21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59",previous));
+}
+
+#[test]
+fn reader_retry_page_audit_survives_rendered_main_upgrade_without_reverse_migrations() {
+    let previous="21d7cc8069dd9563ecc2fa54299e777cb21fc96e87e97229025acc925639ba59";
+    for (source,_) in &READ_ONLY_READER_MIGRATIONS[..10] {
+        assert!(read_only_reader_audit_allowed(source,previous));
+        assert!(!read_only_reader_migration_allowed(source,previous));
+        assert!(!read_only_reader_audit_allowed(previous,source));
+    }
+    assert!(!read_only_reader_audit_allowed(previous,previous));
+    assert!(!read_only_reader_audit_allowed(COMPILED_RUNTIME_PIN.trim(),previous));
+    assert!(!read_only_reader_audit_allowed(&"f".repeat(64),previous));
+    assert!(read_only_reader_migration_allowed(previous,COMPILED_RUNTIME_PIN.trim()));
 }

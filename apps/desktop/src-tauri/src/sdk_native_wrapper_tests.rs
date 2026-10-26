@@ -68,6 +68,15 @@ impl Fixture {
     fn attempt_dir(&self) -> PathBuf { self.attempt_directory.clone() }
     fn schema_recovery() -> Self {
         let mut f=Self::with_padding(false,&"x".repeat(190));let dir=f.attempt_dir();let runtime=dir.join("native-runtime");
+        // This is the historical ENOENT package, not today's schema compiler.
+        // Its receipts stay valid, but a newer wrapper does not gain permission
+        // to run that old bridge merely because this fixture is synthetic.
+        f.plan.identity.bridge_sha256=schema_recovery::SCHEMA_FAILED_BRIDGE_SHA.into();
+        let previous:FrozenAttempt=serde_json::from_value(f.record["attempt"].clone()).unwrap();
+        let frozen=FrozenAttempt::prepare_sdk_rules_first(&previous.attempt_id,&previous.workflow_id,&previous.logical_node_id,
+            previous.request.clone(),&json!(f.plan.identity)).unwrap();
+        f.plan.semantic_request_hash=frozen.semantic_request_hash.clone();f.plan.execution_fingerprint=frozen.execution_fingerprint.clone();
+        f.record["attempt"]=json!(frozen);f.record["frozenAttemptSha256"]=json!(digest(&json!(frozen).to_string()));
         let schema=std::fs::read(runtime.join("tmp/schema.json")).unwrap();std::fs::remove_file(runtime.join("tmp/schema.json")).unwrap();
         std::fs::write(runtime.join("work/.director-text-root"),"director SDK text execution\n").unwrap();
         std::fs::write(runtime.join("runtime-plan.json"),serde_json::to_string(&f.plan).unwrap()).unwrap();
@@ -128,11 +137,16 @@ impl Fixture {
 
 #[cfg(windows)]
 #[test]
-fn sdk_schema_wrapper_accepts_one_bound_recovery_and_rejects_changed_archive_proof_or_runtime() {
+fn sdk_schema_wrapper_preserves_historical_recovery_proof_without_cross_bridge_execution() {
     let mut f=Fixture::schema_recovery();let dir=f.attempt_dir();let mut launches=0;
     let paths=["schema-preparation-original.json","schema-preparation-evidence.json","schema-preparation-recovery.json","native-runtime/runtime-plan.json"];
     let original:Vec<_>=paths.iter().map(|p|std::fs::read(dir.join(p)).unwrap()).collect();let saved=f.record.clone();
-    assert_eq!(f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches).unwrap(),0);assert_eq!(launches,1);
+    std::fs::write(dir.join("receipt.json"),seal(&f.record)).unwrap();
+    assert!(schema_recovery_record_bound(&dir,&f.record,&json!(f.plan.identity)).unwrap());
+    let native_legacy=compiled_native_bridge_sha()==schema_recovery::SCHEMA_FAILED_BRIDGE_SHA;
+    let result=f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches);
+    if native_legacy {assert_eq!(result.unwrap(),0);}else{assert!(result.unwrap_err().contains("SDK_IDENTITY_MISMATCH"));}
+    assert_eq!(launches,usize::from(native_legacy));
     for fault in ["archive","evidence","intent","runtime","controller","identity","request"] {
         match fault {
             "archive"=>std::fs::write(dir.join(paths[0]),"{}").unwrap(),"evidence"=>std::fs::write(dir.join(paths[1]),"{}").unwrap(),
@@ -141,7 +155,9 @@ fn sdk_schema_wrapper_accepts_one_bound_recovery_and_rejects_changed_archive_pro
             "identity"=>f.record["schemaPreparationRecovery"]["effectiveIdentity"]["accountFingerprint"]=json!("f".repeat(64)),
             "request"=>f.record["attempt"]["request"]["model"]=json!("other"),_=>unreachable!(),
         }
-        assert!(f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches).is_err(),"{fault}");assert_eq!(launches,1,"{fault}");
+        std::fs::write(dir.join("receipt.json"),seal(&f.record)).unwrap();
+        assert!(!schema_recovery_record_bound(&dir,&f.record,&json!(f.plan.identity)).unwrap_or(false),"{fault}");
+        assert!(f.run(&super::tests::args(&f.plan),f.prompt.as_bytes(),&mut launches).is_err(),"{fault}");assert_eq!(launches,usize::from(native_legacy),"{fault}");
         f.record=saved.clone();for (p,b) in paths.iter().zip(&original){std::fs::write(dir.join(p),b).unwrap();}
     }
     for (p,b) in paths.iter().zip(original){assert_eq!(std::fs::read(dir.join(p)).unwrap(),b);}

@@ -25,13 +25,17 @@ custom-protocol = ["tauri/custom-protocol"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+ryu-js = "=1.0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+md-5 = "0.10"
 base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
 async-trait = "0.1"
 tokio = { version = "1", features = ["process", "io-util", "time", "rt-multi-thread", "sync", "macros", "fs"] }
 roxmltree = "0.20"

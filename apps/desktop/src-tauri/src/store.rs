@@ -172,8 +172,16 @@ impl Store {
         let rows = q
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
+        let review_guards = if table == "assets" {
+            self.persisted_image_review_guards(&c, None)?
+        } else {
+            Default::default()
+        };
         rows.map(|r| {
-            let v = parse(r.map_err(|e| e.to_string())?)?;
+            let mut v = parse(r.map_err(|e| e.to_string())?)?;
+            if table == "assets" {
+                Self::project_image_review_guard(&mut v, &review_guards);
+            }
             if table == "media" {
                 self.relocate_media(&v)
             } else {
@@ -204,10 +212,12 @@ impl Store {
     /// A deleted record remains readable for task snapshots and media history.
     /// Production uses this explicit guard instead of silently reviving it.
     pub fn active_asset(&self, key: &str) -> Result<Value> {
-        let value = self.get("assets", key)?;
+        let mut value = self.get("assets", key)?;
         if asset_deleted(&value) {
             return Err("资产已删除，请先恢复或在单元配图中替换资产".into());
         }
+        let guards = self.persisted_image_review_guards(&self.conn()?, Some(key))?;
+        Self::project_image_review_guard(&mut value, &guards);
         Ok(value)
     }
     pub fn asset_usage(&self, key: &str) -> Result<Value> {
@@ -1075,8 +1085,11 @@ impl Store {
                 })
                 .unwrap_or(false);
             let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM media_assets ma JOIN media m ON m.id=ma.media_id WHERE ma.media_id=?1 AND ma.asset_id=?2 AND ma.variant_id=?3 AND m.kind='image')",params![ordered_media[0],asset_id,variant],|r|r.get(0)).map_err(|e|e.to_string())?;
-            let applied = valid_identity && valid_version && linked;
-            let reason = if !valid_identity {
+            let manual_review = snapshot["workflowProfile"]==crate::asset_graph::PROFILE;
+            let applied = valid_identity && valid_version && linked && !manual_review;
+            let reason = if manual_review {
+                "candidate_requires_explicit_adoption_or_verified_visual_review"
+            } else if !valid_identity {
                 "frozen_identity_missing_or_mismatched"
             } else if !valid_version {
                 "appearance_version_changed"
@@ -1125,7 +1138,7 @@ impl Store {
         for (asset, variant, version) in missing {
             let candidates: Vec<Value> = {
                 let c = self.conn()?;
-                let mut q=c.prepare("SELECT m.data FROM media_assets ma JOIN media m ON m.id=ma.media_id WHERE ma.asset_id=?1 AND ma.variant_id=?2 AND m.kind='image' AND NOT EXISTS(SELECT 1 FROM metadata pending WHERE pending.key=('lingmo.media.candidate:'||?1||':'||?2||':'||m.id)) AND NOT EXISTS(SELECT 1 FROM job_media jm JOIN jobs j ON j.id=jm.job_id WHERE jm.media_id=m.id AND j.kind='image' AND (j.state!='downloaded' OR COALESCE(json_extract(j.snapshot,'$.assetId'),'')!=?1 OR COALESCE(json_extract(j.snapshot,'$.variantId'),'')!=?2 OR COALESCE(json_extract(j.snapshot,'$.assetVersion'),-1)!=?3 OR jm.media_id!=COALESCE(json_extract(j.result,'$.mediaIds[0]'),(SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid LIMIT 1)))) ORDER BY m.created_at DESC,ma.rowid DESC").map_err(|e|e.to_string())?;
+                let mut q=c.prepare("SELECT m.data FROM media_assets ma JOIN media m ON m.id=ma.media_id WHERE ma.asset_id=?1 AND ma.variant_id=?2 AND m.kind='image' AND NOT EXISTS(SELECT 1 FROM metadata pending WHERE pending.key=('lingmo.media.candidate:'||?1||':'||?2||':'||m.id)) AND NOT EXISTS(SELECT 1 FROM job_media jm JOIN jobs j ON j.id=jm.job_id WHERE jm.media_id=m.id AND j.kind='image' AND (j.state!='downloaded' OR json_extract(j.snapshot,'$.workflowProfile')='desktop-series672-assets112/v1' OR COALESCE(json_extract(j.snapshot,'$.assetId'),'')!=?1 OR COALESCE(json_extract(j.snapshot,'$.variantId'),'')!=?2 OR COALESCE(json_extract(j.snapshot,'$.assetVersion'),-1)!=?3 OR jm.media_id!=COALESCE(json_extract(j.result,'$.mediaIds[0]'),(SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid LIMIT 1)))) ORDER BY m.created_at DESC,ma.rowid DESC").map_err(|e|e.to_string())?;
                 let rows = q
                     .query_map(params![asset, variant, version], |r| r.get::<_, String>(0))
                     .map_err(|e| e.to_string())?
@@ -2175,6 +2188,7 @@ pub(crate) fn save_asset_tx(tx: &rusqlite::Transaction<'_>, mut data: Value) -> 
     )
     .map_err(|e| e.to_string())?;
     tx.execute("UPDATE jobs SET state='stale',error='资产版本已更新',updated_at=?2,next_attempt_at=0 WHERE task_id IS NULL AND state IN ('ready','queued','preparing','waiting_dependency') AND kind IN ('image','video') AND ((kind='image' AND entity_id=?1) OR EXISTS(SELECT 1 FROM json_each(jobs.snapshot,'$.references') AS r WHERE json_extract(r.value,'$.assetId')=?1 OR EXISTS(SELECT 1 FROM json_each(r.value,'$.semanticBindings') b WHERE json_extract(b.value,'$.assetId')=?1)) OR EXISTS(SELECT 1 FROM json_each(jobs.snapshot,'$.inlineReferences') r WHERE json_extract(r.value,'$.assetId')=?1))",params![s(&data,"id"),now()]).map_err(|e|e.to_string())?;
+    crate::asset_lifecycle::after_asset_save(tx,old.as_ref(),&data)?;
     mark_changed(tx)?;
     Ok(data)
 }
@@ -2262,6 +2276,7 @@ pub(crate) fn save_unit_tx(tx: &rusqlite::Transaction<'_>, mut data: Value) -> R
         }
     }
     tx.execute("UPDATE jobs SET state='stale',error='单元版本已更新',updated_at=?2,next_attempt_at=0 WHERE task_id IS NULL AND entity_id=?1 AND kind='video' AND state IN ('ready','queued','preparing','waiting_dependency')",params![s(&data,"id"),now()]).map_err(|e|e.to_string())?;
+    crate::asset_lifecycle::after_unit_save(tx,old.as_ref(),&data)?;
     mark_changed(tx)?;
     Ok(data)
 }
@@ -2376,6 +2391,21 @@ pub(crate) fn set_current_image(
     if kind != "image" {
         return Err("当前图片只能选择图片媒体".into());
     }
+    // A failed costume composition remains inspectable, but its lower-only
+    // download must never become the current image through manual selection.
+    let mut query=tx.prepare("SELECT j.snapshot,j.result FROM job_media jm JOIN jobs j ON j.id=jm.job_id WHERE jm.media_id=?1 AND j.kind='image'").map_err(|e|e.to_string())?;
+    let origins=query.query_map([media],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?
+        .collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(query);
+    for (snapshot,result) in origins {
+        let snapshot=parse(snapshot)?;
+        if snapshot["assetId"]!=asset || snapshot["variantId"]!=variant || !crate::asset_composite::requires_composition(&snapshot) { continue; }
+        let result=result.map(parse).transpose()?.unwrap_or(Value::Null);
+        let proof=result["identityComposition"].as_array().into_iter().flatten().find(|p|p["candidateMediaId"]==media)
+            .ok_or("换装候选缺少完成的像素合成记录，尚不能采用")?;
+        let raw:String=tx.query_row("SELECT data FROM media WHERE id=?1",[media],|r|r.get(0)).map_err(|e|e.to_string())?;
+        crate::asset_composite::validate_adoption(&snapshot,proof,Path::new(s(&parse(raw)?,"path")))?;
+    }
     let current: Option<String> = tx
         .query_row(
             "SELECT media_id FROM adoptions WHERE asset_id=?1 AND variant_id=?2",
@@ -2384,8 +2414,19 @@ pub(crate) fn set_current_image(
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if current.as_deref() == Some(media) || (only_missing && current.is_some()) {
+    if only_missing && current.is_some() {
         return Ok(false);
+    }
+    if current.as_deref() == Some(media) {
+        // Explicitly choosing the retained image can resolve a known reference
+        // drift after its original mother is restored. Backfill stays a no-op;
+        // lifecycle decides which review causes can actually be rechecked.
+        let before: String = tx.query_row("SELECT data FROM assets WHERE id=?1", [asset], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        crate::asset_lifecycle::after_image_adoption(tx, asset, variant, media, current.as_deref())?;
+        let after: String = tx.query_row("SELECT data FROM assets WHERE id=?1", [asset], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        return Ok(before != after);
     }
     let time = now();
     tx.execute(
@@ -2394,6 +2435,7 @@ pub(crate) fn set_current_image(
     )
     .map_err(|e| e.to_string())?;
     tx.execute("INSERT INTO adoptions VALUES(?1,?2,?3,?4) ON CONFLICT(asset_id,variant_id) DO UPDATE SET media_id=excluded.media_id,created_at=excluded.created_at",params![asset,variant,media,time]).map_err(|e|e.to_string())?;
+    crate::asset_lifecycle::after_image_adoption(tx,asset,variant,media,current.as_deref())?;
     // First adoption satisfies unfrozen dependencies. Only prepared references to
     // the replaced asset/variant/media expire; submitted snapshots stay immutable.
     tx.execute("UPDATE jobs SET state='stale',error='当前图片已替换',updated_at=?4,next_attempt_at=0 WHERE task_id IS NULL AND state IN ('ready','queued','preparing') AND kind IN ('image','video') AND (EXISTS(SELECT 1 FROM json_each(jobs.snapshot,'$.references') AS r WHERE json_extract(r.value,'$.assetId')=?1 AND COALESCE(json_extract(r.value,'$.variantId'),?2)=?2 AND COALESCE(json_extract(r.value,'$.mediaId'),'')!=?3) OR EXISTS(SELECT 1 FROM json_each(jobs.snapshot,'$.inlineReferences') r WHERE json_extract(r.value,'$.assetId')=?1 AND json_extract(r.value,'$.variantId')=?2))",params![asset,variant,media,time]).map_err(|e|e.to_string())?;

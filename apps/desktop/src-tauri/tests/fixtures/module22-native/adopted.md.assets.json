@@ -1,0 +1,75 @@
+{
+  "version": "lingmo-v7-assets-v1",
+  "exportProfile": "lingmo-v7",
+  "testFixture": false,
+  "bundleSha256": "723f82d6c44e6cedd3d4e044c7cf1e92e8377955c0ed3a6b1959e5779fc12f2a",
+  "markdownSha256": "08ca2fe78934fd1f4ef1ffd6b94d026b52c09339754a395656d69c43b090bc28",
+  "assets": [
+    {
+      "id": "A0002",
+      "assetRevision": 1,
+      "name": "门厅",
+      "type": "SC",
+      "token": "门厅SC",
+      "filename": "场景-门厅.png",
+      "placeholderOrdinal": 1
+    },
+    {
+      "id": "A0003",
+      "assetRevision": 1,
+      "name": "走廊",
+      "type": "SC",
+      "token": "走廊SC",
+      "filename": "场景-走廊.png",
+      "placeholderOrdinal": 2
+    },
+    {
+      "id": "A0001",
+      "assetRevision": 1,
+      "name": "值守者面罩",
+      "type": "CH",
+      "token": "值守者面罩CH",
+      "filename": "角色-值守者面罩.png",
+      "placeholderOrdinal": 0
+    },
+    {
+      "id": "A0004",
+      "assetRevision": 1,
+      "name": "铜钥匙",
+      "type": "PR",
+      "token": "铜钥匙PR",
+      "filename": "道具-铜钥匙.png",
+      "placeholderOrdinal": 3
+    }
+  ],
+  "units": [
+    {
+      "episode": 1,
+      "sceneId": "1-1",
+      "unitId": "U1",
+      "fragment": 1,
+      "actualSeconds": 6,
+      "containerSeconds": 6,
+      "imageTokens": [
+        "门厅SC",
+        "值守者面罩CH",
+        "铜钥匙PR"
+      ],
+      "bodySha256": "124ce3ef7fa23cbd48973cbef3187504b077a1cdedaef8060311ea489bbe9ac4",
+      "bodyWithoutTokensSha256": "52058dc652db979960580ca75553146baeb78d870cb2c7af320ae3a19bc6438b"
+    },
+    {
+      "episode": 1,
+      "sceneId": "1-2",
+      "unitId": "U2",
+      "fragment": 1,
+      "actualSeconds": 4,
+      "containerSeconds": 4,
+      "imageTokens": [
+        "走廊SC"
+      ],
+      "bodySha256": "5f41c27ff1ac7730f249d3679c2e55fa6002fe202e824862917395ae8d5cf375",
+      "bodyWithoutTokensSha256": "7a3e333fd709fbd3663827c252203563be32f30cd9417bd9f4acbb5101256db5"
+    }
+  ]
+}

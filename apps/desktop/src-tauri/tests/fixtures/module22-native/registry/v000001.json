@@ -1,0 +1,217 @@
+{
+  "version": "series-assets-v1",
+  "id": "a5a67358-e26f-425b-941a-84082acfd412",
+  "sourceHash": "aa7c643804862c0e74d77f63e22b0b884d66b7ee1a5558efb39b82fb4fe7e431",
+  "revision": 1,
+  "assets": [
+    {
+      "key": "值守者·面罩CH",
+      "name": "值守者·面罩",
+      "type": "CH",
+      "status": "面罩遮住口鼻",
+      "upstreamKind": "CHARACTER",
+      "importName": "值守者面罩",
+      "placeholderOrdinal": 0,
+      "aliases": [],
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 值守者·面罩",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 值守者·面罩",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        },
+        "dependencies": [
+          {
+            "assetId": "A0005",
+            "assetRevision": 1,
+            "purpose": "Only adopted text identity; no implicit image"
+          }
+        ]
+      },
+      "id": "A0001",
+      "revision": 1
+    },
+    {
+      "key": "门厅SC",
+      "name": "门厅",
+      "type": "SC",
+      "status": "闭门",
+      "upstreamKind": "SCENE",
+      "importName": "门厅",
+      "placeholderOrdinal": 1,
+      "aliases": [],
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 门厅",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 门厅",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "id": "A0002",
+      "revision": 1
+    },
+    {
+      "key": "走廊SC",
+      "name": "走廊",
+      "type": "SC",
+      "status": "常态",
+      "upstreamKind": "SCENE",
+      "importName": "走廊",
+      "placeholderOrdinal": 2,
+      "aliases": [],
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 走廊",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 走廊",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "id": "A0003",
+      "revision": 1
+    },
+    {
+      "key": "铜钥匙PR",
+      "name": "铜钥匙",
+      "type": "PR",
+      "status": "右手持握",
+      "upstreamKind": "PROP",
+      "importName": "铜钥匙",
+      "placeholderOrdinal": 3,
+      "aliases": [],
+      "origin": {
+        "kind": "source",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic fixture, never production approval"
+      },
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic adopted card 铜钥匙",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Synthetic complete design for 铜钥匙",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture",
+            "basis": "Tests only"
+          }
+        }
+      },
+      "id": "A0004",
+      "revision": 1
+    },
+    {
+      "key": "身份母版CH",
+      "name": "身份母版",
+      "type": "CH",
+      "status": "只读设计",
+      "aliases": [],
+      "origin": {
+        "kind": "design",
+        "sourceRefs": [
+          "E01:R1"
+        ],
+        "basis": "Synthetic read-only ancestor"
+      },
+      "design": {
+        "state": "TEXT_ADOPTED",
+        "text": "Synthetic identity anchor",
+        "full": {
+          "version": "synthetic-design/v1",
+          "body": "Identity anchor only",
+          "sourceRefs": [
+            "E01:R1"
+          ],
+          "supplements": [],
+          "applicability": {
+            "episodes": [
+              1
+            ]
+          },
+          "review": {
+            "kind": "synthetic-fixture"
+          }
+        }
+      },
+      "imageRequired": false,
+      "id": "A0005",
+      "revision": 1,
+      "importName": "身份母版",
+      "placeholderOrdinal": 4
+    }
+  ],
+  "requests": [],
+  "changes": [],
+  "importProfile": "lingmo-v7"
+}

@@ -333,9 +333,9 @@ fn missing_source_blocks_text_design_but_manual_image_prompt_can_queue_without_t
     let error = engine
         .dispatch(json!({"action":"images.design","projectId":pid}))
         .unwrap_err();
-    assert!(error.contains("尚未导入剧本原文"));
+    assert!(error.contains("来源"),"{error}");
     assert!(store.jobs().unwrap().is_empty());
-    engine.dispatch(json!({"action":"images.produce","projectId":pid,"provider":"offline","model":"offline-image","assetIds":["manual"]})).unwrap();
+    engine.dispatch(json!({"action":"images.run","projectId":pid,"provider":"offline","model":"offline-image","assetIds":["manual"]})).unwrap();
     assert!(engine.await_worker_shutdown(2));
     let jobs = store.jobs().unwrap();
     assert_eq!(
@@ -346,12 +346,7 @@ fn missing_source_blocks_text_design_but_manual_image_prompt_can_queue_without_t
         jobs.iter().filter(|job| s(job, "kind") == "image").count(),
         1
     );
-    assert_eq!(
-        jobs.iter()
-            .find(|job| s(job, "kind") == "workflow")
-            .unwrap()["status"],
-        "completed"
-    );
+    assert!(!jobs.iter().any(|job| s(job,"kind")=="workflow"),"image-only action must not create text workflow");
     assert_eq!(
         channels.calls.load(Ordering::SeqCst),
         0,
@@ -370,6 +365,24 @@ fn offline_startup_text_cli_status_never_reads_a_real_account_or_logs_in() {
         .dispatch(json!({"action":"textCli.login","projectId":f.project_id}))
         .is_err());
     assert!(f.store.jobs().unwrap().is_empty());
+}
+
+#[test]
+fn new_images_only_ready_does_not_reserve_missing_mothers_or_block_independent_images() {
+    let f=Fixture::new(Duration::ZERO);
+    for id in ["mother","child","independent"] {
+        f.store.save_asset(json!({"id":id,"variantId":"v","name":id,"kind":"character","identityId":"person","workflowProfile":crate::asset_graph::PROFILE,"filename":format!("{id}.png"),"prompt":"完整图片提示词","promptStatus":"ready","imagePrompt":{"text":"完整中文图片提示词","layoutKind":"character"},"referenceRequirements":if id=="child"{json!([{"targetAssetId":"mother","targetVariantId":"v","role":"identity"}])}else{json!([])}})).unwrap();
+    }
+    let request=json!({"provider":"offline","model":"image","workflowProfile":crate::asset_graph::PROFILE,"assetIds":["child","independent"],"onlyReady":true,"imageProductionPolicy":"automatic"});
+    let report=f.engine.queue_images(&f.store,&request).unwrap();
+    assert_eq!(report["queuedCount"],1);assert_eq!(report["blockedCount"],1);
+    assert_eq!(report["queued"][0]["assetId"],"independent");
+    let jobs=f.store.jobs().unwrap();assert_eq!(jobs.len(),1);assert_eq!(jobs[0]["snapshot"]["ratio"],"1:1");
+    let mut child_only=request.clone();child_only["assetIds"]=json!(["child"]);
+    let blocked=f.engine.queue_images(&f.store,&child_only);
+    // Report-only waiting never creates a hidden dependency/ancestor job.
+    assert!(blocked.is_ok());assert_eq!(f.store.jobs().unwrap().len(),1);
+    assert_eq!(f.channels.calls.load(Ordering::SeqCst),0);
 }
 #[test]
 fn public_known_task_query_keeps_cli_setup_failure_distinct_from_auth_and_never_submits() {
@@ -1764,15 +1777,20 @@ fn stage2_visible_text_preview_matches_new_frozen_image_and_preserves_old_snapsh
 }
 
 #[test]
-fn stage2_evidence_policy_persists_on_new_workflow_and_exact_resume_without_calls() {
+fn legacy_stage2_evidence_policy_persists_on_exact_resume_without_calls() {
     let f = Fixture::new(Duration::ZERO);
     f.store.save_asset(json!({"id":"manual","variantId":"base","kind":"CH","prompt":"用户手写完整形象","promptOrigin":"MANUAL","sourceRefs":[]})).unwrap();
     let request = json!({"action":"images.produce","projectId":f.project_id,"provider":"offline","model":"fake","assetIds":["manual"]});
-    f.engine.dispatch(request).unwrap();
-    assert!(f.engine.await_worker_shutdown(3));
-    let old = f.store.jobs().unwrap().into_iter().find(|j| j["kind"] == "workflow").unwrap();
+    // This is a historical frozen request. A newly created images.produce now
+    // uses the 1.1.2 contract, so construct the actual legacy artifact explicitly.
+    let settings=f.store.settings().unwrap();
+    let mut context=json!({"source":f.store.source().unwrap(),"foundation":f.store.foundation().unwrap(),"assets":f.store.values("assets").unwrap(),"selection":{"assetIds":["manual"]},"settings":settings,"designRuleSha256":pipeline::rule_snapshot("asset-art-director").unwrap()["sha256"]});
+    pipeline::freeze_design_evidence_profile(&mut context);
+    let snapshot=json!({"stage":"images.produce","sourceVersion":f.store.source().unwrap()["version"],"settings":settings,"request":request,"stage2Context":context});
+    let key=f.store.add_job("workflow","images.produce:","local","local",&snapshot,"completed").unwrap();
+    let old=f.store.job(&key).unwrap();
     let profile = old["snapshot"]["stage2Context"][pipeline::DESIGN_EVIDENCE_PROFILE_FIELD].clone();
-    assert!(!profile.is_null(), "new workflow must capture evidence policy before dispatch");
+    assert!(!profile.is_null(), "legacy snapshot must retain its original evidence policy");
     f.store.update_job(s(&old,"id"),"completed",&json!({"result":{"status":"partiallyQueued","blocked":[{"assetId":"manual","reason":"offline hold"}]}})).unwrap();
     let before = raw_job_record(&f.store, s(&old,"id"));
     let reopened = Store::open(f.store.root.clone()).unwrap();
