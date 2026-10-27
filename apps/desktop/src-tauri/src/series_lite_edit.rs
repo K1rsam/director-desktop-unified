@@ -25,7 +25,7 @@ type Result<T> = std::result::Result<T, String>;
 const CREATIVE: &[&str] = &["plan", "selection", "draft"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Number { canonical: String, integer: bool },
@@ -35,33 +35,33 @@ enum Json {
 }
 
 impl Json {
-    fn object(&self) -> Result<&BTreeMap<String, Json>> {
+    pub(crate) fn object(&self) -> Result<&BTreeMap<String, Json>> {
         match self {
             Self::Object(v) => Ok(v),
             _ => Err("expected JSON object".into()),
         }
     }
-    fn array(&self) -> Result<&[Json]> {
+    pub(crate) fn array(&self) -> Result<&[Json]> {
         match self {
             Self::Array(v) => Ok(v),
             _ => Err("expected JSON array".into()),
         }
     }
-    fn string(&self) -> Result<&str> {
+    pub(crate) fn string(&self) -> Result<&str> {
         match self {
             Self::String(v) => Ok(v),
             _ => Err("expected JSON string".into()),
         }
     }
-    fn get(&self, key: &str) -> Result<&Json> {
+    pub(crate) fn get(&self, key: &str) -> Result<&Json> {
         self.object()?
             .get(key)
             .ok_or_else(|| format!("missing field: {key}"))
     }
-    fn is_integer(&self) -> bool {
+    pub(crate) fn is_integer(&self) -> bool {
         matches!(self, Self::Number { integer: true, .. })
     }
-    fn integer(&self) -> Option<i128> {
+    pub(crate) fn integer(&self) -> Option<i128> {
         match self {
             Self::Number {
                 canonical,
@@ -80,7 +80,7 @@ fn need(ok: bool, error: &str) -> Result<()> {
     }
 }
 
-fn fields(value: &Json, required: &[&str], optional: &[&str]) -> Result<()> {
+pub(crate) fn fields(value: &Json, required: &[&str], optional: &[&str]) -> Result<()> {
     let map = value.object()?;
     need(
         required.iter().all(|k| map.contains_key(*k))
@@ -143,7 +143,7 @@ impl<'de> DeserializeSeed<'de> for ContainerSeed {
     }
 }
 
-fn parse(raw: &[u8]) -> Result<Json> {
+pub(crate) fn parse(raw: &[u8]) -> Result<Json> {
     let text = std::str::from_utf8(raw).map_err(|_| "invalid strict UTF-8 JSON")?;
     parse_value(text, 0)
 }
@@ -281,7 +281,7 @@ fn encode(value: &Json, out: &mut String) {
     }
 }
 
-fn canonical(value: &Json) -> Vec<u8> {
+pub(crate) fn canonical(value: &Json) -> Vec<u8> {
     let mut out = String::new();
     encode(value, &mut out);
     out.into_bytes()
@@ -486,7 +486,7 @@ fn nonempty(value: &Json) -> Result<&str> {
     )?;
     Ok(value)
 }
-fn visual_baseline(value: &Json) -> Result<()> {
+pub(crate) fn visual_baseline(value: &Json) -> Result<()> {
     fields(
         value,
         &[

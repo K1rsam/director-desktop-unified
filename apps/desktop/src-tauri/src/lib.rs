@@ -37,6 +37,7 @@ mod series_lite_normalize;
 mod series_lite_identity_store;
 mod series_lite_intake;
 mod series_lite_desktop_source;
+mod series_lite_job_packet;
 mod series_lite_contract;
 pub mod portable;
 pub mod project_library;
