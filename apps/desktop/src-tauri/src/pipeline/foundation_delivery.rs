@@ -1503,7 +1503,11 @@ fn expand_history(value: &Value) -> Result<Value, String> {
     Ok(json!(expanded))
 }
 
-fn capacity_input(stage: &str, mut input: Value, schema: &Value) -> Result<Value, String> {
+fn capacity_input(stage: &str, input: Value, schema: &Value) -> Result<Value, String> {
+    capacity_input_mode(stage, input, schema, false)
+}
+
+fn capacity_input_mode(stage: &str, mut input: Value, schema: &Value, allow_catalogue_table: bool) -> Result<Value, String> {
     if let Some(error) = input["automaticDecisionError"].as_str() {
         return Err(error.to_owned());
     }
@@ -1515,6 +1519,15 @@ fn capacity_input(stage: &str, mut input: Value, schema: &Value) -> Result<Value
         if let Some(history) = input.pointer("/evidence/historicalEvidenceCandidates") {
             input["evidence"]["historicalEvidenceCandidates"] = compact_history(history)?;
         }
+    }
+    // The old planner must finish splitting first. Factoring an oversized
+    // parent candidate before that split changes previously frozen scope,
+    // batchCount and packetId even when all saved child requests still fit.
+    if allow_catalogue_table && input["modelInputProfile"] == super::foundation_wire::PROFILE
+        && input.get(super::foundation_wire_table::FIELD).is_none()
+        && !fits(stage, &input, schema)?
+    {
+        input[super::foundation_wire_table::FIELD] = json!(super::foundation_wire_table::PROFILE);
     }
     Ok(input)
 }
@@ -1528,9 +1541,60 @@ fn prepare_capacity_batch(
     index: usize,
     signals: &[Value],
 ) -> Result<(Batch, Value), String> {
+    let mut legacy_pending = pending.clone();
+    match prepare_capacity_batch_mode(stage, source, &mut legacy_pending, foundation, context, index, signals, false) {
+        Ok(result) => {
+            *pending = legacy_pending;
+            Ok(result)
+        }
+        Err(CapacityPlanningFailure::Invalid(error)) => Err(error),
+        Err(CapacityPlanningFailure::Capacity) => {
+            // Retry only a locally typed capacity failure, from the untouched
+            // queue. No model call/attempt exists here. Successful old planning
+            // always wins; a partially consumed queue must never lose its tail.
+            let mut factored_pending = pending.clone();
+            match prepare_capacity_batch_mode(stage, source, &mut factored_pending, foundation, context, index, signals, true) {
+                Ok(result) => {
+                    *pending = factored_pending;
+                    Ok(result)
+                }
+                Err(error) => Err(error.message(stage)),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CapacityPlanningFailure {
+    Capacity,
+    Invalid(String),
+}
+impl From<String> for CapacityPlanningFailure {
+    fn from(error: String) -> Self { Self::Invalid(error) }
+}
+impl CapacityPlanningFailure {
+    fn message(self, stage: &str) -> String {
+        match self {
+            Self::Invalid(error) => error,
+            Self::Capacity if stage == "F2" => "F2完整请求超过200k应用预算；原文与已接受响应保留，未截断或提交".into(),
+            Self::Capacity => "Q1完整请求超过200k应用预算；未截断资料或自动购买重试".into(),
+        }
+    }
+}
+
+fn prepare_capacity_batch_mode(
+    stage: &str,
+    source: &LockedSource,
+    pending: &mut Vec<Batch>,
+    foundation: &FoundationProposal,
+    context: &Value,
+    index: usize,
+    signals: &[Value],
+    allow_catalogue_table: bool,
+) -> Result<(Batch, Value), CapacityPlanningFailure> {
     super::asset_coverage::enabled(context)?;
     if pending.is_empty() {
-        return Err("容量规划没有待处理批次".into());
+        return Err(CapacityPlanningFailure::Invalid("容量规划没有待处理批次".into()));
     }
     let batch = pending.remove(0);
     let schema = if stage == "F2" {
@@ -1538,7 +1602,7 @@ fn prepare_capacity_batch(
     } else {
         q1_schema()
     };
-    let input = capacity_input(
+    let input = capacity_input_mode(
         stage,
         input_for(
             stage,
@@ -1552,20 +1616,13 @@ fn prepare_capacity_batch(
             signals,
         ),
         &schema,
+        allow_catalogue_table,
     )?;
     if fits(stage, &input, &schema)? {
         return Ok((batch, input));
     }
-    let overflow = || {
-        if stage == "F2" {
-            "F2完整请求超过200k应用预算；原文与已接受响应保留，未截断或提交"
-        } else {
-            "Q1完整请求超过200k应用预算；未截断资料或自动购买重试"
-        }
-        .to_owned()
-    };
     if batch.fragment.is_some() || batch.scope.len() == 1 {
-        return Err(overflow());
+        return Err(CapacityPlanningFailure::Capacity);
     }
     // Port foundation-request-plan.ts: exact projected request, largest fitting
     // ordered prefix, and one intact remainder. Never turn the tail into a queue
@@ -1580,7 +1637,7 @@ fn prepare_capacity_batch(
             pieces: whole_rows(source, &batch.scope[..count]),
             fragment: None,
         };
-        let candidate = capacity_input(
+        let candidate = capacity_input_mode(
             stage,
             input_for(
                 stage,
@@ -1594,6 +1651,7 @@ fn prepare_capacity_batch(
                 signals,
             ),
             &schema,
+            allow_catalogue_table,
         )?;
         if fits(stage, &candidate, &schema)? {
             best = Some((count, prefix, candidate));
@@ -1603,7 +1661,7 @@ fn prepare_capacity_batch(
         }
     }
     let Some((mut count, mut prefix, _)) = best else {
-        return Err(overflow());
+        return Err(CapacityPlanningFailure::Capacity);
     };
     // If the final tail would contain just one short episode, move one episode
     // across the boundary when *both* requests fit. Keep order and call count.
@@ -1618,7 +1676,7 @@ fn prepare_capacity_batch(
             pieces: whole_rows(source, &batch.scope[count - 1..]),
             fragment: None,
         };
-        let left = capacity_input(
+        let left = capacity_input_mode(
             stage,
             input_for(
                 stage,
@@ -1632,8 +1690,9 @@ fn prepare_capacity_batch(
                 signals,
             ),
             &schema,
+            allow_catalogue_table,
         )?;
-        let right = capacity_input(
+        let right = capacity_input_mode(
             stage,
             input_for(
                 stage,
@@ -1647,6 +1706,7 @@ fn prepare_capacity_batch(
                 signals,
             ),
             &schema,
+            allow_catalogue_table,
         )?;
         if fits(stage, &left, &schema)? && fits(stage, &right, &schema)? {
             count -= 1;
@@ -1678,7 +1738,7 @@ fn prepare_capacity_batch(
         }
     }
     pending.insert(0, remainder);
-    let input = capacity_input(
+    let input = capacity_input_mode(
         stage,
         input_for(
             stage,
@@ -1692,9 +1752,10 @@ fn prepare_capacity_batch(
             signals,
         ),
         &schema,
+        allow_catalogue_table,
     )?;
     if !fits(stage, &input, &schema)? {
-        return Err(overflow());
+        return Err(CapacityPlanningFailure::Capacity);
     }
     Ok((prefix, input))
 }
@@ -8993,6 +9054,106 @@ mod tests {
             .unwrap()
             .push(json!("unknown metadata"));
         assert_eq!(compact_history(&unknown).unwrap(), unknown);
+    }
+    #[test]
+    fn capacity_factoring_keeps_complete_catalogue_and_only_marks_new_overflow() {
+        let source=source(1);
+        let batch=plan_batches(&source,&source.episodes.iter().map(|e|e.id.clone()).collect::<Vec<_>>()).unwrap().remove(0);
+        let mut input=input_for("F2",&source,&batch,&empty_foundation(&source),&json!({}),0,1,false,&[]);
+        input["modelInputProfile"]=json!(super::super::foundation_wire::PROFILE);
+        let schema=f2_schema();
+        let small=input.clone();
+        assert!(fits("F2",&small,&schema).unwrap());
+        let planned=capacity_input("F2",small.clone(),&schema).unwrap();
+        assert_eq!(planned,small);
+        input["registry"]=json!((0..1500).map(|n|json!({"key":format!("catalogue:{n}"),"type":"CH","name":"同名人物","aliases":[],"variants":[{"key":format!("variant:{n}"),"name":"基础形象","fromKey":null,"preparation":{"mode":"REFERENCE","note":"完整制作说明保留，各自身份不可合并"}}]})).collect::<Vec<_>>());
+        let original=input.clone();
+        assert!(!fits("F2",&input,&schema).unwrap());
+        assert!(capacity_input("F2",input.clone(),&schema).unwrap().get(super::super::foundation_wire_table::FIELD).is_none(),"default capacity projection preserves the legacy planner");
+        let mut planned=capacity_input_mode("F2",input,&schema,true).unwrap();
+        assert_eq!(planned[super::super::foundation_wire_table::FIELD],super::super::foundation_wire_table::PROFILE);
+        assert!(fits("F2",&planned,&schema).unwrap());
+        planned.as_object_mut().unwrap().remove(super::super::foundation_wire_table::FIELD);
+        assert_eq!(planned,original);
+        let mut indivisible=small;
+        indivisible["projectConditions"]=json!({"direction":"字".repeat(REQUEST_BUDGET)});
+        let held=capacity_input("F2",indivisible,&schema).unwrap();
+        assert!(!fits("F2",&held,&schema).unwrap());
+    }
+    fn capacity_fallback_fixture(episodes: usize) -> (LockedSource, FoundationProposal, Value) {
+        let source=prepare_source(&(1..=episodes).map(|i|format!("第{i}集\n场景：大厅\n△{}\n小王：开始。\n","走".repeat(3000))).collect::<String>()).unwrap();
+        let mut foundation=empty_foundation(&source);
+        foundation.assets=(0..500).map(|i|FoundationAsset{
+            id:format!("preserved-asset-{i}"),name:format!("人物{i}"),kind:"CH".into(),aliases:vec![],description:String::new(),
+            source_refs:vec![],variants:vec![],metadata:Default::default(),
+        }).collect();
+        let context=json!({"foundationModelInputProfile":super::super::foundation_wire::PROFILE,"settings":{"direction":""}});
+        (source,foundation,context)
+    }
+    fn capacity_pending_identity(pending: &[Batch]) -> Value {
+        json!(pending.iter().map(|b|json!({"key":b.key(),"scope":b.scope,"fragment":b.fragment,"pieces":b.pieces.iter().map(|p|json!([p.row_id,p.start,p.end,p.text])).collect::<Vec<_>>()})).collect::<Vec<_>>())
+    }
+    #[test]
+    fn capacity_legacy_split_wins_even_when_early_factoring_could_expand_it() {
+        let (source,foundation,mut context)=capacity_fallback_fixture(4);
+        let scope=source.episodes.iter().map(|e|e.id.clone()).collect::<Vec<_>>();
+        let original=plan_batches(&source,&scope).unwrap();
+        assert_eq!(original.len(),1);
+        let singleton=Batch{scope:scope[..1].to_vec(),pieces:whole_rows(&source,&scope[..1]),fragment:None};
+        let small=capacity_input("F2",input_for("F2",&source,&singleton,&foundation,&context,0,2,false,&[]),&f2_schema()).unwrap();
+        let baseline=request_chars("F2",&small,&f2_schema()).unwrap();
+        assert!(baseline+500<MODEL_TRANSPORT_LIMIT);
+        context["settings"]["direction"]=json!("字".repeat(MODEL_TRANSPORT_LIMIT-baseline-500));
+        let mut old_pending=original.clone();
+        let old=prepare_capacity_batch_mode("F2",&source,&mut old_pending,&foundation,&context,0,&[],false).unwrap();
+        assert!(old.0.scope.len()<scope.len(),"fixture must require the legacy split");
+        let mut early_pending=original.clone();
+        let early=prepare_capacity_batch_mode("F2",&source,&mut early_pending,&foundation,&context,0,&[],true).unwrap();
+        assert!(early.0.scope.len()>old.0.scope.len(),"prove premature factoring changes the historical boundary");
+        let mut actual_pending=original;
+        let actual=prepare_capacity_batch("F2",&source,&mut actual_pending,&foundation,&context,0,&[]).unwrap();
+        assert_eq!(actual.0.key(),old.0.key());
+        assert_eq!(actual.1.to_string(),old.1.to_string(),"preserve complete frozen input, count and scope");
+        assert!(actual.1.get(super::super::foundation_wire_table::FIELD).is_none());
+        assert_eq!(capacity_pending_identity(&actual_pending),capacity_pending_identity(&old_pending));
+    }
+    #[test]
+    fn capacity_typed_overflow_restarts_original_pending_then_marks_only_new_request() {
+        let (source,foundation,mut context)=capacity_fallback_fixture(1);
+        let scope=source.episodes.iter().map(|e|e.id.clone()).collect::<Vec<_>>();
+        let original=plan_batches(&source,&scope).unwrap();
+        let small=capacity_input("F2",input_for("F2",&source,&original[0],&foundation,&context,0,1,false,&[]),&f2_schema()).unwrap();
+        let baseline=request_chars("F2",&small,&f2_schema()).unwrap();
+        assert!(baseline<MODEL_TRANSPORT_LIMIT);
+        context["settings"]["direction"]=json!("字".repeat(MODEL_TRANSPORT_LIMIT-baseline+2000));
+        let mut failed_pending=original.clone();
+        assert!(matches!(prepare_capacity_batch_mode("F2",&source,&mut failed_pending,&foundation,&context,0,&[],false),Err(CapacityPlanningFailure::Capacity)));
+        assert!(failed_pending.is_empty(),"inner old attempt consumed its own local queue");
+        let mut actual_pending=original.clone();
+        let (batch,mut input)=prepare_capacity_batch("F2",&source,&mut actual_pending,&foundation,&context,0,&[]).unwrap();
+        assert_eq!(batch.key(),original[0].key());
+        assert!(actual_pending.is_empty());
+        assert_eq!(input[super::super::foundation_wire_table::FIELD],super::super::foundation_wire_table::PROFILE);
+        assert!(fits("F2",&input,&f2_schema()).unwrap());
+        input.as_object_mut().unwrap().remove(super::super::foundation_wire_table::FIELD);
+        let old=capacity_input("F2",input_for("F2",&source,&original[0],&foundation,&context,0,1,false,&[]),&f2_schema()).unwrap();
+        assert_eq!(input,old,"no canonical input truncated, rewritten, or silently dropped");
+    }
+    #[test]
+    fn capacity_invalid_and_irreducible_failures_preserve_pending_queue() {
+        let (source,foundation,mut context)=capacity_fallback_fixture(1);
+        let scope=source.episodes.iter().map(|e|e.id.clone()).collect::<Vec<_>>();
+        let original=plan_batches(&source,&scope).unwrap();
+        context["assetCoverageProfile"]=json!("invalid-profile");
+        let mut inner=original.clone();
+        assert!(matches!(prepare_capacity_batch_mode("F2",&source,&mut inner,&foundation,&context,0,&[],false),Err(CapacityPlanningFailure::Invalid(_))));
+        let mut pending=original.clone();
+        assert!(prepare_capacity_batch("F2",&source,&mut pending,&foundation,&context,0,&[]).is_err());
+        assert_eq!(capacity_pending_identity(&pending),capacity_pending_identity(&original));
+        context.as_object_mut().unwrap().remove("assetCoverageProfile");
+        context["settings"]["direction"]=json!("字".repeat(REQUEST_BUDGET));
+        assert!(prepare_capacity_batch("F2",&source,&mut pending,&foundation,&context,0,&[]).is_err());
+        assert_eq!(capacity_pending_identity(&pending),capacity_pending_identity(&original));
     }
     #[test]
     fn capacity_projection_preserves_small_request_bytes_and_rejects_indivisible_overflow() {

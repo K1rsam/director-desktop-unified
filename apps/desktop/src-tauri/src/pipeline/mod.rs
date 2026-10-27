@@ -9,6 +9,7 @@ pub mod asset_production_context;
 mod assets;
 pub mod foundation_delivery;
 pub(crate) mod foundation_wire;
+pub(crate) mod foundation_wire_table;
 #[cfg(test)]
 #[path = "foundation_direction_seed_tests.rs"]
 mod foundation_direction_seed_tests;

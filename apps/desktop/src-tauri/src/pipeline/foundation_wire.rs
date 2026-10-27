@@ -685,6 +685,10 @@ pub(crate) fn compile(stage: &str, input: &Value, schema: &Value) -> Result<Comp
     } else {
         format!("{prefix}{guide}")
     });
+    // A new frozen opt-in marks catalogue table encoding. Old snapshots without
+    // it keep their original transport bytes and cache identity. IDs are already
+    // aliased; the table changes representation only, never source or contents.
+    super::foundation_wire_table::pack_input(&mut compiled)?;
     wire.input = compiled;
     if let Some(rows) = wire
         .schema
@@ -768,6 +772,39 @@ mod tests {
             &json!({"$defs":{"sourceRow":{"type":"string","enum":["r:0:8","r:8:16"]}}}),
         )
         .unwrap()
+    }
+    #[test]
+    fn catalogue_table_is_opt_in_after_aliasing_and_preserves_response_contract() {
+        let original_wire = simple();
+        let mut input = original_wire.input.clone();
+        original_wire.restore(&mut input).unwrap();
+        for n in 0..350 {
+            input["registry"].as_array_mut().unwrap().push(json!({
+                "key":format!("table-asset:{n}"),"name":"同名人物","aliases":["a1"],"type":"CH",
+                "variants":[{"key":format!("table-variant:{n}"),"name":"独立形象","fromKey":null,
+                    "preparation":{"mode":"REFERENCE","note":"逐字保留同一说明，各条身份仍然独立。"}}]
+            }));
+        }
+        let schema=json!({"type":"object","properties":{"sourceRefs":{"type":"array","items":{"type":"string"}}}});
+        let legacy=compile("F2",&input,&schema).unwrap();
+        assert!(legacy.input["registry"].is_array());
+        assert_eq!(compile("F2",&input,&schema).unwrap().input.to_string(),legacy.input.to_string());
+        input[super::super::foundation_wire_table::FIELD]=json!(super::super::foundation_wire_table::PROFILE);
+        let packed=compile("F2",&input,&schema).unwrap();
+        assert!(packed.input.to_string().len()<legacy.input.to_string().len());
+        assert_eq!(packed.schema,legacy.schema);
+        assert_eq!(packed.input["source"],legacy.input["source"]);
+        assert_eq!(packed.input["evidence"],legacy.input["evidence"]);
+        let mut expanded=packed.input.clone();
+        expanded["registry"]=super::super::foundation_wire_table::unpack_registry(&expanded["registry"]).unwrap();
+        packed.restore(&mut expanded).unwrap();
+        expanded["transportInstructions"]=input["transportInstructions"].clone();
+        assert_eq!(expanded,input);
+        let mut response=json!({"assets":[{"key":"a1","name":"a1","variants":[{"key":"v1","name":"v1"}]}]});
+        let mut old_response=response.clone();
+        packed.restore(&mut response).unwrap();legacy.restore(&mut old_response).unwrap();
+        assert_eq!(response,old_response);
+        assert_eq!(response["assets"][0]["name"],"a1");
     }
     #[test]
     fn conflict_decision_wire_roundtrips_typed_references_without_rewriting_hashes_or_text() {

@@ -14007,3 +14007,7 @@ mod series_controller_review;
 #[cfg(test)]
 #[path = "text_executor_sdk_receipt_tests.rs"]
 mod sdk_receipt_compat_tests;
+
+#[cfg(test)]
+#[path = "text_executor_foundation_current_replay_tests.rs"]
+mod foundation_current_replay_tests;
