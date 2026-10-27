@@ -463,6 +463,38 @@ fn frozen_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 fn canonical(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path).map_err(|e| e.to_string())
 }
+/// Worker paths are part of the frozen request contract. Parallel lanes are
+/// accepted only at the exact derived authorization/lane path, never merely
+/// because a directory happens to be named lane-N.
+fn validate_wrapper_worker(root: &Path, record: &Value) -> Result<()> {
+    const HELD: &str = "SDK_WRAPPER_ATTEMPT_DIRECTORY";
+    let worker = root.parent().and_then(Path::parent).ok_or(HELD)?;
+    let marker = record.pointer("/attempt/request/input/foundationParallelTrial");
+    if marker.is_none() {
+        return if worker.file_name().and_then(|s| s.to_str()) == Some("sdk-worker") {
+            Ok(())
+        } else { Err(HELD.into()) };
+    }
+    let attempt: FrozenAttempt = serde_json::from_value(record["attempt"].clone()).map_err(|_| HELD)?;
+    attempt.validate_identity().map_err(|_| HELD)?;
+    let marker = marker.unwrap();
+    if attempt.backend != Backend::CodexSdk
+        || marker["workflowId"] != attempt.workflow_id
+        || marker["version"] != "foundation-three-lane-trial/v1"
+        || marker["concurrency"] != 3
+        || !matches!((attempt.request.stage.as_str(), attempt.request.skill.as_str()),
+            ("foundation:F2", "foundation-asset-catalog") | ("foundation:Q1", "foundation-finishing-editor"))
+        || attempt.request.input["delivery"]["method"] != "foundation-delivery/v2"
+        || ["authorizationSha256", "sourceSha256", "basisSha256"].iter().any(|key| !valid_sha(s(marker, key)))
+        || s(marker, "packetId").is_empty() || s(marker, "packetId").len() > 512
+        || s(marker, "packetId").chars().any(|c| c.is_control() || c == '/' || c == '\\')
+    { return Err(HELD.into()); }
+    let project = worker.parent().and_then(Path::parent).and_then(Path::parent).ok_or(HELD)?;
+    if canonical(&worker_root(project, &attempt.request).map_err(|_| HELD)?)? != worker {
+        return Err(HELD.into());
+    }
+    Ok(())
+}
 fn validate_argv(args: &[String], plan: &RuntimePlan) -> Result<PathBuf> {
     if args.first().map(String::as_str) != Some("exec") {
         return Err("SDK_WRAPPER_EXEC_ONLY".into());
@@ -597,18 +629,12 @@ fn run_runtime_wrapper_plan(
     }
     let root = canonical(file.parent().unwrap())?;
     if file.file_name().and_then(|s| s.to_str()) != Some("runtime-plan.json")
-        || ![Some("native-runtime"), Some("native-runtime-wrapper-repair"),Some(schema_recovery::SCHEMA_RECOVERY_ROOT)].contains(&root.file_name().and_then(|s| s.to_str()))
+        || ![Some("native-runtime"), Some("native-runtime-wrapper-repair"),Some(schema_recovery::SCHEMA_RECOVERY_ROOT),Some("native-runtime-lane-recovery")].contains(&root.file_name().and_then(|s| s.to_str()))
         || root
             .parent()
             .and_then(Path::file_name)
             .and_then(|s| s.to_str())
             != Some(plan.attempt_id.as_str())
-        || root
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(|s| s.to_str())
-            != Some("sdk-worker")
     {
         return Err("SDK_WRAPPER_ATTEMPT_DIRECTORY".into());
     }
@@ -617,8 +643,10 @@ fn run_runtime_wrapper_plan(
         4_194_304,
     )?)
     .map_err(|_| "SDK_WRAPPER_RECEIPT_INVALID")?;
+    validate_wrapper_worker(&root, &record)?;
     if record.get("wrapperPreparationRepair").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some("native-runtime-wrapper-repair"))
         || record.get("schemaPreparationRecovery").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some(schema_recovery::SCHEMA_RECOVERY_ROOT))
+        || record.get("lanePreparationRecovery").is_some() != (root.file_name().and_then(|s|s.to_str()) == Some("native-runtime-lane-recovery"))
         || record["state"] != "dispatching"
         || record["attempt"]["attemptId"] != plan.attempt_id
         || !wrapper_runtime_identity_bound(&record, &plan, root.parent().unwrap())?
@@ -666,6 +694,9 @@ fn run_runtime_wrapper_plan(
 }
 fn wrapper_runtime_identity_bound(record: &Value, plan: &RuntimePlan, attempt_root: &Path) -> Result<bool> {
     let effective = serde_json::to_value(&plan.identity).map_err(|e| e.to_string())?;
+    if record.get("lanePreparationRecovery").is_some() {
+        return lane_recovery_record_bound(attempt_root, record, &effective);
+    }
     if record.get("schemaPreparationRecovery").is_some() {
         return schema_recovery_record_bound(attempt_root,record,&effective);
     }

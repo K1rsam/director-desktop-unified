@@ -26,7 +26,8 @@ fn sdk_recovery_progress(c: &Connection, job: &str) -> rusqlite::Result<Option<V
         "SELECT e.id,e.created_at FROM events e JOIN jobs j ON j.id=e.job_id
          WHERE j.id=?1 AND j.kind='text' AND j.provider='codex_sdk' AND j.state='submission_unknown'
          AND ((e.type='sdk_local_preparation_recovery_reserved' AND json_extract(j.prepared,'$.sdkLocalPreparationRecovery')=json(e.data))
-           OR (e.type='sdk_wrapper_preparation_repair_reserved' AND json_extract(j.prepared,'$.sdkWrapperPreparationRepair')=json(e.data)))
+           OR (e.type='sdk_wrapper_preparation_repair_reserved' AND json_extract(j.prepared,'$.sdkWrapperPreparationRepair')=json(e.data))
+           OR (e.type='sdk_lane_preparation_recovery_reserved' AND json_extract(j.prepared,'$.sdkLanePreparationRecovery')=json(e.data)))
          ORDER BY e.id DESC LIMIT 1", [job], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
     let Some((reservation_id, started)) = reservation else { return Ok(None); };
@@ -2235,6 +2236,26 @@ mod sdk_progress_tests {
         store.event(&text,"sdk_local_preparation_recovery_reserved",&json!({"proof":"changed"})).unwrap();
         store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started"}})).unwrap();
         assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
+    }
+
+    #[test]
+    fn sdk_lane_progress_shows_only_bound_recovery_events_and_keeps_unknown() {
+        let (_dir, store, _run, text, _started) = sdk_progress_fixture();
+        let saved = json!({"proof":{"private":"original lane proof"}});
+        let prepared = json!({"sdkDispatchStarted":true,"sdkLanePreparationRecovery":saved});
+        store.conn().unwrap().execute("UPDATE jobs SET state='submission_unknown',prepared=?1 WHERE id=?2",params![prepared.to_string(),text]).unwrap();
+        store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started"}})).unwrap();
+        store.event(&text,"sdk_lane_preparation_recovery_reserved",&json!({"proof":"mismatch"})).unwrap();
+        assert!(store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].is_null());
+        store.event(&text,"sdk_lane_preparation_recovery_reserved",&saved).unwrap();
+        let waiting = store.workflow_progress().unwrap()[0]["nodes"][0]["execution"].clone();
+        assert!(waiting["lastEventType"].is_null(),"old events cannot masquerade as recovery progress");
+        store.event(&text,"sdk_event",&json!({"rawEvent":{"type":"turn.started","private":"payload"}})).unwrap();
+        let active = store.workflow_progress().unwrap();
+        assert_eq!(active[0]["nodes"][0]["execution"]["phase"],"executing");
+        assert!(!serde_json::to_string(&active).unwrap().contains("private"));
+        assert_eq!(store.job(&text).unwrap()["status"],"submission_unknown");
+        assert_eq!(store.job(&text).unwrap()["prepared"],prepared);
     }
 
     #[test]

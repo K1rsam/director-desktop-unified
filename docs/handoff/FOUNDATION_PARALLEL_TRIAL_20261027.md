@@ -84,3 +84,35 @@
 - 上一版：`a7a56b47ea43e6fee81fe637d1755af412253fef2d7c2113cf23f1b2f2dc7254`。
 - 发布目录仅保留当前/上一版两个 EXE；已验证候选按发布脚本清理。
 - 用户正在前台操作其它项目，未重新调用 Computer Use。等待用户在原客户端点击“三路加速继续（试用）”后，从后台回执观察真实运行；尚不宣称 50–150 集生产或 Q1 完成。
+
+## 首次安装版三路试跑：原生目录校验缺口
+
+用户于本地时间 14:20 从原客户端点击三路续跑，唯一授权事件已持久化。前 49 集按原检查点复用；50–55 集首路在约两秒内进入 `submission_unknown`，其余两路未提交。该轮没有完成三路生成、Q1 或最终采用。
+
+确定性原因是 `sdk_native.rs` 的原生 wrapper 仍只允许 `sdk-worker/<attempt>/native-runtime`，新三路工作目录为 `sdk-worker-trials/<authorization>/lane-N/<attempt>/native-runtime`。旧安装版在读取 prompt 及调用官方运行器前返回 `SDK_WRAPPER_ATTEMPT_DIRECTORY`；固定官方 SDK 在向已关闭的 stdin 写入时发生未捕获 `write EOF`，因此外层仅收到 `SDK_STDERR_CLOSED`，按合同保留 UNKNOWN。
+
+已用哈希匹配的实际安装版和原 runtime plan 在 unpackaged 原生 runner 中复现目录拒绝，空 argv、空 stdin 保证不可能进入模型调用。退出码 101，明确错误 `SDK_WRAPPER_ATTEMPT_DIRECTORY`，原 plan 未变，runner 证明进程树清空。私有证据位于 `.local/foundation-three-lane-20261027/first-live-failure/`，含修复前只读数据库备份、文件指纹和原生探针回执。
+
+此前合成三路调度测试与单路 native wrapper 测试分别通过，未覆盖两者结合的目录路径；不能据此宣称三路安装版已验收。当前修复须同时覆盖精确三路目录绑定，以及有完整证据的原任务一次性准备恢复。不得凭 EOF、空事件或没有结果直接重发，也不得修改原冻结请求。
+
+## 原生目录修复及一次性恢复候选
+
+已补齐两条链：普通三路任务按冻结的 workflow、授权摘要、lane、attempt 及 F2/Q1 岗位核验实际目录；本次旧版准备失败仅在固定旧 EXE/bridge、原请求与 schema、零 SDK 事件、完整运行目录及已停止进程树共同证明下，允许同 job、同 attempt 恢复一次。
+
+恢复先以数据库 CAS 预约，再独占封存原 receipt、证据和恢复意图，最后初始化 sidecar。原冻结请求不改，原运行目录不覆盖。意图一经消费，再次恢复只能核对；不能凭 EOF、无回包或切换账户重新派发。恢复中的新 SDK 事件已接入客户端进度投影，UNKNOWN 的事实及历史错误保留。
+
+最终候选验证（2026-10-27）：
+
+- SDK bridge 相关三文件 132 项通过；controller 最终字节另测 14 项通过，不将重复运行累计为独立用例。
+- Windows unpackaged runner：wrapper 9 项、恢复状态 3 项、实际原任务只读证据 1 项、三路合同 4 项、恢复进度 1 项，共 18 项通过。真实只读证据测试为单独显式执行的 ignored 项，未批量启用其它忽略项。
+- 原生 wrapper 回归包含 F2/Q1 三路有效路径、13 类普通路径/身份污染拒绝，以及完整恢复链正例和 7 类恢复链污染拒绝；不会凭名称包含 lane 就放行。
+- 最终 release 构建成功；候选 SHA-256 为 `a18e70e069a5de0512313f0c77be622f10fa15a164ce4faeddb04a830878fb1d`。
+- 同一候选在独立诊断 home 完成首次隐藏启动及保存重开。两轮均 `ok=true`、`backgroundWindowVerified=true`、`generationRequestsSent=0`、`generationJobs=0`；第二轮 `saveReopenVerified=true`、`saveReopenPageVerified=true`。原生 runner 均退出且进程树清空。
+- 再次只读核对真实项目：原失败相关 10 份文件指纹全部未变，原子任务仍只有原先 7 个事件，状态仍为 `submission_unknown`。未人为改库、未发送恢复请求，前 49 集按原检查点保留。
+- `git diff --check` 通过；原有两份 `foundationCoverage` 行尾状态保留，不纳入本次提交。
+
+本机证据：`.local/foundation-three-lane-20261027/lane-fix-native-final/`、`lane-progress-native/`、`lane-fix-node*.log`、`lane-fix-build-final.log`、`lane-smoke-runner1/`、`lane-smoke-runner2/` 和 `lane-candidate-smoke/`。私有项目、请求、回包及证据正文不上传。
+
+此时安装版仍为 `80349b58…`，客户端由用户保持打开，尚未替换。正常关闭后应发布上述最终候选，让旧安装版成为上一版，保留其哈希用于原失败证明。更新后通过原进度卡“核对原结果后继续”恢复；已有三路授权不重建，不再要求寻找初次“三路加速继续（试用）”入口。
+
+真实原任务恢复、第 50–150 集三路产出、Q1 分路核对和统一收口仍待原客户端运行验收；上述工程与离线安装包结果不代表这些生产阶段已通过。本轮未提交图片或视频，未操作或关闭用户前台。

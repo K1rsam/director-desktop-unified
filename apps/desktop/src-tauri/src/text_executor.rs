@@ -4544,6 +4544,8 @@ mod sdk_supervisor_handoff;
 mod sdk_account_handoff;
 #[path = "text_executor_sdk_local_recovery.rs"]
 mod sdk_local_recovery;
+#[path = "text_executor_sdk_lane_recovery.rs"]
+mod sdk_lane_recovery;
 #[path = "text_executor_sdk_schema_recovery.rs"]
 mod sdk_schema_recovery;
 #[path = "text_executor_sdk_schema_rejection.rs"]
@@ -12004,6 +12006,7 @@ impl SavedTextExecutor {
         self.sdk_parallel_worker_bound(job,snapshot)?;
         self.sdk_local_recovery_bound(job)?;
         self.sdk_schema_recovery_bound(job)?;
+        self.sdk_lane_recovery_bound(job)?;
         self.sdk_input_envelope_bound(job,snapshot)?;
         let fail = || {
             "SDK_RAW_BINDING_MISMATCH: 原请求、原始文本、事件、回执或执行身份不一致；证据与预算保留"
@@ -12166,6 +12169,7 @@ impl SavedTextExecutor {
                 return Err("SDK_EXISTING_ATTEMPT_UNRESOLVED: 新工作流不能替换原未知执行".into());
             }
             if let Some(value)=self.sdk_recover_input_frame(request,snapshot,&job,&original).await? {return Ok(value);}
+            if let Some(value)=self.sdk_recover_lane_preparation(request,snapshot,&job,&original).await?{return Ok(value);}
             if let Some(value) = self.sdk_recover_schema_preparation(request, snapshot, &job, &original).await? {
                 return Ok(value);
             }

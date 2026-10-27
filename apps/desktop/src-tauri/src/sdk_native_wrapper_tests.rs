@@ -66,6 +66,112 @@ impl Fixture {
         Self { _temp: temp, attempt_directory, plan, record, prompt: compiled.prompt }
     }
     fn attempt_dir(&self) -> PathBuf { self.attempt_directory.clone() }
+    fn rebind_request(&mut self, request: crate::pipeline::TextRequest) {
+        let old: FrozenAttempt = serde_json::from_value(self.record["attempt"].clone()).unwrap();
+        let attempt = FrozenAttempt::prepare_sdk_rules_first(&old.attempt_id, &old.workflow_id,
+            &old.logical_node_id, request, &old.runtime_identity).unwrap();
+        let compiled = crate::text_executor::compile_sdk_attempt_input(&attempt).unwrap();
+        self.plan.semantic_request_hash = attempt.semantic_request_hash.clone();
+        self.plan.execution_fingerprint = attempt.execution_fingerprint.clone();
+        self.plan.compiled_prompt_sha256 = digest(&compiled.prompt);
+        self.plan.compiled_schema_sha256 = digest(&compiled.schema);
+        let schema: Value = serde_json::from_str(&compiled.schema).unwrap();
+        self.plan.runtime_schema_sha256 = digest(&schema.to_string());
+        std::fs::write(self.plan.temp_directory.join("schema.json"), schema.to_string()).unwrap();
+        self.record["attempt"] = json!(attempt);
+        self.record["frozenAttemptSha256"] = json!(digest(&json!(attempt).to_string()));
+        self.record["requestSnapshotSha256"] = json!(digest(&json!(attempt.request).to_string()));
+        self.record["compiledPrompt"] = json!(compiled.prompt);
+        self.record["compiledSchema"] = json!(compiled.schema);
+        self.record["compiledPromptSha256"] = json!(self.plan.compiled_prompt_sha256);
+        self.record["compiledSchemaSha256"] = json!(self.plan.compiled_schema_sha256);
+        self.prompt = compiled.prompt;
+    }
+    fn rebind_wrapper_identity(&mut self, request: crate::pipeline::TextRequest) {
+        let old: FrozenAttempt = serde_json::from_value(self.record["attempt"].clone()).unwrap();
+        let attempt = FrozenAttempt::prepare_sdk_rules_first(&old.attempt_id, &old.workflow_id,
+            &old.logical_node_id, request, &old.runtime_identity).unwrap();
+        self.plan.semantic_request_hash = attempt.semantic_request_hash.clone();
+        self.plan.execution_fingerprint = attempt.execution_fingerprint.clone();
+        self.record["attempt"] = json!(attempt);
+        self.record["frozenAttemptSha256"] = json!(digest(&json!(attempt).to_string()));
+        self.record["requestSnapshotSha256"] = json!(digest(&json!(attempt.request).to_string()));
+    }
+    fn parallel(lane: u64, stage: &str) -> Self {
+        let mut f = Self::new(false);
+        let new = f._temp.path().join("sdk-worker-trials").join("a".repeat(64))
+            .join(format!("lane-{lane}")).join("attempt-synthetic");
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::rename(f.attempt_dir(), &new).unwrap();
+        f.attempt_directory = new;
+        f.plan.working_directory = f.attempt_dir().join("native-runtime/work");
+        f.plan.temp_directory = f.attempt_dir().join("native-runtime/tmp");
+        let request = crate::pipeline::TextRequest {
+            stage: format!("foundation:{stage}"),
+            skill: if stage == "F2" { "foundation-asset-catalog" } else { "foundation-finishing-editor" }.into(),
+            model: f.plan.model.clone(), reasoning: f.plan.reasoning.clone(),
+            input: json!({"delivery":{"method":"foundation-delivery/v2"},
+                "foundationParallelTrial":{"version":"foundation-three-lane-trial/v1", "concurrency":3,
+                    "authorizationSha256":"a".repeat(64), "sourceSha256":"b".repeat(64), "basisSha256":"c".repeat(64),
+                    "workflowId":"synthetic-workflow", "laneId":lane, "packetId":format!("synthetic:{stage}:{lane}")}}),
+            schema: json!({"type":"object"}), rule_snapshot: json!({}),
+        };
+        f.rebind_request(request);
+        f
+    }
+    fn lane_recovery() -> Self {
+        let mut f = Self::parallel(0, "F2");
+        let effective = json!(f.plan.identity);
+        let mut failed_identity = effective.clone();
+        failed_identity["supervisorSha256"] = json!(LANE_FAILED_SUPERVISOR_SHA);
+        failed_identity["bridgeSha256"] = json!(crate::text_sdk::lane_recovery::LANE_FAILED_BRIDGE_SHA);
+        f.record["attempt"]["runtimeIdentity"] = failed_identity.clone();
+        let request = serde_json::from_value(f.record["attempt"]["request"].clone()).unwrap();
+        f.rebind_request(request);
+        let dir = f.attempt_dir();
+        let runtime = dir.join("native-runtime");
+        std::fs::write(runtime.join("work/.director-text-root"), b"director SDK text execution\n").unwrap();
+        let schema = std::fs::read(runtime.join("tmp/schema.json")).unwrap();
+        let schema_dir = runtime.join("tmp/codex-output-schema-synthetic");
+        std::fs::create_dir(&schema_dir).unwrap();
+        std::fs::rename(runtime.join("tmp/schema.json"), schema_dir.join("schema.json")).unwrap();
+        let mut failed_plan = json!(f.plan);
+        failed_plan["identity"] = failed_identity;
+        std::fs::write(runtime.join("runtime-plan.json"), failed_plan.to_string()).unwrap();
+        let original_bytes = seal(&f.record);
+        let original: Value = serde_json::from_str(&original_bytes).unwrap();
+        std::fs::write(dir.join("lane-preparation-original.json"), &original_bytes).unwrap();
+        let a = &original["attempt"];
+        let events = json!([
+            {"id":1,"type":"sdk_dispatch_receipt","data":{"ok":true,"protocolVersion":PROTOCOL,"attemptId":a["attemptId"],"result":{
+                "state":"dispatching","lastSequence":0,"semanticRequestHash":a["semanticRequestHash"],"executionFingerprint":a["executionFingerprint"],
+                "attemptEnvelopeHash":a["attemptEnvelopeHash"],"compiledPromptSha256":original["compiledPromptSha256"],"compiledSchemaSha256":original["compiledSchemaSha256"]}}},
+            {"id":2,"type":"sdk_transport_unknown","data":{"attemptId":a["attemptId"],"lastSdkSequence":0,"error":"SDK_STDERR_CLOSED"}},
+            {"id":3,"type":"sdk_process_tree","data":{"processTreeStopProven":true,"activeProcesses":0,"totalProcesses":3}},
+            {"id":4,"type":"sdk_stderr","data":{"truncated":false,"bytes":511,"retainedBytes":511}}
+        ]);
+        let inventory = crate::text_sdk::lane_recovery::lane_runtime_inventory(&runtime).unwrap();
+        let evidence = json!({"version":"sdk-lane-preparation-evidence/v1","attemptId":a["attemptId"],"attemptEnvelopeHash":a["attemptEnvelopeHash"],
+            "originalReceiptSha256":digest(&original_bytes),"originalReceiptSeal":original["receiptEnvelopeSha256"],
+            "runtimeInventory":inventory,"runtimeInventorySha256":digest(&inventory.to_string()),
+            "events":events,"eventsSha256":digest(&events.to_string()),"failedSupervisorSha256":LANE_FAILED_SUPERVISOR_SHA,
+            "sdkImplementationSha256":SDK_IMPLEMENTATION_SHA,"sdkEvents":0,"processTreeStopProven":true,"beforeOfficialRuntimeSpawn":true});
+        let proof = json!({"version":"sdk-lane-preparation-recovery/v1","attemptId":a["attemptId"],"attemptEnvelopeHash":a["attemptEnvelopeHash"],
+            "controllerSha256":lane_controller_sha256(),"originalReceiptSha256":digest(&original_bytes),"originalReceiptSeal":original["receiptEnvelopeSha256"],
+            "runtimeInventorySha256":digest(&inventory.to_string()),"evidenceSha256":digest(&evidence.to_string()),"effectiveIdentitySha256":digest(&effective.to_string()),
+            "sdkEvents":0,"processTreeStopProven":true,"beforeOfficialRuntimeSpawn":true});
+        std::fs::write(dir.join("lane-preparation-evidence.json"), evidence.to_string()).unwrap();
+        std::fs::write(dir.join("lane-preparation-recovery.json"), proof.to_string()).unwrap();
+        f.record["lanePreparationRecovery"] = json!({"proof":proof,"effectiveIdentity":effective});
+        let recovered_runtime = dir.join("native-runtime-lane-recovery");
+        std::fs::create_dir_all(recovered_runtime.join("work")).unwrap();
+        std::fs::create_dir(recovered_runtime.join("tmp")).unwrap();
+        std::fs::write(recovered_runtime.join("work/.director-text-root"), b"director SDK text execution\n").unwrap();
+        std::fs::write(recovered_runtime.join("tmp/schema.json"), schema).unwrap();
+        f.plan.working_directory = recovered_runtime.join("work");
+        f.plan.temp_directory = recovered_runtime.join("tmp");
+        f
+    }
     fn schema_recovery() -> Self {
         let mut f=Self::with_padding(false,&"x".repeat(190));let dir=f.attempt_dir();let runtime=dir.join("native-runtime");
         // This is the historical ENOENT package, not today's schema compiler.
@@ -227,6 +333,115 @@ fn sdk_native_wrapper_full_validation_accepts_frozen_normal_and_proven_recovery_
         assert_eq!(launches, 1); assert_eq!(f.record["attempt"], frozen);
         if let Some(archive) = archive { assert_eq!(std::fs::read(f.attempt_dir().join("local-preparation-original.json")).unwrap(), archive); }
         assert!(!f.attempt_dir().join("native-runtime/process-receipt.json").exists());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_native_wrapper_full_validation_accepts_exact_frozen_three_lane_roots() {
+    for stage in ["F2", "Q1"] {
+        for lane in 0..3 {
+            let f = Fixture::parallel(lane, stage);
+            let frozen = f.record["attempt"].clone();
+            let mut launches = 0;
+            assert_eq!(f.run(&super::tests::args(&f.plan), f.prompt.as_bytes(), &mut launches).unwrap(), 0);
+            assert_eq!(launches, 1);
+            assert_eq!(f.record["attempt"], frozen);
+            assert!(!f.attempt_dir().join("native-runtime/process-receipt.json").exists());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_native_wrapper_full_validation_rejects_parallel_scope_forgery_before_launch() {
+    for fault in ["lane", "authorization", "missing-marker", "null-marker", "workflow", "stage", "skill", "method", "version", "concurrency", "packet", "basis", "legacy-root"] {
+        let mut f = Fixture::parallel(0, "F2");
+        let mut request: crate::pipeline::TextRequest = serde_json::from_value(f.record["attempt"]["request"].clone()).unwrap();
+        match fault {
+            "lane" => request.input["foundationParallelTrial"]["laneId"] = json!(1),
+            "authorization" => request.input["foundationParallelTrial"]["authorizationSha256"] = json!("d".repeat(64)),
+            "missing-marker" => { request.input.as_object_mut().unwrap().remove("foundationParallelTrial"); },
+            "null-marker" => request.input["foundationParallelTrial"] = Value::Null,
+            "workflow" => request.input["foundationParallelTrial"]["workflowId"] = json!("foreign-workflow"),
+            "stage" => request.stage = "seriesAuthor".into(),
+            "skill" => request.skill = "foreign-skill".into(),
+            "method" => request.input["delivery"]["method"] = json!("other"),
+            "version" => request.input["foundationParallelTrial"]["version"] = json!("unknown"),
+            "concurrency" => request.input["foundationParallelTrial"]["concurrency"] = json!(4),
+            "packet" => request.input["foundationParallelTrial"]["packetId"] = json!("../escape"),
+            "basis" => request.input["foundationParallelTrial"]["basisSha256"] = json!("invalid"),
+            "legacy-root" => {
+                let new = f._temp.path().join("sdk-worker/attempt-synthetic");
+                std::fs::rename(f.attempt_dir(), &new).unwrap(); f.attempt_directory = new;
+                f.plan.working_directory = f.attempt_dir().join("native-runtime/work");
+                f.plan.temp_directory = f.attempt_dir().join("native-runtime/tmp");
+            },
+            _ => unreachable!(),
+        }
+        // Re-freeze the request identity without passing the malformed marker
+        // through the compiler first: this exercises the wrapper's own gate,
+        // rather than only the compiler or an outdated envelope hash.
+        f.rebind_wrapper_identity(request);
+        let mut launches = 0;
+        assert!(f.run(&super::tests::args(&f.plan), f.prompt.as_bytes(), &mut launches).is_err(), "{fault}");
+        assert_eq!(launches, 0, "{fault}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_native_wrapper_full_validation_accepts_proven_same_attempt_lane_recovery() {
+    let f = Fixture::lane_recovery();
+    let dir = f.attempt_dir();
+    let names = ["lane-preparation-original.json", "lane-preparation-evidence.json", "lane-preparation-recovery.json", "native-runtime/runtime-plan.json"];
+    let before: Vec<_> = names.iter().map(|name| std::fs::read(dir.join(name)).unwrap()).collect();
+    let frozen = f.record["attempt"].clone();
+    assert_eq!(frozen["runtimeIdentity"]["supervisorSha256"], LANE_FAILED_SUPERVISOR_SHA);
+    assert_ne!(frozen["runtimeIdentity"]["supervisorSha256"], json!(f.plan.identity)["supervisorSha256"]);
+    let mut launches = 0;
+    assert_eq!(f.run(&super::tests::args(&f.plan), f.prompt.as_bytes(), &mut launches).unwrap(), 0);
+    assert_eq!(launches, 1);
+    assert_eq!(f.record["attempt"], frozen);
+    for (name, bytes) in names.iter().zip(before) { assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes); }
+    assert!(!dir.join("native-runtime/process-receipt.json").exists());
+    assert!(!dir.join("native-runtime-lane-recovery/process-receipt.json").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn sdk_native_wrapper_full_validation_rejects_tampered_lane_recovery_before_launch() {
+    for fault in ["proof", "archive", "evidence", "controller", "effective-identity", "prior-runtime", "namespace"] {
+        let mut f = Fixture::lane_recovery();
+        let dir = f.attempt_dir();
+        match fault {
+            "proof" => {
+                f.record["lanePreparationRecovery"]["proof"]["beforeOfficialRuntimeSpawn"] = json!(false);
+                std::fs::write(dir.join("lane-preparation-recovery.json"), f.record["lanePreparationRecovery"]["proof"].to_string()).unwrap();
+            },
+            "archive" => std::fs::write(dir.join("lane-preparation-original.json"), "{}").unwrap(),
+            "evidence" => std::fs::write(dir.join("lane-preparation-evidence.json"), "{}").unwrap(),
+            "controller" => {
+                f.record["lanePreparationRecovery"]["proof"]["controllerSha256"] = json!("f".repeat(64));
+                std::fs::write(dir.join("lane-preparation-recovery.json"), f.record["lanePreparationRecovery"]["proof"].to_string()).unwrap();
+            },
+            "effective-identity" => {
+                f.plan.identity.account_fingerprint = "f".repeat(64);
+                f.record["lanePreparationRecovery"]["effectiveIdentity"] = json!(f.plan.identity);
+                f.record["lanePreparationRecovery"]["proof"]["effectiveIdentitySha256"] = json!(digest(&json!(f.plan.identity).to_string()));
+                std::fs::write(dir.join("lane-preparation-recovery.json"), f.record["lanePreparationRecovery"]["proof"].to_string()).unwrap();
+            },
+            "prior-runtime" => std::fs::write(dir.join("native-runtime/runtime-plan.json"), "{}").unwrap(),
+            "namespace" => {
+                let new = dir.join("native-runtime-wrapper-repair");
+                std::fs::rename(dir.join("native-runtime-lane-recovery"), &new).unwrap();
+                f.plan.working_directory = new.join("work"); f.plan.temp_directory = new.join("tmp");
+            },
+            _ => unreachable!(),
+        }
+        let mut launches = 0;
+        assert!(f.run(&super::tests::args(&f.plan), f.prompt.as_bytes(), &mut launches).is_err(), "{fault}");
+        assert_eq!(launches, 0, "{fault}");
     }
 }
 

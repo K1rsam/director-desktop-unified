@@ -46,6 +46,11 @@ pub(crate) use local_recovery::{local_preparation_evidence, local_recovery_ident
 #[path = "text_sdk_schema_recovery.rs"]
 mod schema_recovery;
 pub(crate) use schema_recovery::{schema_preparation_evidence, schema_recovery_identity_bound, schema_recovered_receipt_bound, schema_recovery_record_bound};
+#[path = "text_sdk_lane_recovery.rs"]
+mod lane_recovery;
+pub(crate) use lane_recovery::{lane_preparation_evidence,lane_recovery_identity_bound,lane_recovered_receipt_bound,lane_recovery_record_bound,LANE_FAILED_SUPERVISOR_SHA};
+const LANE_CONTROLLER:&str=include_str!("../../../../sdk-bridge/src/lane-preparation-controller.mjs");
+pub(crate) fn lane_controller_sha256()->String{digest(LANE_CONTROLLER)}
 #[path = "text_sdk_wrapper_repair.rs"]
 mod wrapper_repair;
 pub(crate) use wrapper_repair::{wrapper_preparation_evidence, repaired_receipt_bound, wrapper_repair_record_bound, WRAPPER_FAILED_BRIDGE_SHA, WRAPPER_FAILED_SUPERVISOR_SHA};
@@ -626,12 +631,23 @@ struct Worker {
 }
 impl Worker {
     async fn spawn(config: &Config) -> Result<Self> {
-        Self::spawn_entry(config,false,false).await
+        Self::spawn_entry(config,false,false,false).await
     }
-    async fn spawn_entry(config: &Config, schema_recovery: bool, large_input:bool) -> Result<Self> {
+    async fn spawn_entry(config: &Config, schema_recovery: bool, large_input:bool, lane_recovery:bool) -> Result<Self> {
         config.verify()?;
         std::fs::create_dir_all(&config.state).map_err(|e| e.to_string())?;
-        let entry = if schema_recovery {
+        let entry = if lane_recovery {
+            use std::io::Write;
+            let m=std::fs::symlink_metadata(&config.state).map_err(|e|e.to_string())?;
+            if !m.is_dir()||m.is_symlink(){return Err("SDK_LANE_CONTROLLER_DIRECTORY".into());}
+            let file=config.state.join(format!("lane-controller-{}.mjs",lane_controller_sha256()));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&file){
+                Ok(mut handle)=>{handle.write_all(LANE_CONTROLLER.as_bytes()).map_err(|e|e.to_string())?;handle.sync_all().map_err(|e|e.to_string())?;},
+                Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e.to_string()),
+            }
+            let m=std::fs::symlink_metadata(&file).map_err(|e|e.to_string())?;
+            if !m.is_file()||m.is_symlink()||crate::store::hash_file(&file)?.0!=lane_controller_sha256(){return Err("SDK_LANE_CONTROLLER_CHANGED".into());}file
+        } else if schema_recovery {
             use std::io::Write;
             let metadata=std::fs::symlink_metadata(&config.state).map_err(|e|e.to_string())?;
             if !metadata.is_dir() || metadata.is_symlink() {return Err("SDK_SCHEMA_CONTROLLER_DIRECTORY".into());}
@@ -832,7 +848,7 @@ impl OfficialSdkTransport {
     }
     async fn connect(&self, worker: &mut Option<Worker>) -> Result<()> {
         if worker.is_none() {
-            *worker = Some(if self.large_input.load(Ordering::SeqCst) {Worker::spawn_entry(&self.config,false,true).await?}else{Worker::spawn(&self.config).await?});
+            *worker = Some(if self.large_input.load(Ordering::SeqCst) {Worker::spawn_entry(&self.config,false,true,false).await?}else{Worker::spawn(&self.config).await?});
         }
         Ok(())
     }
@@ -940,11 +956,15 @@ impl OfficialSdkTransport {
     pub(crate) async fn recover_schema_preparation(&self, attempt: &FrozenAttempt, proof: &Value, evidence: &Value) -> Result<Observation> {
         self.execute_method(attempt,Some(&json!({"proof":proof,"evidence":evidence}))).await
     }
+    pub(crate) async fn recover_lane_preparation(&self,attempt:&FrozenAttempt,proof:&Value,evidence:&Value)->Result<Observation>{
+        self.execute_method(attempt,Some(&json!({"proof":proof,"evidence":evidence}))).await
+    }
     async fn execute_method(&self, attempt: &FrozenAttempt, recovery: Option<&Value>) -> Result<Observation> {
         attempt.validate_identity()?;
         self.config.verify_attempt_scope(attempt)?;
+        let lane_recovery=recovery.is_some_and(|r|r["proof"]["version"]==lane_recovery::LANE_RECOVERY_VERSION);
         let schema_recovery=recovery.is_some_and(|r|r["proof"]["version"]==schema_recovery::SCHEMA_RECOVERY_VERSION);
-        if attempt.backend != Backend::CodexSdk || if schema_recovery { !schema_recovery_identity_bound(&attempt.runtime_identity,&self.config.identity) }
+        if attempt.backend != Backend::CodexSdk || if lane_recovery {!lane_recovery_identity_bound(&attempt.runtime_identity,&self.config.identity)} else if schema_recovery { !schema_recovery_identity_bound(&attempt.runtime_identity,&self.config.identity) }
             else if recovery.is_some() { !local_recovery_identity_bound(&attempt.runtime_identity, &self.config.identity) } else { attempt.runtime_identity != self.config.identity }
         {
             return Err("SDK_ATTEMPT_IDENTITY".into());
@@ -958,12 +978,15 @@ impl OfficialSdkTransport {
             *active = Some(attempt.attempt_id.clone());
         }
         let mut worker = self.worker.lock().await;
-        if schema_recovery {
+        if lane_recovery {
+            if worker.is_some(){return Err("SDK_LANE_CONTROLLER_ALREADY_CONNECTED".into());}
+            *worker=Some(Worker::spawn_entry(&self.config,false,false,true).await?);
+        } else if schema_recovery {
             if worker.is_some(){return Err("SDK_SCHEMA_CONTROLLER_ALREADY_CONNECTED".into());}
-            *worker=Some(Worker::spawn_entry(&self.config,true,false).await?);
+            *worker=Some(Worker::spawn_entry(&self.config,true,false,false).await?);
         } else {self.connect(&mut worker).await?;}
         let worker = worker.as_mut().unwrap();
-        let (method, params) = if schema_recovery {
+        let (method, params) = if lane_recovery { ("recover-lane-preparation",recovery.unwrap().clone()) } else if schema_recovery {
             ("recover-schema-preparation",recovery.unwrap().clone())
         } else if let Some(proof) = recovery {
             (if proof["version"] == "sdk-wrapper-preparation-repair/v1" {"repair-wrapper-preparation"} else {"recover-local-preparation"}, json!({"proof":proof}))
