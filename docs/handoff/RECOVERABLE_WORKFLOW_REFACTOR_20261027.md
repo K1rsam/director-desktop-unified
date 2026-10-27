@@ -73,6 +73,7 @@
 ### 后续原生接线批（尚未进入安装候选 08）
 
 - 提交 `d60143a` 新增完整岗位材料包编译、冻结读回和漂移拒绝。44 个冻结 Python oracle 中 13 个成功包字节一致、31 个拒绝一致；实际 crate 的 job_packet 11 项已包含于上述 88/92 项通过。精确数字留在原字节中，不经 `Value` 浮点往返。workspace/续季验证和精确 transport 另行注册；三岗实际调度及采用仍未启用。
+- `compile-release-13` / `lite-registered-13`：实际 crate 的 lite 相关 **83 项通过**。新增 workspace 原生验源、首季及 v7 闭季接续；68 个原版 oracle 中 8 个支持的成功、59 个拒绝一致，另 1 个原版合法旧单区接续明确未支持。新增岗位 UTF-8 载体保存完整包、外置身份/上下文/迭代 pin 与原数字；13 个成功 golden 原字节保存重开一致。均未进入候选 12，也未启用三岗生产；精确模型响应接收、执行/采用及真实内容验收尚在接线。
 
 - 已在真实 Rust crate 注册 standard-source 完整证明、normalizeDraft/event packing、永久 A-ID 映射。标准包在三个 BundleGate 入口统一分流，历史 raw-row 仍保留独立读取器，不能降级绕过标准证明。
 - `compile-release-09` 成功，真实 crate 中 lite 相关 **45 项通过、0 失败**（含永久身份映射的重开、双连接 CAS、墓碑与零写入读取）。证据 `lite-registered-09/`。这不是三岗生产、真实内容审核或安装版 lite 验收。
