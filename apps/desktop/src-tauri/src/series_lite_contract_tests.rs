@@ -1,7 +1,54 @@
 use super::*;
 fn pack() -> VerifiedPack {
-    VerifiedPack::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../rules/series-lite/20261027-v0.1.2"))
-        .unwrap()
+    VerifiedPack::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../rules/series-lite/20261027-v0.1.2"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn embedded_release_matches_pinned_files_without_runtime_script_dependency() {
+    let embedded = VerifiedPack::embedded().unwrap();
+    assert_eq!(embedded.files, pack().files);
+    assert!(embedded.require_new_production().is_err());
+}
+
+#[test]
+fn role_selection_includes_system_contract_and_full_shared_methods_once() {
+    let p = pack();
+    let methods = [
+        "acting-blocking-methods",
+        "camera-emotion-methods",
+        "sound-rhythm-methods",
+        "lighting-space-methods",
+        "director-refinement",
+        "fantasy-expression-methods",
+    ];
+    let contracts = [
+        "system-presentation",
+        "asset-registry-contract",
+        "shot-handoffs",
+    ];
+    for role in ["author", "finisher", "reviewer"] {
+        let rules = p.selected_role_rules(role, &methods, &contracts).unwrap();
+        assert_eq!(rules.len(), 5);
+        assert_eq!(
+            rules["references/system.md"],
+            p.files["references/system.md"]
+        );
+        assert_eq!(
+            rules["references/creative-core.md"],
+            p.files["references/creative-core.md"]
+        );
+        assert!(p.selected_role_rules(role, &["unknown"], &[]).is_err());
+        assert!(p.selected_role_rules(role, &[], &["unknown"]).is_err());
+        assert!(p
+            .selected_role_rules(role, &["director-refinement", "director-refinement"], &[])
+            .is_err());
+        assert!(p
+            .selected_role_rules(role, &[], &["system-presentation", "system-presentation"])
+            .is_err());
+    }
 }
 
 #[test]
@@ -14,7 +61,10 @@ fn pinned_release_checks_all_actual_bytes_and_keeps_activation_closed() {
     assert_eq!(report["contract"]["sourceCommit"], SOURCE_COMMIT);
     assert_eq!(report["active"], false);
     assert_eq!(report["fullRustGateAccepted"], false);
-    assert!(p.require_new_production().unwrap_err().contains("SERIES_LITE_INACTIVE"));
+    assert!(p
+        .require_new_production()
+        .unwrap_err()
+        .contains("SERIES_LITE_INACTIVE"));
 }
 #[test]
 fn complete_role_bytes_reject_missing_extra_changed_or_unknown_material() {
@@ -43,7 +93,10 @@ fn provenance_rejects_any_frozen_file_drift_even_non_role_scripts() {
     for name in ["SKILL.md", "references/schema.md", "scripts/lite_edit.py"] {
         let mut files = p.files.clone();
         files.get_mut(name).unwrap().push(b' ');
-        assert!(VerifiedPack::verify_files(MANIFEST, files).is_err(), "{name}");
+        assert!(
+            VerifiedPack::verify_files(MANIFEST, files).is_err(),
+            "{name}"
+        );
     }
     let mut missing = p.files.clone();
     missing.remove("VERSION");
@@ -61,10 +114,17 @@ fn old_requests_are_not_resigned_and_version_spoofs_never_activate() {
     let rules = p.inspection_role_rules("author", false).unwrap();
     let old = json!({"workflowProfile":"series672","rules":{"original":"immutable"},"status":"completed"});
     let before = old.clone();
-    assert_eq!(p.verify_existing(&old, "author", false, &BTreeMap::new()).unwrap(), ExistingContract::LegacyUnchanged);
+    assert_eq!(
+        p.verify_existing(&old, "author", false, &BTreeMap::new())
+            .unwrap(),
+        ExistingContract::LegacyUnchanged
+    );
     assert_eq!(old, before);
     let frozen = json!({"seriesLiteContract":identity()});
-    assert_eq!(p.verify_existing(&frozen, "author", false, &rules).unwrap(), ExistingContract::VerifiedFrozenRulesOnly);
+    assert_eq!(
+        p.verify_existing(&frozen, "author", false, &rules).unwrap(),
+        ExistingContract::VerifiedFrozenRulesOnly
+    );
     for field in [
         "creativeVersion",
         "releaseVersion",
@@ -75,8 +135,15 @@ fn old_requests_are_not_resigned_and_version_spoofs_never_activate() {
         "dataContracts",
     ] {
         let mut forged = frozen.clone();
-        forged["seriesLiteContract"][field] = if field == "active" { json!(true) } else { json!("unknown") };
-        assert!(p.verify_existing(&forged, "author", false, &rules).is_err(), "{field}");
+        forged["seriesLiteContract"][field] = if field == "active" {
+            json!(true)
+        } else {
+            json!("unknown")
+        };
+        assert!(
+            p.verify_existing(&forged, "author", false, &rules).is_err(),
+            "{field}"
+        );
         assert!(p.require_new_production().is_err());
     }
 }

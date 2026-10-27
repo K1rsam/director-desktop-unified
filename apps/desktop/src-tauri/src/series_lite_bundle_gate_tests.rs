@@ -1,5 +1,33 @@
 use super::*;
 #[test]
+fn standard_source_reaches_real_export_gate_and_matches_frozen_node_delivery() {
+    // Synthetic corpus from the pinned 0.1.2 tools: a complete standard-source
+    // delivery and re-signed source/order/quote mutations, not production data.
+    let cases: Value = serde_json::from_str(include_str!(
+        "series_lite_bundle_standard_delivery_golden.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let mut gate = NativeLegacyBundleGate {
+            registry: None,
+            source_lock: None,
+            season_scope: None,
+        };
+        let actual = crate::series_lite_bundle::export_lingmo_v7(
+            case["raw"].as_str().unwrap().as_bytes(),
+            &mut gate,
+        );
+        if case.get("error").is_some() {
+            assert!(actual.is_err(), "{}", case["name"]);
+        } else {
+            let actual = actual.unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
+            assert_eq!(actual.markdown, case["markdown"].as_str().unwrap());
+            assert_eq!(actual.manifest_json, case["manifest"].as_str().unwrap());
+            assert!(same(&actual.gate_report, &case["report"]));
+        }
+    }
+}
+#[test]
 fn alias_resolution() {
     let source =
         json!({"key":"E1","sourceRows":[{"id":"E1:R1","line":1,"text":"源"}],"contextRows":[]});

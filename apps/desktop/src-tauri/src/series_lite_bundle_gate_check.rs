@@ -1,5 +1,4 @@
-//! Complete raw-row + Lingmo-v7 BundleGate adapter. Structured standard-source
-//! packages are explicitly refused until their full node proof verifier exists.
+//! Lingmo-v7 BundleGate with version-bound legacy and standard-source proof routes.
 use super::*;
 use crate::series_lite_bundle::{check_mechanical, verify_source_lock, BundleGate, GateEvidence};
 use crate::series_lite_registry::{check_asset_bindings, check_season_bundle};
@@ -74,7 +73,7 @@ impl BundleGate for NativeLegacyBundleGate<'_> {
         let episodes = arr(&bundle["episodes"], "SCOPE")?;
         let sources = episodes
             .iter()
-            .map(|e| normalize_legacy_source(&e["source"]))
+            .map(|e| crate::series_lite_bundle_standard::normalize_source(&e["source"]))
             .collect::<Result<Vec<_>>>()?;
         check_mechanical(&bundle, &sources)?;
         for a in bundle["assets"].as_array().unwrap() {
@@ -107,7 +106,7 @@ impl BundleGate for NativeLegacyBundleGate<'_> {
                 serde_json::from_slice(raw_lock).map_err(|e| format!("SOURCE_LOCK_HASH: {e}"))?;
             let lock_sources = arr(&lock["episodes"], "SOURCE_LOCK_SCOPE")?
                 .iter()
-                .map(|e| normalize_legacy_source(&e["source"]))
+                .map(|e| crate::series_lite_bundle_standard::normalize_source(&e["source"]))
                 .collect::<Result<Vec<_>>>()?;
             verify_source_lock(raw, raw_lock, &sources, &lock_sources)?
         };
@@ -209,7 +208,7 @@ impl BundleGate for NativeLegacyBundleGate<'_> {
             if e["source"].get("dialogue").is_some() {
                 let mut raw_source = e["source"].clone();
                 raw_source.as_object_mut().unwrap().remove("dialogue");
-                let inferred = normalize_legacy_source(&raw_source)?;
+                let inferred = crate::series_lite_bundle_standard::normalize_source(&raw_source)?;
                 let sig = |s: &Value, fields: &[&str]| {
                     Value::Array(
                         s["dialogue"]

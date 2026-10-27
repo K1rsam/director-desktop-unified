@@ -228,7 +228,7 @@ fn extract(row: &Value, index: usize, legacy: bool) -> Option<Value> {
     if !valid || !legacy && (re(r"^\s*▲").is_match(&spoken) || metadata(&spoken, false)) {
         return None;
     }
-    let expression = re(r"^\s*([^：:△\s][^：:]{0,28})[：:]\s*(.*)$");
+    let expression = re(r"^\s*([^：:△\s][^：:]{0,28})[：:]\s*([^\r\n\x{2028}\x{2029}]*)$");
     let m = expression.captures(&spoken)?;
     if m[1].encode_utf16().count() > 29 || !legacy && m[1].contains(['【', '】']) {
         return None;
