@@ -61,6 +61,7 @@ const LOCAL_WRITE_ACTIONS = new Set([
   'settings.save', 'settings.global.save', 'backup.create', 'backup.restore',
 ]);
 const GENERATION_ACTIONS = new Set([
+  'source.analyze',
   'images.reviewCapability', 'images.reviewCapability.restartUnknown', 'images.reviewCandidate',
   'foundation.run', 'foundation.choices.apply', 'images.design', 'images.produce', 'images.run',
   'storyboard.run', 'storyboard.decision.resolve', 'units.regenerate', 'storyboard.refine', 'workflows.resume', 'videos.submit',

@@ -1,0 +1,142 @@
+{
+  "schemaVersion": "source-format-intake-receipt/v1",
+  "date": "2026-10-27",
+  "branch": "fix/source-format-intake-20261027",
+  "baseCommit": "b464d28c3f7eaa2bc6233e4f3a9780d6763aad04",
+  "changes": [
+    "source-parser/v11",
+    "source-analysis-runner/v1",
+    "one-click format analysis before foundation",
+    "linear source-integrity validation"
+  ],
+  "tests": [
+    {
+      "command": "npm run typecheck",
+      "passed": true
+    },
+    {
+      "command": "npm run test:frontend",
+      "passed": 349,
+      "failed": 0
+    },
+    {
+      "command": "cargo test --lib pipeline::source::",
+      "passed": 78,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "command": "cargo test --lib source_",
+      "passed": 192,
+      "failed": 0,
+      "ignored": 8
+    },
+    {
+      "failed": 0,
+      "modelCalls": 0,
+      "passed": 1,
+      "command": "cargo test --lib private_locked_source_format_acceptance -- --ignored --nocapture"
+    }
+  ],
+  "privateSample": {
+    "rows": 4668,
+    "episodes": 150,
+    "scenes": 250,
+    "prefaceRows": 27,
+    "blockingBefore": 1,
+    "blockingAfter": 0,
+    "sourceTextAndCoordinatesPreserved": true,
+    "manualDecisionsPreserved": true,
+    "userProjectDatabaseModified": false,
+    "modelCalls": 0,
+    "finalPipelineSeconds": 11.95
+  },
+  "performance": {
+    "oldSeconds": 27.8822843,
+    "newSeconds": 7.8949881,
+    "oldExit": 0,
+    "newExit": 0,
+    "reportsByteEqual": true,
+    "result": {
+      "blockingAfter": 0,
+      "blockingBefore": 1,
+      "boundaryDecisionsUnchanged": true,
+      "episodes": 150,
+      "firstEpisodeScenes": 3,
+      "newParser": "source-parser/v11",
+      "oldParser": "source-parser/v10",
+      "prefaceContextRows": 27,
+      "remainingCodes": [],
+      "rows": 4668,
+      "scenesAfter": 250,
+      "scenesBefore": 250,
+      "sha256": "506fe7a2dae288221ba5bb62f806c7eb54afb9c87d9255147867577e48db93d1",
+      "sourceRowsIdentityUnchanged": true
+    }
+  },
+  "windowsNative": {
+    "rounds": 4,
+    "passed": true,
+    "generationRequests": 0,
+    "exeSha256": "a7a56b47ea43e6fee81fe637d1755af412253fef2d7c2113cf23f1b2f2dc7254"
+  },
+  "installation": {
+    "status": "published_and_hash_verified",
+    "previousSha256": "a91fa1a327b0188032785787076f1d1308cddc6dc23e04025b2502a32953dd89",
+    "currentSha256": "a7a56b47ea43e6fee81fe637d1755af412253fef2d7c2113cf23f1b2f2dc7254",
+    "shortcutTarget": "D:\\EDY\\Documents\\CL\\director-desktop-integration-20261008\\apps\\desktop\\.local\\client\\director-desktop-next.exe",
+    "executableCount": 2
+  },
+  "notVerified": [
+    "live model interpretation for unsupported dialects; synthetic model responses validated",
+    "new script creative production and visual quality",
+    "macOS native runtime"
+  ],
+  "generation": {
+    "textModelCalls": 0,
+    "imageRequests": 0,
+    "videoRequests": 0
+  },
+  "evidence": [
+    {
+      "sha256": "4b226c38bb2cd3e234c43d8857eb4ad20edb8d7cc90f8bda9f308279eaea7f30",
+      "path": ".local/source-intake-20261027/source-analysis-tests.log"
+    },
+    {
+      "sha256": "5a1d5dfc0039048f3e68421cca3b92e60109893dd07cd189bb830c4f77da7c83",
+      "path": ".local/source-intake-20261027/source-regression.log"
+    },
+    {
+      "sha256": "9024e8c67d7be4bb76308c3b41df4f47173cd186a5afaea92aa93bdb095de395",
+      "path": ".local/source-intake-20261027/scope-fixture-regression.log"
+    },
+    {
+      "sha256": "3a1d8fed2319305cffbed287905837dddf983be4a469bf7616627407cd0b2d60",
+      "path": ".local/source-intake-20261027/parser-final.log"
+    },
+    {
+      "sha256": "3764ab8dd2fd55f28cf9d368fbd1f2a34101790509faa6da84e6ef138c4539f7",
+      "path": ".local/source-intake-20261027/source-final.log"
+    },
+    {
+      "sha256": "c7d1a6c08b2c005825a454ce9405886293b38f6e17250cd638fedcc9b5b6eacb",
+      "path": ".local/source-intake-20261027/linear-integrity-benchmark.json"
+    },
+    {
+      "sha256": "da8826b444e360f5b6184e4a560a34a9fcc71ae8b7561533771df32e85b7a48d",
+      "path": ".local/source-intake-20261027/build.log"
+    },
+    {
+      "sha256": "17efd7cb369f8d3a5853a385bb134de777469daf98821c289dbfc3cee8df95e1",
+      "path": ".local/source-intake-20261027/native-final/acceptance.json"
+    },
+    {
+      "sha256": "4c1a4bb54d1a3b0df7dcfad1b5eec24a386874ae46cc41a003deb602721c344f",
+      "path": ".local/source-intake-20261027/private-sample-final.log"
+    },
+    {
+      "sha256": "4e3549bd89a8a1a8d6f4fe0bacf6b1ffab1fb00a7f69d18e04400f76520a7eae",
+      "path": ".local/source-intake-20261027/publish.log"
+    }
+  ]
+}

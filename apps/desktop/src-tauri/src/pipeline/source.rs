@@ -290,16 +290,17 @@ const MULTILINE_DISPLAY_PARSER_VERSION: &str = "source-parser/v7";
 const JOINT_SPEAKER_PARSER_VERSION: &str = "source-parser/v8";
 const TITLE_METADATA_PARSER_VERSION: &str = "source-parser/v9";
 const EXPLICIT_INLINE_PARSER_VERSION: &str = "source-parser/v10";
+const FORMAT_PARSER_VERSION: &str = "source-parser/v11";
 
 #[path = "source_explicit_inline.rs"]
 mod explicit_inline;
 
 fn uses_joint_speaker_rules(version: &str) -> bool {
-    [JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&version)
+    [JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION, FORMAT_PARSER_VERSION].contains(&version)
 }
 
 fn uses_fidelity_rules(version: &str) -> bool {
-    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&version)
+    [FIDELITY_PARSER_VERSION, MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION, FORMAT_PARSER_VERSION].contains(&version)
 }
 
 fn display_block_header(text: &str) -> bool {
@@ -353,7 +354,7 @@ fn display_enclosure_field(line: &str) -> Option<&str> {
 /// of speakers: the same labels outside that exact enclosure remain dialogue.
 /// Incomplete enclosures and explicit speech cues never grant an exemption.
 fn multiline_display_row_ids(source: &LockedSource, named: &HashSet<String>) -> HashSet<String> {
-    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&source.parser_version.as_str()) {
+    if ![MULTILINE_DISPLAY_PARSER_VERSION, JOINT_SPEAKER_PARSER_VERSION, TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION, FORMAT_PARSER_VERSION].contains(&source.parser_version.as_str()) {
         return HashSet::new();
     }
     let mut ids = HashSet::new();
@@ -451,6 +452,7 @@ fn display_only_row_ids(source: &LockedSource) -> HashSet<String> {
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
         EXPLICIT_INLINE_PARSER_VERSION,
+        FORMAT_PARSER_VERSION,
     ]
     .contains(&source.parser_version.as_str())
     {
@@ -631,13 +633,126 @@ fn prior_title_parser_version(text: &str) -> &'static str {
     prior
 }
 
-fn fresh_parser_version(text: &str) -> &'static str {
+fn prior_inline_parser_version(text: &str) -> &'static str {
     let prior = prior_title_parser_version(text);
     if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, EXPLICIT_INLINE_PARSER_VERSION)) {
         // Only an actual explicit-inline change opts new imports into v10.
         if explicit_inline::changes_dialogue_rows(&old, &new) { return EXPLICIT_INLINE_PARSER_VERSION; }
     }
     prior
+}
+
+// Only explicit recognition / new imports choose a newer dialect. Replaying
+// saved sources always uses their recorded version and original decisions.
+fn fresh_parser_version(text: &str) -> &'static str {
+    let prior = prior_inline_parser_version(text);
+    static ZERO_SCENE: OnceLock<Regex> = OnceLock::new();
+    let zero_scene = ZERO_SCENE.get_or_init(|| Regex::new(
+        r"^(?:#{1,6}\s*)?(?:第\s*[零〇一二三四五六七八九十百千两\d]+\s*集.*?场\s*|场\s*)?[1-9]\d*\s*[-－.．]\s*0(?:\s|[:：]|日|夜|昼|晨|黄昏|清晨|凌晨|傍晚|白天|夜晚|内|外|INT|EXT|$)"
+    ).unwrap());
+    if biography_preface_rows(text).is_empty()
+        && !raw_lines(text).iter().any(|line| zero_scene.is_match(line.trim()))
+    { return prior; }
+    if let (Ok(old), Ok(new)) = (parse_source(text, prior), parse_source(text, FORMAT_PARSER_VERSION)) {
+        let mut old = serde_json::to_value(old).unwrap();
+        let mut new = serde_json::to_value(new).unwrap();
+        old.as_object_mut().unwrap().remove("parserVersion");
+        new.as_object_mut().unwrap().remove("parserVersion");
+        if old != new { return FORMAT_PARSER_VERSION; }
+    }
+    prior
+}
+
+fn uses_explicit_inline_rules(version: &str) -> bool {
+    [EXPLICIT_INLINE_PARSER_VERSION, FORMAT_PARSER_VERSION].contains(&version)
+}
+
+// Strip only balanced presentation wrappers for evidence matching; the actual
+// source row, UTF-16 coordinates and identifiers always retain original bytes.
+fn format_heading_text(line: &str) -> &str {
+    let mut value = line.trim();
+    let hashes = value.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&hashes) { value = value[hashes..].trim(); }
+    if let Some(inner) = value.strip_prefix("**").and_then(|v| v.strip_suffix("**")) {
+        value = inner.trim();
+    }
+    for (open, close) in [('【', '】'), ('[', ']'), ('（', '）'), ('(', ')')] {
+        if let Some(inner) = value.strip_prefix(open).and_then(|v| v.strip_suffix(close)) {
+            value = inner.trim();
+            break;
+        }
+    }
+    value
+}
+
+fn biography_heading(line: &str) -> bool {
+    static HEADING: OnceLock<Regex> = OnceLock::new();
+    HEADING.get_or_init(|| Regex::new(
+        r"^(?:(?:主要)?(?:人物|角色)(?:小传|档案)(?:\s*[：:]\s*[\p{L}\p{M}\p{N}·・]{1,24})?|(?:(?:主角|男主角|女主角|男主|女主|角色|人物)\s*[：:]\s*)?[\p{L}\p{M}\p{N}·・]{1,24}\s+(?:人物|角色)(?:小传|档案))$"
+    ).unwrap()).is_match(format_heading_text(line))
+}
+
+fn biography_field(line: &str) -> Option<String> {
+    let value = format_heading_text(line);
+    let (name, content) = value.split_once(['：', ':'])?;
+    let name = name.trim().trim_matches('*').trim();
+    (!content.trim().is_empty() && ["姓名", "名字", "身份", "年龄", "性别", "出身", "职业", "背景", "性格", "外貌", "所属", "角色定位"].contains(&name))
+        .then(|| name.to_owned())
+}
+
+fn biography_cover(line: &str) -> bool {
+    let value = format_heading_text(line);
+    if value.is_empty() || value.chars().count() > 80
+        || value.contains(['。', '！', '？', '!', '?', '△', '▲', '：', ':', '“', '”'])
+    { return false; }
+    if value.strip_prefix('《').and_then(|v| v.strip_suffix('》'))
+        .is_some_and(|v| !v.trim().is_empty() && !v.contains(['《', '》']))
+    { return true; }
+    static COVER: OnceLock<Regex> = OnceLock::new();
+    COVER.get_or_init(|| Regex::new(
+        r"^.+?(?:共|全)?\s*([零〇一二三四五六七八九十百千\d]+)\s*集\s*(?:短剧漫剧|动画短剧|动画漫剧|短剧|漫剧|动画)?\s*剧本$"
+    ).unwrap()).captures(value)
+        .and_then(|c| number_value(c.get(1)?.as_str())).is_some_and(|number| number > 0)
+}
+
+fn biography_production_boundary(line: &str) -> bool {
+    let value = format_heading_text(line);
+    static BARE_SCENE: OnceLock<Regex> = OnceLock::new();
+    episode_heading_re().is_match(value)
+        || value.starts_with(['△', '▲'])
+        || ["正文", "剧本正文", "序章", "序幕"].iter()
+            .any(|word| value == *word || value.starts_with(&format!("{word}：")) || value.starts_with(&format!("{word} ")))
+        || value.starts_with("场景：") || value.starts_with("场景:")
+        || BARE_SCENE.get_or_init(|| Regex::new(r"^(?:场\s*)?\d+\s*[-－]\s*\d+\s*[:：]?$").unwrap()).is_match(value)
+        || fidelity_pair_re().captures(value).is_some_and(|c| fidelity_pair_valid(&c))
+        || value.starts_with("第") && value.contains("场")
+}
+
+fn biography_preface_rows(text: &str) -> HashSet<usize> {
+    let lines = raw_lines(text);
+    let nonempty: Vec<_> = lines.iter().enumerate().filter(|(_, line)| !line.trim().is_empty()).collect();
+    let Some(&(first, first_line)) = nonempty.first() else { return HashSet::new(); };
+    let heading_position = if biography_heading(first_line) { 0 }
+        else if biography_cover(first_line) && nonempty.get(1).is_some_and(|(_, line)| biography_heading(line)) { 1 }
+        else { return HashSet::new(); };
+    let heading_index = nonempty[heading_position].0;
+    let end = lines.iter().enumerate().skip(heading_index + 1)
+        .find(|(_, line)| biography_production_boundary(line)).map(|(index, _)| index).unwrap_or(lines.len());
+    let anchors: Vec<_> = nonempty.iter().skip(heading_position + 1)
+        .take_while(|(index, _)| *index < end).take(3).map(|(_, line)| *line).collect();
+    let Some(anchor) = anchors.first() else { return HashSet::new(); };
+    let evidence = if ["基本资料", "基本信息", "基础资料", "基础信息", "人物资料", "角色资料", "角色信息"].contains(&format_heading_text(anchor)) {
+        anchors.get(1).is_some_and(|line| biography_field(line).is_some())
+    } else {
+        biography_field(anchor).zip(anchors.get(1).and_then(|line| biography_field(line)))
+            .is_some_and(|(first, second)| first != second)
+    };
+    if !evidence { return HashSet::new(); }
+    (first..end).filter(|index| !lines[*index].trim().is_empty()).collect()
+}
+
+fn valid_numbered_scene(value: &str, parser_version: &str) -> bool {
+    value.parse::<u32>().is_ok_and(|number| number > 0 || parser_version == FORMAT_PARSER_VERSION)
 }
 
 fn scene_separator(ch: char) -> bool {
@@ -952,6 +1067,7 @@ fn parse_dialogue_with_label(text: &str, start: usize, row_id: &str, parser_vers
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
         EXPLICIT_INLINE_PARSER_VERSION,
+        FORMAT_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let (channel_text, channel_label) = if current_voice_rules {
@@ -1133,6 +1249,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
         EXPLICIT_INLINE_PARSER_VERSION,
+        FORMAT_PARSER_VERSION,
     ]
     .contains(&parser_version)
     {
@@ -1146,6 +1263,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         JOINT_SPEAKER_PARSER_VERSION,
         TITLE_METADATA_PARSER_VERSION,
         EXPLICIT_INLINE_PARSER_VERSION,
+        FORMAT_PARSER_VERSION,
     ]
     .contains(&parser_version);
     let fidelity = uses_fidelity_rules(parser_version);
@@ -1207,9 +1325,10 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
     let mut continued_metadata = HashSet::new();
     let mut previous_heading_number = None;
     let lines = raw_lines(text);
-    let title_metadata = if [TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION].contains(&parser_version) {
+    let title_metadata = if [TITLE_METADATA_PARSER_VERSION, EXPLICIT_INLINE_PARSER_VERSION, FORMAT_PARSER_VERSION].contains(&parser_version) {
         title_metadata_row_indices(text)
     } else { HashSet::new() };
+    let biography_metadata = if parser_version == FORMAT_PARSER_VERSION { biography_preface_rows(text) } else { HashSet::new() };
     let first_nonempty = lines.iter().position(|line| !line.trim().is_empty());
     for (index, raw) in lines.iter().enumerate() {
         let line = raw.trim();
@@ -1241,7 +1360,9 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
                                 == Some(0)
                 })
                 .unwrap_or(false);
-        if let Some(c) = episode_re.captures(line) {
+        if biography_metadata.contains(&index) {
+            kind = "context";
+        } else if let Some(c) = episode_re.captures(line) {
             let number = number_value(c.get(1).unwrap().as_str()).ok_or("无法识别原集号")?;
             let title = c.get(2).map(|m| m.as_str()).unwrap_or("");
             let heading_has_scene = combined_re.captures(title).is_some_and(|c| {
@@ -1251,7 +1372,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
                         .unwrap()
                         .as_str()
                         .contains(['。', '！', '？', '△', '▲', ':', '：'])
-                    && c.get(3).unwrap().as_str().parse::<u32>().unwrap_or(0) > 0
+                    && valid_numbered_scene(c.get(3).unwrap().as_str(), parser_version)
                     && metadata_re.is_match(c.get(4).unwrap().as_str())
             });
             let supplemental_heading = structural
@@ -1315,7 +1436,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
                             .unwrap()
                             .as_str()
                             .contains(['。', '！', '？', '△', '▲', ':', '：'])
-                        && c.get(3).unwrap().as_str().parse::<u32>().unwrap_or(0) > 0
+                        && valid_numbered_scene(c.get(3).unwrap().as_str(), parser_version)
                         && metadata_re.is_match(c.get(4).unwrap().as_str())
                 }) {
                     if combined.get(2).unwrap().as_str().parse::<u32>().ok() == Some(number) {
@@ -1397,7 +1518,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
             };
             let separate_metadata = bare
                 .as_ref()
-                .map(|c| c.get(2).unwrap().as_str().parse::<u32>().unwrap_or(0) > 0)
+                .map(|c| valid_numbered_scene(c.get(2).unwrap().as_str(), parser_version))
                 .unwrap_or(false)
                 && following
                     .map(|(_, s)| {
@@ -1421,7 +1542,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
             let has_metadata = pair
                 .as_ref()
                 .map(|c| {
-                    c.get(2).unwrap().as_str().parse::<u32>().unwrap_or(0) > 0
+                    valid_numbered_scene(c.get(2).unwrap().as_str(), parser_version)
                         && metadata_re.is_match(c.get(3).unwrap().as_str())
                         && (!fidelity || fidelity_pair_valid(c))
                 })
@@ -1543,7 +1664,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         offset = end;
     }
     apply_joint_dialogues(&mut source);
-    if parser_version == EXPLICIT_INLINE_PARSER_VERSION {
+    if uses_explicit_inline_rules(parser_version) {
         explicit_inline::apply(&mut source);
     }
     let display_ids = display_only_row_ids(&source);
@@ -1557,7 +1678,7 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         .iter()
         .filter_map(|r| r.dialogue.as_ref().map(|q| q.speaker.clone()))
         .collect();
-    if parser_version == EXPLICIT_INLINE_PARSER_VERSION { speaker_names.extend(declared_speaker_names(&source)); }
+    if uses_explicit_inline_rules(parser_version) { speaker_names.extend(declared_speaker_names(&source)); }
     let inline_re = Regex::new(
         r"(?:^|[\s；;])([\p{L}][\p{L}\p{N}·・_]{0,23})(?:\s*[（(][^\r\n:：()（）]*[）)])?\s*[:：]",
     )
@@ -1566,8 +1687,8 @@ fn parse_source(text: &str, parser_version: &str) -> Result<LockedSource, String
         if let Some(q) = &row.dialogue {
             if inline_re
                 .captures_iter(&q.quote)
-                .any(|c| ((parser_version != EXPLICIT_INLINE_PARSER_VERSION && fidelity) || speaker_names.contains(c.get(1).unwrap().as_str()))
-                    && (parser_version != EXPLICIT_INLINE_PARSER_VERSION || explicit_inline::outside_enclosure(&q.quote,c.get(1).unwrap().start())))
+                .any(|c| ((!uses_explicit_inline_rules(parser_version) && fidelity) || speaker_names.contains(c.get(1).unwrap().as_str()))
+                    && (!uses_explicit_inline_rules(parser_version) || explicit_inline::outside_enclosure(&q.quote,c.get(1).unwrap().start())))
             {
                 source.diagnostics.push(SourceDiagnostic{code:"DIALOGUE_MULTI_SPEAKER_UNCONFIRMED".into(),row_ids:vec![row.id.clone()],message:"同一原行含多个明确说者，保留原行；需按原坐标明确对白分段，不能把后段读给首位说者".into(),blocking:true});
             }
@@ -1780,7 +1901,7 @@ fn migrate_scene_edits(
 fn validate_integrity(source: &LockedSource) -> Result<(), String> {
     let display_ids = display_only_row_ids(source);
     let joint_names = uses_joint_speaker_rules(&source.parser_version).then(|| joint_speaker_grammar(source));
-    let inline_names = (source.parser_version == EXPLICIT_INLINE_PARSER_VERSION).then(|| explicit_inline::speaker_names(source));
+    let inline_names = (uses_explicit_inline_rules(&source.parser_version)).then(|| explicit_inline::speaker_names(source));
     if source.schema_version != "locked-source/v1"
         || source.coordinate_system != "utf16"
         || source.sha256 != digest(&source.text)
@@ -1790,12 +1911,15 @@ fn validate_integrity(source: &LockedSource) -> Result<(), String> {
     }
     let mut cursor = 0;
     let mut ids = HashSet::new();
+    // Check UTF-16 lengths while reconstructing once. Re-slicing the complete
+    // script for every row scans every preceding character again (quadratic
+    // for long scripts); the final byte equality proves the same row contents.
     let mut reconstructed = String::new();
     for row in &source.rows {
         if row.range.start != cursor
             || row.range.end <= cursor
             || !ids.insert(&row.id)
-            || slice_utf16(&source.text, &row.range)? != row.text
+            || row.text.encode_utf16().count() != row.range.end - row.range.start
         {
             return Err("来源行存在遗漏、重叠、错序或回读不一致".into());
         }
@@ -1835,8 +1959,12 @@ fn validate_integrity(source: &LockedSource) -> Result<(), String> {
         }
         if let Some(q) = &row.dialogue {
             if q.range.start < row.range.start
+                || q.range.end < q.range.start
                 || q.range.end > row.range.end
-                || slice_utf16(&source.text, &q.range)? != q.quote
+                || slice_utf16(&row.text, &SourceRange {
+                    start: q.range.start - row.range.start,
+                    end: q.range.end - row.range.start,
+                })? != q.quote
             {
                 return Err("对白引用与原文不一致".into());
             }
@@ -2110,6 +2238,30 @@ fn apply_decisions_inner(
                 row_ids: vec![],
                 metadata: Default::default(),
             });
+        }
+    }
+    // v11: an explicit decision can move every actual row of an automatic
+    // scene while leaving its trailing blank separator outside the decision.
+    // That separator is still source evidence, but cannot preserve a phantom
+    // scene. Do not expand the user's range or touch scenes retaining a title
+    // or body; historical parsers retain their original replay byte contract.
+    if out.parser_version == FORMAT_PARSER_VERSION && !decisions.is_empty() {
+        let substantive_scenes: HashSet<_> = out.rows.iter()
+            .filter(|row| !row.text.trim().is_empty())
+            .filter_map(|row| row.scene_id.as_deref()).collect();
+        let displaced_scenes: HashSet<String> = source.rows.iter()
+            .filter(|row| !row.text.trim().is_empty()
+                && decisions.iter().any(|decision| decision.kind != "independent_episode"
+                    && row.range.start >= decision.start && row.range.end <= decision.end))
+            .filter_map(|row| row.scene_id.as_ref())
+            .filter(|scene_id| !substantive_scenes.contains(scene_id.as_str()))
+            .cloned().collect();
+        for row in &mut out.rows {
+            if row.text.trim().is_empty()
+                && row.scene_id.as_ref().is_some_and(|id| displaced_scenes.contains(id))
+            {
+                row.scene_id = None;
+            }
         }
     }
     // Rebuild memberships from current row assignments; never retain previous stale members.
@@ -3008,3 +3160,7 @@ mod joint_tests;
 #[cfg(test)]
 #[path = "source_title_tests.rs"]
 mod title_tests;
+
+#[cfg(test)]
+#[path = "source_format_tests.rs"]
+mod format_tests;

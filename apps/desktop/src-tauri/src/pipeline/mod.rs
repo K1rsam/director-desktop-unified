@@ -14,6 +14,7 @@ pub(crate) mod foundation_wire;
 mod foundation_direction_seed_tests;
 mod scene_edits;
 mod source;
+pub(crate) mod source_analysis;
 mod storyboard;
 pub(crate) mod storyboard_scene_facts;
 pub(crate) mod storyboard_sound_events;

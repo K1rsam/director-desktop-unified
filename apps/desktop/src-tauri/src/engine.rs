@@ -34,6 +34,8 @@ mod lingmo_project;
 mod refinement_identity;
 #[path = "engine_asset_workflow.rs"]
 mod asset_workflow_engine;
+#[path = "engine_source_analysis.rs"]
+mod source_analysis_engine;
 #[path = "engine_visual_review.rs"]
 mod visual_review_engine;
 #[cfg(test)]
@@ -1346,6 +1348,9 @@ impl Engine {
                 let events=q.query_map([s(&request,"jobId")],|r|Ok(json!({"type":r.get::<_,String>(0)?,"data":r.get::<_,String>(1)?,"createdAt":r.get::<_,String>(2)?}))).map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
                 j["events"] = json!(events);
                 return Ok(j);
+            }
+            "source.analyze" => {
+                self.spawn_source_analysis(store.clone(), &request)?;
             }
             "source.import" => {
                 let source = crate::importer::prepare_source_import(
@@ -3306,6 +3311,8 @@ impl Engine {
             match existing_foundation_start(&store, &input)? {
                 FoundationStartBoundary::New => {},
                 FoundationStartBoundary::Resume(run) => {
+                    let analysis_parent=s(&request,"sourceAnalysisWorkflowId");
+                    if !analysis_parent.is_empty() {store.link_existing_source_analysis_successor(analysis_parent,&run)?;}
                     return self.resume_production_checked(store, &json!({"action":"workflows.resume","workflowId":run}),crate::execution_policy::creative_runtime_ready());
                 },
                 FoundationStartBoundary::Hold(reason) => return Err(reason),
@@ -3378,8 +3385,15 @@ impl Engine {
             crate::workflow::verify_guard(&tx, &guard)?;
         }
         let native_receipt=self.reserve_native_workflow(&request,&input["source"],&input["settings"])?;
-        let snapshot = json!({"runnerVersion":"desktop-runner/v1","foundationMethod":if stage=="foundation.run" {json!("foundation-delivery/v2")}else{Value::Null},"stage":stage,"savedSettingsSha256":saved_settings_sha256,"sourceVersion":input["source"]["version"],"selection":input["selection"],"planningProfile":input["capabilities"],"input":input,"guard":guard,"rules":rules,"nativeAcceptance":native_receipt});
-        let job = if stage == "storyboard.refine" {
+        let mut snapshot = json!({"runnerVersion":"desktop-runner/v1","foundationMethod":if stage=="foundation.run" {json!("foundation-delivery/v2")}else{Value::Null},"stage":stage,"savedSettingsSha256":saved_settings_sha256,"sourceVersion":input["source"]["version"],"selection":input["selection"],"planningProfile":input["capabilities"],"input":input,"guard":guard,"rules":rules,"nativeAcceptance":native_receipt});
+        let source_analysis_parent = s(&request, "sourceAnalysisWorkflowId");
+        if !source_analysis_parent.is_empty() {
+            if stage != "foundation.run" { return Err("格式识别只能衔接制作基础".into()); }
+            snapshot["sourceAnalysisContinuation"] = json!({"version":"source-analysis-continuation/v1","workflowId":source_analysis_parent});
+        }
+        let job = if !source_analysis_parent.is_empty() {
+            store.reserve_foundation_after_source_analysis(source_analysis_parent, &snapshot)?
+        } else if stage == "storyboard.refine" {
             store.reserve_storyboard_refinement_workflow(&snapshot)?
         } else if input["foundationPhase"] == "AUTO_INTERPRET" {
             store.reserve_foundation_auto_workflow(&snapshot)?
@@ -3398,6 +3412,9 @@ impl Engine {
     fn resume_production(self: &Arc<Self>, store: Store, request: &Value) -> Result<()> {
         let id = s(request, "workflowId");
         let job = store.job(id)?;
+        if job["entityId"] == "source.analyze" {
+            return self.resume_source_analysis(store, request, &job);
+        }
         if request.get("supplyContractCorrection").is_some()
             && (s(request,"action")!="workflows.resume" || job["entityId"]!="storyboard.run"
                 || job["snapshot"]["input"]["workflowProfile"]!=crate::asset_graph::PROFILE) {

@@ -12,6 +12,8 @@ use std::{
 use uuid::Uuid;
 #[path = "store_job_records.rs"]
 mod job_records;
+#[path = "store_source_analysis.rs"]
+mod source_analysis;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub fn now() -> String {
@@ -1887,7 +1889,7 @@ WHEN j.state='ready' THEN json_object('model',json_extract(j.snapshot,'$.model')
 ELSE json_object('model',json_extract(j.snapshot,'$.model'),'unitVersion',json_extract(j.snapshot,'$.unitVersion'),'problems',json_extract(j.snapshot,'$.problems')) END,
 CASE WHEN j.prepared IS NULL THEN NULL ELSE json_object('estimatedCost',json_extract(j.prepared,'$.estimatedCost'),'capabilityVersion',json_extract(j.prepared,'$.capabilityVersion')) END,
 NULL,
-CASE WHEN j.result IS NULL THEN NULL WHEN j.kind='workflow' THEN json_object('schemaVersion',json_extract(j.result,'$.schemaVersion'),'status',json_extract(j.result,'$.status'),'blocked',json_extract(j.result,'$.blocked'),'imagePlan',(SELECT json_group_array(json_object('assetId',json_extract(item.value,'$.assetId'),'variantId',json_extract(item.value,'$.variantId'),'dependencies',json_extract(item.value,'$.dependencies'),'status',json_extract(item.value,'$.status'),'missingAdoption',json_extract(item.value,'$.missingAdoption'),'candidateCount',json_extract(item.value,'$.candidateCount'))) FROM json_each(j.result,'$.imagePlan') item))
+CASE WHEN j.result IS NULL THEN NULL WHEN j.kind='workflow' THEN json_object('schemaVersion',json_extract(j.result,'$.schemaVersion'),'status',json_extract(j.result,'$.status'),'blocked',json_extract(j.result,'$.blocked'),'source',CASE WHEN j.entity_id='source.analyze' THEN json_object('version',json_extract(j.result,'$.source.version'),'sha256',json_extract(j.result,'$.source.sha256')) ELSE NULL END,'continuation',json_extract(j.result,'$.continuation'),'imagePlan',(SELECT json_group_array(json_object('assetId',json_extract(item.value,'$.assetId'),'variantId',json_extract(item.value,'$.variantId'),'dependencies',json_extract(item.value,'$.dependencies'),'status',json_extract(item.value,'$.status'),'missingAdoption',json_extract(item.value,'$.missingAdoption'),'candidateCount',json_extract(item.value,'$.candidateCount'))) FROM json_each(j.result,'$.imagePlan') item))
 ELSE json_object('status',json_extract(j.result,'$.status'),'actualCost',json_extract(j.result,'$.actualCost'),'resultUrls',json_extract(j.result,'$.resultUrls')) END,
 j.error,j.created_at,j.updated_at,j.next_attempt_at,j.query_attempts,j.download_attempts,
 (SELECT json_group_array(media_id) FROM (SELECT media_id FROM job_media WHERE job_id=j.id ORDER BY rowid)),

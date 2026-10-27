@@ -4606,6 +4606,11 @@ fn frozen_text_parent_matches(entity: &str, parent: &Value, request: &TextReques
             ("assetDesign", "asset-art-director") | ("assetVisualFacts", "asset-visual-facts-extractor"));
     }
     match (entity, s(parent, "runnerVersion"), request.stage.as_str()) {
+        ("source.analyze", "source-analysis-runner/v1", "sourceStructure") =>
+            parent["stage"] == "source.analyze" && request.skill == "source-structure-reader"
+                && request.input["sourceSha256"] == parent["input"]["source"]["sha256"]
+                && request.input["sourceVersion"] == parent["sourceVersion"]
+                && request.input["sourceStructureProfile"] == parent["input"]["sourceStructureProfile"],
         ("foundation.run", "desktop-runner/v1", "foundation") => request.skill == "story-foundation",
         ("foundation.run", "desktop-runner/v1", "foundation:F2") => request.skill == "foundation-asset-catalog",
         ("foundation.run", "desktop-runner/v1", "foundation:Q1") => request.skill == "foundation-finishing-editor",

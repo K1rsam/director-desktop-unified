@@ -77,7 +77,7 @@ pub const STANDARD_ACTIONS: &[&str] = &[
     "chrome.managed.start", "chrome.managed.login", "chrome.managed.recover",
     "runtime.prepare",
     "images.reviewCapability", "images.reviewCapability.restartUnknown", "images.reviewCandidate",
-    "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
+    "source.analyze", "foundation.run", "foundation.choices.apply", "images.design", "images.produce", "images.run",
     "workflows.resume", "providers.refresh", "videos.preflight", "videos.prepare", "videos.submit",
     "jobs.query", "jobs.download", "jobs.reconcile", "textCli.status", "textCli.login",
     "textCli.loginStatus", "textCli.cancelLogin", "textCli.openLogin", "dreamina.status",
@@ -103,7 +103,7 @@ pub fn standard_report() -> Value {
         "allowedActions":actions,"credentialBackend":crate::platform::credential_backend_status(),
         "reasons":["剧本策划、分镜创作和资产提示词使用全局设置中选择的文字渠道；编写提示词不会自动生成图片。",
             "图片及视频沿用已实现渠道的账户、模型、费用确认和未知提交保护；即梦画布生成桥尚未接入。",
-            if creative_runtime_ready() { "新分镜任务采用 series v6.7.2，资产提示词采用 V1.1.2；历史任务按冻结规则恢复，成稿质量按实际结果验收。" } else { "分镜执行器尚未就绪。" }],
+            if creative_runtime_ready() { "新分镜任务采用 series v6.7.3 与桌面 Skill v1.1.4，资产提示词采用 V1.1.2；历史任务按冻结规则恢复，成稿质量按实际结果验收。" } else { "分镜执行器尚未就绪。" }],
         "textBackends":[{"id":"codex_cli","status":"enabled"},{"id":"codex_sdk","status":if crate::text_sdk::native_execution_enabled(){"explicit_selection_when_ready"}else{"offline_contract_only"}}],
         "localAcceptance":{"backend":"codex_cli","model":"gpt-6.1-sol","reasoning":"medium"}})
 }

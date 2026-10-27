@@ -1129,6 +1129,11 @@ fn a_revision_adoption_inherits_the_exact_original_planner_and_rebinds_current_u
 #[test]
 fn zero_unit_storyboard_selects_source_episodes_and_versioned_planning_profile() {
     let f = Fixture::new(Duration::ZERO);
+    // Current production requires an explicitly adopted visual baseline. This
+    // scope test must satisfy that prerequisite rather than test an old gate.
+    let coverage=json!({"form":"自然三维国漫造型","rendering":"连续柔和明暗","materials":"布料与金属分明","colorLighting":"统一冷暖且暗部可读","aspectRatio":"画幅16:9","localExceptions":"局部Q版需要回接"});
+    let visual=coverage.as_object().unwrap().values().map(|v|v.as_str().unwrap()).collect::<Vec<_>>().join("；");
+    f.store.save_settings(&json!({"ratio":"16:9","visualStyle":visual,"projectVisualStyle":visual,"visualBaseline":{"version":"series-visual-baseline-v1","id":"synthetic-scope-baseline","revision":1,"status":"adopted","visualStyle":visual,"coverage":coverage,"adoptionBasis":"synthetic explicit adoption"}})).unwrap();
     assert!(f.store.values("units").unwrap().is_empty());
     let source = f.store.source().unwrap();
     let first = source["episodes"][0]["id"].clone();

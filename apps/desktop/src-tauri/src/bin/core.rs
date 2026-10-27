@@ -22,6 +22,7 @@ fn main() {
         if (mode.as_deref() == Some("--native-cli-acceptance") || home.join("native-cli-acceptance.json").try_exists().map_err(|e| e.to_string())?)
             && [
                 "foundation.run",
+                "source.analyze",
                 "images.design",
                 "storyboard.run",
                 "storyboard.refine",
