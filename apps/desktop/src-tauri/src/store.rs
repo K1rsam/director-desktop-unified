@@ -52,6 +52,20 @@ pub struct Store {
     pub root: PathBuf,
 }
 
+// Opt-in synchronous test scope only. Production layout and connection policy
+// are unchanged; captured proof tests can exercise real absolute worker paths
+// without allowing SQL writes through any nested Store::conn call.
+#[cfg(test)]
+thread_local! {
+    static READONLY_TEST_ROOTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+struct ReadonlyTestScope(usize);
+#[cfg(test)]
+impl Drop for ReadonlyTestScope {
+    fn drop(&mut self) { READONLY_TEST_ROOTS.with(|roots|roots.borrow_mut().truncate(self.0)); }
+}
+
 fn open_database(path: &Path, flags: rusqlite::OpenFlags) -> Result<Connection> {
     #[cfg(windows)]
     {
@@ -72,6 +86,12 @@ fn open_database(path: &Path, flags: rusqlite::OpenFlags) -> Result<Connection> 
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn with_readonly_connections<T>(root:&Path, read:impl FnOnce()->T)->T {
+        let depth=READONLY_TEST_ROOTS.with(|roots|{let mut roots=roots.borrow_mut();let depth=roots.len();roots.push(root.to_owned());depth});
+        let _guard=ReadonlyTestScope(depth);
+        read()
+    }
     pub fn open(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let this = Self { root };
@@ -159,7 +179,14 @@ impl Store {
         Ok(this)
     }
     pub fn conn(&self) -> Result<Connection> {
-        let c = open_database(&self.root.join("project.sqlite"), rusqlite::OpenFlags::default()).map_err(|e| e.to_string())?;
+        let flags=rusqlite::OpenFlags::default();
+        #[cfg(test)]
+        let readonly=READONLY_TEST_ROOTS.with(|roots|roots.borrow().contains(&self.root));
+        #[cfg(test)]
+        let flags=if readonly {rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX}else{flags};
+        let c = open_database(&self.root.join("project.sqlite"), flags).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if readonly {c.pragma_update(None,"query_only",true).map_err(|e|e.to_string())?;}
         c.busy_timeout(Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         c.pragma_update(None, "foreign_keys", "ON")

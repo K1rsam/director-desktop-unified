@@ -76,6 +76,11 @@ pub struct TextRequest {
 #[async_trait]
 pub trait TextExecutor: Send + Sync {
     async fn execute(&self, request: TextRequest) -> Result<Value, String>;
+    /// Inspect the original frozen rebase and its shared repair budget without
+    /// generating. Persistent executors must bind this to durable source evidence.
+    async fn foundation_conflict_context(&self, _legacy: &TextRequest, _proposal: &Value) -> Result<Value, String> {
+        Err("FOUNDATION_CONFLICT_CONTEXT_UNAVAILABLE: 执行器未提供持久冲突证据，不分派新修订".into())
+    }
     /// Stable time of the saved original response, used only by new parallel Q1
     /// checkpoints. Authorization or replay time is not a response timestamp.
     async fn foundation_parallel_receipt_time(&self, _input: &Value) -> Result<String, String> {

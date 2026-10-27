@@ -80,7 +80,7 @@ mod tests {
 fn sha(value:&Value)->bool { value.as_str().is_some_and(|v|v.len()==64 && v.bytes().all(|b|b.is_ascii_hexdigit())) }
 pub(super) fn validate_markers(request:&TextRequest)->Result<()> {
     let input=&request.input;
-    let any=["foundationParallelTrial","foundationParallelRebase","foundationParallelFinal"].iter().any(|k|input.get(*k).is_some());
+    let any=["foundationParallelTrial","foundationParallelRebase","foundationParallelFinal","foundationConflictResolution"].iter().any(|k|input.get(*k).is_some());
     if !any{return Ok(());}
     if !matches!((request.stage.as_str(),request.skill.as_str()),("foundation:F2","foundation-asset-catalog")|("foundation:Q1","foundation-finishing-editor"))
         || input["delivery"]["method"]!="foundation-delivery/v2" {return Err(HELD.into());}
@@ -100,6 +100,7 @@ pub(super) fn validate_markers(request:&TextRequest)->Result<()> {
             return Err(HELD.into());
         }
     }
+    foundation_conflict::validate_marker(request)?;
     if let Some(final_check)=input.get("foundationParallelFinal") {
         if request.stage!="foundation:Q1" || !sha(&final_check["basisSha256"]) || !sha(&final_check["signalsSha256"])
             || !final_check["scope"].is_array(){return Err(HELD.into());}

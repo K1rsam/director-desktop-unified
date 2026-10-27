@@ -1707,6 +1707,26 @@ pub(super) fn source_before_scene_edits(source: &LockedSource) -> Result<LockedS
 }
 
 pub fn validate_source(source: &LockedSource) -> Result<(), String> {
+    // Source validation is deterministic for the running parser binary. Cache
+    // only successful checks and bind ALL serialized fields, not merely the
+    // text SHA: altered rows, classifications, decisions and scene edits must
+    // still be rejected. No source prose or trust survives process restart.
+    static VERIFIED: OnceLock<std::sync::Mutex<std::collections::VecDeque<[u8; 32]>>> = OnceLock::new();
+    let encoded = serde_json::to_vec(source).map_err(|e| e.to_string())?;
+    let key: [u8; 32] = Sha256::digest(&encoded).into();
+    let memo = VERIFIED.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    if memo.lock().is_ok_and(|entries| entries.contains(&key)) { return Ok(()); }
+    validate_source_uncached(source)?;
+    if let Ok(mut entries) = memo.lock() {
+        if !entries.contains(&key) {
+            if entries.len() == 4 { entries.pop_front(); }
+            entries.push_back(key);
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_uncached(source: &LockedSource) -> Result<(), String> {
     validate_integrity(source)?;
     let canonical = parse_source(&source.text, &source.parser_version)?;
     let expected = if source.boundary_decisions.is_empty() {
@@ -3090,6 +3110,7 @@ mod tests {
     #[test]
     fn source_classification_cannot_be_tampered_and_decision_keeps_existing_episode() {
         let mut s = prepare_source("第一集\n小王：走。\n").unwrap();
+        validate_source(&s).unwrap();
         let mut counterfeit = s.clone();
         counterfeit.rows[1].kind = "context".into();
         counterfeit.rows[1].dialogue = None;
@@ -3112,6 +3133,30 @@ mod tests {
         assert_eq!(s.episodes.len(), 1);
         assert_eq!(s.episodes[0].number, 1);
         validate_source(&s).unwrap();
+    }
+    #[test]
+    fn source_validation_memo_binds_projection_not_only_text_hash() {
+        let source = prepare_source("第1集\n场景：大厅\n小王：原话不改。\n").unwrap();
+        validate_source(&source).unwrap();
+        validate_source(&source).unwrap();
+        for field in ["speaker", "kind", "range", "episode", "scene", "parser"] {
+            let mut changed = source.clone();
+            match field {
+                "speaker" => changed.rows[2].dialogue.as_mut().unwrap().speaker = "另一人".into(),
+                "kind" => changed.rows[2].kind = "context".into(),
+                "range" => changed.rows[2].range.end -= 1,
+                "episode" => changed.episodes[0].number = 99,
+                "scene" => changed.scenes[0].title = "另一地点".into(),
+                _ => changed.parser_version = "unknown-parser".into(),
+            }
+            assert_eq!(changed.sha256, source.sha256);
+            assert_eq!(changed.text, source.text);
+            let expected = validate_source_uncached(&changed);
+            assert!(expected.is_err(), "{field}");
+            assert_eq!(validate_source(&changed), expected, "{field}");
+            assert_eq!(validate_source(&changed), expected, "invalid is never admitted");
+        }
+        validate_source(&source).unwrap();
     }
     #[test]
     fn scene_mentions_scores_and_utc_colon_are_body() {

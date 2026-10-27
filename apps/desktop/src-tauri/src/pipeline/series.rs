@@ -66,6 +66,8 @@ pub(crate) use tests::repair_plan_tests::series_repair_replay_fixture;
 #[cfg(test)]
 pub(crate) use tests::seed_engine_series_fixture;
 #[cfg(test)]
+pub(crate) use tests::visual_baseline_tests::settings as synthetic_visual_baseline_settings;
+#[cfg(test)]
 pub(crate) use tests::series_review_entry_replay_fixture;
 #[cfg(test)]
 pub(crate) use tests::controller_review_tests::{series_controller_fixture,series_controller_delivery_fixture};

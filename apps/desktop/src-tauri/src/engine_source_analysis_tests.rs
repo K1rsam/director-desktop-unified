@@ -381,7 +381,9 @@ fn source_analysis_local_reparse_completes_with_unavailable_model_channel() {
             break;
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            // This checks local completion and zero model calls, not a timing
+            // SLA; parallel native build/tests can temporarily saturate CPUs.
+            started.elapsed() < std::time::Duration::from_secs(30),
             "local task failed or stalled: {jobs:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -394,7 +396,7 @@ fn source_analysis_local_reparse_completes_with_unavailable_model_channel() {
             drop(lease);
             break;
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

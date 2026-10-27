@@ -21,6 +21,8 @@ const STANDALONE_RECEIVED_INTERRUPTED: &str =
     "文字步骤中断或尚未校验；继续原流程时重新执行，原回包保留";
 #[path = "text_cli_unknown.rs"]
 mod cli_unknown;
+#[path = "text_executor_foundation_conflict.rs"]
+mod foundation_conflict;
 pub(crate) use cli_unknown::{check_cli_unknown_hold, cli_unknown_jobs};
 
 #[derive(Default)]
@@ -5148,6 +5150,9 @@ pub(crate) fn spawn_cli_child(
 }
 #[async_trait::async_trait]
 impl TextExecutor for SavedTextExecutor {
+    async fn foundation_conflict_context(&self,legacy:&TextRequest,proposal:&Value)->Result<Value> {
+        self.foundation_conflict_context_resumed(legacy,proposal).await
+    }
     async fn foundation_parallel_receipt_time(&self,input:&Value)->Result<String> {
         crate::foundation_trial_store::receipt_time(&self.store,self.workflow_id.as_deref().ok_or("FOUNDATION_PARALLEL_RECEIPT_WORKFLOW")?,input)
     }
@@ -5397,6 +5402,7 @@ impl TextExecutor for SavedTextExecutor {
         self.check_cli_allocation_boundary(&request, &snapshot)?;
         check_cli_unknown_hold(&self.store)?;
         self.check_sdk_unresolved_hold()?;
+        self.foundation_conflict_dispatch_bound(&request)?;
         self.sdk_revision_budget(&request)?;
         let _permit = TEXT_SLOTS
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
@@ -8559,7 +8565,7 @@ fn restore_optional_fields(value: &mut Value, schema: &Value) {
 }
 fn step_key(request: &TextRequest) -> String {
     let mut key = base_step_key(request);
-    for field in ["foundationParallelTrial","foundationParallelRebase","foundationParallelFinal"] {
+    for field in ["foundationParallelTrial","foundationParallelRebase","foundationParallelFinal","foundationConflictResolution"] {
         if let Some(marker)=request.input.get(field) {
             key.push_str(&format!(":{field}:{}",crate::pipeline::digest(&marker.to_string())));
         }
@@ -12141,6 +12147,7 @@ impl SavedTextExecutor {
         self.sdk_checkpoint_binding(request, snapshot)?;
         let mut queued_preparation=None;
         if let Some(job) = self.sdk_find(snapshot)? {
+            self.foundation_conflict_existing_bound(request,&job,snapshot)?;
             self.sdk_parallel_worker_bound(&job,snapshot)?;
             if job["receipt"]["transportValidation"] == "schema_rejected" {
                 return Err("SDK_SCHEMA_REJECTED: 原请求被格式校验明确拒绝；当前没有可用的一次性格式修正，不自动重发".into());
@@ -12231,6 +12238,7 @@ impl SavedTextExecutor {
         let _ = self.visual_fact_replay(request, snapshot)?;
         let _ = self.carrier_rejected_result(request, snapshot, &hash)?;
         let _ = self.carrier_received_result(request, snapshot, &hash)?;
+        self.foundation_conflict_dispatch_bound(request)?;
         self.sdk_revision_budget(request)?;
         }
         let config = crate::text_sdk::Config::from_frozen_identity(
@@ -12677,6 +12685,10 @@ impl SavedTextExecutor {
                 return Err("SDK_CHECKPOINT_BINDING: 原流程节点变化，原任务/回包保持".into());
             }
         }
+        crate::workflow_conflict_artifacts::record_callback(
+            &tx, request, &snapshot, &job, self.workflow_id.as_deref(),
+            &step_key(request), &raw, value, reason,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 }

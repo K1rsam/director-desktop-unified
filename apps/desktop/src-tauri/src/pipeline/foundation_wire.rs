@@ -32,6 +32,7 @@ pub(crate) struct CompiledWire {
     forward: HashMap<String, (Kind, String)>,
     reverse: HashMap<String, (Kind, String)>,
     canonical: HashSet<String>,
+    conflict_decision: bool,
 }
 
 #[derive(Default)]
@@ -198,6 +199,51 @@ fn collect_structured(ids: &mut Ids, value: &Value, context: Option<Kind>) -> Re
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+// Only the new decision protocol gains these additional typed slots. Changing
+// compilation of an older frozen compact request would invalidate its evidence.
+fn collect_decision_ids(ids:&mut Ids,value:&Value)->Result<(),String> {
+    match value {
+        Value::Object(fields)=>for (name,child) in fields {
+            match name.as_str() {
+                "sourceAssetId"|"targetAssetId"=>ids.add(Kind::Asset,child)?,
+                "sourceVariantId"|"targetVariantId"=>ids.add(Kind::Variant,child)?,
+                _=>{},
+            }
+            collect_decision_ids(ids,child)?;
+        },
+        Value::Array(values)=>for child in values {collect_decision_ids(ids,child)?;},
+        _=>{},
+    }
+    Ok(())
+}
+
+fn collect_decision_schema_ids(ids:&mut Ids,schema:&Value)->Result<(),String> {
+    let Some(object)=schema.as_object() else{return Ok(())};
+    if let Some(properties)=object.get("properties").and_then(Value::as_object) {
+        for (name,child) in properties {
+            let kind=match name.as_str(){"targetAssetId"=>Some(Kind::Asset),"targetVariantId"=>Some(Kind::Variant),_=>None};
+            if let Some(kind)=kind {
+                if let Some(values)=child.get("enum").and_then(Value::as_array) {
+                    for value in values {ids.add(kind,value)?;}
+                }
+            }
+            collect_decision_schema_ids(ids,child)?;
+        }
+    }
+    for field in ["$defs","definitions"] {
+        if let Some(children)=object.get(field).and_then(Value::as_object) {
+            for child in children.values(){collect_decision_schema_ids(ids,child)?;}
+        }
+    }
+    if let Some(child)=object.get("items"){collect_decision_schema_ids(ids,child)?;}
+    for field in ["anyOf","oneOf","allOf","prefixItems"] {
+        if let Some(children)=object.get(field).and_then(Value::as_array) {
+            for child in children {collect_decision_schema_ids(ids,child)?;}
+        }
     }
     Ok(())
 }
@@ -419,6 +465,12 @@ impl CompiledWire {
                         {
                             self.scalar(child, None, restore)?;
                         }
+                        "sourceAssetId" | "targetAssetId" if self.conflict_decision => {
+                            self.scalar(child, Some(Kind::Asset), restore)?
+                        }
+                        "targetVariantId" if self.conflict_decision => {
+                            self.scalar(child, Some(Kind::Variant), restore)?
+                        }
                         "assetId" | "assetKey" | "baseKey" | "asset_id" => {
                             self.scalar(child, Some(Kind::Asset), restore)?
                         }
@@ -429,6 +481,9 @@ impl CompiledWire {
                         "fromKey" => self.identity(child, restore)?,
                         "keepKey" | "intoKey" => self.scalar(child, Some(Kind::Asset), restore)?,
                         "key" if context.is_some() => self.scalar(child, context, restore)?,
+                        "id" if self.conflict_decision && context.is_some() => {
+                            self.scalar(child,context,restore)?
+                        }
                         "key"
                             if child.as_str().is_some_and(|id| {
                                 self.forward
@@ -446,6 +501,9 @@ impl CompiledWire {
                             if child.is_array() =>
                         {
                             self.list(child, Some(Kind::Episode), restore)?
+                        }
+                        "evidenceRows" if self.conflict_decision => {
+                            self.list(child, Some(Kind::Row), restore)?
                         }
                         "sourceRefs" | "anchorRowIds" | "evidenceRefs" => {
                             self.list(child, Some(Kind::Row), restore)?
@@ -468,6 +526,12 @@ impl CompiledWire {
                         "sceneRefs" | "scenes" if child.is_array() => self.pairs(child, restore)?,
                         "registry" | "candidates" | "assets" | "materialCandidates" => {
                             self.walk(child, Some(Kind::Asset), restore)?
+                        }
+                        "current" | "candidate" if self.conflict_decision
+                            && child.get("variants").is_some_and(Value::is_array)
+                            && child.get("id").and_then(Value::as_str).is_some_and(|id|
+                                self.forward.get(id).or_else(||self.reverse.get(id)).is_some_and(|(kind,_)|*kind==Kind::Asset)) => {
+                            self.walk(child,Some(Kind::Asset),restore)?
                         }
                         "variants" | "crossBatchVariants" => {
                             self.walk(child, Some(Kind::Variant), restore)?
@@ -498,6 +562,35 @@ impl CompiledWire {
         *value = restored;
         Ok(())
     }
+
+    /// Rewrite only explicitly typed decision schema slots. Hash enums,
+    /// conflict IDs, paths, prose, and arbitrary enum strings stay byte-exact.
+    fn decision_schema(&self, schema:&mut Value)->Result<(),String> {
+        let Some(object)=schema.as_object_mut() else{return Ok(())};
+        if let Some(properties)=object.get_mut("properties").and_then(Value::as_object_mut) {
+            for (name,child) in properties {
+                let kind=match name.as_str(){"targetAssetId"=>Some(Kind::Asset),"targetVariantId"=>Some(Kind::Variant),_=>None};
+                if let Some(kind)=kind {
+                    if let Some(values)=child.get_mut("enum").and_then(Value::as_array_mut) {
+                        for value in values {self.scalar(value,Some(kind),false)?;}
+                    }
+                }
+                self.decision_schema(child)?;
+            }
+        }
+        for field in ["$defs","definitions"] {
+            if let Some(children)=object.get_mut(field).and_then(Value::as_object_mut) {
+                for child in children.values_mut(){self.decision_schema(child)?;}
+            }
+        }
+        if let Some(child)=object.get_mut("items"){self.decision_schema(child)?;}
+        for field in ["anyOf","oneOf","allOf","prefixItems"] {
+            if let Some(children)=object.get_mut(field).and_then(Value::as_array_mut) {
+                for child in children {self.decision_schema(child)?;}
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn compile(stage: &str, input: &Value, schema: &Value) -> Result<CompiledWire, String> {
@@ -520,6 +613,13 @@ pub(crate) fn compile(stage: &str, input: &Value, schema: &Value) -> Result<Comp
     }
     collect_tables(&mut ids, input)?;
     collect_structured(&mut ids, input, None)?;
+    let conflict_decision=input.get("foundationConflictResolution").is_some();
+    if conflict_decision {
+        collect_decision_ids(&mut ids,input)?;
+        // Schema-only canonical a1/v1 are real IDs, not reusable wire aliases.
+        // Register before allocation, including null-capable enum definitions.
+        collect_decision_schema_ids(&mut ids,schema)?;
+    }
     let canonical: HashSet<_> = ids.known.keys().cloned().collect();
     let mut forward = HashMap::new();
     let mut reverse = HashMap::new();
@@ -570,6 +670,7 @@ pub(crate) fn compile(stage: &str, input: &Value, schema: &Value) -> Result<Comp
         forward,
         reverse,
         canonical,
+        conflict_decision,
     };
     // Keep borrows disjoint without changing the immutable mapping.
     let mut compiled = input.clone();
@@ -598,6 +699,11 @@ pub(crate) fn compile(stage: &str, input: &Value, schema: &Value) -> Result<Comp
                 *value = json!(alias);
             }
         }
+    }
+    if input.get("foundationConflictResolution").is_some() {
+        let mut schema=wire.schema.clone();
+        wire.decision_schema(&mut schema)?;
+        wire.schema=schema;
     }
     Ok(wire)
 }
@@ -662,6 +768,82 @@ mod tests {
             &json!({"$defs":{"sourceRow":{"type":"string","enum":["r:0:8","r:8:16"]}}}),
         )
         .unwrap()
+    }
+    #[test]
+    fn conflict_decision_wire_roundtrips_typed_references_without_rewriting_hashes_or_text() {
+        let initial=simple();let mut input=initial.input.clone();initial.restore(&mut input).unwrap();
+        let row=input["source"]["rows"][0][0].clone();
+        // Even a hash-shaped slot containing an identity-like string must not
+        // be transformed: hashes/IDs of conflicts are opaque canonical bindings.
+        input["foundationConflictResolution"]=json!({"manifestSha256":"asset:long:1","causeSha256":"a1"});
+        input["foundationConflictManifest"]=json!({"manifestSha256":"asset:long:1","causeSha256":"a1",
+            "items":[{"conflictId":"a1","expectedOldHash":"asset:long:1","path":"/assets/asset:long:1/description",
+                "sourceAssetId":"asset:long:1","targetAssetId":"asset:long:2",
+                "current":{"text":"a1 e1 r1","sourceRefs":[row]},"candidate":{"text":"原文不可删","sourceRefs":[row]}}]});
+        input["foundationConflictRepairHistory"]=json!([{"error":"a1 e1 r1","requestSha256":"asset:long:1","rawSha256":"r1"}]);
+        let schema=json!({"$defs":{"sourceRow":{"type":"string","enum":[row]}},"properties":{
+            "manifestSha256":{"enum":["asset:long:1"]},"decisions":{"items":{"anyOf":[{"properties":{
+                "targetAssetId":{"enum":["asset:long:2",null]},"targetVariantId":{"enum":["variant:long:1",null]},
+                "expectedOldHash":{"enum":["asset:long:1"]},"conflictId":{"enum":["a1"]},
+                "evidenceRows":{"items":{"$ref":"#/$defs/sourceRow"}}}}]}}}});
+        let wire=compile("foundation:F2",&input,&schema).unwrap();
+        let properties=&wire.schema["properties"]["decisions"]["items"]["anyOf"][0]["properties"];
+        assert_eq!(properties["targetAssetId"]["enum"][0],wire.input["registry"][1]["key"]);
+        assert_eq!(properties["targetVariantId"]["enum"][0],wire.input["registry"][0]["variants"][0]["key"]);
+        assert_eq!(properties["expectedOldHash"]["enum"],schema["properties"]["decisions"]["items"]["anyOf"][0]["properties"]["expectedOldHash"]["enum"]);
+        assert_eq!(wire.input["foundationConflictResolution"],input["foundationConflictResolution"]);
+        assert_eq!(wire.input["foundationConflictRepairHistory"],input["foundationConflictRepairHistory"]);
+        let mut restored=wire.input.clone();wire.restore(&mut restored).unwrap();
+        restored["transportInstructions"]=input["transportInstructions"].clone();assert_eq!(restored,input);
+        let canonical=json!({"version":"foundation-conflict-resolution/v1","manifestSha256":"asset:long:1","decisions":[{
+            "conflictId":"a1","expectedOldHash":"asset:long:1","targetAssetId":"asset:long:2","targetVariantId":"variant:long:1",
+            "evidenceRows":[row],"replacementText":"e1 r1 a1","reason":"r1与原文相同"}]});
+        let mut response=canonical.clone();wire.walk(&mut response,None,false).unwrap();
+        assert_eq!(response["decisions"][0]["evidenceRows"][0],wire.schema["$defs"]["sourceRow"]["enum"][0]);
+        wire.restore(&mut response).unwrap();assert_eq!(response,canonical);
+        wire.restore(&mut response).unwrap();assert_eq!(response,canonical);
+        response["decisions"][0]["evidenceRows"]=json!(["r999999"]);let invalid=response.clone();
+        assert!(wire.restore(&mut response).is_err());assert_eq!(response,invalid);
+    }
+    #[test]
+    fn conflict_decision_slots_do_not_change_legacy_compact_compilation() {
+        let initial=simple();let mut input=initial.input.clone();initial.restore(&mut input).unwrap();
+        input["legacyOpaque"]=json!({"sourceAssetId":"a-new-canonical-id","targetAssetId":"asset:long:2",
+            "targetVariantId":"variant:long:1","evidenceRows":["row:0123456789ab:0:8"]});
+        let wire=compile("Q1",&input,&json!({})).unwrap();
+        assert_eq!(wire.input["legacyOpaque"],input["legacyOpaque"]);
+        assert_eq!(wire.input["registry"],initial.input["registry"]);
+        let mut response=json!({"targetAssetId":"a2","targetVariantId":"v1","evidenceRows":["r1"]});
+        let before=response.clone();wire.restore(&mut response).unwrap();assert_eq!(response,before);
+    }
+    #[test]
+    fn conflict_decision_schema_only_short_canonical_ids_are_reserved_before_aliases() {
+        let initial=simple();let mut input=initial.input.clone();initial.restore(&mut input).unwrap();
+        input["foundationConflictResolution"]=json!({"manifestSha256":"a1"});
+        input["foundationConflictManifest"]=json!({"items":[{"sourceAssetId":"asset:long:1",
+            "current":{"id":"a1","name":"a1原文","variants":[{"id":"v1","name":"v1原文"}]}}]});
+        let schema=json!({"properties":{"decisions":{"items":{"anyOf":[{"properties":{
+            "targetAssetId":{"enum":["a1",null]},"targetVariantId":{"enum":["v1",null]},
+            "expectedOldHash":{"enum":["a1"]}}}]}}}});
+        let wire=compile("F2",&input,&schema).unwrap();
+        assert_ne!(wire.input["registry"][0]["key"],"a1");
+        assert_ne!(wire.input["registry"][0]["variants"][0]["key"],"v1");
+        let props=&wire.schema["properties"]["decisions"]["items"]["anyOf"][0]["properties"];
+        let current=&wire.input["foundationConflictManifest"]["items"][0]["current"];
+        assert_eq!(current["id"],props["targetAssetId"]["enum"][0]);
+        assert_eq!(current["variants"][0]["id"],props["targetVariantId"]["enum"][0]);
+        assert_eq!(current["name"],"a1原文");assert_eq!(props["expectedOldHash"]["enum"][0],"a1");
+        let mut response=json!({"decisions":[{"targetAssetId":props["targetAssetId"]["enum"][0],
+            "targetVariantId":props["targetVariantId"]["enum"][0],"expectedOldHash":"a1"}]});
+        wire.restore(&mut response).unwrap();
+        let canonical=json!({"decisions":[{"targetAssetId":"a1","targetVariantId":"v1","expectedOldHash":"a1"}]});
+        assert_eq!(response,canonical);wire.restore(&mut response).unwrap();assert_eq!(response,canonical);
+        let mut restored=wire.input.clone();wire.restore(&mut restored).unwrap();
+        restored["transportInstructions"]=input["transportInstructions"].clone();assert_eq!(restored,input);
+        input.as_object_mut().unwrap().remove("foundationConflictResolution");
+        let legacy=compile("F2",&input,&schema).unwrap();
+        assert_eq!(legacy.input["registry"],initial.input["registry"]);
+        assert_eq!(legacy.schema,schema);assert_eq!(legacy.input["foundationConflictManifest"],input["foundationConflictManifest"]);
     }
     #[test]
     fn typed_references_same_names_and_literals_stay_distinct() {

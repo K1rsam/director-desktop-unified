@@ -2,6 +2,26 @@
 use super::*;
 use std::sync::Mutex;
 
+#[derive(Clone)]
+struct SavedRebase {
+    id: String,
+    request: TextRequest,
+    snapshot: Value,
+    result: Value,
+    state: String,
+    error: Option<String>,
+}
+
+fn exact_request(a: &TextRequest, b: &TextRequest) -> bool {
+    a.stage == b.stage
+        && a.skill == b.skill
+        && a.input == b.input
+        && a.schema == b.schema
+        && a.rule_snapshot == b.rule_snapshot
+        && a.model == b.model
+        && a.reasoning == b.reasoning
+}
+
 #[tokio::test]
 #[ignore = "explicit saved first-wave database and local report directory; zero model calls"]
 async fn real_saved_wave_readonly_revalidation() {
@@ -32,20 +52,48 @@ async fn real_saved_wave_readonly_revalidation() {
     let parent: Value = serde_json::from_str(&parent).unwrap();
     let input = &parent["input"];
     let source: LockedSource = serde_json::from_value(input["source"].clone()).unwrap();
-    let mut q=c.prepare("SELECT j.snapshot,CASE WHEN w.state='accepted' THEN w.result ELSE j.result END FROM workflow_steps w JOIN jobs j ON w.text_job_id=j.id WHERE w.workflow_id=?1 AND w.stage='foundation:F2' AND j.state IN ('completed','rejected') AND j.result IS NOT NULL ORDER BY w.rowid").unwrap();
-    let originals: Vec<(TextRequest, Value)> = q
+    let mut q=c.prepare("SELECT j.id,j.snapshot,CASE WHEN w.state='accepted' THEN w.result ELSE j.result END,j.state,w.state,j.error FROM workflow_steps w JOIN jobs j ON w.text_job_id=j.id WHERE w.workflow_id=?1 AND w.stage='foundation:F2' AND j.state IN ('completed','rejected') AND j.result IS NOT NULL ORDER BY w.rowid").unwrap();
+    let rows: Vec<(String, String, String, String, String, Option<String>)> = q
         .query_map([&workflow], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })
         .unwrap()
-        .map(|r| {
-            let (a, b) = r.unwrap();
-            (
-                serde_json::from_str(&a).unwrap(),
-                serde_json::from_str(&b).unwrap(),
-            )
-        })
+        .map(Result::unwrap)
         .collect();
+    let mut originals = vec![];
+    let mut rebases = vec![];
+    for (id, snapshot, result, state, node_state, error) in &rows {
+        let request: TextRequest = serde_json::from_str(snapshot).unwrap();
+        let result: Value = serde_json::from_str(result).unwrap();
+        assert!(
+            request.input.get("foundationConflictResolution").is_none(),
+            "fixture must precede new decision dispatch"
+        );
+        if request.input.get("foundationParallelRebase").is_some() {
+            assert!(
+                state == "completed" && node_state == "accepted"
+                    || state == "rejected" && node_state == "rejected",
+                "old rebase receipt and node state must agree"
+            );
+            rebases.push(SavedRebase {
+                id: id.clone(),
+                request,
+                snapshot: serde_json::from_str(snapshot).unwrap(),
+                result,
+                state: state.clone(),
+                error: error.clone(),
+            });
+        } else {
+            originals.push((request, result));
+        }
+    }
     assert_eq!(
         originals.len(),
         6,
@@ -139,34 +187,117 @@ async fn real_saved_wave_readonly_revalidation() {
     context["foundationParallelTrial"] = authorization;
     struct Replay {
         originals: Vec<(TextRequest, Value)>,
+        rebases: Vec<SavedRebase>,
         seen: Mutex<Vec<usize>>,
+        legacy_seen: Mutex<Vec<String>>,
+        conflict_contexts: Mutex<Vec<Value>>,
         next: Mutex<Vec<TextRequest>>,
+        workflow: String,
     }
     #[async_trait::async_trait]
     impl TextExecutor for Replay {
         async fn execute(&self, r: TextRequest) -> Result<Value, String> {
-            let matching = self.originals.iter().position(|(old, _)| {
-                old.stage == r.stage
-                    && old.input == r.input
-                    && old.schema == r.schema
-                    && old.rule_snapshot == r.rule_snapshot
-                    && old.model == r.model
-                    && old.reasoning == r.reasoning
-            });
+            let matching = self
+                .originals
+                .iter()
+                .position(|(old, _)| exact_request(old, &r));
             if let Some(at) = matching {
                 self.seen.lock().unwrap().push(at);
                 return Ok(self.originals[at].1.clone());
             }
+            if let Some(old) = self
+                .rebases
+                .iter()
+                .find(|old| exact_request(&old.request, &r))
+            {
+                assert_eq!(
+                    old.state, "completed",
+                    "rejected legacy repair must never execute again"
+                );
+                self.legacy_seen.lock().unwrap().push(old.id.clone());
+                return Ok(old.result.clone());
+            }
             self.next.lock().unwrap().push(r);
             Err("SAVED_WAVE_PREVIEW_ONLY_NO_MODEL".into())
+        }
+
+        async fn foundation_conflict_context(
+            &self,
+            legacy: &TextRequest,
+            manifest: &Value,
+        ) -> Result<Value, String> {
+            let matches: Vec<_> = self
+                .rebases
+                .iter()
+                .filter(|old| exact_request(&old.request, legacy))
+                .collect();
+            assert!(
+                matches.len() <= 1,
+                "one exact frozen old repair per conflict"
+            );
+            for field in [
+                "originalInputSha256",
+                "originalResultSha256",
+                "currentBasisSha256",
+            ] {
+                assert_eq!(
+                    legacy.input["foundationParallelRebase"][field], manifest[field],
+                    "{field}"
+                );
+            }
+            assert_eq!(legacy.input["scope"], manifest["scope"]);
+            assert_eq!(legacy.input["sourceSha256"], manifest["sourceSha256"]);
+            assert_eq!(
+                legacy.stage,
+                format!("foundation:{}", manifest["stage"].as_str().unwrap())
+            );
+            let mut old_paths = legacy.input["foundationParallelRebase"]["conflicts"]
+                .as_array()
+                .unwrap()
+                .clone();
+            old_paths.sort_by_key(Value::to_string);
+            let mut new_paths = manifest["conflicts"].as_array().unwrap().clone();
+            new_paths.sort_by_key(Value::to_string);
+            assert_eq!(old_paths, new_paths);
+            let old = matches.first().copied();
+            let accepted = old.filter(|old| old.state == "completed");
+            let count = usize::from(old.is_some());
+            let next = if accepted.is_some() {
+                Value::Null
+            } else {
+                json!(count + 1)
+            };
+            let previous:Vec<_>=old.into_iter().map(|old|json!({"jobId":old.id,"workflowId":self.workflow,"legacy":true,"status":old.state,"requestSha256":value_sha(&old.snapshot).unwrap(),"resultSha256":value_sha(&old.result).unwrap(),"rawSha256":value_sha(&old.result).unwrap(),"error":old.error})).collect();
+            let mut marker = json!({"version":"foundation-conflict-resolution/v1","attempt":next,"maximumAttempts":2,"legacyJobId":old.map(|old|old.id.clone()),"previousAttemptSha256":old.map(|old|value_sha(&old.snapshot).unwrap()),"legacyConsumedAttempts":count});
+            for field in [
+                "sourceSha256",
+                "originalInputSha256",
+                "originalResultSha256",
+                "currentBasisSha256",
+                "issueSetSha256",
+                "causeSha256",
+                "manifestSha256",
+            ] {
+                marker[field] = manifest[field].clone();
+            }
+            let recovery = json!({"legacyAccepted":accepted.map(|old|json!({"raw":old.result,"request":old.request,"jobId":old.id})),"existingResolution":null,"consumedAttempts":count,"nextAttempt":next,"previousAttempts":previous,"marker":marker});
+            self.conflict_contexts
+                .lock()
+                .unwrap()
+                .push(json!({"legacyRequest":legacy,"manifest":manifest,"recovery":recovery}));
+            Ok(recovery)
         }
     }
     let model = originals[0].0.model.clone();
     let reasoning = originals[0].0.reasoning.clone();
     let replay = Replay {
         originals,
+        rebases,
         seen: Mutex::new(vec![]),
+        legacy_seen: Mutex::new(vec![]),
+        conflict_contexts: Mutex::new(vec![]),
         next: Mutex::new(vec![]),
+        workflow: workflow.clone(),
     };
     let result = run(&source, &context, &replay, &model, &reasoning).await;
     let stop = result
@@ -177,7 +308,36 @@ async fn real_saved_wave_readonly_revalidation() {
     unique.sort();
     unique.dedup();
     let requests = replay.next.lock().unwrap();
-    let report = json!({"kind":"READ_ONLY_SAVED_WAVE_REVALIDATION_NOT_CLIENT_ACCEPTANCE","readOnly":true,"modelCalls":0,"replayedNodeIndexes":seen,"nextRequests":*requests,"stop":stop});
+    let legacy_seen = replay.legacy_seen.lock().unwrap().clone();
+    let contexts = replay.conflict_contexts.lock().unwrap();
+    if let Some(last) = contexts.last() {
+        std::fs::write(
+            out.join("saved-wave-conflict-context.json"),
+            serde_json::to_vec_pretty(last).unwrap(),
+        )
+        .unwrap();
+    }
+    // Verify every saved row again on this same READ_ONLY connection, including
+    // rejected data, rather than mutating states to simulate a recovered node.
+    let after: Vec<(String, String, String, String, String, Option<String>)> = q
+        .query_map([&workflow], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows, after,
+        "all captured states, snapshots and raw results stay unchanged"
+    );
+    let report = json!({"kind":"READ_ONLY_SAVED_WAVE_REVALIDATION_NOT_CLIENT_ACCEPTANCE","readOnly":true,"modelCalls":0,"replayedNodeIndexes":seen,"legacyAcceptedReplayed":legacy_seen,"legacyRejectedPreserved":replay.rebases.iter().filter(|r|r.state=="rejected").map(|r|r.id.clone()).collect::<Vec<_>>(),"savedRowsUnchanged":true,"nextRequests":*requests,"stop":stop});
     std::fs::write(
         out.join("saved-wave-revalidation.json"),
         serde_json::to_vec_pretty(&report).unwrap(),
@@ -192,9 +352,59 @@ async fn real_saved_wave_readonly_revalidation() {
         stop.contains("SAVED_WAVE_PREVIEW_ONLY_NO_MODEL"),
         "unexpected domain failure: {stop}"
     );
-    assert!(!requests.is_empty());
-    assert!(requests
+    assert_eq!(
+        requests.len(),
+        1,
+        "stop at first genuinely new decision without invoking a provider"
+    );
+    let next = &requests[0];
+    assert!(next.input.get("foundationConflictResolution").is_some());
+    assert!(next.input.get("foundationParallelRebase").is_none());
+    let last = contexts
+        .last()
+        .expect("new decision has a frozen conflict context");
+    let legacy: TextRequest = serde_json::from_value(last["legacyRequest"].clone()).unwrap();
+    assert_eq!(
+        next.input["source"], legacy.input["source"],
+        "full current batch source unchanged"
+    );
+    assert_eq!(next.input["scope"], legacy.input["scope"]);
+    assert_eq!(
+        next.rule_snapshot, legacy.rule_snapshot,
+        "complete rule package retained"
+    );
+    assert_eq!(next.input["foundationConflictManifest"], last["manifest"]);
+    let rejected: Vec<_> = replay
+        .rebases
         .iter()
-        .all(|r| r.input.get("foundationParallelRebase").is_some()
-            || r.input["batchIndex"].as_u64().is_some_and(|i| i >= 6)));
+        .filter(|r| r.state == "rejected")
+        .collect();
+    if !rejected.is_empty() {
+        assert_eq!(
+            rejected.len(),
+            1,
+            "fixture contains one consumed rejected repair"
+        );
+        assert!(exact_request(&rejected[0].request, &legacy));
+        assert_eq!(last["recovery"]["consumedAttempts"], 1);
+        assert_eq!(last["recovery"]["nextAttempt"], 2);
+        assert_eq!(next.input["foundationConflictResolution"]["attempt"], 2);
+        let accepted: Vec<_> = replay
+            .rebases
+            .iter()
+            .filter(|r| r.state == "completed")
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(
+            legacy_seen, accepted,
+            "all earlier accepted repairs replayed exactly"
+        );
+        assert!(!legacy_seen.contains(&rejected[0].id));
+    } else if replay.rebases.is_empty() {
+        assert_eq!(
+            next.input["foundationConflictResolution"]["attempt"], 1,
+            "six-node legacy fixture starts first sparse decision"
+        );
+        assert!(legacy_seen.is_empty());
+    }
 }

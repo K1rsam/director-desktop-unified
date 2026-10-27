@@ -443,8 +443,11 @@ fn global_catalog_feeds_new_storyboard_and_preflight_without_project_cache_or_ge
         )
         .unwrap()))
         .unwrap();
+    let mut settings = pipeline::series::synthetic_visual_baseline_settings();
+    settings["videoProvider"] = json!("bh");
+    settings["videoModel"] = json!("fixture-model");
     store
-        .save_settings(&json!({"videoProvider":"bh","videoModel":"fixture-model"}))
+        .save_settings(&settings)
         .unwrap();
     let old = store
         .add_job(

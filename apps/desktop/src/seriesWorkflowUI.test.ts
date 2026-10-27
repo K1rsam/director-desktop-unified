@@ -8,6 +8,26 @@ import type { Asset, Workspace } from './types.ts';
 function fixture(): Workspace {
   return { project: { id: 'project', title: '合成项目' }, assets: [], units: [], media: [], jobs: [], settings: { ratio: '9:16' }, providers: [], rules: [] };
 }
+test('pending identity preserves historical image but isolates new generation and actual consumers', () => {
+  const workspace = fixture();
+  const parent: Asset = { id: 'parent', name: '身份待核对', kind: 'SC', prompt: '原词', adoptedMediaId: 'saved', foundationConflictReview: { pending: true } };
+  const child: Asset = { id: 'child', name: '真实消费者', kind: 'SC', prompt: '派生词', referenceRequirements: [{ targetAssetId: 'parent' }] };
+  const independent: Asset = { id: 'other', name: '独立资产', kind: 'SC', prompt: '独立词', sourceAssetId: 'parent' };
+  workspace.assets = [parent, child, independent];
+  workspace.media = [{ id: 'saved', kind: 'image', path: 'saved.png', assetId: 'parent' }];
+  const before = structuredClone(workspace);
+  assert.ok(realAdoptedImage(workspace, parent), 'history remains viewable');
+  assert.equal(usableAdoptedImage(workspace, parent), undefined);
+  assert.equal(assetImageStatus(workspace, parent), '身份待核对');
+  assert.equal(imageReadyForGeneration(workspace, parent), false);
+  assert.equal(imageReadyForGeneration(workspace, child), false);
+  assert.equal(imageReadyForGeneration(workspace, independent), true, 'identity-only relation does not block');
+  assert.equal(imageProductionCounts(workspace).adopted, 0);
+  assert.deepEqual(workspace, before, 'UI projection never rewrites history');
+  parent.foundationConflictReview = { pending: false };
+  assert.ok(usableAdoptedImage(workspace, parent));
+  assert.equal(imageReadyForGeneration(workspace, child), true);
+});
 test('stage routing retains stable IDs and remembers each project without persisting global settings as a work page', () => {
   assert.deepEqual(PRODUCTION_PAGES, ['foundation', 'storyboard', 'images', 'videos']);
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage'), saved = new Map<string, string>();

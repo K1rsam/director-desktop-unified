@@ -109,5 +109,13 @@ test('实际第一阶段组件显示保存范围、核对和最终采用，不�
     assert.match(progressHtml, /冲突修订 · 通道 2/);
     assert.match(progressHtml, /统一收口 · 通道 3/);
     assert.equal(mutations, 0);
+    workspace.jobs[0].status = 'completed';
+    workspace.workflowProgress![0].status = 'completed';
+    workspace.foundationConflictReview = { pendingCount: 2 };
+    const pendingHtml = renderToStaticMarkup(createElement(WorkflowProgress, { workspace, stage: 'foundation', writable: true, mutate: async () => { mutations++; return workspace; } }));
+    assert.match(pendingHtml, /整理完成 · 2 项待核对/);
+    assert.match(pendingHtml, /未计为全部通过/);
+    assert.doesNotMatch(pendingHtml, /全剧已整理/);
+    assert.equal(mutations, 0);
   } finally { await server.close(); }
 });

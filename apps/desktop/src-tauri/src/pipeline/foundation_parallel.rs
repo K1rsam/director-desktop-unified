@@ -5,6 +5,11 @@ use super::*;
 pub(crate) const PROFILE: &str = "foundation-three-lane-trial/v1";
 const REBASE: &str = "foundation-parallel-rebase/v1";
 
+#[path = "foundation_conflict_resolution.rs"]
+mod conflict_resolution;
+#[path = "foundation_conflict_runner.rs"]
+mod conflict_runner;
+
 #[cfg(test)]
 #[path = "foundation_saved_wave_tests.rs"]
 mod saved_wave_tests;
@@ -512,6 +517,13 @@ fn name_conflicts(
             .iter()
             .filter(|a| a.id != asset.id && a.kind == asset.kind)
         {
+            if conflict_resolution::distinct_pair_recorded(current, &asset.id, &other.id)
+                || conflict_resolution::distinct_pair_recorded(candidate, &asset.id, &other.id)
+                || conflict_resolution::deferred_pair_recorded(current, &asset.id, &other.id)
+                || conflict_resolution::deferred_pair_recorded(candidate, &asset.id, &other.id)
+            {
+                continue;
+            }
             if asset.name == other.name
                 || asset.aliases.contains(&other.name)
                 || other.aliases.contains(&asset.name)
@@ -1052,6 +1064,17 @@ async fn wave(
                         q1_schema()
                     },
                 )?;
+                let manifest = conflict_resolution::build_manifest(root_source,batch,basis,&current,&candidate,input,&result,&conflicts)?;
+                let legacy = TextRequest {stage:format!("foundation:{stage}"),skill:if stage=="F2"{F2_RULE.into()}else{Q1_RULE.into()},
+                    model:model.into(),reasoning:reasoning.into(),input:revised.clone(),schema:delivery_schema(stage,&revised),
+                    rule_snapshot:snapshot(if stage=="F2"{F2_RULE}else{Q1_RULE},&[])?};
+                let recovery = executor.foundation_conflict_context(&legacy,&manifest.input).await?;
+                if !recovery["legacyAccepted"].is_object() {
+                    let outcome = conflict_runner::run(&manifest,&legacy,recovery,source,root_source,batch,basis,&current,&candidate,context,executor).await?;
+                    current = outcome.proposal;
+                    signals.extend(own_signals);
+                    continue;
+                }
                 let fixed = execute(
                     stage, source, batch, &revised, &current, context, resolved, executor, model,
                     reasoning,

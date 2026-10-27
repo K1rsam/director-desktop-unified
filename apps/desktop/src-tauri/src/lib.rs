@@ -19,6 +19,7 @@ pub mod lingmo_media;
 pub mod media_probe;
 pub mod pipeline;
 pub(crate) mod foundation_trial_store;
+mod foundation_conflict_gate;
 pub mod asset_graph;
 pub mod asset_composite;
 mod asset_identity_layout;
@@ -37,6 +38,9 @@ pub mod tasks;
 pub mod text_cli;
 pub mod text_executor;
 pub mod workflow;
+mod workflow_artifacts;
+mod workflow_conflict_artifacts;
+mod workflow_issues;
 pub mod windows_runtime;
 #[cfg(test)]
 mod workflow_tests;

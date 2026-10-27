@@ -763,6 +763,7 @@ fn validate_image_semantics(store: &Store, reference: &Value) -> Result<()> {
 
 /// Images and videos share the same immutable-reference validity boundary.
 pub fn validate_generation_snapshot(store: &Store, snapshot: &Value) -> Result<()> {
+    crate::foundation_conflict_gate::validate_snapshot(store,snapshot)?;
     if s(snapshot, "kind") == "video" {
         validate_snapshot(store, snapshot)?;
     } else if s(snapshot, "kind") == "image" {

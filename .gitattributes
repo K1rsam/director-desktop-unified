@@ -10,5 +10,6 @@ apps/chrome-bridge/overrides/src/** -text -whitespace
 web-image-bridge/vendor/** -text -whitespace
 # Complete creative rule snapshots preserve the exact frozen source bytes.
 rules/series/** -text -whitespace
+rules/series-lite/** -text -whitespace
 rules/assets/** -text -whitespace
 rules/desktop/** -text -whitespace

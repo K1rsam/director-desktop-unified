@@ -20,6 +20,7 @@ export function imageAssetNeeded(asset: Asset): boolean {
   return !['INLINE', 'AUDIO'].includes(String(preparation.mode || '')) && !['audio-only', 'voice-only', 'mention-only'].includes(usage) && asset.imageRequired !== false;
 }
 export function imageClassificationPending(asset: Asset): boolean { return record(asset.preparation).mode === 'UNRESOLVED'; }
+export function imageIdentityPending(asset?: Asset): boolean { return record(asset?.foundationConflictReview).pending === true; }
 export function realAdoptedImage(workspace: Workspace, asset: Asset) {
   const current = assetImages(workspace, asset).current;
   return current?.placeholder === true ? undefined : current;
@@ -33,7 +34,7 @@ export function imageReviewState(asset: Asset): 'review' | 'invalid' | undefined
  * only use an adoption whose image has not been invalidated. */
 export function usableAdoptedImage(workspace: Workspace, asset: Asset) {
   const pending = ['unknown', 'submission_unknown', 'candidate', 'pending_review'].includes(text(asset.imageStatus));
-  return imageReviewState(asset) || pending ? undefined : realAdoptedImage(workspace, asset);
+  return imageReviewState(asset) || pending || imageIdentityPending(asset) ? undefined : realAdoptedImage(workspace, asset);
 }
 /** Recheck the retained image against its original frozen references; this is
  * never a quality approval or permission to submit another generation. */
@@ -75,6 +76,7 @@ export function imagePromptDesignBlocked(asset?: Asset): boolean {
 export function assetImageStatus(workspace: Workspace, asset: Asset): string {
   const status = text(asset.imageStatus), images = assetImages(workspace, asset);
   const waiting = imageWaitingNames(workspace, asset), waitingLayout = waiting.some(name => name.endsWith('（锁脸区域待登记）'));
+  if (imageIdentityPending(asset)) return '身份待核对';
   if (imageClassificationPending(asset)) return '类别待核对';
   if (status === 'approved' || status === 'adopted') return realAdoptedImage(workspace, asset) ? '正式采用' : images.current?.placeholder === true ? '占位待补图' : status === 'approved' ? '合格待选' : '待核对当前图';
   const labels: Record<string, string> = { waiting_reference: '等待参考', waiting_dependency: '等待参考', waitingAdoption: '等待参考', queued: '排队中', running: '生成中', submitted: '生成中', candidate: '候选待选', pending_review: '候选待选', needs_repair: '待修', rejected: '待修', invalid: '图片无效', qualified: '合格待选', needs_review: '待复核', stale: '待复核', unknown: '原结果待核对', submission_unknown: '原结果待核对' };
@@ -101,7 +103,7 @@ export function imageProductionCounts(workspace: Workspace) {
 /** This is a conservative UI selection, not a frozen request. Rust still checks
  * exact media hashes, identities and the provider before anything is submitted. */
 export function imageReadyForGeneration(workspace: Workspace, asset: Asset): boolean {
-  if (!imageAssetNeeded(asset) || imageClassificationPending(asset) || !imagePromptText(asset).trim() || usableAdoptedImage(workspace, asset)) return false;
+  if (!imageAssetNeeded(asset) || imageIdentityPending(asset) || imageClassificationPending(asset) || !imagePromptText(asset).trim() || usableAdoptedImage(workspace, asset)) return false;
   const blocked = ['blocked', 'stale', 'needs_review', 'rejected', 'invalid'];
   if ([asset.promptStatus, record(asset.imagePrompt).status, asset.designStatus, record(asset.mediaPlan).status].some(value => blocked.includes(text(value)))) return false;
   if (imageBatchBlocked(workspace.jobs, [asset.id]) || imageWaitingNames(workspace, asset).length) return false;
@@ -118,6 +120,7 @@ export function imageReadyForGeneration(workspace: Workspace, asset: Asset): boo
     return false; // Returned candidates must be reviewed, not batch-resubmitted.
   }
   const visit = (current: Asset, ancestors: Set<string>): boolean => {
+    if (imageIdentityPending(current)) return false;
     if (ancestors.has(current.id)) return false;
     if (current.referenceRequirements != null && !Array.isArray(current.referenceRequirements)) return false;
     const path = new Set(ancestors); path.add(current.id);

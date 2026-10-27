@@ -1138,8 +1138,10 @@ impl Engine {
             .collect();
         if let Some(object)=display_settings.as_object_mut(){object.remove(crate::app_settings::SCOPE);}
         if self.standard_native {if let Some(global)=crate::app_settings::load(&self.home)? {for (_,entry) in global["catalogs"].as_object().into_iter().flatten(){let cap=entry["capabilities"].clone();providers.retain(|p|p["provider"]!=cap["provider"]);providers.push(cap);}}}
+        let foundation=store.foundation()?;
+        let conflict_review=crate::foundation_conflict_gate::project(&source,&foundation,&mut assets);
         Ok(
-            json!({"project":store.project()?,"source":source,"foundation":store.foundation()?,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report,"lingmoDocuments":crate::lingmo_import::documents(store)?,"imageProductionScope":store.image_production_scope()?,"imageReviewCapability":self.visual_review_capability(store,&display_settings)?,"imageReviewDelegation":store.visual_review_delegation()?}),
+            json!({"project":store.project()?,"source":source,"foundation":foundation,"foundationConflictReview":conflict_review,"assets":assets,"deletedAssets":deleted_assets,"media":media,"units":units,"jobs":summaries,"workflowProgress":store.workflow_progress()?,"settings":display_settings,"credentialStatus":credential_status,"providers":providers,"dreaminaAccount":self.dreamina_sessions.snapshot(&self.dreamina_config(store)?)?,"rules":rules,"diagnostics":diagnostics,"lastImportReport":report,"lingmoDocuments":crate::lingmo_import::documents(store)?,"imageProductionScope":store.image_production_scope()?,"imageReviewCapability":self.visual_review_capability(store,&display_settings)?,"imageReviewDelegation":store.visual_review_delegation()?}),
         )
     }
     pub fn cancel_canvas_oauth(&self) { self.canvas_sessions.shutdown(); }
@@ -3070,6 +3072,10 @@ impl Engine {
             .iter()
             .filter_map(|id| assets.iter().find(|a| s(a, "id") == id))
         {
+            if let Err(reason)=crate::foundation_conflict_gate::require_clear(&gate_input["source"],&gate_input["foundation"],a) {
+                blocked.push(json!({"assetId":a["id"],"code":crate::foundation_conflict_gate::CODE,"reason":reason}));
+                continue;
+            }
             // Selecting a descendant also queues its missing ancestors. Existing
             // ancestor images are reused unless that ancestor was explicitly selected.
             if selected.map(|l| !l.contains(&a["id"])).unwrap_or(false)
@@ -3096,6 +3102,11 @@ impl Engine {
                 continue;
             }
             let result: Result<String> = (|| {
+                for dependency in image_dependency_ids(&assets,a)? {
+                    if let Some(parent)=assets.iter().find(|p|s(p,"id")==dependency) {
+                        crate::foundation_conflict_gate::require_clear(&gate_input["source"],&gate_input["foundation"],parent)?;
+                    }
+                }
                 if !independent_image(a) {
                     return Err("此形象沿用来源素材或为纯声音，无需独立出图".into());
                 }
@@ -7290,6 +7301,7 @@ mod production_input_transport_tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("project")).unwrap();
         store.create("synthetic projection", "fixture").unwrap();
+        store.save_settings(&pipeline::series::synthetic_visual_baseline_settings()).unwrap();
         let source = store.save_source(json!(pipeline::prepare_source("第一集\n场景：门口\n甲：开门。\n").unwrap())).unwrap();
         let place = json!({"episodeId":source["episodes"][0]["id"],"sceneId":source["scenes"][0]["id"]});
         store.save_asset(json!({"id":"p-base","baseAssetId":"p","identityId":"p","variantId":"base","name":"甲","kind":"CH","sourceRefs":[source["rows"][2]["id"]],"scope":{"kind":"SCENES","scenes":[place],"reason":null},"applicability":{"episodes":[source["episodes"][0]["id"]],"scenes":[source["scenes"][0]["id"]]}})).unwrap();
@@ -7464,6 +7476,7 @@ mod joint_unknown_boundary_tests {
         for stage in ["foundation.run","storyboard.run"] {
             let temp=tempfile::tempdir().unwrap();let engine=Engine::new_offline_verification(temp.path().join("isolated-app")).unwrap();
             let store=Store::open(temp.path().join("project")).unwrap();store.create("synthetic unknown parser migration","synthetic").unwrap();store.ensure_workflow_storage().unwrap();
+            store.save_settings(&pipeline::series::synthetic_visual_baseline_settings()).unwrap();
             let (old,new)=sources();let old=store.save_source(old).unwrap();
             let original=input(&old,0);let mut snapshot=job(stage,&original,"partially_blocked",true)["snapshot"].clone();
             snapshot["input"].as_object_mut().unwrap().remove(pipeline::asset_coverage::FIELD);
