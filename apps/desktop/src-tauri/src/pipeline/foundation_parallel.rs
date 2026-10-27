@@ -5,10 +5,108 @@ use super::*;
 pub(crate) const PROFILE: &str = "foundation-three-lane-trial/v1";
 const REBASE: &str = "foundation-parallel-rebase/v1";
 
+#[cfg(test)]
+#[path = "foundation_saved_wave_tests.rs"]
+mod saved_wave_tests;
+
 fn value_sha<T: serde::Serialize>(value: &T) -> Result<String, String> {
     Ok(digest(
         &serde_json::to_string(value).map_err(|e| e.to_string())?,
     ))
+}
+
+/// A rebase edits a fixed saved result, not the whole catalogue. Select by exact
+/// registered identities only, then close over every relationship of retained
+/// assets (including their variants). Never infer identity from a name. Source,
+/// evidence, original result and rules are deliberately outside this projection.
+fn project_rebase_catalogues(input: &mut Value, assets: &[Value]) {
+    fn strings(value: &Value, out: &mut HashSet<String>) {
+        match value {
+            Value::String(s) => {
+                out.insert(s.clone());
+            }
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(object) => object.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut owners = HashMap::new();
+    for (index, asset) in assets.iter().enumerate() {
+        if let Some(id) = asset["id"].as_str() {
+            owners.insert(id.to_owned(), index);
+        }
+        for variant in asset["variants"].as_array().into_iter().flatten() {
+            if let Some(id) = variant["id"].as_str() {
+                owners.insert(id.to_owned(), index);
+            }
+        }
+    }
+    let mut roots = HashSet::new();
+    for field in [
+        "foundationParallelOriginalResult",
+        "foundationParallelCurrentCatalogue",
+        "automaticDecisions",
+        "humanChoiceRegistry",
+        "confirmedDecisions",
+        "evidence",
+    ] {
+        strings(&input[field], &mut roots);
+    }
+    for path in input["foundationParallelRebase"]["conflicts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        roots.extend(path.split('/').map(str::to_owned));
+    }
+    let mut retained = HashSet::new();
+    let mut pending: Vec<_> = roots
+        .iter()
+        .filter_map(|id| owners.get(id).copied())
+        .collect();
+    while let Some(index) = pending.pop() {
+        if !retained.insert(index) {
+            continue;
+        }
+        let mut references = HashSet::new();
+        strings(&assets[index], &mut references);
+        pending.extend(references.iter().filter_map(|id| owners.get(id).copied()));
+    }
+    for field in ["registry", "candidates", "materialCandidates"] {
+        if let Some(entries) = input[field].as_array_mut() {
+            entries.retain(|entry| {
+                let key = entry
+                    .get("baseKey")
+                    .or_else(|| entry.get("key"))
+                    .and_then(Value::as_str);
+                // Unrecognised/legacy structures are kept, never guessed away.
+                key.and_then(|key| owners.get(key))
+                    .is_none_or(|index| retained.contains(index))
+            });
+        }
+    }
+}
+
+fn rebase_capacity_input(
+    stage: &str,
+    input: Value,
+    current: &FoundationProposal,
+    schema: &Value,
+) -> Result<Value, String> {
+    let mut input = capacity_input(stage, input, schema)?;
+    let before = request_chars(stage, &input, schema)?;
+    if before <= MODEL_TRANSPORT_LIMIT {
+        return Ok(input);
+    }
+    let assets = serde_json::to_value(&current.assets).map_err(|e| e.to_string())?;
+    project_rebase_catalogues(&mut input, assets.as_array().ok_or("重基目录不是数组")?);
+    let guide = input["transportInstructions"].as_str().unwrap_or("");
+    input["transportInstructions"] = json!(format!("{guide} 本次为固定原稿受限重基，registry/candidates/materialCandidates仅提供原稿引用身份、明确冲突两端及其完整关系依赖闭包；未提供条目不表示不存在，不得重新发现、合并或改动批外身份。完整原稿、本批原文及历史证据均保留。"));
+    let after = request_chars(stage, &input, schema)?;
+    // Bounded numerical diagnostics: never log source, prompts or account data.
+    eprintln!("FOUNDATION_PARALLEL_REBASE_CAPACITY stage={stage} beforeRequestChars={before} afterRequestChars={after} limit={MODEL_TRANSPORT_LIMIT}");
+    Ok(input)
 }
 
 /// Called before capacity measurement/normal wire compilation. Never changes
@@ -944,9 +1042,10 @@ async fn wave(
                 revised["foundationParallelCurrentCatalogue"]=json!(current.assets.iter().filter(|a|conflicts.iter().any(|c|c.starts_with(&format!("/assets/{}/",a.id))||c==&format!("/assets/{}",a.id)||c.ends_with(&format!("/identity-collision-with/{}",a.id)))).map(|a|json!({"key":a.id,"name":a.name,"type":a.kind,"description":a.description,"aliases":a.aliases,"role":a.metadata.get("role"),"relationNote":a.metadata.get("relationNote"),"preparation":a.metadata.get("preparation"),"variants":a.variants.iter().map(|v|json!({"key":v.id,"name":v.name,"description":v.description,"fromKey":v.source_variant_id,"preparation":v.metadata.get("preparation")})).collect::<Vec<_>>()})).collect::<Vec<_>>());
                 let guide = revised["transportInstructions"].as_str().unwrap_or("");
                 revised["transportInstructions"]=json!(format!("{guide} 这是原批唯一一次受限重基。foundationParallelOriginalResult是已保存原稿；根据当前registry/candidates修复列出的共享身份、元数据及母图关系冲突，优先复用准确key。仅允许修改原稿assets条目中冲突字段及其身份key/父key，条目顺序与数量、名称、分类、集场、sourceRefs、形象名称及集场全部保留；其它字段逐值保持。不得增加/删除/归并批外身份、修改原文、扩大范围或推断已成功采用。"));
-                revised = capacity_input(
+                revised = rebase_capacity_input(
                     stage,
                     revised,
+                    &current,
                     &if stage == "F2" {
                         f2_schema()
                     } else {
@@ -1197,6 +1296,93 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     };
+
+    #[test]
+    fn rebase_projection_keeps_exact_identity_closure_and_all_non_catalogue_bytes() {
+        let mut assets: Vec<_> = (0..11).map(|i| json!({"id":format!("A{i}"),"variants":[{"id":format!("V{i}"),"preparation":{"fromKey":if i==0 {Value::Null} else {json!(format!("V{}",i-1))}}}]})).collect();
+        assets.push(json!({"id":"unrelated","name":"same name","variants":[]}));
+        assets.push(json!({"id":"collision","variants":[]}));
+        let mut input = json!({
+            "registry":assets.iter().map(|a|json!({"key":a["id"],"variants":a["variants"]})).collect::<Vec<_>>(),
+            "candidates":[{"key":"A10","name":"same name","crossBatchVariants":[{"key":"V10","fromKey":"V9"}]}],
+            "materialCandidates":[{"key":"V8","baseKey":"A8","kind":"VARIANT"},{"key":"unrelated"}],
+            "source":{"rows":[["row","完整本批原文"]]},
+            "evidence":{"historicalEvidenceCandidates":[["row0","完整历史证据"]]},
+            "foundationParallelOriginalResult":{"assets":[{"key":"V10","name":"same name"}]},
+            "foundationParallelRebase":{"attempt":1,"allowedAssetOrdinals":[0],"conflicts":["/assets/new/identity-collision-with/collision"]},
+            "foundationParallelTrial":{"laneId":1,"basisSha256":"frozen"}
+        });
+        let before = input.clone();
+        project_rebase_catalogues(&mut input, &assets);
+        assert_eq!(input["registry"].as_array().unwrap().len(), 12);
+        assert!(input["registry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["key"] != "unrelated"));
+        assert_eq!(input["candidates"], before["candidates"]);
+        assert_eq!(
+            input["materialCandidates"],
+            json!([before["materialCandidates"][0]])
+        );
+        for (key, value) in before.as_object().unwrap() {
+            if !["registry", "candidates", "materialCandidates"].contains(&key.as_str()) {
+                assert_eq!(&input[key], value, "{key}");
+            }
+        }
+        // A backwards relationship/cycle must terminate and keep all members.
+        assets[0]["variants"][0]["preparation"]["fromKey"] = json!("V10");
+        let once = input.clone();
+        project_rebase_catalogues(&mut input, &assets);
+        assert_eq!(input, once);
+    }
+
+    #[test]
+    fn rebase_projection_measures_real_compiled_transport_for_f2_and_q1() {
+        let source = prepare_source("第1集\n场景：大厅\n△大厅保持安静。\n").unwrap();
+        let context = json!({"selection":{"episodeIds":[source.episodes[0].id]},"foundationModelInputProfile":super::super::super::foundation_wire::PROFILE});
+        let (selected, foundation, _) = delivery_basis(&source, &context).unwrap();
+        let batch = plan_batches(&source, &selected).unwrap().remove(0);
+        let assets: Vec<_> = (0..100)
+            .map(|i| json!({"id":format!("CH_{i:016x}"),"variants":[]}))
+            .collect();
+        for stage in ["F2", "Q1"] {
+            let schema = if stage == "F2" {
+                f2_schema()
+            } else {
+                q1_schema()
+            };
+            let mut input = input_for(
+                stage,
+                &source,
+                &batch,
+                &foundation,
+                &context,
+                0,
+                1,
+                false,
+                &[],
+            );
+            input["registry"] = json!(assets.iter().map(|a|json!({"key":a["id"],"name":"registered asset","aliases":["完整但与固定重基无关的目录说明。".repeat(200)],"variants":[]})).collect::<Vec<_>>());
+            input["foundationParallelOriginalResult"] =
+                json!({"assets":[{"key":assets[0]["id"],"description":"完整原稿"}]});
+            input["foundationParallelRebase"] = json!({"attempt":1,"conflicts":[format!("/assets/{}/description",assets[0]["id"].as_str().unwrap())]});
+            let original = input.clone();
+            let before = request_chars(stage, &input, &schema).unwrap();
+            project_rebase_catalogues(&mut input, &assets);
+            let after = request_chars(stage, &input, &schema).unwrap();
+            assert!(before > MODEL_TRANSPORT_LIMIT, "{stage}: {before}");
+            assert!(after < MODEL_TRANSPORT_LIMIT, "{stage}: {after}");
+            assert_eq!(input["source"], original["source"]);
+            assert_eq!(input["evidence"], original["evidence"]);
+            assert_eq!(
+                input["foundationParallelOriginalResult"],
+                original["foundationParallelOriginalResult"]
+            );
+            assert_eq!(allowed_refs(&input), allowed_refs(&original));
+            eprintln!("synthetic rebase {stage}: compiled request {before} -> {after}");
+        }
+    }
     struct Fake {
         cache: Mutex<HashMap<String, Value>>,
         requests: Mutex<Vec<TextRequest>>,

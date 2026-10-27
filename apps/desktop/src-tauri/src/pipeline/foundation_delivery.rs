@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 
 #[path = "foundation_parallel.rs"]
 pub(crate) mod parallel;
+#[path = "foundation_catalogue_fragments.rs"]
+mod catalogue_fragments;
 
 pub const METHOD_VERSION: &str = "foundation-delivery/v2";
 // Original defaults: project-foundation-contracts.ts, foundation-fragments.ts,
@@ -3393,8 +3395,11 @@ fn apply_catalogue(
     let mut staged = prior.clone();
     let mut seen = HashSet::new();
     let mut explicit_base_scopes = HashSet::new();
-    for (ordinal, wire) in wire.assets.iter().enumerate() {
-        let asset = build_asset(source, batch, wire, &staged, &allowed, false, ordinal)?;
+    // Repeated registered identities may describe disjoint scene uses. Keep the
+    // raw response and original ordinals; coalesce only proven compatible parts.
+    let fragments = catalogue_fragments::catalogue_fragments(value, source, batch, prior, &allowed)?;
+    for (ordinal, wire) in &fragments {
+        let asset = build_asset(source, batch, wire, &staged, &allowed, false, *ordinal)?;
         let bid = base_id(&asset)?;
         if wire.variants.as_ref().is_some_and(|variants| {
             variants.iter().any(|v| v.key.as_deref() == Some(bid.as_str()))

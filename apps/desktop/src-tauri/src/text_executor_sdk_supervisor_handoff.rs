@@ -32,7 +32,7 @@ fn base_policy(proof: &Value) -> &str {
     if proof["policy"] == ACCOUNT_POLICY { s(&proof["accountAuthorization"], "basePolicy") }
     else { s(proof, "policy") }
 }
-fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool {
+pub(super) fn proof_valid(snapshot: &Value, settings: &Value, run: &str, key: &str) -> bool {
     let proof = &snapshot[FIELD];
     let Some(fields) = proof.as_object() else {
         return false;
