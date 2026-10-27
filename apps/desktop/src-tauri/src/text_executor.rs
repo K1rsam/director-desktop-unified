@@ -4536,6 +4536,10 @@ struct FrozenTextReplay {
     audit: Value,
 }
 
+#[path = "text_executor_lite_exact.rs"]
+mod lite_exact;
+pub use lite_exact::VerifiedRawText;
+
 #[path = "text_executor_scoped_shot_replay.rs"]
 mod scoped_shot_replay;
 #[path = "text_executor_sdk_foundation_replay.rs"]
@@ -5268,6 +5272,10 @@ impl TextExecutor for SavedTextExecutor {
             .publish_storyboard_episode(&guard, output, input, run)
     }
     async fn execute(&self, request: TextRequest) -> Result<Value> {
+        lite_exact::validate_request(&request)?;
+        if lite_exact::enabled(&request) && !matches!(s(&self.settings,"textProvider"), "codex" | "codex_sdk") {
+            return Err("LITE_EXACT_BACKEND_UNSUPPORTED: 精确文本仅接入 CLI/SDK，不回退其他渠道".into());
+        }
         match s(&self.settings, "textProvider") {
             "" | "codex" | "api" => {},
             "codex_sdk" => {
@@ -5545,7 +5553,12 @@ impl TextExecutor for SavedTextExecutor {
             }
         }
     }
+    async fn execute_exact(&self, request: TextRequest, expected: &crate::series_lite_transport::TransportIdentity, context: &crate::series_lite_transport::RoleContext) -> Result<VerifiedRawText> {
+        self.lite_execute_exact(request, expected, context).await
+    }
     async fn accept(&self, request: &TextRequest, value: &Value) -> Result<()> {
+        self.lite_exact_callback_bound(request,value)?;
+        if lite_exact::enabled(request) && s(&self.settings,"textProvider")=="codex" {return self.lite_exact_cli_commit(request,value,None);}
         if s(&self.settings,"textProvider") == "codex_sdk" { return self.sdk_commit(request,value,None); }
         // A received standalone design must retain its bound original raw even
         // when the caller's domain validator materializes a normalized value.
@@ -5699,6 +5712,8 @@ impl TextExecutor for SavedTextExecutor {
         Ok(())
     }
     async fn reject(&self, request: &TextRequest, value: &Value, reason: &str) -> Result<()> {
+        self.lite_exact_callback_bound(request,value)?;
+        if lite_exact::enabled(request) && s(&self.settings,"textProvider")=="codex" {return self.lite_exact_cli_commit(request,value,Some(reason));}
         if s(&self.settings,"textProvider") == "codex_sdk" { return self.sdk_commit(request,value,Some(reason)); }
         let standalone = self.standalone_asset_received(request)?;
         let snapshot = self.result_snapshot(request)?;
@@ -6957,6 +6972,7 @@ impl SavedTextExecutor {
             .transpose()
     }
     fn request_domain_snapshot(&self, request: &TextRequest) -> Result<Value> {
+        lite_exact::validate_request(request)?;
         validate_model_input_profile(request)?;
         if let Some(wire) = compile_model_transport(request)? {
             if transport_payload_characters(request, &wire.input, &wire.schema)
@@ -8136,6 +8152,11 @@ impl SavedTextExecutor {
             observer,
         )
         .await?;
+        if lite_exact::enabled(r) {
+            let envelope = lite_exact::wrap(&bytes)?;
+            self.store.event(job,"lite_exact_received",&lite_exact::receive_evidence(&envelope,&allocation.request_hash))?;
+            return Ok(envelope);
+        }
         let value =
             serde_json::from_slice(&bytes).map_err(|e| format!("文本输出不是有效JSON: {e}"))?;
         restore_model_output(r, wire.as_ref(), value)
@@ -8580,6 +8601,11 @@ fn step_key(request: &TextRequest) -> String {
 }
 fn base_step_key(request: &TextRequest) -> String {
     let input = &request.input;
+    if lite_exact::enabled(request) {
+        // Content drift within one controller slot must collide and be held,
+        // not silently acquire a new node because its packet/base hash changed.
+        return format!("{}:{}",request.stage,crate::pipeline::digest(&json!({"episode":input["roleContext"]["episode"],"iteration":input["roleContext"]["iterationId"],"context":input["roleContext"]["contextId"]}).to_string()));
+    }
     if input["workflowProfile"]==crate::asset_graph::PROFILE && request.stage.starts_with("series") {
         return format!("{}:{}",request.stage,crate::pipeline::digest(&input["executionRoleId"].to_string()));
     }
@@ -12094,12 +12120,15 @@ impl SavedTextExecutor {
             return Err(fail());
         }
         let request: TextRequest = serde_json::from_value(snapshot.clone()).map_err(|_| fail())?;
-        let wire = compile_model_transport(&request)?;
-        let raw = restore_model_output(
-            &request,
-            wire.as_ref(),
-            serde_json::from_slice(&bytes).map_err(|_| fail())?,
-        )?;
+        // Common attempt/account/file proof above applies to both formats.
+        // Exact text never enters Value's numeric parser; the Value below is
+        // only an explicit UTF-8 transport envelope, not parsed model JSON.
+        let raw = if lite_exact::enabled(&request) {
+            lite_exact::wrap(&bytes)?
+        } else {
+            let wire = compile_model_transport(&request)?;
+            restore_model_output(&request, wire.as_ref(), serde_json::from_slice(&bytes).map_err(|_| fail())?)?
+        };
         let event:String=self.store.conn()?.query_row("SELECT data FROM events WHERE job_id=?1 AND type='text_received_raw' ORDER BY id DESC LIMIT 1",[id],|r|r.get(0)).map_err(|_|fail())?;
         let event: Value = serde_json::from_str(&event).map_err(|_| fail())?;
         if event["requestHash"] != hash || event["value"] != raw || job["result"] != raw {
@@ -12536,6 +12565,11 @@ impl SavedTextExecutor {
         std::fs::write(dir.join("result.json"), text.as_bytes()).map_err(|e| e.to_string())?;
         self.store.event(job, "sdk_raw_result", envelope)?;
         let hash = crate::pipeline::digest(&snapshot.to_string());
+        let value = if lite_exact::enabled(request) {
+            let envelope = lite_exact::wrap(text.as_bytes())?;
+            self.store.event(job,"lite_exact_received",&lite_exact::receive_evidence(&envelope,&hash))?;
+            envelope
+        } else {
         let parsed: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(error) => {
@@ -12559,7 +12593,8 @@ impl SavedTextExecutor {
             }
         };
         let wire = compile_model_transport(request)?;
-        let value = restore_model_output(request, wire.as_ref(), parsed)?;
+        restore_model_output(request, wire.as_ref(), parsed)?
+        };
         let mut prepared = self.store.job(job)?["prepared"].clone();
         prepared["sdkRawTextSha256"] = json!(crate::pipeline::digest(text));
         self.store.event(

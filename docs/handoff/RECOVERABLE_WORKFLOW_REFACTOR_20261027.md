@@ -66,6 +66,16 @@
 
 ## lite 0.1.2 冻结与适配边界
 
+### 主工程接收、供料与本地执行（2026-10-27，仍未启用三岗生产）
+
+- `compile-release-15` 因新场级投影误克隆 slice 而编译失败；已改为独立 Vec，保留失败日志。`compile-release-16` 成功，二进制 SHA256 `7918b68f10f78b38d821942897a6bf95293f211bd549693d282f0ffc9333a9b6`。
+- `lite-exact-execution-16b`：19/19 通过（exact 7、场级投影 5、本地执行 7）。第一次测试启动使用相对路径未产生 runner 回执，不能算通过；16b 改用绝对路径，实收 Windows Job Object 回执及完整测试输出。
+- exact SDK/CLI 分流保留原响应 UTF-8 与精确小数；复用原 jobs、workflow_steps、账户回执和 UNKNOWN 对账。只证明原文本来源，不能代替领域验证、独审或采用。API、无 workflow 独立执行、CLI 自动 transport retry 尚未开放。
+- 场级投影只从实际 units 的 bindings 推导同场稳定并集，要求外置场级供料 pin；同一编号场次允许阳台与餐厅两种场景资产，不能拆成两个场次。未供资产、跨场/纯参考父卡越权和 voice-only 入图拒绝；源、场次其他字段、资产版本和精确时间不改。供料 pin 的来源真实性仍由 controller 核验，投影本身不授予设计采用。
+- Rust 本地 `sync → check → export → verify` 接入真实 crate。20 个冻结原版执行/恢复场景、8 个依赖投影（含十一层）、7 个字段容量对照包含于上述执行测试；最终 MD 与目录字节一致。同版恢复需独立持久 receipt pin，禁止覆盖回执；`contentReview=NOT_PROVEN` 始终保留。旧非 v7 跨季入口仍明确不支持。
+- `compile-release-17` 成功，二进制 SHA256 `76d44ea6a58768d618e6d16ac33c2d46e5d2fb1de8d870560cd18092767b4dc6`；`lite-supply-17`：30/30 通过。含 28 项供料测试及 2 项真实 Desktop parser/adapter 包装器测试。第 28 集不能被内部序号改为第 1 集；保留 UTF16 与原场映射。旧完整设计需原发布、原作者/独审回执和当前版本一致，显式依赖闭包逐项核证；未知类型及证据不足返回局部 gap，不伪造 lite TEXT_ADOPTED。
+- 本批未进入安装候选 12，未调用真实模型、图片或视频。岗位持久账本、完整三岗调度、原生采用/第四阶段投影及真实内容验收仍在实施，不以这 49 项新增工程通过宣称最终发行通过。
+
 冻结包位于 `rules/series-lite/20261027-v0.1.2/`，来自指定提交 `6dea8d6c57dde38f04a4d71f05f4c039004dd4a9`。90 份文件逐项符合原 SHA256SUMS；原脚本仅开发期等价对照，普通用户运行依赖仍为 Rust。旁置 receipt 的 active=false，未替换已生效旧规则。
 
 已迁入 compose/patch/preflight、同版用途登记、registry/season 校验、精确时间、源锁、灵墨导出／独立反解／文件 hash、sync 消费回执。完整源正规化、创作门禁及实际三岗链仍在接续，不能将纯函数对照通过写成新项目验收。

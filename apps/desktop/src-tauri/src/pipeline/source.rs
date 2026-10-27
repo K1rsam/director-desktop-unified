@@ -941,7 +941,7 @@ fn raw_lines(text: &str) -> Vec<&str> {
     rows
 }
 
-fn number_value(value: &str) -> Option<u32> {
+pub(crate) fn number_value(value: &str) -> Option<u32> {
     if let Ok(number) = value.parse() {
         return Some(number);
     }

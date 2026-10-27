@@ -74,9 +74,21 @@ pub struct TextRequest {
     pub rule_snapshot: Value,
 }
 
+pub use crate::series_lite_transport::{RoleContext as ExactRoleContext, TransportIdentity as ExactTransportIdentity};
+
 #[async_trait]
 pub trait TextExecutor: Send + Sync {
     async fn execute(&self, request: TextRequest) -> Result<Value, String>;
+    /// Exact UTF-8 response text, with independent controller-ledger packet pins.
+    /// This inactive transport seam does not approve a draft or enable a route.
+    async fn execute_exact(
+        &self,
+        _request: TextRequest,
+        _expected: &crate::series_lite_transport::TransportIdentity,
+        _context: &crate::series_lite_transport::RoleContext,
+    ) -> Result<crate::text_executor::VerifiedRawText, String> {
+        Err("LITE_EXACT_UNAVAILABLE: 执行器未提供原响应文本证据".into())
+    }
     /// Inspect the original frozen rebase and its shared repair budget without
     /// generating. Persistent executors must bind this to durable source evidence.
     async fn foundation_conflict_context(&self, _legacy: &TextRequest, _proposal: &Value) -> Result<Value, String> {
