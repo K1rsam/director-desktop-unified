@@ -1,0 +1,348 @@
+{
+  "version": "20261020-v1.0-desktop-lingmo",
+  "skill": "desktop-storyboard-director",
+  "researchDate": "2026-10-20",
+  "scope": "Independent Codex text workflow based on desktop generation logic; Lingmo v7 delivery.",
+  "base": {
+    "skill": "series-storyboard-director",
+    "version": "20261020-v6.5-source-presentation-progress",
+    "inheritedProvenance": "references/base-provenance.json",
+    "originalFilesChecked": 100,
+    "originalFilesChangedByThisTask": 0,
+    "sourceManifestSha256": "829b617e654c080230afcc0c78f7c8b0730dbf8aa6a56f78924a4cd5104b81b7",
+    "creativeMethods": "Preserved current v6.5 method bytes; not replaced by older desktop or web methods."
+  },
+  "userSuppliedZip": {
+    "filename": "全剧分镜总导演Skill_20261020_v6.3_系统呈现与同步完整版.zip",
+    "sha256": "a97d25b680cc72ff53a359ef4e79cbf7d5d2a03b5dc12c45c5125472f21b9cb8",
+    "files": 97,
+    "sameAsLocalV65": 84,
+    "changedInLocalV65": 13,
+    "zipOnlyFiles": 0
+  },
+  "conversations": [
+    {
+      "threadId": "01a102af-9c36-72f3-8f9d-2486868bea64",
+      "evidence": "Targeted reading of local same-ID session messages, relevant attachment and current desktop source."
+    },
+    {
+      "threadId": "01a15705-79b9-7af0-9a36-f3eb23dccb7e",
+      "evidence": "Local same-ID messages and installed v6.5 files; retain explicit-source system handling and progress rules."
+    }
+  ],
+  "webSource": {
+    "repository": "https://github.com/K1rsam/director-web",
+    "commit": "13d191d40fc815d16cbd9a583d7ae602bd4d25e5",
+    "branch": "handoff/3008-v2026.10.20.1",
+    "workingTreeCleanAfterTargetedTests": true,
+    "targetedOfflineTests": {
+      "tests": 44,
+      "pass": 44,
+      "fail": 0
+    },
+    "wholeRepositoryTested": false,
+    "productionGenerationRun": false
+  },
+  "desktopSource": {
+    "project": "director-desktop-integration-20261008",
+    "head": "3b7df2e0fc8cf6b62e8d5637d86e3d018fb57e38",
+    "dirtyAtRead": true,
+    "editedByThisTask": false,
+    "scope": "Observed file bytes at read time; HEAD alone does not identify the dirty working tree.",
+    "pipelinePathsRelativeTo": "apps/desktop/src-tauri/src",
+    "manifestRelativeTo": "project root",
+    "observedFiles": [
+      {
+        "path": "pipeline/stage3_pack.rs",
+        "sha256": "2970b8e1bb0ffc6c02d2ddaa50ca34f47f8b447d8dd0040ad98ebad47ce8fd7b"
+      },
+      {
+        "path": "pipeline/source.rs",
+        "sha256": "a5978f02121e4c28b27517c4f2e040ca0f0e1f3cea4d0e76d500bc6b7252adfb"
+      },
+      {
+        "path": "pipeline/foundation_delivery.rs",
+        "sha256": "65f25a3395a3bf2c6345f84422c71e88925891d70510c4639e6f771ee9d59e25"
+      },
+      {
+        "path": "pipeline/assets.rs",
+        "sha256": "248fc00bf904df8382220c38356395e8ac9e50bdb6e321dfd7f34dadbe42b18f"
+      },
+      {
+        "path": "pipeline/asset_production_context.rs",
+        "sha256": "314dedb172c9d3f04675a8233f4f9624e2977b4fbd1c960b9879b726969c2aef"
+      },
+      {
+        "path": "pipeline/storyboard.rs",
+        "sha256": "454f84b5669e8e4fd2c19522c205433f0501d88fe2e4de5a0a1941356c6c5b15"
+      },
+      {
+        "path": "pipeline/storyboard_creative.rs",
+        "sha256": "aca28457680c427017e806afe7ef1d8ae1ec674cc6a974f67e75d2d964ec0ef7"
+      },
+      {
+        "path": "pipeline/storyboard_assets.rs",
+        "sha256": "0d6fb4088456b966ddfd1e9e48a6d41ae0aca082b7bfa141c7527974b1a8c637"
+      },
+      {
+        "path": "pipeline/storyboard_refinement.rs",
+        "sha256": "7b940b25dee6b2c8e2dc38afe45d1151e98ff9aeca3c4687b61f2408a60d7d1a"
+      },
+      {
+        "path": "text_executor.rs",
+        "sha256": "957d4cba0aa1f6b55f6e2ecae4c897cf981dee1058df3c889d87018d05dc226a"
+      },
+      {
+        "path": "rules/stage3/manifest.json",
+        "sha256": "9562dc07b267b5be38566fcafc0ba9ffdcca7697699f2e5b9eb4d93011c77e6a"
+      }
+    ],
+    "stage3FrozenFilesVerified": {
+      "total": 22,
+      "matchedHashesAndBytes": 22
+    },
+    "uncommittedPrinciplesUsed": [
+      "UNIT_DURATION scoped candidate repair without relaxing limits",
+      "LOC-PROP shared-object design consistency with source evidence"
+    ],
+    "rustTestsRunThisTask": false,
+    "desktopGuiRunThisTask": false
+  },
+  "newLocalCapabilities": [
+    {
+      "module": "scripts/materialize-dialogue.mjs",
+      "contract": "normalized-quote-utf16-v1",
+      "kind": "offline source-range materialization",
+      "not": "Rust absolute-source-offset adapter, semantic review or measured speech"
+    },
+    {
+      "module": "scripts/apply-delta.mjs",
+      "contract": "desktop-draft-delta-v1",
+      "kind": "hash-bound complete candidate assembly",
+      "not": "automatic adoption, semantic editing or fantasy authorization"
+    },
+    {
+      "module": "scripts/python-runtime.mjs",
+      "kind": "portable Python discovery and UTF-8 invocation"
+    }
+  ],
+  "export": {
+    "profile": "lingmo-v7",
+    "contract": "references/lingmo-v7-contract.md",
+    "unchangedExporterFromBase": true,
+    "internalPrecision": "up to 9 decimal places",
+    "outerDuration": "max(4, ceil(actual)); both actual and outer must fit confirmed cap",
+    "pythonNamingAlgorithmUnchanged": true
+  },
+  "validationReport": "references/validation-report.md",
+  "evidenceLimits": {
+    "newRealScriptProduced": false,
+    "creativeQualitySuperiorityEstablished": false,
+    "lingmoPlatformImportTested": false,
+    "macRuntimeTested": false,
+    "realImagesAudioVideoGenerated": false,
+    "nativeDesktopDatabaseImporterProvided": false,
+    "transactionOrNetworkExactlyOnceClaim": false
+  },
+  "localChanges": [
+    {
+      "path": "agents/openai.yaml",
+      "change": "modified",
+      "baseSha256": "c84872e12130779452fb94cf6b7e46c981ee4f681457e6b20a5ba8382f541c45",
+      "sha256": "a526c732ccc4ab6546e6b71a84281522cd1369e22579f0b813b8370fa20920e6"
+    },
+    {
+      "path": "references/base-provenance.json",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "222d3fa9042518ebdee2b3aa138585357fdb265d4f995670e644e60157f8dec4"
+    },
+    {
+      "path": "references/context-and-dispatch.md",
+      "change": "modified",
+      "baseSha256": "df3f6f71bc6bb8aba03b1bb9d62ec2833adf47001a9e30ff78e0f9ab719d1b76",
+      "sha256": "e66cf7c06759d46c7c9f71931b8d6781007373984d8aec4ba2ef988d2cfc1110"
+    },
+    {
+      "path": "references/desktop-adapter.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "aa14a2e0e492f0cf1c5f2ba656b18be1e1637779f80a8adb492b8c0e10354ea9"
+    },
+    {
+      "path": "references/desktop-comparison.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "a9e1131f982250391ccb6e62f12fee4f0f957a132d8573b2745aabf2e525cdd0"
+    },
+    {
+      "path": "references/desktop-generation.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "df88d8a0bf4ac36159ac0d6441e5069e586a97fb9cb33c3333929f5a69d14303"
+    },
+    {
+      "path": "references/production-contract.md",
+      "change": "modified",
+      "baseSha256": "37c3f72bb2b4e06bc76e562748dd151c4aa18903ffaabfde4da9ae7bfefea81c",
+      "sha256": "095a09bc2b8ef8fdb8198c7ee19f9d6f9747ab319daedcf109f954694dd15e60"
+    },
+    {
+      "path": "references/source-map.md",
+      "change": "modified",
+      "baseSha256": "65f542265da054646af55dc2702d23648d2134e489310523da8b002590b8bd61",
+      "sha256": "c38bf7cb424ab25850f2011d949482934e82615f46ba11e47a4a17fb19b78878"
+    },
+    {
+      "path": "references/tools.md",
+      "change": "modified",
+      "baseSha256": "0cc505b876ac5e794c1896e5e31080d3aacc34e3ef77118b7e4034e1a33dc1c8",
+      "sha256": "eddfcf5a47cc0f77c2c81238c6ddf44b6b9c723b96cdbf6496f68262289910fb"
+    },
+    {
+      "path": "references/validation-report.md",
+      "change": "modified",
+      "baseSha256": "26337c34fc13d3924a0c4531fe302878db3429cff19b08ac1612b8e7e37dda47",
+      "sha256": "3f7603313b83f1cd3ca7bada7b9bcf995d7fd4fc79552e97f3aa486e4225a2e0"
+    },
+    {
+      "path": "references/workspace-contract.md",
+      "change": "modified",
+      "baseSha256": "5329c7a36d8fccfebee2e57bea446830ddf9f2a7ef66c87271c82a762146d93b",
+      "sha256": "c32594c967e42d979f6a636fda87357c58c155951323c41a2a63422765d22097"
+    },
+    {
+      "path": "scripts/apply-delta.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "fe0534b04dbeecf5643d05170e7103bf0738f2d2c70897b8148405674488f3c7"
+    },
+    {
+      "path": "scripts/lingmo-asset-names.mjs",
+      "change": "modified",
+      "baseSha256": "aa81ed702ab63d8b5d97306eeffcc698393d5a7c71f1ce1fe96a01d6d52986cd",
+      "sha256": "6cc299f17fe7fd53f497521913fe9adb19f310618ee4bf1672c45f7aa3458c95"
+    },
+    {
+      "path": "scripts/materialize-dialogue.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "705d8f652d7ea7142fa9802bc2a1c2b812a9ac96596f5c17018a586cd2dcb46e"
+    },
+    {
+      "path": "scripts/python-runtime.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ba1a1f8e85059bb72330beb399365d39976272d5e235e414754172b167b56116"
+    },
+    {
+      "path": "SKILL.md",
+      "change": "modified",
+      "baseSha256": "b2ea7c9f2949e0b462997cd032f2c7a598839feafbb3dea97282fd704d0a8742",
+      "sha256": "dceb564c94212c97787602e5dd731e7acce1ae1b7f29ab25b9885f9c8fefb5ab"
+    },
+    {
+      "path": "stages/asset-design/SKILL.md",
+      "change": "modified",
+      "baseSha256": "59b4a110b1ff718f5e3c02886ae12326c6ba5c0ab18cfd2cd1663ce8cb536de8",
+      "sha256": "44805d4ac5bd78300bbf9cdc1157dad56fb1aaa0da10edc23f744b3f4f447994"
+    },
+    {
+      "path": "stages/episode-production/SKILL.md",
+      "change": "modified",
+      "baseSha256": "9ef4bcf7f353c7112943d8a84fb63ebd78d0e58fd4a34290b7bb59e1b2732c15",
+      "sha256": "9672438f27e4ad8b95723370687a90d7aaa0a14f28cf5e0af7ebeffea1fe150f"
+    },
+    {
+      "path": "stages/review-delivery/SKILL.md",
+      "change": "modified",
+      "baseSha256": "79a6b75c36955999c3cd3de1e918918156145f20bf8a2356b6cb3c550231865d",
+      "sha256": "7d645f452455470091601bf7caeb5896225db82a6e13e076d19e5a4ba25f5ef7"
+    },
+    {
+      "path": "stages/source-intake/SKILL.md",
+      "change": "modified",
+      "baseSha256": "72b6ddd8c462ea99d39df91f2db21ba956420ddeaf190036fd6aa870cf6edd32",
+      "sha256": "54f19aa1302682702b3418927388de32d34c7992dec22b849b3323da1beb8b4b"
+    },
+    {
+      "path": "tests/asset-registry.test.mjs",
+      "change": "modified",
+      "baseSha256": "812db6b3a15fb69c33dd78133569e8f2faa66c26046ad434207e177af4e70f0d",
+      "sha256": "47b60806f22b4e8cca1758ab4c0679b9923355f23123629ddec885e90e7720ef"
+    },
+    {
+      "path": "tests/desktop-delta.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "190baa1195e2f16bd01b97ff9febc80bb2f01d072c18f4e9babfb59095deec3d"
+    },
+    {
+      "path": "tests/desktop-dialogue.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "977ee3d448805fac2ee1b8e49abcf27e656363498cc77cd14d7a78a93a48a532"
+    },
+    {
+      "path": "tests/lingmo-integration.test.mjs",
+      "change": "modified",
+      "baseSha256": "4238a29084ddcf7b8a9e14b8785583c5ccc539f9e97c68d66086f1251d08098b",
+      "sha256": "a02992d938c38b47252197ad1d3cdbf6403ab39d56966d92e96d1fb4582d8cfe"
+    },
+    {
+      "path": "tests/python-runtime.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "7e9cc8f6142cb538d79ad9132cc929393fdf1c1ec84fe0f79708a079a4b4d8ee"
+    },
+    {
+      "path": "tests/storyboard.test.mjs",
+      "change": "modified",
+      "baseSha256": "99efb9a2b8a4432df336f4e762c593d074b7a600597e886e03eaadc7871e3c7b",
+      "sha256": "be135302878121e8bd702d216345cd4f60a2ec08e9568ad97c3bd160813f7aaf"
+    },
+    {
+      "path": "tests/test_context_packet.py",
+      "change": "modified",
+      "baseSha256": "021470521278a966103fe62b13908f3c24c11b95c42e8dc06ace81707df1fccc",
+      "sha256": "df09fd23ee16db0d3985a59612dd8d55ee43348b0c5875315f436c1cd43ff495"
+    },
+    {
+      "path": "tests/test_dispatch.py",
+      "change": "modified",
+      "baseSha256": "97d6b27a8252c03762ff8bd6e5724a9104c003e64a35491e7c30144df551ab8d",
+      "sha256": "03d183233516c96ffd88ea5e58520e323b1d1fddadd541f86c10984f08290b2d"
+    },
+    {
+      "path": "tests/test_inspect_editing.py",
+      "change": "modified",
+      "baseSha256": "112bedd2bbec5d8147ac0d56d75f7a8695db5c058f45186c01aa2bea00dfc824",
+      "sha256": "2279ca652c63371e117bfc19cac38840b0628eafc41cebd70594b4ffc6e9de17"
+    },
+    {
+      "path": "tests/test_white_placeholders.py",
+      "change": "modified",
+      "baseSha256": "f952589f773ea932c0c0a9f6cf0aae337504c99e70a9a58d6c4503badc925410",
+      "sha256": "4f32e984e9550f80ac99fc7cbd1a9e022e8252f0092fab0023021fca246b3fb6"
+    },
+    {
+      "path": "tests/test_workspace.py",
+      "change": "modified",
+      "baseSha256": "93aa8c7f336e0e29be7d6636490e043fe50830333b7c08e67f8f59ae612ba419",
+      "sha256": "bfc5a72d9fc320aafd4de7c9aa46fba32a62ca2bfbb5f36f68680247d007810f"
+    },
+    {
+      "path": "VERSION",
+      "change": "modified",
+      "baseSha256": "b6a74193517f72512c2cd7f1803ffebd26fd00de098700a8c39ca0874641eb25",
+      "sha256": "eb70c6c83c40f039d99f4db416fc616659a662259e2ad7895ad04db6eca06012"
+    },
+    {
+      "path": "使用说明.md",
+      "change": "modified",
+      "baseSha256": "9c792d9510d0cba1cf57667811f3c8e9ae01f5027157db51384c39ccce6b2cd1",
+      "sha256": "917279d69b607b286a9cdb8f874c275e496e6c27e07e67316e5459c9088d08ae"
+    }
+  ],
+  "hashPolicy": "localChanges excludes this self-referential manifest and SHA256SUMS.txt. Final SHA256SUMS.txt covers all distributed files except itself. Historical base manifests retain their original meaning."
+}

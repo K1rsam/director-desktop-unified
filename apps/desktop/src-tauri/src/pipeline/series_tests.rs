@@ -9,6 +9,16 @@ pub(crate) mod repair_plan_tests;
 pub(crate) mod supplement_tests;
 #[path = "series_controller_review_tests.rs"]
 pub(crate) mod controller_review_tests;
+#[path = "series_visual_baseline_tests.rs"]
+pub(crate) mod visual_baseline_tests;
+
+// Explicitly create a new synthetic 6.7.2 input after a test adjusts its
+// subcontract markers. Never use this helper for persisted request recovery.
+fn mark_new_legacy_fixture(input: &mut Value) {
+    input.as_object_mut().unwrap().remove("seriesSkillVersion");
+    input.as_object_mut().unwrap().remove("seriesRulePackSha256");
+    mark_legacy_input(input).unwrap();
+}
 
 #[test]
 fn dialogue_diagnostics_use_absolute_source_ranges_and_never_rewrite_the_raw() {
@@ -176,7 +186,8 @@ async fn pooled_rules_domain_repair_preserves_source_full_design_rejected_candid
             repair.input["validationRepair"]["maximumAttempts"],
             MAX_REPAIRS
         );
-        let legacy = repair_rules("finisher", false).unwrap();
+        let mut legacy = rules::role_for(rule_version(&input).unwrap(), "repair", false).unwrap();
+        legacy["originRules"] = rules::role_for(rule_version(&input).unwrap(), "finisher", false).unwrap();
         assert_eq!(
             restore_repair_rule_snapshot(&repair.rule_snapshot).unwrap(),
             legacy
@@ -207,7 +218,7 @@ async fn pooled_rules_keep_regular_review_repairs_plain_and_reject_unknown_marke
     let (input, good) = fixture();
     assert_eq!(
         repair_rules_for(&input, "repair", false).unwrap(),
-        rules::role("repair", false).unwrap()
+        rules::role_for(rule_version(&input).unwrap(), "repair", false).unwrap()
     );
     let mut executor = Offline::new(good);
     executor.review_rounds = 1;
@@ -215,7 +226,7 @@ async fn pooled_rules_keep_regular_review_repairs_plain_and_reject_unknown_marke
     assert_eq!(output["status"], "completed", "{}", output["blocked"]);
     let calls = executor.requests.lock().unwrap();
     let repair = calls.iter().find(|r| r.stage == "seriesRepair").unwrap();
-    assert_eq!(repair.rule_snapshot, rules::role("repair", false).unwrap());
+    assert_eq!(repair.rule_snapshot, rules::role_for(rule_version(&input).unwrap(), "repair", false).unwrap());
     let mut unknown = input;
     unknown["seriesRuleMaterialization"] = json!("series-rule-content-once/future");
     assert_eq!(
@@ -235,7 +246,7 @@ fn fixture() -> (Value, Value) {
     let plan = json!({"schemaVersion":"storyboard-plan/v2","unitPackingPolicy":"event-first-v1","emotionArc":"等待转为确认","events":[{"id":"E1","sceneId":sid,"sourceRefs":refs,"boundaryBefore":{"kind":"episode_start","reason":"本集开始"},"emotionContract":emotion}],"workPackages":[{"id":"W1","eventId":"E1","sourceRefs":refs,"contextRefs":[],"entryFactIds":[],"dependsOn":[],"scenarioKeys":[],"emotionContract":emotion}],"provisionalUnits":[{"id":"P1","packageId":"W1","sourceRefs":refs,"secondsRange":[3.2,3.2]}],"entryFacts":[],"fantasyCandidates":[]});
     let draft = json!({"schemaVersion":"storyboard-draft/v2","units":[{"id":"U1","episodeId":eid,"eventId":"E1","sceneId":sid,"boundaryBefore":{"kind":"episode_start","reason":"本集开始"},"title":"门外到来","unitDirection":"甲由等待转为确认，目光先动再说。","intent":{"subject":"甲","change":"等待到确认","landing":"门外","retain":["原话"]},"scene":"门口","participants":["甲"],"props":[],"lighting":"门外侧光","initialState":"甲在门内左侧，面向走廊。","exitState":"甲目光落在门外，身体仍在门内。","sourceRefs":refs,"assetRefs":[{"assetId":"a","variantId":"base","use":"character","order":1,"sourceRefs":refs},{"assetId":"s","variantId":"base","use":"scene","order":2,"sourceRefs":refs}],"imageBindings":["a","s"],"shots":[{"id":"S1","duration":3.2,"camera":"中近景固定机位，保留门框","picture":"甲抬眼望向门外，张口说话。","lighting":"侧光照脸，门框留阴影","sound":"轻脚步由远及近","dialogueParts":[{"lineId":q.id,"quoteStart":q.range.start,"quoteEnd":q.range.end,"presentation":"画内","delivery":"轻声确认","voiceStart":0.2,"voiceEnd":1.3}],"transition":"自然切出","sourceRefs":refs,"contextRefs":[]}]}],"fantasyRealization":[],"revisionNotes":[],"unresolved":[]});
     let mut input = json!({"source":source,"assets":assets,"foundation":{"direction":{"style":"3D国漫"},"facts":[]},"settings":{"visualStyle":"3D国漫，16:9","confirmedDirection":"3D国漫，情绪充分，保留源文，不加额外幻想。","fantasyMode":"off","maxUnitSeconds":30},"capabilities":{"minDuration":0,"maxDuration":30,"imageLimit":30},"selection":{"episodeIds":[eid]},"productionScope":{"version":"desktop-production-scope/v1","status":"locked","sourceSha256":source.sha256,"episodeIds":[eid]}});
-    mark_input(&mut input).unwrap();
+    mark_legacy_input(&mut input).unwrap();
     (
         input,
         json!({"schemaVersion":"series-episode-candidate/v1","plan":plan,"selection":[],"draft":draft}),
@@ -1290,6 +1301,14 @@ pub(crate) async fn seed_engine_series_fixture(
 ) -> Value {
     assert!((1..=2).contains(&completed));
     let (mut input, authored) = two_episode_fixture();
+    for (key, value) in visual_baseline_tests::settings().as_object().unwrap() {
+        input["settings"][key] = value.clone();
+    }
+    // These engine tests exercise same-version reuse of a newly created run.
+    // The shared historical fixtures above intentionally stay on 6.7.2.
+    input.as_object_mut().unwrap().remove("seriesSkillVersion");
+    input.as_object_mut().unwrap().remove("seriesRulePackSha256");
+    mark_input(&mut input).unwrap();
     input["settings"]["productionDirection"] = input["settings"]["confirmedDirection"].clone();
     input["settings"]["productionDirectionConfirmed"] = json!(true);
     input["settings"]["textProvider"] = json!("forbidden-in-offline-test");

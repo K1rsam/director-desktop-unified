@@ -1,0 +1,269 @@
+--- a/scripts/intake/standard-script-plan.mjs
++++ b/scripts/intake/standard-script-plan.mjs
+@@ -1,5 +1,5 @@
+ import { compileStandardScript, createSourceIndex, explicitSubtitles, StandardScriptError, standardScriptPlanVersion } from './standard-script.mjs';
+-import { explicitPerformanceCue, sourceHeadPerformanceCue, sourceVoiceHead, sourceUtteranceProperty } from '../core/runtime/inline-performance.mjs';
++import { explicitPerformanceCue, sourceHeadPerformanceCue, sourceVoiceHead, sourceUtteranceProperty, sourceInterleavedChannelCue } from '../core/runtime/inline-performance.mjs';
+ const legacyEpisodeHeading = /^第[〇零一二三四五六七八九十百千万两\d]+集(?:[ \t:：]|$)/u;
+ const legacySceneHeading = /^\d+[ \t]*-[ \t]*\d+(?:[ \t]|$)/u;
+ const castHeading = /^(?:出场人物|人物|角色)[ \t]*[：:]/u;
+@@ -68,6 +68,17 @@
+     return names;
+ }
+ function readHead(line, knownSpeakers, syntax, headCues = false, wholeSpeakers = knownSpeakers) {
++    const colonless = syntax === 'current' ? /^([^:：()（）\r\n]+?)([（(])(OS|VO)([）)])[\t ]*([^\r\n]+)$/diu.exec(line.content) : null;
++    if (colonless && (colonless[2] === '（' ? '）' : ')') === colonless[4] && !/^[:：]/u.test(colonless[5])) {
++        const name = colonless[1].trim();
++        if (!validName(name) || !knownSpeakers.has(name)) return {
++            line: line.number, code: 'UNKNOWN_SPEAKER',
++            message: '缺冒号OS/VO头仅接受已确认说者；请提供原文人物声明或knownSpeakers。'
++        };
++        return {speaker: trimRange(colonless[1], line.start), channel: colonless[3].toUpperCase(),
++            channelSource: {start: line.start + colonless.indices[3][0], end: line.start + colonless.indices[3][1]},
++            bodyStart: line.start + colonless.indices[5][0]};
++    }
+     const external = syntax === 'current' ? /^([^:：()（）]+?)[（(]([^()（）]*)[）)][\t \u00a0\u3000]*(OS|VO)[\t \u00a0\u3000]*(?:([:：])([\s\S]*)|$)$/diu.exec(line.content) : null;
+     const match = external ? [
+         external[0],
+@@ -215,11 +226,12 @@
+                 end: channel.end
+             };
+             const cues = tokens.filter((token)=>token !== channel);
+-            if (cues.length && channel.start > cues[0].start && channel.end < cues.at(-1).end) return {
+-                line: line.number,
+-                code: 'UNSUPPORTED_CUE_LAYOUT',
+-                message: '声道插在两段提示之间，当前连续切片无法安全拆分提示。'
+-            };
++            if (cues.length && channel.start > cues[0].start && channel.end < cues.at(-1).end) {
++                const local = range => ({start: range.start - line.start, end: range.end - line.start});
++                const split = sourceInterleavedChannelCue(line.content, [local(speaker)], [local(head.channelSource)]);
++                if (!split) return {line: line.number, code: 'UNSUPPORTED_CUE_LAYOUT', message: '声道与提示无法按原文独立切片。'};
++                head.cueSlices = split.map(range => ({start: range.start + line.start, end: range.end + line.start}));
++            }
+             if (cues.length) head.cue = {
+                 start: cues[0].start,
+                 end: cues.at(-1).end
+@@ -361,6 +373,7 @@
+         if (head && 'speaker' in head && !head.channelSource) wholeSpeakers.add(text.slice(head.speaker.start, head.speaker.end));
+     }
+     const read = (line, names = knownSpeakers)=>readHead(line, names, syntax, headCues, wholeSpeakers);
++    const cueRanges = head => head.cueSlices ?? (head.cue ? [head.cue] : []);
+     const actorAction = (line)=>syntax === 'current' && [
+             ...knownSpeakers
+         ].some((name)=>line.content.startsWith(name) && /^(?:(?:震惊|惊讶|惊愕|错愕|惊恐|疑惑|慌忙|微微|轻轻|猛然|猛地|忽然|突然|缓缓|立刻|随即|再次|不由得?|下意识)地?){0,2}(?:抬头|低头|转头|转身|起身|蹲下|抬手|摆手|挥手|握拳|攥拳|攥紧|摊手|耸肩|点头|摇头|闭眼|睁眼|后退|躬身|跪下)[^:：?？!！“”‘’「」『』"'（）()\r\n]*。$/u.test(line.content.slice(name.length)) && !/(?:说道|问道|喊道|答道|开口|表示|声称|告诉|认为|觉得|[吗呢吧啊]。)/u.test(line.content.slice(name.length)));
+@@ -443,7 +456,7 @@
+         }));
+         const fields = [
+             head.speaker,
+-            head.cue,
++            ...cueRanges(head),
+             head.channelSource
+         ].filter((r)=>Boolean(r));
+         const original = mapped(first, last, {
+@@ -467,7 +480,7 @@
+                     layout: original.layout,
+                     speaker: parts(head.speaker),
+                     channel: head.channel,
+-                    cue: head.cue ? parts(head.cue) : null,
++                    cue: head.cue ? cueRanges(head).flatMap(parts) : null,
+                     channelSource: head.channelSource ? parts(head.channelSource) : null
+                 },
+                 ...captions
+@@ -546,7 +559,7 @@
+             if (head.bodyStart >= bodyFinish || head.bodyStart > end) return null;
+             const ranges = [
+                 head.speaker,
+-                head.cue,
++                ...cueRanges(head),
+                 head.channelSource,
+                 {
+                     start: head.bodyStart,
+@@ -575,7 +588,7 @@
+                 speaker: parts(head.speaker),
+                 channel: head.channel,
+                 channelSource: head.channelSource ? parts(head.channelSource) : null,
+-                cue: head.cue ? parts(head.cue) : null
++                cue: head.cue ? cueRanges(head).flatMap(parts) : null
+             };
+         });
+         if (dialogues.some((d)=>!d)) return null;
+@@ -808,7 +821,7 @@
+                 }
+                 const fields = [
+                     head.speaker,
+-                    head.cue,
++                    ...cueRanges(head),
+                     head.channelSource
+                 ].filter((range)=>Boolean(range));
+                 plan.entries.push({
+@@ -816,7 +829,7 @@
+                     kind: 'DIALOGUE',
+                     channel: head.channel,
+                     speaker: parts(head.speaker),
+-                    cue: head.cue ? parts(head.cue) : null,
++                    cue: head.cue ? cueRanges(head).flatMap(parts) : null,
+                     channelSource: head.channelSource ? parts(head.channelSource) : null,
+                     ...mapped(i, last, {
+                         start,
+--- a/scripts/intake/standard-script.mjs
++++ b/scripts/intake/standard-script.mjs
+@@ -1,6 +1,6 @@
+ import { createHash } from 'node:crypto';
+ import { isDeepStrictEqual } from 'node:util';
+-import { inlinePerformanceProjection, compactPerformanceHeadProjection, sourceVoiceProjection, sourceBarePerformanceProjection, sourceHeadPrefix, sourceUtteranceProperty } from '../core/runtime/inline-performance.mjs';
++import { inlinePerformanceProjection, compactPerformanceHeadProjection, sourceVoiceProjection, sourceBarePerformanceProjection, sourceHeadPrefix, sourceUtteranceProperty, sourceInterleavedCueMatches, sourceColonlessVoiceHeader } from '../core/runtime/inline-performance.mjs';
+ export function explicitSubtitles(text) {
+     const spans = [];
+     const stack = [], pairs = {
+@@ -407,6 +407,9 @@
+         function assemble(parts, field, allowEmpty = false, sink = consumed, allowCaptionGaps = false) {
+             if (!Array.isArray(parts) || !allowEmpty && !parts.length) fail('EMPTY_OR_INVALID_PARTS', `${path}.${field}`);
+             const isLayout = field === 'layout' || field.endsWith('.layout');
++            const childCue = /^(children|dialogues)\[(\d+)\]\.cue$/u.exec(field);
++            const cueOwner = field === 'cue' ? entry : childCue ? entry[childCue[1]]?.[Number(childCue[2])] : null;
++            const headerCueGaps = cueOwner && sourceInterleavedCueMatches(index.text, cueOwner.speaker, cueOwner.cue, cueOwner.channelSource);
+             let end = -1;
+             const copied = Array.from(parts, (part, i)=>{
+                 const fieldPath = `${path}.${field}[${i}]`;
+@@ -430,7 +433,7 @@
+                 if (!Number.isInteger(part.start) || !Number.isInteger(part.end) || part.start < unit.start || part.end > unit.end || part.start >= part.end) fail('INVALID_RANGE', fieldPath, part.unitId);
+                 if (splitPair(index.text, part.start) || splitPair(index.text, part.end)) fail('UNICODE_BOUNDARY', fieldPath, part.unitId);
+                 if (part.start < end) fail('PART_ORDER_OR_DUPLICATION', fieldPath, part.unitId);
+-                if (!isLayout && !allowCaptionGaps && i > 0 && part.start !== end) fail('TEXT_GAP', fieldPath, part.unitId);
++                if (!isLayout && !allowCaptionGaps && !headerCueGaps && i > 0 && part.start !== end) fail('TEXT_GAP', fieldPath, part.unitId);
+                 end = part.end;
+                 const text = index.text.slice(part.start, part.end);
+                 if (part.kind === 'SOURCE_SEPARATOR' && !/^[\t \r\n]+$/.test(text)) fail('INVALID_SEPARATOR', fieldPath, part.unitId);
+@@ -602,7 +605,7 @@
+                     dialogue.speaker,
+                     dialogue.cue,
+                     dialogue.channelSource
+-                ].filter((f)=>Boolean(f)).sort((x, y)=>x.parts[0].start - y.parts[0].start);
++                ].filter((f)=>Boolean(f)).flatMap(f=>f.parts.map(part=>({parts:[part]}))).sort((x, y)=>x.parts[0].start - y.parts[0].start);
+                 let edge = unitStart;
+                 for (const f of fields){
+                     if (f.parts[0].start < edge || !(edge === unitStart ? /^[\s\uFEFF]*$/ : /^[\s()（）,，]*$/).test(index.text.slice(edge, f.parts[0].start))) fail('BODY_GROUP_HEADER', path);
+@@ -676,7 +679,7 @@
+                         speaker,
+                         cue,
+                         channelSource
+-                    ].filter((f)=>Boolean(f)).sort((x, y)=>x.parts[0].start - y.parts[0].start);
++                    ].filter((f)=>Boolean(f)).flatMap(f=>f.parts.map(part=>({parts:[part]}))).sort((x, y)=>x.parts[0].start - y.parts[0].start);
+                     let edge = childStart;
+                     for (const f of prefixFields){
+                         if (f.parts[0].start < edge || !(edge === childStart ? /^[\s\uFEFF()（）【】\[\]]*$/ : /^[\s\uFEFF()（）【】\[\],，]*$/).test(index.text.slice(edge, f.parts[0].start))) fail('DIALOGUE_GROUP_HEADER', childPath);
+@@ -725,7 +728,7 @@
+                     output.speaker,
+                     output.cue,
+                     output.channelSource
+-                ].filter((field)=>Boolean(field)).sort((a, b)=>a.parts[0].start - b.parts[0].start);
++                ].filter((field)=>Boolean(field)).flatMap(f=>f.parts.map(part=>({parts:[part]}))).sort((a, b)=>a.parts[0].start - b.parts[0].start);
+                 let edge = unitStart;
+                 for (const field of fields){
+                     const gap = index.text.slice(edge, field.parts[0].start);
+@@ -734,7 +737,8 @@
+                     edge = field.parts[field.parts.length - 1].end;
+                 }
+                 const separator = index.text.slice(edge, textStart);
+-                if (edge > textStart || !/^[\t ()（）【】\[\]]*(?:[:：][\t \r\n]*|[\r\n][\t \r\n]*)$/.test(separator)) fail('DIALOGUE_TEXT_BOUNDARY', `${path}.layout`);
++                const colonlessVoice = sourceColonlessVoiceHeader(index.text, output.speaker, output.channelSource, output.channel, textStart, output.cue);
++                if (edge > textStart || !colonlessVoice && !/^[\t ()（）【】\[\]]*(?:[:：][\t \r\n]*|[\r\n][\t \r\n]*)$/.test(separator)) fail('DIALOGUE_TEXT_BOUNDARY', `${path}.layout`);
+             }
+         } else {
+             const prefix = index.text.slice(unitStart, textStart);
+--- a/scripts/core/runtime/inline-performance.mjs
++++ b/scripts/core/runtime/inline-performance.mjs
+@@ -50,8 +50,40 @@
+  // A finite explanation predicate is spoken syntax, not a character or a
+  // world rule. All original words and the colon remain in the utterance.
+  return /^[\p{L}\p{N}]{1,16}(?:老样子|如下|很简单|是这样)$/u.test(label)
++  || /^(?:换新约|工种变更|先看清|三件事|先算费用)$/u.test(label)
+   || /^(?:系统|系统音|系统窗口|系统提示窗口)$/u.test(speaker)&&/^(?:触发(?:终极)?(?:主线|支线)?任务|任务目标|任务奖励|解锁(?:全新)?(?:建筑|技能))$/u.test(label)
+   || read.test(cue)&&!silent.test(cue)&&/^(?:条款|条目)[一二三四五六七八九十百\d]+$/u.test(label);
++}
++// Local compatibility patch 20261020: metadata may straddle one explicit
++// channel token. Return exact disjoint cue spans, never synthesize source text.
++const fieldParts=value=>Array.isArray(value)?value:value?.parts;
++export function sourceInterleavedChannelCue(source,speaker,channelSource){
++ const names=fieldParts(speaker),voices=fieldParts(channelSource);
++ if(names?.length!==1||voices?.length!==1)return null;
++ const from=names[0].end;
++ const match=/^[\t \u00a0\u3000]*([（(])([^()（）\r\n]*)([）)])[\t ]*[:：]/du.exec(source.slice(from));
++ if(!match||(match[1]==='（'?'）':')')!==match[3])return null;
++ const base=from+match.indices[2][0];
++ const tokens=[...match[2].matchAll(/[^,， \t]+/g)].map(t=>({text:t[0],start:base+t.index,end:base+t.index+t[0].length}));
++ const positions=tokens.flatMap((t,i)=>/^(OS|VO)$/iu.test(t.text)?[i]:[]);
++ if(positions.length!==1||positions[0]===0||positions[0]===tokens.length-1)return null;
++ const at=positions[0],voice=tokens[at];
++ if(voices[0].start!==voice.start||voices[0].end!==voice.end)return null;
++ if(tokens.some((t,i)=>i!==at&&/\b(?:OS|VO)\b|旁白|画外音|内心独白|系统音/iu.test(t.text)))return null;
++ return [{start:tokens[0].start,end:voice.start},{start:tokens[at+1].start,end:tokens.at(-1).end}];
++}
++export function sourceInterleavedCueMatches(source,speaker,cue,channelSource){
++ const expected=sourceInterleavedChannelCue(source,speaker,channelSource),actual=fieldParts(cue);
++ return Boolean(expected&&actual?.length===expected.length&&actual.every((p,i)=>p.start===expected[i].start&&p.end===expected[i].end));
++}
++/** Colon omission is allowed only for a whole explicit (OS)/(VO) header.
++ * Identity confirmation remains the intake parser's separate responsibility. */
++export function sourceColonlessVoiceHeader(source,speaker,channelSource,channel,bodyStart,cue){
++ const names=fieldParts(speaker),voices=fieldParts(channelSource);
++ if(names?.length!==1||voices?.length!==1||fieldParts(cue)?.length||!Number.isInteger(bodyStart))return false;
++ const from=names[0].end;
++ const match=/^[\t \u00a0\u3000]*([（(])(OS|VO)([）)])[\t ]*$/diu.exec(source.slice(from,bodyStart));
++ return Boolean(match&&(match[1]==='（'?'）':')')===match[3]&&channel===match[2].toUpperCase()&&voices[0].start===from+match.indices[2][0]&&voices[0].end===from+match.indices[2][1]);
+ }
+ /** Mechanical header shape only; the parser separately requires independent identity evidence. */
+ export function compactPerformanceHeadProjection(source,speaker,cue,channelSource){
+--- a/scripts/core/runtime/storyboard-v4/core/standard-source.mjs
++++ b/scripts/core/runtime/storyboard-v4/core/standard-source.mjs
+@@ -1,6 +1,6 @@
+ import {fail} from './shared.mjs';
+ import {createHash} from 'node:crypto';
+-import {inlinePerformanceProjection,compactPerformanceHeadProjection,sourceVoiceProjection,sourceBarePerformanceProjection,sourceHeadPrefix,sourceUtteranceProperty} from '../../inline-performance.mjs';
++import {inlinePerformanceProjection,compactPerformanceHeadProjection,sourceVoiceProjection,sourceBarePerformanceProjection,sourceHeadPrefix,sourceUtteranceProperty,sourceInterleavedCueMatches,sourceColonlessVoiceHeader} from '../../inline-performance.mjs';
+ 
+ export const STANDARD_EPISODE_PROTOCOL='standard-episode-v1';
+ const voices={SPEECH:'现场对白',OS:'OS',VO:'VO',NARRATION:'VO',SYSTEM:'系统音'};
+@@ -141,12 +141,14 @@
+   const parts=(raw,expected,label,empty=false,sink=spans,captionGaps=false)=>{
+    check(Array.isArray(raw)&&(empty||raw.length>0),'STANDARD_PARTS',`${label}缺少来源片段`);
+    const isLayout=label.endsWith('版式');
++   const cueOwners=entry.kind==='DIALOGUE'?[entry]:entry.dialogues??entry.children??[];
++   const headerCueGaps=label.endsWith('提示')&&cueOwners.some(child=>child.cue?.parts===raw&&sourceInterleavedCueMatches(sourceText,child.speaker,child.cue,child.channelSource));
+    let previous=-1;
+    const result=raw.map(part=>{
+     const unit=byId.get(part.unitId);
+     check(unit&&entry.sourceUnitIds.includes(part.unitId)&&Number.isSafeInteger(part.start)&&Number.isSafeInteger(part.end)&&part.start>=unit.start&&part.end<=unit.end&&part.end>part.start,'STANDARD_PARTS',`${label}原文范围无效`);
+     check(['SOURCE_SLICE','SOURCE_SEPARATOR'].includes(part.kind)&&(part.kind!=='SOURCE_SEPARATOR'||/^[\t \r\n]+$/.test(sourceText.slice(part.start,part.end))),'STANDARD_PARTS','标准片段类型不合法');
+-    check(part.start>=previous&&(isLayout||captionGaps||previous<0||part.start===previous),'STANDARD_PARTS','标准正文切片不连续');previous=part.end;
++    check(part.start>=previous&&(isLayout||captionGaps||headerCueGaps||previous<0||part.start===previous),'STANDARD_PARTS','标准正文切片不连续');previous=part.end;
+     if(isLayout)check(/^[\s\uFEFF:：()（）△▲【】\[\],，]+$/.test(sourceText.slice(part.start,part.end)),'STANDARD_LAYOUT','标准版式不能隐藏正文字符');
+     if(v2||v3||performance)for(const offset of [part.start,part.end])check(!(offset>0&&offset<sourceText.length&&/[\uD800-\uDBFF]/.test(sourceText[offset-1])&&/[\uDC00-\uDFFF]/.test(sourceText[offset])),'STANDARD_PARTS','对白分组不能切开Unicode字符');
+     sink.push([part.start,part.end]);return [part.start-start,part.end-start];
+@@ -169,6 +171,8 @@
+    standard.channelSource=entry.channelSource?parts(entry.channelSource.parts,entry.channelSource.text,'声道'):[];
+    standard.channel=voices[entry.channel];
+    compactVoice(sourceText,entry,v5);
++   const headerText=sourceText.slice(entry.speaker.parts[0].start,entry.textAssembly.parts[0].start);
++   if(entry.channelSource&&!/[:：\r\n]/u.test(headerText))check(sourceColonlessVoiceHeader(sourceText,entry.speaker,entry.channelSource,entry.channel,entry.textAssembly.parts[0].start,entry.cue),'STANDARD_CHANNEL_HEADER','缺冒号声道须完整精确绑定OS/VO括号头');
+    if(postColonFields(sourceText,entry)){postCueHeader(sourceText,start,entry.textAssembly.parts[0].start,entry);groupUtterance(entry.text,entry.speaker.text,entry.cue?.text);}
+    const projection=performanceField(entry);if(projection)standard.performance=projection;
+   }
+@@ -212,7 +216,7 @@
+     const compact=compactVoice(sourceText,d,v5),header=/^\s*([^:：()（）]+?)(?:[（(]([^()（）]*)[）)])?(?:(?<=[）)])[\t \u00a0\u3000]*(OS|VO))?[ \t]*[:：][ \t\r\n]*$/iu.exec(sourceText.slice(start,a));
+     const qualified=Boolean(header?.[2]&&!/^(?:OS|VO|旁白|画外音|内心独白|系统音)$/iu.test(header[2].trim())&&sourceText.slice(start,a).replace(/(?<=[）)])[\t \u00a0\u3000]*(?:OS|VO)[\t \u00a0\u3000]*(?=[:：])/iu,'').replace(/[:：][\s]*$/u,'').trim()===d.speaker.text&&declaredSpeakerForm(sourceText,d.speaker.text));
+     check(header&&(qualified||header[1].trim()===sourceHeadPrefix(sourceText,d.speaker,d.cue,d.channelSource)),'STANDARD_BODY_HEADER','混合对白说者与原文头不一致');
+-    const fields=[d.speaker,d.cue,d.channelSource].filter(Boolean).sort((x,y)=>x.parts[0].start-y.parts[0].start);let edge=start;
++    const fields=[d.speaker,d.cue,d.channelSource].filter(Boolean).flatMap(f=>f.parts.map(part=>({parts:[part]}))).sort((x,y)=>x.parts[0].start-y.parts[0].start);let edge=start;
+     for(const f of fields){check(f.parts[0].start>=edge&&(edge===start?/^[\s\uFEFF]*$/:/^[\s()（）,，]*$/).test(sourceText.slice(edge,f.parts[0].start)),'STANDARD_BODY_HEADER','混合对白字段跨越源头');edge=f.parts.at(-1).end;}
+     check(edge<=a&&/^[\t ()（）]*[:：][\t \r\n]*$/.test(sourceText.slice(edge,a)),'STANDARD_BODY_HEADER','混合对白冒号边界无效');
+     const tokens=[...(compact&&!header[3]?[compact.text]:[]),...(header[3]?[header[3]]:[]),...(qualified?'':header[2]??'').split(/[,， \t]+/).filter(Boolean)],channels=tokens.filter(t=>/^(OS|VO)$/i.test(t)),expected=channels[0]?.toUpperCase()??({旁白:'NARRATION',画外音:'VO',系统音:'SYSTEM'})[d.speaker.text]??'SPEECH';
+@@ -239,7 +243,7 @@
+     const header=/^\s*([^:：()（）]+?)(?:[（(]([^()（）]*)[）)])?(?:(?<=[）)])[\t \u00a0\u3000]*(OS|VO))?[ \t]*[:：][ \t]*$/iu.exec(sourceText.slice(childStart,a));
+     const qualified=Boolean(header?.[2]&&!/^(?:OS|VO|旁白|画外音|内心独白|系统音)$/iu.test(header[2].trim())&&sourceText.slice(childStart,a).replace(/(?<=[）)])[\t \u00a0\u3000]*(?:OS|VO)[\t \u00a0\u3000]*(?=[:：])/iu,'').replace(/[:：][ \t]*$/u,'').trim()===child.speaker.text&&declaredSpeakerForm(sourceText,child.speaker.text));
+     check(header&&(qualified||header[1].trim()===sourceHeadPrefix(sourceText,child.speaker,child.cue,child.channelSource))&&/^[\p{L}\p{N}·・ _.-]+(?:、[\p{L}\p{N}·・ _.-]+)*$/u.test(qualified?header[1].trim():child.speaker.text),'STANDARD_GROUP_HEADER','对白分组说者与原文头不一致');
+-    const fields=[speaker,cue,channelSource].filter(f=>f.length).sort((x,y)=>x[0][0]-y[0][0]);let edge=childStart;
++    const fields=[speaker,cue,channelSource].filter(f=>f.length).flatMap(f=>f.map(part=>[part])).sort((x,y)=>x[0][0]-y[0][0]);let edge=childStart;
+     for(const f of fields){check(f[0][0]+start>=edge&&(edge===childStart?/^[\s\uFEFF()（）【】\[\]]*$/:/^[\s\uFEFF()（）【】\[\],，]*$/).test(sourceText.slice(edge,f[0][0]+start)),'STANDARD_GROUP_HEADER','对白分组字段跨过原文头');edge=f.at(-1)[1]+start;}
+     check(edge<=a&&/^[\t ()（）【】\[\]]*[:：][\t ]*$/.test(sourceText.slice(edge,a)),'STANDARD_GROUP_HEADER','对白分组冒号边界无效');
+     const tokens=[...(compact&&!header[3]?[compact.text]:[]),...(header[3]?[header[3]]:[]),...(qualified?'':header[2]||'').split(/[,， \t]+/).filter(Boolean)],channels=tokens.filter(token=>/^(OS|VO)$/i.test(token));

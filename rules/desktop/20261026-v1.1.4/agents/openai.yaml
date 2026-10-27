@@ -1,0 +1,4 @@
+interface:
+  display_name: "桌面流程分镜导演"
+  short_description: "结合桌面端精准供料、完整主创与整集整编，在Codex交付灵墨v7分镜和资产资料"
+  default_prompt: "使用 $desktop-storyboard-director 按桌面生成逻辑处理这份完整剧本，保留原文和已采用资产，完成统筹、主创、整编及复核，交付灵墨v7分镜MD、白图包和完整资产资料。"

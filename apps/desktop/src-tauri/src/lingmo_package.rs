@@ -232,6 +232,7 @@ fn verify_delivery(
 ) -> Result<()> {
     let bundle = &delivery["bundle"];
     let receipt = &delivery["adoptionReceipt"];
+    series::validate_visual_baseline_handoff(&direction["settings"], delivery)?;
     check(
         bundle["workflowProfile"] == series::PROFILE
             && bundle["sourceSha256"] == manifest["sourceSha256"]

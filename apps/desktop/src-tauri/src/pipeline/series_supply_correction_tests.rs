@@ -58,7 +58,7 @@ pub(crate) async fn series_unpublished_revision_fixture(
 }
 async fn normal_revision_fixture(pending: bool) -> (Value, Vec<(TextRequest, Value)>, Value) {
     let (mut input, good, author) = material_input();
-    mark_input(&mut input).unwrap();
+    mark_new_legacy_fixture(&mut input);
     input["source"]["version"] = json!(1);
     allocate_asset_identities(input["assets"].as_array_mut().unwrap()).unwrap();
     if pending {

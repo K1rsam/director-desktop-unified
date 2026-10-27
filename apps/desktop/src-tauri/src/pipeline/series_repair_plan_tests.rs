@@ -94,7 +94,7 @@ pub(super) fn fixture_with_frozen_sound_sources() -> (Value, Value) {
     input["selection"]["episodeIds"] = json!([eid]);
     input["productionScope"]["episodeIds"] = json!([eid]);
     input["productionScope"]["sourceSha256"] = json!(locked.sha256);
-    mark_input(&mut input).unwrap();
+    mark_new_legacy_fixture(&mut input);
     (input, authored)
 }
 

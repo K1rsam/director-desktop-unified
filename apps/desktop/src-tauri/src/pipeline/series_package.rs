@@ -103,6 +103,8 @@ fn validate_common_context(input: &Value, frozen: &Value) -> Result<(), String> 
         return Err("SERIES_EXPORT_FROZEN_SCOPE_OR_RULES_MISMATCH".into());
     }
     if super::direction(input) != super::direction(frozen)
+        || (visual_baseline::enabled(input)
+            && input["settings"]["visualBaseline"] != frozen["settings"]["visualBaseline"])
         || fantasy_mode(input)? != fantasy_mode(frozen)?
         || limit(input)? != limit(frozen)?
     {
@@ -334,6 +336,7 @@ fn write_contexts(
     for key in [
         "projectVisualStyle",
         "visualStyle",
+        "visualBaseline",
         "productionDirection",
         "productionDirectionConfirmed",
         "confirmedDirection",
@@ -440,7 +443,7 @@ fn write_contexts(
     )
     .map_err(|e| e.to_string())?;
     export::verify(&saved_md, &saved_index, &json!({"units":all_units}))?;
-    let manifest = json!({"version":"desktop-series-delivery-package/v1","workflowProfile":PROFILE,"status":"LOCAL_PACKAGE_READY","scopeComplete":complete,"platformImportVerified":false,"mediaGenerated":false,"sourceSha256":source.sha256,"rulePackSha256":rules::pack_hash()?,"productionScope":input["productionScope"],"episodeIds":deliveries.iter().map(|d|d["episodeId"].clone()).collect::<Vec<_>>(),"markdown":"全剧_灵墨v7.md","assetIndex":"全剧_灵墨v7.md.assets.json","currentRegistry":"资料/registry/current.json","imageQueue":"资料/image-queue.json","placeholderDirectory":"白图","files":files});
+    let manifest = json!({"version":"desktop-series-delivery-package/v1","workflowProfile":PROFILE,"status":"LOCAL_PACKAGE_READY","scopeComplete":complete,"platformImportVerified":false,"mediaGenerated":false,"sourceSha256":source.sha256,"rulePackSha256":rule_pack_hash(input)?,"productionScope":input["productionScope"],"episodeIds":deliveries.iter().map(|d|d["episodeId"].clone()).collect::<Vec<_>>(),"markdown":"全剧_灵墨v7.md","assetIndex":"全剧_灵墨v7.md.assets.json","currentRegistry":"资料/registry/current.json","imageQueue":"资料/image-queue.json","placeholderDirectory":"白图","files":files});
     write_json(&root, "manifest.json", &manifest, &mut Vec::new())?;
     Ok(
         json!({"path":root.to_string_lossy(),"count":deliveries.len(),"manifestPath":root.join("manifest.json").to_string_lossy(),"imageCount":image_files.len(),"unitCount":all_units.len(),"scopeComplete":complete,"status":"LOCAL_PACKAGE_READY"}),

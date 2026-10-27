@@ -63,9 +63,11 @@ pub(super) fn materialize(draft: &mut Value, input: &Value) -> Result<(), String
         unit[UNIT_FIELD] = expected;
         unit["prompt"] = json!(format!("画幅：{ratio}\n\n{}", s(unit, "prompt")));
     }
+    visual_baseline::materialize(draft, input)?;
     Ok(())
 }
 pub(super) fn export_style(unit: &Value, style: &str) -> Result<String, String> {
+    visual_baseline::export_style(unit, style)?;
     let Some(render) = unit.get(UNIT_FIELD) else {
         return Ok(style.into());
     };

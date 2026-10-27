@@ -10,6 +10,10 @@ PACKS = (
     ("series", "20261025-v6.7.2", Path("E:/Soullnk/.agents/skills/series-storyboard-director"),
      "20261025-v6.7.2-readable-image-bindings", "8a5fe9d55c0d40f5b8e82a4c9735201bb00415ea + local v6.7.2 amendments"),
     ("assets", "1.1.2", Path("E:/cx/资产项目/.agents/skills/gpt-image25-asset-workflow"), "V1.1.2", "user-installed V1.1.2"),
+    ("series", "20261026-v6.7.3", Path("E:/Soullnk/.agents/skills/series-storyboard-director"),
+     "20261026-v6.7.3-visual-baseline", "user-maintained Soullnk v6.7.3; exact local bytes frozen independently of prior releases"),
+    ("desktop", "20261026-v1.1.4", Path("E:/Soullnk/.agents/skills/desktop-storyboard-director"),
+     "20261026-v1.1.4-visual-baseline", "user-maintained Soullnk desktop v1.1.4; exact local bytes frozen independently of prior releases"),
 )
 
 def sha(path):
@@ -24,9 +28,13 @@ def inventory(directory):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--package", action="append", choices=[f"{name}/{directory}" for name, directory, *_ in PACKS],
+                        help="Select exact versioned packages; repeat to freeze only new packages without replacing old ones.")
     args = parser.parse_args()
     results = []
     for name, directory, source, version, origin in PACKS:
+        if args.package and f"{name}/{directory}" not in args.package:
+            continue
         target = ROOT / "rules" / name / directory
         manifest = target / "desktop-freeze.json"
         if args.verify:
@@ -37,6 +45,8 @@ def main():
         else:
             if target.exists():
                 raise SystemExit(f"Refusing to replace an existing frozen package: {target}")
+            if (source / "VERSION").read_text(encoding="utf-8").strip() != version:
+                raise SystemExit(f"Source version differs from requested package: {name}/{directory}")
             files = inventory(source)
             for relative in files:
                 dest = target / relative

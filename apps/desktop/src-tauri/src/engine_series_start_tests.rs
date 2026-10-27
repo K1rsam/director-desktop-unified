@@ -3,9 +3,12 @@ use super::*;
 
 #[test]
 fn frozen_series_workflow_resume_audits_its_own_rule_pack_without_replacing_history() {
-    let rules = json!(pipeline::series::rule_snapshots().unwrap());
+    let mut input = json!({});
+    pipeline::series::mark_legacy_input(&mut input).unwrap();
+    input.as_object_mut().unwrap().remove("seriesDesignSourceUses");
+    let rules = json!(pipeline::series::rule_snapshots_for(&input).unwrap());
     let snapshot = json!({"runnerVersion":"desktop-runner/v1","stage":"storyboard.run",
-        "input":{"workflowProfile":pipeline::series::PROFILE},"rules":rules});
+        "input":input,"rules":rules});
     let job = json!({"kind":"workflow","entityId":"storyboard.run","snapshot":snapshot});
     let original = job.clone();
     assert!(job["snapshot"]["input"].get("seriesDesignSourceUses").is_none());

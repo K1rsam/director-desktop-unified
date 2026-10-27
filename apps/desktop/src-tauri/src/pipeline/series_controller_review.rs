@@ -91,7 +91,7 @@ pub(crate) fn build_context(auth: &Value, review: &TextRequest, raw: &Value,
         "originReviewJobId":review_job,"originReviewNodeKey":node,"originSnapshotSha256":snapshot_sha,
         "originRequestSha256":digest(&serde_json::to_string(review).map_err(|e|e.to_string())?),
         "originRawSha256":hash(raw),"assetsSha256":hash(packet_value(&review.input["packet"],"assets")?),
-        "rulePackSha256":rules::pack_hash()?,"firstReviewIteration":start,"maximumRepairs":MAX_REPAIRS,
+        "rulePackSha256":rule_pack_hash(input)?,"firstReviewIteration":start,"maximumRepairs":MAX_REPAIRS,
         "issues":issues,"nextEpisodeBoundary":boundary,"stopAfterEpisodeId":ep.id,
         "provenance":"controller supplement; original independent review unchanged"});
     context["sha256"]=json!(hash(&context));Ok(context)

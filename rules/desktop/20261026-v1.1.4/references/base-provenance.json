@@ -1,0 +1,416 @@
+{
+  "version": "20261020-v6.5-source-presentation-progress",
+  "release": {
+    "baseVersion": "20261020-v6.4-subagent-model-selection",
+    "releaseNotes": "references/release-v6.5.md",
+    "versionFile": "VERSION",
+    "repository": "https://github.com/K1rsam/series-storyboard-director",
+    "repositorySkillPath": "skills/series-storyboard-director",
+    "scope": "Directly retain and visibly explain source-explicit system presentation; ask only unresolved or explicitly requested changes; report evidence-based stage progress and scoped time estimates.",
+    "runtimeCodeChanged": false,
+    "liveModelDispatchValidated": false,
+    "crossDeviceRuntimeValidated": false,
+    "longRunningProgressValidated": false,
+    "etaAccuracyValidated": false
+  },
+  "snapshot": "Base creative snapshot 2026-10-16, local v4 timing and v5 expression/consent adaptations, then user-directed v6 active amplification on 2026-10-19. User clarified wider coverage of suitable passages on 2026-10-20. Local versioned amendment procedure clarified during bidirectional comparison with 3008 on 2026-10-20. System presentation choices and local multi-package amendment handoff clarified on 2026-10-20.",
+  "exportAdapter": {
+    "newProductionExportProfile": "lingmo-v7",
+    "legacyVerificationProfile": "series-single-zone-v1",
+    "contract": "references/lingmo-v7-contract.md",
+    "localModules": [
+      "scripts/storyboard.mjs",
+      "scripts/assets.mjs",
+      "scripts/lingmo-v7.mjs",
+      "scripts/lingmo-asset-names.mjs",
+      "scripts/time-values.mjs",
+      "scripts/make-white-placeholders.py"
+    ],
+    "sourceCreativeRulesChangedForExport": false
+  },
+  "sourceFiles": [
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/acting-blocking-methods/SKILL.md",
+      "packaged": "references/creative/skills/acting-blocking-methods/SKILL.md",
+      "sha256": "71453a6d95d9bfe0248144f249dc46d8672c6c261e3a83aee8cf6bd72172a9bf",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/camera-emotion-methods/SKILL.md",
+      "packaged": "references/creative/skills/camera-emotion-methods/SKILL.md",
+      "sha256": "75ee50cf0d425c20fe5e641a8097adeb1e7287859a20269c26c63f184087424e",
+      "mode": "local-v5-expression-and-consent-adaptation; previous timing and source fidelity protections retained",
+      "sourceSha256": "6c3630ff4d0ab654feda6072fca994d549640ed4fc68edf6351739ab4911b079",
+      "previousPackagedSha256": "81de9c142f7f157970b943072987a8d2dbc90fa6008d803ee1cb5677fe4c9100",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "81de9c142f7f157970b943072987a8d2dbc90fa6008d803ee1cb5677fe4c9100"
+        }
+      ],
+      "upstreamUpdateSha256": "205f5c04fc3a1bfe9ac2053c7bc792b9227ff19366909f2ca78c3c4998ea5162"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/director-refinement/SKILL.md",
+      "packaged": "references/creative/skills/director-refinement/SKILL.md",
+      "sha256": "6410f2fcc3e23076f00783f2c28f82e61f4f397b7e86016af32b9e58b3cc83bb",
+      "mode": "local-v6-active-amplification; previous source fidelity, consent, continuity and timing protections retained",
+      "sourceSha256": "579e82ae4256cbc9e9af3bfdfd0a3ec3590b91f1af818b7a77611264ffd2c937",
+      "previousPackagedSha256": "8cb337a22d114050c0ef23d7e0f174b060e56f45e3c1fc10aed0748a60de99d3",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "8cb337a22d114050c0ef23d7e0f174b060e56f45e3c1fc10aed0748a60de99d3"
+        }
+      ]
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/episode-emotion-planner/SKILL.md",
+      "packaged": "references/creative/skills/episode-emotion-planner/SKILL.md",
+      "sha256": "87c1432df2ddcb0c3682e7400b89d59495aea913745545c77256991f45b02838",
+      "mode": "local-v6.1-opportunity-coverage clarification; previous source, consent and timing boundaries retained",
+      "sourceSha256": "7d6da5154fbefe89490186f0c7905f7959ea6abe121b0c05ed73f21dc56deaa7",
+      "previousPackagedSha256": "1677647cec2d07e4ebd7c507afb2e6bf08724d3e897850c2032c0fce4c949d09",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "572a27efa226e62d4df11461cfe6d9a4e4f06334b9be1cd3571e3523d8a2e6c4"
+        },
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "c93741a04504849b54dbf1226c3827f268c415a19f80a78fa303fb420f775882"
+        },
+        {
+          "fromVersion": "20261019-v6-active-amplification",
+          "packagedSha256": "1677647cec2d07e4ebd7c507afb2e6bf08724d3e897850c2032c0fce4c949d09"
+        }
+      ],
+      "upstreamUpdateSha256": "1e9cb4a6554c70433871f0840a549383e21d4a07705c4d1bb0c9afe606be1fcc"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/episode-finishing-editor/SKILL.md",
+      "packaged": "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "sha256": "1b3bb2b2ed8edcec1873806618b91ed23e0b4d6ca1f9caac9282e46902c6813d",
+      "mode": "local-v6-active-amplification; previous source fidelity, consent, continuity and timing protections retained",
+      "sourceSha256": "2083577fff437605cc0ff4f7d262786914f52f8427d636110b1e0a162855b465",
+      "previousPackagedSha256": "6744de13eebe0ba054f5346c1e32da7e4c477c588eb225c0f322bc0da0b21e2b",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "d84e415d947733b20222e2178f9235446861a5100c0e8659a48f2b9c587bf182"
+        },
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "6744de13eebe0ba054f5346c1e32da7e4c477c588eb225c0f322bc0da0b21e2b"
+        }
+      ],
+      "upstreamUpdateSha256": "031a37b8629ecef228c8a3f3b358c473feaf44bbaa7e1220b0ecac62840e9ac2"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/fantasy-expression-methods/SKILL.md",
+      "packaged": "references/creative/skills/fantasy-expression-methods/SKILL.md",
+      "sha256": "b148df7488f17ce2f0ffe4c83f8cf22ad601d2ca243a9ef37ccab2dabe585732",
+      "mode": "local-v6-active-amplification; previous source fidelity, consent, continuity and timing protections retained",
+      "sourceSha256": "8c3d0c1eb38574de2c175c038935049d1f20efaf2aa4a054434936d56b709c3d",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "8c3d0c1eb38574de2c175c038935049d1f20efaf2aa4a054434936d56b709c3d"
+        },
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "1add1d8202b70d0d94f932df27501ad6226771491cb37d86406cfe31c53d5479"
+        }
+      ],
+      "previousPackagedSha256": "1add1d8202b70d0d94f932df27501ad6226771491cb37d86406cfe31c53d5479",
+      "upstreamUpdateSha256": "5af09e8b98a3aece7046dc717a2aba16be977cc6026e23873f3d1c3ea9a5848c"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/lighting-space-methods/SKILL.md",
+      "packaged": "references/creative/skills/lighting-space-methods/SKILL.md",
+      "sha256": "88c248178c4a95e4deb83ac9537d5fc1acf1d26f9a13164751c9a40ea92eaf31",
+      "mode": "local-viewing-benefit-and-editing-adaptation; source fidelity and continuity constraints retained",
+      "sourceSha256": "b97201cbbe4895bc0f5c3a6a3dfe4a16dfaebf9f84935a17b951d9f4ba01f614",
+      "previousPackagedSha256": "b97201cbbe4895bc0f5c3a6a3dfe4a16dfaebf9f84935a17b951d9f4ba01f614"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/sound-rhythm-methods/SKILL.md",
+      "packaged": "references/creative/skills/sound-rhythm-methods/SKILL.md",
+      "sha256": "7e2ffee1d2814f216a25c477929489b024bea24e7a0333e34e6054a317f9a8bb",
+      "mode": "local-adaptation; source fidelity, expressive performance, fantasy and continuity retained",
+      "sourceSha256": "1000ea079ff9d4c42921fd5b0f058eb4b3a33ce01a3b5910f0c19f1b7bef1512",
+      "previousPackagedSha256": "1000ea079ff9d4c42921fd5b0f058eb4b3a33ce01a3b5910f0c19f1b7bef1512"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/source-context-preparer/SKILL.md",
+      "packaged": "references/creative/skills/source-context-preparer/SKILL.md",
+      "sha256": "7d971a60c0955f25d93e9719c45551a640d428cbcebc224c058e41bfac773d06",
+      "mode": "local-v5-expression-and-consent-adaptation; previous timing and source fidelity protections retained",
+      "sourceSha256": "f563acc7ef27d08e60fd596778e511d7132d4e62144d4cb75f6fee63a4a9d291",
+      "previousPackagedSha256": "de22025921e899fa727e3556e568242c2136b6fb127e78f2b0f389fc05e5036f",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "de22025921e899fa727e3556e568242c2136b6fb127e78f2b0f389fc05e5036f"
+        }
+      ],
+      "upstreamUpdateSha256": "f563acc7ef27d08e60fd596778e511d7132d4e62144d4cb75f6fee63a4a9d291"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/skills/unit-performance-director/SKILL.md",
+      "packaged": "references/creative/skills/unit-performance-director/SKILL.md",
+      "sha256": "1cd93cd92b5b203d2a1b597c39e0745481812d807f463a26ca033a756085aa8f",
+      "mode": "local-v6-active-amplification; previous source fidelity, consent, continuity and timing protections retained",
+      "sourceSha256": "8a627052a0cc80d409514a4da51b7edefbd5efa350ac8210f0e45f87dcbff578",
+      "previousPackagedSha256": "8aaa6db9c3e82cc66fa3f8dff88165cd3e1e6f0572efcc93c6b13ee4d5a4e036",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "2fcc1e4183a4f98acefde21fe6436eb0471cf39e432d407977e9a45d78d8311a"
+        },
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "8aaa6db9c3e82cc66fa3f8dff88165cd3e1e6f0572efcc93c6b13ee4d5a4e036"
+        }
+      ],
+      "upstreamUpdateSha256": "b5900625cb88974a4064054573c9f6641f4f07ca08149d340d6b9724706be38b"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/camera-path-repair.md",
+      "packaged": "references/creative/references/cards/camera-path-repair.md",
+      "sha256": "2c6c6c91706f04c2f311ee91df31315992cee58c7b808c4e6f1b1bd986db51de",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/comic-contrast.md",
+      "packaged": "references/creative/references/cards/comic-contrast.md",
+      "sha256": "462f6d3dc3cd0a055d31cf13941fb67327b762f91847927a4fff275076e90eed",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/danger-rescue.md",
+      "packaged": "references/creative/references/cards/danger-rescue.md",
+      "sha256": "84a5ea29fdb89a11cfc8bfd0787db72bda6a43c5ca25cbcc29ee5027ab606893",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/editing-integrity.md",
+      "packaged": "references/creative/references/cards/editing-integrity.md",
+      "sha256": "2154e5cd033f60c4caad6a45aa3a5e3c8884ae69320177c381496cbe045eef42",
+      "mode": "local-viewing-benefit-and-editing-adaptation; source fidelity and continuity constraints retained",
+      "sourceSha256": "63a322cbde08040b5999ce38f113304389ca044e1e2214bf8e8bbe2b87ddf0b0",
+      "previousPackagedSha256": "63a322cbde08040b5999ce38f113304389ca044e1e2214bf8e8bbe2b87ddf0b0"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/expressive-emphasis.md",
+      "packaged": "references/creative/references/cards/expressive-emphasis.md",
+      "sha256": "859627f68e7067f79d57afc787fcc08f4904dbff2c7c3394e30e5e21ba0644a2",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/joy-acceptance.md",
+      "packaged": "references/creative/references/cards/joy-acceptance.md",
+      "sha256": "412e4fa0c83c61ea70ac60a131e58672eca6c406ab5a58a0de5fb44d47f8e216",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/long-voice.md",
+      "packaged": "references/creative/references/cards/long-voice.md",
+      "sha256": "68e88a0070e1c74fe5baf8953d308835fa895a999602a50ff0f6f396ce74a775",
+      "mode": "local-viewing-benefit-and-editing-adaptation; source fidelity and continuity constraints retained",
+      "sourceSha256": "c917620f81197a0146fbca98750e4c679b08d4ca50f6847812faf1ff0bb7ac7b",
+      "previousPackagedSha256": "c917620f81197a0146fbca98750e4c679b08d4ca50f6847812faf1ff0bb7ac7b"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/quiet-nonhuman.md",
+      "packaged": "references/creative/references/cards/quiet-nonhuman.md",
+      "sha256": "e8d11f9819962328f4d5bfc39bfd383eb0a7cd8200a1820cbb0d453f7ac91cb3",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/scale-silence.md",
+      "packaged": "references/creative/references/cards/scale-silence.md",
+      "sha256": "20b47ff4dfe9b647ddb80e4492daf2d6be0619321c6d9f41fc371cf0ebd5c258",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/spatial-contact.md",
+      "packaged": "references/creative/references/cards/spatial-contact.md",
+      "sha256": "2d2b7bd1a922cfc61f1de84aca4ad6087e9bdac3f85ca1e378d4a9f13e6c4c1d",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/cards/status-conflict.md",
+      "packaged": "references/creative/references/cards/status-conflict.md",
+      "sha256": "90281f3f9e6d764a7711ecd89b4c2ddb7d833aeb8bd94926e4150bdbb67d8f3f",
+      "mode": "verbatim"
+    },
+    {
+      "upstream": "runtime/storyboard-v4/core/references/common-contract.md",
+      "packaged": "references/creative/references/common-contract.md",
+      "sha256": "38c1066f69e0b29385047fe9271b32b5aa79956214f871672ecca94a6afab7db",
+      "mode": "local-v6-active-amplification; previous source fidelity, consent, continuity and timing protections retained",
+      "sourceSha256": "f1a576d1bc232787a396a2be94748ca2c20a0a954b72929fce77ddec7c0dedb9",
+      "previousPackagedSha256": "b0f1a1557a8ba4ab53157d5b4619aa82d66763fcecf34a11d47da951db51cb1d",
+      "adaptationHistory": [
+        {
+          "fromVersion": "20261019-v4-timing-benefit",
+          "packagedSha256": "f41efe59e583bfb6189525def6634cf39aaf39369319f4123db10e57f26a4e42"
+        },
+        {
+          "fromVersion": "20261019-v5-expression-consent",
+          "packagedSha256": "b0f1a1557a8ba4ab53157d5b4619aa82d66763fcecf34a11d47da951db51cb1d"
+        }
+      ],
+      "upstreamUpdateSha256": "0512334ae643c2c2f7186a24e7c669a43d9b0b0edf801b89717b9bfab1719bbe"
+    },
+    {
+      "upstream": "prompts/foundation/F2.md",
+      "packaged": "references/foundation/F2.md",
+      "sha256": "923231d70cfa040df287209c4f4b199a36b28fa33c8fcdc82d3e747572df37c0",
+      "mode": "local-file-interface-adaptation; source creative constraints retained",
+      "sourceSha256": "2485c3f786ab315b14469dfaa93e5188a27d0f85bb056f1518274deda5392bfd"
+    },
+    {
+      "upstream": "prompts/foundation/Q1.md",
+      "packaged": "references/foundation/Q1.md",
+      "sha256": "0e937021549f7f5e1b2076b45b7c0d4c005138988c0f16ee086df12c084b0d92",
+      "mode": "local-file-interface-adaptation; source creative constraints retained",
+      "sourceSha256": "13e0d4b8db943f764c1b2c9a5ce4ea45bbc9212b44f8a65d1d8b9d5eb9b02ca8"
+    },
+    {
+      "upstream": "prompts/foundation/F1.md",
+      "packaged": "references/foundation/F1.md",
+      "sha256": "5de47294077f1b0cec0faf1c34fe1e90cf6e8cc2ac1cb6f7d7517139b55f1429",
+      "mode": "local-file-interface-adaptation; source navigation and design constraints retained",
+      "sourceSha256": "29a337ef3b5dd7e4f5ba07289e631f793c2e7323d2910f3831a85864349e0dfb"
+    },
+    {
+      "upstream": "prompts/asset-image-design-v1.md",
+      "packaged": "references/foundation/asset-image-design.md",
+      "sha256": "6f0f4d96f838a489d3e3409c26128c644f3304a89b41901348a99dd8e8061d8c",
+      "mode": "local-file-interface-adaptation; source navigation and design constraints retained",
+      "sourceSha256": "3c0231726ed49e2691bedd6a158dd9d69168acbee87e3e4011548c212e68bc59"
+    }
+  ],
+  "portable": true,
+  "runtimeDependencyOnSourceProject": false,
+  "qualityWorkflow": {
+    "contract": "references/preproduction-contract.md",
+    "assetHandoff": "references/asset-handoff.md",
+    "fullDesignField": "design.full",
+    "designDependencyField": "design.dependencies",
+    "creativeSourcesChanged": true,
+    "status": "preproduction and complete design retained; expression and screen-text decisions checked in actual draft; complete revision and continuity evidence; no automatic quality pass"
+  },
+  "contextWorkflow": {
+    "contract": "references/context-and-dispatch.md",
+    "coordinatorCreatesEpisodes": false,
+    "defaultAuthorBatch": 2,
+    "freshContext": true,
+    "creativeSourcesChanged": true,
+    "changedCreativeFiles": [
+      "references/creative/skills/camera-emotion-methods/SKILL.md",
+      "references/creative/skills/director-refinement/SKILL.md",
+      "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "references/creative/skills/lighting-space-methods/SKILL.md",
+      "references/creative/skills/unit-performance-director/SKILL.md",
+      "references/creative/references/cards/editing-integrity.md",
+      "references/creative/references/cards/long-voice.md",
+      "references/creative/references/common-contract.md"
+    ],
+    "status": "local adaptation; full-series cost reduction and audiovisual quality unverified"
+  },
+  "timingWorkflow": {
+    "contract": "references/creative/references/common-contract.md",
+    "scope": "continuous audiovisual timing and semantic repetition; no duration target",
+    "tool": "scripts/inspect_editing.py",
+    "reportVersion": "editing-signals-v2",
+    "advisoryOnly": true,
+    "qualityEvidence": "Scoped textual validation is recorded outside the distribution; no video or universal superiority claim."
+  },
+  "expressionWorkflow": {
+    "contract": "references/expression-and-screen-text.md",
+    "releaseNotes": "references/release-v6.3.md",
+    "scope": "Default active amplification for ordinary scripts; stronger performance and richer, bolder fantasy where suitable and authorized; separate consent and actual-draft review retained.",
+    "upstreamEvidence": [
+      {
+        "path": "docs/3008-SCREEN-TEXT-CONSENT-20261019.md",
+        "sha256": "51316bd64a8cee51517cf8d966dc5be728235ddbb8f7c1f8edcf4bc8dea9bd96"
+      },
+      {
+        "path": "docs/3008-EXPRESSION-PREFERENCES-20261019.md",
+        "sha256": "915fc77cada1607627d3d33268a76bfd6104b0f74b7bfa0025997ee15e9e75ee"
+      }
+    ],
+    "changedCreativeFiles": [
+      "references/creative/skills/camera-emotion-methods/SKILL.md",
+      "references/creative/skills/episode-emotion-planner/SKILL.md",
+      "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "references/creative/skills/fantasy-expression-methods/SKILL.md",
+      "references/creative/skills/source-context-preparer/SKILL.md",
+      "references/creative/skills/unit-performance-director/SKILL.md",
+      "references/creative/references/common-contract.md"
+    ],
+    "runtimeCodeChanged": false,
+    "automaticSemanticValidation": false,
+    "upstreamNewVideoQualityVerified": false,
+    "v6ChangedCreativeFiles": [
+      "references/creative/skills/director-refinement/SKILL.md",
+      "references/creative/skills/episode-emotion-planner/SKILL.md",
+      "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "references/creative/skills/fantasy-expression-methods/SKILL.md",
+      "references/creative/skills/unit-performance-director/SKILL.md",
+      "references/creative/references/common-contract.md"
+    ],
+    "defaultPolicy": "Skill default is explicitly attributed; existing explicit limits, off and cancelled selections take precedence; old adopted drafts are not automatically rewritten.",
+    "v6Origin": "Direct user correction requesting more and stronger emotional performance in ordinary scripts, and both exaggerated performance and fantasy in suitable scripts.",
+    "v61ChangedCreativeFiles": [
+      "references/creative/skills/episode-emotion-planner/SKILL.md"
+    ],
+    "v61Origin": "Direct user clarification: find and use more suitable passages, with wider actual coverage as well as stronger individual passages.",
+    "v62ChangedLocalFiles": [
+      "references/expression-and-screen-text.md",
+      "references/production-contract.md"
+    ],
+    "localAmendmentEvidence": "Existing file/CLI path exercised in isolated synthetic production-mode fixture; source anchors, decision authority and current-input matching still require explicit human/agent review; no new executable behavior.",
+    "upstreamSyncEvidence": {
+      "path": "docs/3008-OPPORTUNITY-COVERAGE-20261020.md",
+      "sha256": "398557786a292dfe130124a5d6c531e3cd35ebbd2903fe42c5bc80dbdd0fb56d",
+      "upstreamChange": "ENG-0009 / opportunity-coverage-v1",
+      "scope": "Common active-amplification and opportunity-coverage principles aligned; local versioned amendment procedure clarified.",
+      "runtimeProtocolCopied": false,
+      "upstreamLimitations": "Automatic fantasy supplements are disabled for an entire run when any package needs multiple execution batches; director-refinement remains limited to selected opportunities.",
+      "localLimitations": "Source anchors, actual authorization and current claim/plan binding still require explicit review; not fully enforced by scripts.",
+      "futureSync": "Compare applicable changes when either side is asked to optimize; one authorized notice and readback for new differences, no background monitoring or same-version loops.",
+      "historicalBaselineOnly": true,
+      "note": "Historical ENG-0009 baseline. ENG-0010 synchronization is recorded separately in upstreamRound2Evidence; old frozen v1 requests retain their original policy."
+    },
+    "systemPresentation": {
+      "contract": "references/system-presentation.md",
+      "scope": "Source-triggered per-system options and actual decisions, visibility/hearing/contact boundaries, adopted designs, versioned direction packets, concrete audiovisual realization and bounded choice changes.",
+      "runtimeCodeChanged": false,
+      "semanticValidationAutomatic": false,
+      "platformTrendClaim": false
+    },
+    "v63ChangedLocalContracts": [
+      "references/system-presentation.md",
+      "references/production-contract.md",
+      "references/preproduction-contract.md",
+      "references/expression-and-screen-text.md",
+      "references/context-and-dispatch.md",
+      "references/data-contract.md",
+      "references/asset-handoff.md"
+    ],
+    "upstreamRound2Evidence": {
+      "path": "docs/3008-SYSTEM-MULTIBATCH-20261020.md",
+      "sha256": "78d0556ec03739a73eb0901739bd75747cace414fd457571afe7731d91bd9acc",
+      "upstreamChange": "ENG-0010 / opportunity-coverage-v2 / execution-batches-v2 / SYSTEM_PRESENTATION_V1",
+      "scope": "Common source-faithful system choices, actual downstream consumption, bounded choice changes and multi-batch supplement safety aligned. The local Skill uses its own versioned file workflow.",
+      "runtimeProtocolCopied": false,
+      "upstreamLimitations": "New tasks use v2; old frozen v1 requests and FINAL are not migrated. Source semantics and visual realization still need actual review. No paid-model or new video-quality proof.",
+      "localLimitations": "Episode applicability, source meaning, actual adoption authority and current-input consistency require explicit readback; packet validation alone does not establish these facts.",
+      "futureSync": "Compare applicable changes on the next authorized optimization; no background monitoring or same-version message loops."
+    }
+  }
+}

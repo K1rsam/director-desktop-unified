@@ -1,0 +1,52 @@
+{
+  "version": "series-intake-v1",
+  "generator": {
+    "api": "node:module.stripTypeScriptTypes",
+    "mode": "transform",
+    "nodeVersion": "v24.19.0",
+    "command": "node24 scripts/intake/generate.mjs --source-dir /absolute/original-project",
+    "steps": [
+      "Read the two original UTF-8 TypeScript files without edits.",
+      "Run stripTypeScriptTypes(source,{mode:\"transform\"}); this handles constructor parameter properties.",
+      "Rewrite only the recorded local import specifiers.",
+      "Write generated .mjs and record original/generated SHA-256."
+    ]
+  },
+  "files": [
+    {
+      "upstream": "lib/standard-script.ts",
+      "packaged": "standard-script.mjs",
+      "sourceSha256": "8b2bfb5207afe93065a441791efdad7772231bbe350c06bac25ceb923326f5ec",
+      "generatedSha256": "fe428e273df31630df297a73510df6b228963ca749c763c88e601feb2b922485",
+      "importRewrites": [
+        {
+          "from": "../runtime/inline-performance.mjs",
+          "to": "../core/runtime/inline-performance.mjs"
+        }
+      ]
+    },
+    {
+      "upstream": "lib/standard-script-plan.ts",
+      "packaged": "standard-script-plan.mjs",
+      "sourceSha256": "c2eafae3c8add312304933a2be38263f45d65e86abde8f305e8835170634ac16",
+      "generatedSha256": "7bfc1b027039d6b939118630dbc4a8fe516b3596de8ed5d187be877f94aec0ea",
+      "importRewrites": [
+        {
+          "from": "../runtime/inline-performance.mjs",
+          "to": "../core/runtime/inline-performance.mjs"
+        },
+        {
+          "from": "./standard-script",
+          "to": "./standard-script.mjs"
+        }
+      ]
+    }
+  ],
+  "runtimeDependency": {
+    "upstream": "runtime/inline-performance.mjs",
+    "packaged": "../core/runtime/inline-performance.mjs",
+    "sha256": "45825afacb2317fc4fa9f4b116f4605bb72df493694a95f5aed19fb53538d4da"
+  },
+  "runtimeCompilationRequired": false,
+  "semanticReview": "NOT_RUN"
+}

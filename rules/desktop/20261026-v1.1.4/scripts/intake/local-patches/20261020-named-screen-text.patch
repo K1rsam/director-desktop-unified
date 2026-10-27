@@ -1,0 +1,122 @@
+diff --git a/scripts/core/runtime/inline-performance.mjs b/scripts/core/runtime/inline-performance.mjs
+index 51b70c5..b7ed3db 100644
+--- a/scripts/core/runtime/inline-performance.mjs
++++ b/scripts/core/runtime/inline-performance.mjs
+@@ -41,6 +41,13 @@ export function sourceHeadPrefix(source,speaker,cue,channelSource){
+  }
+  return source.slice(speaker.parts[0].start,end);
+ }
++/** Exact named visual-only source header; does not match quotes or OS/VO cue lists. */
++export function sourceNamedScreenTextHead(text){
++ const match=/^[\t \u00a0\u3000]*([\p{L}\p{N}·・ _.-]+?)(?:（屏幕文字）|\(屏幕文字\))[\t \u00a0\u3000]*[:：][\t \u00a0\u3000]*/u.exec(text);
++ if(!match||!match[1].trim())return null;
++ return {carrier:match[1].trim(),prefixLength:match[0].length};
++}
++
+ // Explicit explanation predicates, system properties and voiced clause
+ // readings are not second speakers. Arbitrary labels do not gain this exception.
+ // Keep the colon and value in the original utterance, never as a world rule.
+diff --git a/scripts/intake/standard-script-plan.mjs b/scripts/intake/standard-script-plan.mjs
+index 2350685..83d8b57 100644
+--- a/scripts/intake/standard-script-plan.mjs
++++ b/scripts/intake/standard-script-plan.mjs
+@@ -1,5 +1,5 @@
+ import { compileStandardScript, createSourceIndex, explicitSubtitles, StandardScriptError, standardScriptPlanVersion } from './standard-script.mjs';
+-import { explicitPerformanceCue, sourceHeadPerformanceCue, sourceVoiceHead, sourceUtteranceProperty, sourceInterleavedChannelCue } from '../core/runtime/inline-performance.mjs';
++import { explicitPerformanceCue, sourceHeadPerformanceCue, sourceVoiceHead, sourceUtteranceProperty, sourceInterleavedChannelCue, sourceNamedScreenTextHead } from '../core/runtime/inline-performance.mjs';
+ const legacyEpisodeHeading = /^第[〇零一二三四五六七八九十百千万两\d]+集(?:[ \t:：]|$)/u;
+ const legacySceneHeading = /^\d+[ \t]*-[ \t]*\d+(?:[ \t]|$)/u;
+ const castHeading = /^(?:出场人物|人物|角色)[ \t]*[：:]/u;
+@@ -487,7 +487,7 @@ export function prepareStandardEpisode(text, sourceId, options = {}) {
+             ]
+         };
+     };
+-    const structural = (line)=>episodeHeading.test(line.content) || sceneHeading.test(line.content) || sceneMetadataHeading.test(line.content) || endMarker(line) || Boolean(annotationKind(line.content)) || typedMarker.test(line.content) || syntax === 'current' && (screenTextHeading.test(line.content) || omissionMarker.test(line.content)) || /^[△▲]/.test(line.content);
++    const structural = (line)=>episodeHeading.test(line.content) || sceneHeading.test(line.content) || sceneMetadataHeading.test(line.content) || endMarker(line) || Boolean(annotationKind(line.content)) || typedMarker.test(line.content) || syntax === 'current' && (screenTextHeading.test(line.content) || sourceNamedScreenTextHead(line.content) || omissionMarker.test(line.content)) || /^[△▲]/.test(line.content);
+     const error = (line, code, message)=>diagnostics.push({
+             line: line.number,
+             code,
+@@ -695,8 +695,9 @@ export function prepareStandardEpisode(text, sourceId, options = {}) {
+             i++;
+             continue;
+         }
+-        if (syntax === 'current' && screenTextHeading.test(line.content)) {
+-            if (!line.content.replace(screenTextHeading, '').trim()) error(line, 'EMPTY_ONSCREEN_TEXT', '显式画面文字标记后没有内容。');
++        const namedScreenHead = syntax === 'current' ? sourceNamedScreenTextHead(line.content) : null;
++        if (syntax === 'current' && (screenTextHeading.test(line.content) || namedScreenHead)) {
++            if (!(namedScreenHead ? line.content.slice(namedScreenHead.prefixLength) : line.content.replace(screenTextHeading, '')).trim()) error(line, 'EMPTY_ONSCREEN_TEXT', '显式画面文字标记后没有内容。');
+             else plan.entries.push({
+                 target: 'BODY',
+                 kind: 'ONSCREEN_TEXT',
+diff --git a/scripts/core/runtime/storyboard-v4/core/standard-source.mjs b/scripts/core/runtime/storyboard-v4/core/standard-source.mjs
+index 0b9ef6c..3411f83 100644
+--- a/scripts/core/runtime/storyboard-v4/core/standard-source.mjs
++++ b/scripts/core/runtime/storyboard-v4/core/standard-source.mjs
+@@ -1,6 +1,6 @@
+ import {fail} from './shared.mjs';
+ import {createHash} from 'node:crypto';
+-import {inlinePerformanceProjection,compactPerformanceHeadProjection,sourceVoiceProjection,sourceBarePerformanceProjection,sourceHeadPrefix,sourceUtteranceProperty,sourceInterleavedCueMatches,sourceColonlessVoiceHeader} from '../../inline-performance.mjs';
++import {inlinePerformanceProjection,compactPerformanceHeadProjection,sourceVoiceProjection,sourceBarePerformanceProjection,sourceHeadPrefix,sourceUtteranceProperty,sourceInterleavedCueMatches,sourceColonlessVoiceHeader,sourceNamedScreenTextHead} from '../../inline-performance.mjs';
+ 
+ export const STANDARD_EPISODE_PROTOCOL='standard-episode-v1';
+ const voices={SPEECH:'现场对白',OS:'OS',VO:'VO',NARRATION:'VO',SYSTEM:'系统音'};
+@@ -315,7 +315,7 @@ export function standardOnscreenTexts(row){
+  if(row.standard?.kind==='ONSCREEN_TEXT'){
+   const all=row.standard.parts.map(pair=>[...pair]),raw=all.map(([a,b])=>row.text.slice(a,b)).join('');
+   // The typed label remains in the proof/source row, not the visible caption.
+-  const prefix=/^(?:弹幕|字幕|屏幕文字)[\t \u00a0\u3000]*[:：][\t \u00a0\u3000]*/u.exec(raw)?.[0].length??0;
++  const prefix=sourceNamedScreenTextHead(raw)?.prefixLength??(/^(?:弹幕|字幕|屏幕文字)[\t \u00a0\u3000]*[:：][\t \u00a0\u3000]*/u.exec(raw)?.[0].length??0);
+   let edge=0;const parts=all.flatMap(([a,b])=>{const skip=Math.max(0,prefix-edge);edge+=b-a;return a+skip<b?[[a+skip,b]]:[];});
+   return [{id:`${row.id}:T1`,rowId:row.id,line:row.line,kind:'ONSCREEN_TEXT',text:raw.slice(prefix),parts,sourceIds:[row.id]}];
+  }
+diff --git a/tests/intake.test.mjs b/tests/intake.test.mjs
+index 6d00871..91cbec6 100644
+--- a/tests/intake.test.mjs
++++ b/tests/intake.test.mjs
+@@ -41,6 +41,26 @@ test('OS VO system multiline group and inline cue preserve spoken bytes and cue
+  assert.equal(source.intakeEvidence.receipt.semantic,'NOT_RUN');
+ });
+ 
++test('named screen-only carriers become exact captions without speech and preserve CRLF/emoji coordinates',async()=>{
++ const {prepareSource}=await import(pathToFileURL(cli));
++ const {normalizeSource}=await import(pathToFileURL(join(root,'scripts/core/runtime/storyboard-v4/core/source.mjs')));
++ const text='第1集\r\n1-1 日 内 记录台\r\n人物：守门人、中枢终端（屏幕文字）、战地嘉奖（屏幕文字）\r\n守门人（OS）：不能让他们听见。\r\n守门人（VO，通讯器）：收到了。\r\n中枢终端（屏幕文字）：核心警告😀：存档失败！\r\n战地嘉奖(屏幕文字): 新权限已到。\r\n字幕：次日\r\n';
++ const source=prepareSource(text,'E01',[]);
++ assert.deepEqual(source.dialogue.map(d=>[d.speaker,d.channel,d.quote]),[['守门人','OS','不能让他们听见。'],['守门人','VO','收到了。']]);
++ assert.deepEqual(source.onscreenTexts.map(t=>t.text),['核心警告😀：存档失败！','新权限已到。','次日']);
++ for(const caption of source.onscreenTexts){const row=source.sourceRows.find(r=>r.id===caption.rowId);assert.equal(caption.parts.map(pair=>row.text.slice(...pair)).join(''),caption.text);assert.equal(row.standard.kind,'ONSCREEN_TEXT');}
++ assert.equal(source.standardPackage.evidence.map(u=>u.text).join(''),text);
++ assert.doesNotThrow(()=>normalizeSource(JSON.parse(JSON.stringify(source))));
++ const first=source.onscreenTexts[0],row=source.sourceRows.find(r=>r.id===first.rowId);assert.equal(row.text.slice(0,first.parts[0][0]),'中枢终端（屏幕文字）：');
++});
++
++test('screen words inside genuine dialogue and voice cue lists do not become captions; empty named text stays blocked',async()=>{
++ const {prepareSource}=await import(pathToFileURL(cli));
++ const text='第1集\n1-1 日 内 记录台\n人物：守门人\n守门人：他说“中枢终端（屏幕文字）：核心警告”这几个字。\n守门人（VO，读屏幕文字）：我在读这一行。\n';
++ const source=prepareSource(text,'E01',[]);assert.equal(source.dialogue.length,2);assert.equal(source.onscreenTexts?.length??0,0);assert.equal(source.dialogue[1].channel,'VO');
++ assert.throws(()=>prepareSource('第1集\n1-1 日 内 记录台\n中枢终端（屏幕文字）：\n','E01',[]),e=>e.code==='INTAKE_DIAGNOSTICS'&&e.diagnostics.some(d=>d.code==='EMPTY_ONSCREEN_TEXT'));
++});
++
+ test('confirmed colonless OS/VO headers retain original bytes and unknown identities remain blocked',async()=>{
+  const {prepareSource}=await import(pathToFileURL(cli));
+  for(const channel of ['OS','VO']){
+@@ -246,14 +266,18 @@ test('generated baselines and explicit local compatibility patch hashes match ch
+  for(const item of manifest.files){const contents=await readFile(join(root,'scripts/intake',item.packaged));assert.equal(hash(contents),item.packagedSha256??item.generatedSha256);assert.match(item.sourceSha256,/^[a-f0-9]{64}$/);assert.match(item.generatedSha256,/^[a-f0-9]{64}$/);}
+  const runtime=manifest.runtimeDependency;
+  assert.equal(hash(await readFile(join(root,'scripts/intake',runtime.packaged))),runtime.packagedSha256??runtime.sha256);
++ const latestPatchedFiles=new Map();
+  for(const patch of manifest.localPatches??[]){
+   assert.equal(hash(await readFile(join(root,'scripts/intake',patch.patchFile))),patch.patchSha256);
+   assert.ok(patch.reason&&patch.files.length);
+   for(const file of patch.files){
+    assert.match(file.beforeSha256,/^[a-f0-9]{64}$/);
+-   assert.equal(hash(await readFile(join(root,file.path))),file.afterSha256);
++   assert.match(file.afterSha256,/^[a-f0-9]{64}$/);
++   if(latestPatchedFiles.has(file.path))assert.equal(file.beforeSha256,latestPatchedFiles.get(file.path),'local patch chain must be contiguous');
++   latestPatchedFiles.set(file.path,file.afterSha256);
+   }
+  }
++ for(const [file,expected]of latestPatchedFiles)assert.equal(hash(await readFile(join(root,file))),expected);
+  assert.equal(manifest.generator.mode,'transform');assert.equal(manifest.runtimeCompilationRequired,false);
+ });
+ 

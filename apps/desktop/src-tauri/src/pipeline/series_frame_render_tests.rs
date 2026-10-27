@@ -107,7 +107,7 @@ async fn series_frame_render_review_repair_keeps_raw_old_roles_unaffected_units_
 async fn series_frame_render_new_profile_reopens_without_dispatch_and_exports_matching_ratio() {
     let (mut input, authored) = fixture();
     input["settings"]["ratio"] = json!("9:16");
-    mark_input(&mut input).unwrap();
+    mark_new_legacy_fixture(&mut input);
     assert_eq!(input[frame_render::PROFILE_FIELD], "frame-render/v1");
     let (_temp, input, mut executor) = durable_from(input, authored);
     executor.generator.review_rounds = 1;

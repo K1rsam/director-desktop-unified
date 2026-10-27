@@ -1,0 +1,150 @@
+{
+  "version": "series-intake-v1",
+  "generator": {
+    "api": "node:module.stripTypeScriptTypes",
+    "mode": "transform",
+    "nodeVersion": "v24.19.0",
+    "command": "node24 scripts/intake/generate.mjs --source-dir /absolute/original-project",
+    "steps": [
+      "Read the two original UTF-8 TypeScript files without edits.",
+      "Run stripTypeScriptTypes(source,{mode:\"transform\"}); this handles constructor parameter properties.",
+      "Rewrite only the recorded local import specifiers.",
+      "Write generated .mjs and record original/generated SHA-256."
+    ]
+  },
+  "files": [
+    {
+      "upstream": "lib/standard-script.ts",
+      "packaged": "standard-script.mjs",
+      "sourceSha256": "8b2bfb5207afe93065a441791efdad7772231bbe350c06bac25ceb923326f5ec",
+      "generatedSha256": "fe428e273df31630df297a73510df6b228963ca749c763c88e601feb2b922485",
+      "importRewrites": [
+        {
+          "from": "../runtime/inline-performance.mjs",
+          "to": "../core/runtime/inline-performance.mjs"
+        }
+      ],
+      "packagedSha256": "859671eaa5bd3180e8ca76f8b8cb5fe3f975d80d3c16bcbc57ea3181f1909639",
+      "localPatchId": "source-head-compat-20261020"
+    },
+    {
+      "upstream": "lib/standard-script-plan.ts",
+      "packaged": "standard-script-plan.mjs",
+      "sourceSha256": "c2eafae3c8add312304933a2be38263f45d65e86abde8f305e8835170634ac16",
+      "generatedSha256": "7bfc1b027039d6b939118630dbc4a8fe516b3596de8ed5d187be877f94aec0ea",
+      "importRewrites": [
+        {
+          "from": "../runtime/inline-performance.mjs",
+          "to": "../core/runtime/inline-performance.mjs"
+        },
+        {
+          "from": "./standard-script",
+          "to": "./standard-script.mjs"
+        }
+      ],
+      "packagedSha256": "9df654e9338c76c949b936587993e219aa85ae8cdc4067335cc0323a69daf238",
+      "localPatchId": "named-screen-text-20261020"
+    }
+  ],
+  "runtimeDependency": {
+    "upstream": "runtime/inline-performance.mjs",
+    "packaged": "../core/runtime/inline-performance.mjs",
+    "sha256": "45825afacb2317fc4fa9f4b116f4605bb72df493694a95f5aed19fb53538d4da",
+    "packagedSha256": "d22a9bfae917fceaffdeabd8dadad95f17e0a479e68303fdbc63c31c0df87f76",
+    "localPatchId": "named-screen-text-20261020"
+  },
+  "runtimeCompilationRequired": false,
+  "semanticReview": "NOT_RUN",
+  "localPatches": [
+    {
+      "id": "source-head-compat-20261020",
+      "date": "2026-10-20",
+      "origin": "Project-local source-intake compatibility repair authorized for 战争打了六亿年; no source script edits.",
+      "reason": "Confirmed colonless (OS)/(VO) heads; five finite spoken colon clauses; one explicit channel between two source-backed cue spans. Unknown identities, arbitrary nested heads, duplicate channels, and corrupt continuations remain diagnostics.",
+      "patchFile": "local-patches/20261020-source-head-compat.patch",
+      "patchSha256": "32eba85cc347fa7bedd51bab518cfa4c10d860391edfaa3c88241006599530c2",
+      "application": "Apply unified diff to the recorded generated/runtime baselines using UTF-8 text with LF normalization. The original TypeScript SHA-256 and generatedSha256 remain unchanged; packagedSha256 records patched local files. Regeneration alone does not reproduce this patched package; reapply and verify this patch.",
+      "files": [
+        {
+          "path": "scripts/intake/standard-script-plan.mjs",
+          "beforeSha256": "7bfc1b027039d6b939118630dbc4a8fe516b3596de8ed5d187be877f94aec0ea",
+          "afterSha256": "d16919cf2d9f25b04974a6ae2ad097348ab38c5aee7b54b5d2e08fc5261288e9",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "scripts/intake/standard-script.mjs",
+          "beforeSha256": "fe428e273df31630df297a73510df6b228963ca749c763c88e601feb2b922485",
+          "afterSha256": "859671eaa5bd3180e8ca76f8b8cb5fe3f975d80d3c16bcbc57ea3181f1909639",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "scripts/core/runtime/inline-performance.mjs",
+          "beforeSha256": "45825afacb2317fc4fa9f4b116f4605bb72df493694a95f5aed19fb53538d4da",
+          "afterSha256": "697d37fa20be747c65cc27e312053f2b2ea416de18815aff7f02779325db09de",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "scripts/core/runtime/storyboard-v4/core/standard-source.mjs",
+          "beforeSha256": "b56cb5be2d6cd3cf3035f801af9340089a2731aca299435edfe0617ea999e88e",
+          "afterSha256": "d71e9997d5d8b1b5e8bca1b9f1139c5c190bfc0a930dbca73fd0b8d55e4da209",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        }
+      ],
+      "semanticReview": "NOT_RUN",
+      "replayVerification": {
+        "forward": "git -c core.autocrlf=false apply matched all four exact afterSha256",
+        "reverse": "git -c core.autocrlf=false apply -R matched all four exact beforeSha256",
+        "semantic": "NOT_RUN"
+      }
+    },
+    {
+      "id": "named-screen-text-20261020",
+      "date": "2026-10-20",
+      "origin": "User-authorized project-local source-intake typing repair for named screen-only carriers; raw screenplay and normalized v1 preserved.",
+      "reason": "Exact carrier（屏幕文字）：body headers must be ONSCREEN_TEXT rather than speech. Shared prefix recognition routes the parser and strips only metadata in canonical visible-text projection; no schema/compiler change.",
+      "patchFile": "local-patches/20261020-named-screen-text.patch",
+      "patchSha256": "236c81257da883d2df093d4b8a9ebad510a1ccf311a15e34f68a61b54369872a",
+      "application": "Apply this diff after source-head-compat-20261020 with git -c core.autocrlf=false apply; original TS/generated baseline hashes remain unchanged. packagedSha256 records the current patch chain.",
+      "files": [
+        {
+          "path": "scripts/core/runtime/inline-performance.mjs",
+          "beforeSha256": "697d37fa20be747c65cc27e312053f2b2ea416de18815aff7f02779325db09de",
+          "afterSha256": "d22a9bfae917fceaffdeabd8dadad95f17e0a479e68303fdbc63c31c0df87f76",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "scripts/intake/standard-script-plan.mjs",
+          "beforeSha256": "d16919cf2d9f25b04974a6ae2ad097348ab38c5aee7b54b5d2e08fc5261288e9",
+          "afterSha256": "9df654e9338c76c949b936587993e219aa85ae8cdc4067335cc0323a69daf238",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "scripts/core/runtime/storyboard-v4/core/standard-source.mjs",
+          "beforeSha256": "d71e9997d5d8b1b5e8bca1b9f1139c5c190bfc0a930dbca73fd0b8d55e4da209",
+          "afterSha256": "bdd3f5aecaddbe0c8b4681d02f7cf518ea6d3320bbd36c8acd8c9e948afaed9b",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        },
+        {
+          "path": "tests/intake.test.mjs",
+          "beforeSha256": "281af9bdc22c6fb590dd888a8953ca3062ecda3892cf933c3d4812c6f57bb7af",
+          "afterSha256": "d86b3435bb47c1d952ddb360dc536c1faeddacc372d904fcb1af37d35b86304a",
+          "beforeLineEndings": "LF",
+          "afterLineEndings": "LF"
+        }
+      ],
+      "semanticReview": "SOURCE_TYPING_CONFIRMED_FOUR_PROJECT_ROWS_ONLY",
+      "replayVerification": {
+        "forward": "Exact afterSha256 matched for all four patched files in isolated replay tree",
+        "reverse": "Exact beforeSha256 matched for all four patched files after git apply -R",
+        "semantic": "NOT_A_STORYBOARD_ACCEPTANCE"
+      }
+    }
+  ]
+}

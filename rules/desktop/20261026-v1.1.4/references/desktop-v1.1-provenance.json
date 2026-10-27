@@ -1,0 +1,340 @@
+{
+  "version": "20261021-v1.1-stage3-execution",
+  "skill": "desktop-storyboard-director",
+  "date": "2026-10-21",
+  "base": {
+    "version": "20261020-v1.0-desktop-lingmo",
+    "provenance": "references/desktop-v1.0-provenance.json",
+    "baselineLockSha256": "da38353f48f501c88da5cfae80bfacf040bb1fff8145956a7a874f16a5bd4bbc",
+    "preExistingIntakePatchesRetained": true,
+    "creativePolicy": "Retain shared mature methods; merge desktop execution rules into real role inputs. No wholesale rollback to older desktop methods."
+  },
+  "desktopSource": {
+    "project": "director-desktop-integration-20261008",
+    "reviewedHead": "7cd4ab5d9f668eebedaa54753b7cf942529b2f88",
+    "laterObservedHead": "9570afb809c04b1434de05c538b0c8f6797cd91d",
+    "laterWorkingTreeClean": true,
+    "laterChangeScope": "Execution-policy settings fix; no Stage 3 pipeline changes between reviewed and later observed HEAD.",
+    "editedByThisTask": false,
+    "ordinaryProductionContextAdded": "2026-10-20T20:07:59+08:00",
+    "scope": "Read-only rule/adapter research; no native Rust, database, GUI or paid generation executed."
+  },
+  "localCapabilities": [
+    {
+      "module": "scripts/stage3-task.py",
+      "contract": "desktop-stage3-task-v1",
+      "purpose": "Pre-dispatch role instructions and exact material projections; not proof of reading or semantic coverage"
+    },
+    {
+      "module": "scripts/apply-delta.mjs",
+      "contracts": [
+        "desktop-draft-delta-v1",
+        "desktop-field-patch-v1"
+      ],
+      "purpose": "Hash-bound candidate assembly; preserve unchanged content; not adoption"
+    },
+    {
+      "module": "scripts/materialize-dialogue.mjs",
+      "contracts": [
+        "normalized-quote-utf16-v1",
+        "source-bound-sound-events-v1"
+      ],
+      "purpose": "Source-preserving speech and explicitly interpreted non-speech events"
+    },
+    {
+      "module": "scripts/inspect_editing.py",
+      "purpose": "Source-linked timing signals; no automated semantic judgement"
+    }
+  ],
+  "export": {
+    "profile": "lingmo-v7",
+    "sourceBoundSoundEventsAdded": true,
+    "safeNamesAndPlaceholderOrdinalsUnchanged": true,
+    "internalPrecision": "up to 9 decimal places",
+    "outerDuration": "max(4, ceil(actual)); both actual and outer within chosen cap"
+  },
+  "verification": {
+    "nodeTests": {
+      "tests": 294,
+      "pass": 294,
+      "fail": 0
+    },
+    "pythonTests": {
+      "tests": 101,
+      "pass": 101,
+      "fail": 0
+    },
+    "report": "references/validation-report.md",
+    "realScriptComparison": "Two isolated full-episode finishing tasks from fixed original author drafts; see report for observed outcomes, not whole-series superiority"
+  },
+  "protected": {
+    "seriesFiles": 100,
+    "seriesChanged": 0,
+    "productionDraftsEdited": false,
+    "nativeDesktopEdited": false
+  },
+  "evidenceLimits": {
+    "semanticAssetCompatibilityAutomatic": false,
+    "creativeQualitySuperiorityEstablished": false,
+    "lingmoPlatformImportTested": false,
+    "macRuntimeTested": false,
+    "realImagesAudioVideoGenerated": false,
+    "fullSeriesNewGenerationTested": false,
+    "transactionOrNetworkExactlyOnceClaim": false
+  },
+  "localChanges": [
+    {
+      "path": "references/asset-registry-contract.md",
+      "change": "modified",
+      "baseSha256": "876b38a2cda5441c7d45694d6adb4a7fdb50ea1e65ad18db66d5ae9bf22920ee",
+      "sha256": "0c1ad7dc10b0cf21451840f7711645f0140f29439a3f18ae198808e64ee1d600"
+    },
+    {
+      "path": "references/context-and-dispatch.md",
+      "change": "modified",
+      "baseSha256": "e66cf7c06759d46c7c9f71931b8d6781007373984d8aec4ba2ef988d2cfc1110",
+      "sha256": "6b18f79b6d984ac7c8bde7c66a723efffe091e88f22f2a5f4449af0d250f8d95"
+    },
+    {
+      "path": "references/creative/skills/director-refinement/SKILL.md",
+      "change": "modified",
+      "baseSha256": "6410f2fcc3e23076f00783f2c28f82e61f4f397b7e86016af32b9e58b3cc83bb",
+      "sha256": "355f00a1e992f9e2d1494f580e21c6fe01336c5a22507652f678e5a2ed7003c4"
+    },
+    {
+      "path": "references/creative/skills/episode-emotion-planner/SKILL.md",
+      "change": "modified",
+      "baseSha256": "87c1432df2ddcb0c3682e7400b89d59495aea913745545c77256991f45b02838",
+      "sha256": "1cb942652812449dac5b6bbfc2e80d45085e1e962c78f4cb4395bf09f4c356ad"
+    },
+    {
+      "path": "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "change": "modified",
+      "baseSha256": "1b3bb2b2ed8edcec1873806618b91ed23e0b4d6ca1f9caac9282e46902c6813d",
+      "sha256": "ecfce86db5052f85ab61317b93a16476a6a1990fe6937d5680d292cc415038a0"
+    },
+    {
+      "path": "references/creative/skills/unit-performance-director/SKILL.md",
+      "change": "modified",
+      "baseSha256": "1cd93cd92b5b203d2a1b597c39e0745481812d807f463a26ca033a756085aa8f",
+      "sha256": "97249be4e3b67a0af8b38782cfb7c36afcc2d8b1663eae96e77df8931552ac49"
+    },
+    {
+      "path": "references/data-contract.md",
+      "change": "modified",
+      "baseSha256": "fb8a843c6bd19126d52ced83b726aa36b733b41613280c7bd9fa6d330277a3cf",
+      "sha256": "e1abdad7eac104cb3486058a53f74e4648b6a77f9077408098e229843cebf889"
+    },
+    {
+      "path": "references/desktop-adapter.md",
+      "change": "modified",
+      "baseSha256": "aa14a2e0e492f0cf1c5f2ba656b18be1e1637779f80a8adb492b8c0e10354ea9",
+      "sha256": "f5b60f6b2d1eb990148c91b100069e608e7adc338410df56e6e5d37c720fa608"
+    },
+    {
+      "path": "references/desktop-comparison.md",
+      "change": "modified",
+      "baseSha256": "a9e1131f982250391ccb6e62f12fee4f0f957a132d8573b2745aabf2e525cdd0",
+      "sha256": "cabce75e45cec9fea20b3d640aafb2a72ae2ecc362c3b72497f94a624a667f91"
+    },
+    {
+      "path": "references/desktop-generation.md",
+      "change": "modified",
+      "baseSha256": "df88d8a0bf4ac36159ac0d6441e5069e586a97fb9cb33c3333929f5a69d14303",
+      "sha256": "363dcc82642484b517f864b85f58a37d30f3b5b7ef89afbf3f47bcf0975be068"
+    },
+    {
+      "path": "references/desktop-v1.0-provenance.json",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "d0f80b5091cf1b727e720d9e7d559857cd2fe7cfca800eac8efba114f7fc1394"
+    },
+    {
+      "path": "references/lingmo-v7-contract.md",
+      "change": "modified",
+      "baseSha256": "dd6f63fd40a22c14c28d150d6c70e37b55eab25deb16a50fd2997d022b2b299c",
+      "sha256": "a83a06af9ea3725b67297fd0a16fbdae28149517e7a02458f2da0004d9fb31a8"
+    },
+    {
+      "path": "references/preproduction-contract.md",
+      "change": "modified",
+      "baseSha256": "c7b358e2fb2dbb084f7d04da9f343bde3fe261a057558523a08b644a99e35aa0",
+      "sha256": "a92224f1bad528f75a23f474fd09ef51395ad43bf277adfc98a51a99abd6aa99"
+    },
+    {
+      "path": "references/production-contract.md",
+      "change": "modified",
+      "baseSha256": "095a09bc2b8ef8fdb8198c7ee19f9d6f9747ab319daedcf109f954694dd15e60",
+      "sha256": "71e8bf38417fff10790078c0fa17db5b925b4cc39ab1ac032d2c4ab792803c84"
+    },
+    {
+      "path": "references/source-map.md",
+      "change": "modified",
+      "baseSha256": "c38bf7cb424ab25850f2011d949482934e82615f46ba11e47a4a17fb19b78878",
+      "sha256": "b1f1f005e3882de6c55fffa956fc8aa35d1a9707abedd98b243a30a87850f2ef"
+    },
+    {
+      "path": "references/system-presentation.md",
+      "change": "modified",
+      "baseSha256": "e0469d98058d7f2621d12f82c6958477e2b1e5129c09858e2c1245992b068044",
+      "sha256": "a286e67a68a7343e42de3d620287f363da5320c7f63fc5189bbd7c68de7be733"
+    },
+    {
+      "path": "references/tools.md",
+      "change": "modified",
+      "baseSha256": "eddfcf5a47cc0f77c2c81238c6ddf44b6b9c723b96cdbf6496f68262289910fb",
+      "sha256": "1afb63420e19458a9586e345d0b616d7f3d1ba2c35221eda53a5e87a3121495b"
+    },
+    {
+      "path": "references/validation-report.md",
+      "change": "modified",
+      "baseSha256": "3f7603313b83f1cd3ca7bada7b9bcf995d7fd4fc79552e97f3aa486e4225a2e0",
+      "sha256": "f1e508227288535a322ca6a1e48eb1f3b393fc5e955e6df1b27065c781344692"
+    },
+    {
+      "path": "references/validation-v1.0.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "3f7603313b83f1cd3ca7bada7b9bcf995d7fd4fc79552e97f3aa486e4225a2e0"
+    },
+    {
+      "path": "references/workspace-contract.md",
+      "change": "modified",
+      "baseSha256": "c32594c967e42d979f6a636fda87357c58c155951323c41a2a63422765d22097",
+      "sha256": "05841321b58c3ab1dd367c883154cfc059752254f46536adb3561377c91a43b5"
+    },
+    {
+      "path": "scripts/apply-delta.mjs",
+      "change": "modified",
+      "baseSha256": "fe0534b04dbeecf5643d05170e7103bf0738f2d2c70897b8148405674488f3c7",
+      "sha256": "be5463626c66b02451a6b439dab972cc752530c972324fb8addee2960a38808f"
+    },
+    {
+      "path": "scripts/context_packet.py",
+      "change": "modified",
+      "baseSha256": "73b272cac78bb16b566a34390834df22032d39f78233f78808c7092bff8b5b3c",
+      "sha256": "c179faa11618b3f2f46043e0b6c6e5e34c39c8905ff9e9f9df3c294af8dcd7d0"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/delta.mjs",
+      "change": "modified",
+      "baseSha256": "aa561da409900a14b290ad229d40d1ef09f112f7f4a4c4b6aab9cdc719e9149c",
+      "sha256": "8a63fccc13e9ac42d638667961523457337788bd784561d182e85637ac354867"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/output-schema.mjs",
+      "change": "modified",
+      "baseSha256": "e47dd841c191d930fe3b638334722e2fca5fb2f59e3ccf1d3e38413ff3da47ef",
+      "sha256": "4501f449716b67e7fec6e1c4e299505f64d44a7406e7dbd72c85be837f74a8e8"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/quality.mjs",
+      "change": "modified",
+      "baseSha256": "159d3ec8a8a47845dcaaf9141452e12ddf1d282a5224f714cdd01a5be80de1a8",
+      "sha256": "e2785f9858efec596e1a4e214484d0a71a4eb6d10f4dae444ebb6dc8c0d553fc"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/sound-events.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "eaccc421fa93c0907b72ab129db06751d4de23ab125f55686d74a4d4b0db1bb1"
+    },
+    {
+      "path": "scripts/core/vendor-manifest.json",
+      "change": "modified",
+      "baseSha256": "c94da38debca0adce2489715c18b4d8e8c9a0eb762384d2e75b7678cc4b8cc63",
+      "sha256": "463943bdbef368c0ee9fb60ab3f78a52419a459d8c2e90adff7ed6f0cd3976ca"
+    },
+    {
+      "path": "scripts/inspect_editing.py",
+      "change": "modified",
+      "baseSha256": "23da792979ee986e595a6bce85fb5aa63b2b04dd97891ba17570cfd71e31f949",
+      "sha256": "3c51c77cefbf8bce1954a7c3704ac2beded61f1afdde12945f839032a886d63a"
+    },
+    {
+      "path": "scripts/lingmo-v7.mjs",
+      "change": "modified",
+      "baseSha256": "9d56b4e50dcb5945da9a0300ca9026ce1c791d82f9cf17eb68b9174c41a46081",
+      "sha256": "3443387935a25d8f6ad4605604cd3cbe89c5a833d797f9e41e5ea378cdd49c66"
+    },
+    {
+      "path": "scripts/materialize-dialogue.mjs",
+      "change": "modified",
+      "baseSha256": "705d8f652d7ea7142fa9802bc2a1c2b812a9ac96596f5c17018a586cd2dcb46e",
+      "sha256": "17d6c71b8225cca631f2ed8c6403ce57039cc91a80f87d92d636edf366919ad7"
+    },
+    {
+      "path": "scripts/stage3-task.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "10650bfcaebeab207e9d5eff90842ddc8b61c0363bfadd31851923a41003b452"
+    },
+    {
+      "path": "scripts/storyboard.mjs",
+      "change": "modified",
+      "baseSha256": "47de63a87aa43c7fca5f98f964057541ac5cfd3a3333541a8bb786ff7c3aad12",
+      "sha256": "26d28f607b9824f2f58b1d3bcd029be2b3ffed9702e99c47951ba87dd7c24e46"
+    },
+    {
+      "path": "SKILL.md",
+      "change": "modified",
+      "baseSha256": "dceb564c94212c97787602e5dd731e7acce1ae1b7f29ab25b9885f9c8fefb5ab",
+      "sha256": "b78e15311d8dfee4241a1b1db33fe9a5d990a62a48cb845d054aecc726dbf664"
+    },
+    {
+      "path": "stages/asset-design/SKILL.md",
+      "change": "modified",
+      "baseSha256": "44805d4ac5bd78300bbf9cdc1157dad56fb1aaa0da10edc23f744b3f4f447994",
+      "sha256": "7190f8290c121adb2d226792dc993df340baaa65fc6e2fa08c78e605728e9e98"
+    },
+    {
+      "path": "stages/episode-production/SKILL.md",
+      "change": "modified",
+      "baseSha256": "9672438f27e4ad8b95723370687a90d7aaa0a14f28cf5e0af7ebeffea1fe150f",
+      "sha256": "55e96e5509ff925fb453ff817b50dfa9e010bf08d49c7689c73c25e28a12f095"
+    },
+    {
+      "path": "stages/review-delivery/SKILL.md",
+      "change": "modified",
+      "baseSha256": "7d645f452455470091601bf7caeb5896225db82a6e13e076d19e5a4ba25f5ef7",
+      "sha256": "7f4762cd110571fccbd5e765299f95fb8ecb9af347581bd6121a38c088b96e7c"
+    },
+    {
+      "path": "tests/desktop-field-patch.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "7b738758129b78cabe885f759ecdfa98e313ffeab46be6f5c693e8ccb5f066ed"
+    },
+    {
+      "path": "tests/desktop-sound-events.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "c2b79a6db67faf194691de3080b59fb4eeae6d87d7cb1624ef5e09a38f945a48"
+    },
+    {
+      "path": "tests/test_inspect_editing.py",
+      "change": "modified",
+      "baseSha256": "2279ca652c63371e117bfc19cac38840b0628eafc41cebd70594b4ffc6e9de17",
+      "sha256": "cf80b797bbfa291ee45cae311381e64b1e9a0088d87b70fd32e846898a920b88"
+    },
+    {
+      "path": "tests/test_stage3_task.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "d5b2bd5af18972e185c84b7c3d689e3af3e539dd664bbe5f2d1c779c4bee0030"
+    },
+    {
+      "path": "VERSION",
+      "change": "modified",
+      "baseSha256": "eb70c6c83c40f039d99f4db416fc616659a662259e2ad7895ad04db6eca06012",
+      "sha256": "bef74349019bc1dd048b614994a1acbad89d6597fe39a62c9c1d5d40a7e03fce"
+    },
+    {
+      "path": "使用说明.md",
+      "change": "modified",
+      "baseSha256": "917279d69b607b286a9cdb8f874c275e496e6c27e07e67316e5459c9088d08ae",
+      "sha256": "fce790bd2be59eb9b3d0b3bc792fc184936a17937e309129b9ae2aa43b7afd38"
+    }
+  ],
+  "hashPolicy": "localChanges excludes this manifest and SHA256SUMS.txt; SHA256SUMS covers every distributed file except itself. Historical provenance retains historical meaning."
+}

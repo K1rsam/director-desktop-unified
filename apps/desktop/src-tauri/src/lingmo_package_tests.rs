@@ -69,6 +69,7 @@ async fn complete_package_is_consumed_without_source_or_generation_and_reopens_w
     let evidence = stored(&store, id).unwrap().unwrap();
     let locked: LockedSource = serde_json::from_value(f.input["source"].clone()).unwrap();
     assert_eq!(evidence["sourceLock"], json!(locked));
+    assert_eq!(evidence["direction"]["settings"]["visualBaseline"], f.input["settings"]["visualBaseline"]);
     assert_eq!(
         evidence["queue"]["items"].as_array().unwrap().len(),
         store.values("assets").unwrap().len()
@@ -85,6 +86,16 @@ async fn complete_package_is_consumed_without_source_or_generation_and_reopens_w
     let reopened = Store::open(store.root.clone()).unwrap();
     assert_eq!(stored(&reopened, id).unwrap(), Some(evidence));
     assert_eq!(reopened.values("assets").unwrap(), before_assets);
+}
+
+#[tokio::test]
+async fn complete_package_rejects_different_visual_adoption_even_with_updated_file_hash() {
+    let f = Fixture::new().await;
+    f.change("资料/direction.json", |value| {
+        value["settings"]["visualBaseline"]["revision"] = json!(999);
+    });
+    let request = json!({"path":f.package.join("全剧_灵墨v7.md")});
+    assert!(lingmo_import::preview_file(&request).is_err());
 }
 
 #[tokio::test]

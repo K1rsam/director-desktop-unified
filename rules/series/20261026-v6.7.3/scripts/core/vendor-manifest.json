@@ -1,0 +1,71 @@
+{
+  "snapshotDate": "2026-10-16",
+  "policy": "Unmodified minimal import closure; filesystem store helpers vendored only to satisfy imports, never invoked by this adapter.",
+  "files": [
+    {
+      "path": "runtime/inline-performance.mjs",
+      "source": "runtime/inline-performance.mjs",
+      "sha256": "45825afacb2317fc4fa9f4b116f4605bb72df493694a95f5aed19fb53538d4da"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/delta.mjs",
+      "source": "runtime/storyboard-v4/core/delta.mjs",
+      "sha256": "aa561da409900a14b290ad229d40d1ef09f112f7f4a4c4b6aab9cdc719e9149c"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/event-unit-packing.mjs",
+      "source": "runtime/storyboard-v4/core/event-unit-packing.mjs",
+      "sha256": "3aa5b1aeb55f3b9b8dbedfec1b15f377ab2a6fe51d9726cbfdfdd0d133da08d4"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/fantasy-timing.mjs",
+      "source": "runtime/storyboard-v4/core/fantasy-timing.mjs",
+      "sha256": "49aff568193093e08649c3224b4d0d33ed9ef965e64eea7c7c08dd500cabfc1b"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/output-schema.mjs",
+      "source": "runtime/storyboard-v4/core/output-schema.mjs",
+      "sha256": "e47dd841c191d930fe3b638334722e2fca5fb2f59e3ccf1d3e38413ff3da47ef"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/quality.mjs",
+      "source": "runtime/storyboard-v4/core/quality.mjs",
+      "sha256": "159d3ec8a8a47845dcaaf9141452e12ddf1d282a5224f714cdd01a5be80de1a8"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/shared.mjs",
+      "source": "runtime/storyboard-v4/core/shared.mjs",
+      "sha256": "adf04635927ee41a4348d69307efe88f7de27948fe0a7df4f69e0d2ff7df684e"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/source-resolution.mjs",
+      "source": "runtime/storyboard-v4/core/source-resolution.mjs",
+      "sha256": "8be74f65b4291a66c6f79b7a333589ed813ee32cc8d57cb031302c16c3e40de7"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/source.mjs",
+      "source": "runtime/storyboard-v4/core/source.mjs",
+      "sha256": "bb00a546fa4366f2121f914dc77e7ce0bb45fceafafd2c262cc414850b21d94c"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/standard-source.mjs",
+      "source": "runtime/storyboard-v4/core/standard-source.mjs",
+      "sha256": "b56cb5be2d6cd3cf3035f801af9340089a2731aca299435edfe0617ea999e88e"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/store.mjs",
+      "source": "runtime/storyboard-v4/core/store.mjs",
+      "sha256": "5595f7cf2447ebb987ee4a2db491be5d826cc9045341d0fa5d5aba02076e4159"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/visual-style.mjs",
+      "source": "runtime/storyboard-v4/core/visual-style.mjs",
+      "sha256": "6dbdc6841f5f44fb189da8319ebaaf0311a0b0f179312cd783720e773ec55b1b"
+    },
+    {
+      "path": "runtime/storyboard-v4/core/visual-subjects.mjs",
+      "source": "runtime/storyboard-v4/core/visual-subjects.mjs",
+      "sha256": "492e4588c4f1217090cdaf03175bb421648a3a0c2b8395bbc4a14fd814f8ef9e"
+    }
+  ]
+}

@@ -82,7 +82,7 @@ async fn supplement_source_fact_summary_is_versioned_and_never_loosens_exact_evi
     for modern in [false, true] {
         let (mut input, good, author) = material_input();
         if modern {
-            mark_input(&mut input).unwrap();
+            mark_new_legacy_fixture(&mut input);
         }
         let mut executor = MaterialExecutor::new(good, author);
         if modern {
@@ -175,7 +175,7 @@ async fn existing_supply_complete_facts_follow_new_contract_and_keep_legacy_quot
     for modern in [false, true] {
         let (mut input, good, author) = supply_input(true);
         if modern {
-            mark_input(&mut input).unwrap();
+            mark_new_legacy_fixture(&mut input);
         }
         let mut executor = MaterialExecutor::new(good, author);
         executor.supply_assets = Some(input["assets"].as_array().unwrap().clone());

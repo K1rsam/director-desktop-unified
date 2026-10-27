@@ -1,0 +1,578 @@
+{
+  "version": "20261026-v1.1.4-visual-baseline",
+  "skill": "desktop-storyboard-director",
+  "date": "2026-10-26",
+  "base": {
+    "version": "20261021-v1.1-stage3-execution",
+    "provenance": "references/desktop-v1.1-provenance.json"
+  },
+  "upstream": {
+    "repository": "https://github.com/K1rsam/series-storyboard-director",
+    "commit": "5c2711302244cc94e29f50f287a1a4093efe6a0c",
+    "version": "20261023-v6.6.0-season-scope",
+    "method": "Three-way adaptation against published v6.5; retain desktop runtime and role workflow"
+  },
+  "retained": [
+    "pre-dispatch stage3 role packets",
+    "combined planning and authorship",
+    "full episode reading with field-patch or linked delta",
+    "source-bound non-speech events",
+    "UTF-16 dialogue materialization",
+    "unchanged adopted drafts and compatibility evidence"
+  ],
+  "adopted": [
+    "full relevant adopted asset designs",
+    "actual shot cut-pair inspection",
+    "independent intake source lock and postproduction isolation",
+    "opt-in locked season scope across real consumers",
+    "planned/closed handoff and explicit continuation"
+  ],
+  "verification": {
+    "report": "references/validation-report.md"
+  },
+  "limits": {
+    "realProductionRun": false,
+    "platformImport": false,
+    "videoQuality": false,
+    "macRuntime": false,
+    "githubPublished": true
+  },
+  "localChanges": [
+    {
+      "path": "references/asset-handoff.md",
+      "change": "modified",
+      "baseSha256": "f6b9c9feeabbbeef4dca49cbd0881552a5e09d075aa44816fe1c2fecf9402cbf",
+      "sha256": "0375b41ad54409420be3ab2cba1af210493a5db49ad6d6dc8a03aefe2a71ae3e"
+    },
+    {
+      "path": "references/asset-registry-contract.md",
+      "change": "modified",
+      "baseSha256": "0c1ad7dc10b0cf21451840f7711645f0140f29439a3f18ae198808e64ee1d600",
+      "sha256": "94e30e343bcd38839c08c764fc46a6a23f6a1a1edc3b1d8cdbd0261c0d1ab811"
+    },
+    {
+      "path": "references/context-and-dispatch.md",
+      "change": "modified",
+      "baseSha256": "6b18f79b6d984ac7c8bde7c66a723efffe091e88f22f2a5f4449af0d250f8d95",
+      "sha256": "3e8f94b712a18f1f5bc33fbb5bdb927a18603d4db8af1dd9cb7eb2fd2974d8e0"
+    },
+    {
+      "path": "references/creative/references/common-contract.md",
+      "change": "modified",
+      "baseSha256": "38c1066f69e0b29385047fe9271b32b5aa79956214f871672ecca94a6afab7db",
+      "sha256": "16df9f2f5471117cccbfe5d8a3e8df76fd1ac43edb728cfde82aa83373144647"
+    },
+    {
+      "path": "references/creative/skills/episode-finishing-editor/SKILL.md",
+      "change": "modified",
+      "baseSha256": "ecfce86db5052f85ab61317b93a16476a6a1990fe6937d5680d292cc415038a0",
+      "sha256": "6aa2a5defe71fdc30d573b7be76da0e82d26630e3f76af3f529482c21ef64a53"
+    },
+    {
+      "path": "references/creative/skills/sound-rhythm-methods/SKILL.md",
+      "change": "modified",
+      "baseSha256": "7e2ffee1d2814f216a25c477929489b024bea24e7a0333e34e6054a317f9a8bb",
+      "sha256": "3ac389436e36a9cd52465df413ed1920ce13686289022d3ff8e16fd88abf2c16"
+    },
+    {
+      "path": "references/creative/skills/source-context-preparer/SKILL.md",
+      "change": "modified",
+      "baseSha256": "7d971a60c0955f25d93e9719c45551a640d428cbcebc224c058e41bfac773d06",
+      "sha256": "1baf758fe1b2e169ca1186fed964eb6b5894db774bc6fe5bb91a0755fcfaa986"
+    },
+    {
+      "path": "references/creative/skills/unit-performance-director/SKILL.md",
+      "change": "modified",
+      "baseSha256": "97249be4e3b67a0af8b38782cfb7c36afcc2d8b1663eae96e77df8931552ac49",
+      "sha256": "db26832b46cac3e985e29f7dfefcb0afd1aa84dd8e55713f975b3cc94ee1b6dd"
+    },
+    {
+      "path": "references/data-contract.md",
+      "change": "modified",
+      "baseSha256": "d2de5004afb7811337edea730355ca3be439d0b6d20ea91b4fa2585e4c1a3778",
+      "sha256": "c16ebdf681d44baabebdee3f4872779b33f81cbaed0d17c86589858087550ac8"
+    },
+    {
+      "path": "references/desktop-adapter.md",
+      "change": "modified",
+      "baseSha256": "f5b60f6b2d1eb990148c91b100069e608e7adc338410df56e6e5d37c720fa608",
+      "sha256": "b92e5e1bd2577e51c1e44ce5683797d8243cb8d296138f0e0aebbdb129b43e45"
+    },
+    {
+      "path": "references/desktop-generation.md",
+      "change": "modified",
+      "baseSha256": "363dcc82642484b517f864b85f58a37d30f3b5b7ef89afbf3f47bcf0975be068",
+      "sha256": "087e87711ef888529b1244e2b005f2d1a612077327b57f291b924a3cd9620b8f"
+    },
+    {
+      "path": "references/desktop-v1.1-provenance.json",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "84170edbd00dbba39686d045338b5144e934bb96bcf459e15b8e827b29914859"
+    },
+    {
+      "path": "references/expression-and-screen-text.md",
+      "change": "modified",
+      "baseSha256": "baea9d8b76d9c572afc9993c5ef1232ffbf88c5d80a51f79739f1774838f35bd",
+      "sha256": "61a1f34146d73856dfde1c9b6081f135bb8b6ba44bcf38b0063ebd9c2c91fb56"
+    },
+    {
+      "path": "references/lingmo-v7-contract.md",
+      "change": "modified",
+      "baseSha256": "a83a06af9ea3725b67297fd0a16fbdae28149517e7a02458f2da0004d9fb31a8",
+      "sha256": "33e87725d4465747dabfed85fc461cba249667de7375f2b04de6bcdf9412f4e1"
+    },
+    {
+      "path": "references/parallel-and-continuity.md",
+      "change": "modified",
+      "baseSha256": "c090ff081c55aa4d41f493bd82de2ec469197197b9021fcbd5a1528ad4ebed16",
+      "sha256": "8d7f10b1fe0f13794c37abbbfb4225c0425eb942907086b9316cebbcce37c9fb"
+    },
+    {
+      "path": "references/preproduction-contract.md",
+      "change": "modified",
+      "baseSha256": "a92224f1bad528f75a23f474fd09ef51395ad43bf277adfc98a51a99abd6aa99",
+      "sha256": "821d7f3a1cd56017a24f86b6a969385f6ac31ab9f7f92acd56d367755b0f776e"
+    },
+    {
+      "path": "references/production-contract.md",
+      "change": "modified",
+      "baseSha256": "71e8bf38417fff10790078c0fa17db5b925b4cc39ab1ac032d2c4ab792803c84",
+      "sha256": "29691e8733f2e3b84e2c879b0027e6c51f7c019d7fc8c02a912d0cf2e11518a9"
+    },
+    {
+      "path": "references/release-v1.1.1.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "4268edff9e50c44fef2aae06a15cf93161f6cafe1a58cddf962255671d9bcb07"
+    },
+    {
+      "path": "references/release-v6.5.1.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "7f82ee1772c57670ea0a47f9c35718c0e990f8456a0769e73c5e3e2ddba50157"
+    },
+    {
+      "path": "references/release-v6.5.2.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "7eae6007828866d926c6565943ec6e478c4a8a78fad3dc3a4fd89dccd5d537e6"
+    },
+    {
+      "path": "references/release-v6.5.3.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "bc848d1ca4cbdb1e3317d1755f170190b33aa88eef84e55e6e288c0c3ee58744"
+    },
+    {
+      "path": "references/release-v6.6.0.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ac27bc722da894827d4befdcd5f93a188ec27ba37ee12a9782960d1a2bbbaae8"
+    },
+    {
+      "path": "references/season-continuation.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "2dbc30a8d2ab7787e1f61a70f39950a64fd30441ea631429f958220977092c5d"
+    },
+    {
+      "path": "references/season-scope-contract.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "6cde66dcb33d48b2b7e6bf2edd73090d1d85dfa90a12ee19cafc370a72ac6914"
+    },
+    {
+      "path": "references/shot-handoffs.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "f5ae1d10a1037e38143c11d4544c8817ef14f6a272aa8daff25ec37b0f4487a8"
+    },
+    {
+      "path": "references/source-map.md",
+      "change": "modified",
+      "baseSha256": "b1f1f005e3882de6c55fffa956fc8aa35d1a9707abedd98b243a30a87850f2ef",
+      "sha256": "00547df5ab0979d5fe50f2a9cc24fba6e5e1cf9f7e00fe1b62d2e6fa63b305bf"
+    },
+    {
+      "path": "references/tools.md",
+      "change": "modified",
+      "baseSha256": "1afb63420e19458a9586e345d0b616d7f3d1ba2c35221eda53a5e87a3121495b",
+      "sha256": "0ea481da6deca1704eefd78213593755e572600dc6c647ea663f3092cf9e1257"
+    },
+    {
+      "path": "references/validation-report.md",
+      "change": "modified",
+      "baseSha256": "f1e508227288535a322ca6a1e48eb1f3b393fc5e955e6df1b27065c781344692",
+      "sha256": "23b2e1739ae119fa8542d2332a36a1632ed201bbdee3dcac9b49eb6a60360185"
+    },
+    {
+      "path": "references/validation-v1.1.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "f1e508227288535a322ca6a1e48eb1f3b393fc5e955e6df1b27065c781344692"
+    },
+    {
+      "path": "references/workspace-contract.md",
+      "change": "modified",
+      "baseSha256": "05841321b58c3ab1dd367c883154cfc059752254f46536adb3561377c91a43b5",
+      "sha256": "2c53af7ee2aec999c49281b875df5ecb781122b4a29a7d2345d38d925541338b"
+    },
+    {
+      "path": "scripts/assets.mjs",
+      "change": "modified",
+      "baseSha256": "ed732211361ac7534c38fae891174df0a1653b645bdc916e18a875fd89e16a7b",
+      "sha256": "7bad57e1eb3b3e63118bb7354c2306ceb4e348fded9164e126e6d39e874e80c8"
+    },
+    {
+      "path": "scripts/context_packet.py",
+      "change": "modified",
+      "baseSha256": "c179faa11618b3f2f46043e0b6c6e5e34c39c8905ff9e9f9df3c294af8dcd7d0",
+      "sha256": "25b1e21bc2d9f95bffbc2dceb89d10ce07be001170769ed3515e3ccaa55a8b0c"
+    },
+    {
+      "path": "scripts/inspect_editing.py",
+      "change": "modified",
+      "baseSha256": "3c51c77cefbf8bce1954a7c3704ac2beded61f1afdde12945f839032a886d63a",
+      "sha256": "7877963eb2ade6262b9bfe373bd114184672364ea2279a4996e8e21b9b33e7f0"
+    },
+    {
+      "path": "scripts/lingmo-v7.mjs",
+      "change": "modified",
+      "baseSha256": "481e3d08fb2fed32e6af94caba07c38572201ef468cb5c9465365c5b734ca24b",
+      "sha256": "7a03b1fafaef4c0e21e636a8b1fa689c0b50788fef336472e6fb540b4a61ab6f"
+    },
+    {
+      "path": "scripts/season-handoff.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "18f42a5af9c5e582078e9c918228d0367989dff939baaad880959af46be79b4d"
+    },
+    {
+      "path": "scripts/season-scope.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "5c1d8e574ae1b9b3153f0af59eb92d140d3c7975228b541d8f3ac1bc6ef2be8b"
+    },
+    {
+      "path": "scripts/season_scope.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "fb58ea9c34a24fae0246fe334e335334d0e71c4e8203ec8fda5c501c6f0475e1"
+    },
+    {
+      "path": "scripts/stage3-task.py",
+      "change": "modified",
+      "baseSha256": "10650bfcaebeab207e9d5eff90842ddc8b61c0363bfadd31851923a41003b452",
+      "sha256": "3556380b0884974fc02dd04c198f1d9373091aa4404ed085f923aa5b2894b90c"
+    },
+    {
+      "path": "scripts/storyboard.mjs",
+      "change": "modified",
+      "baseSha256": "7eb13801e8be5c17d044038a7f7740f47bd1cb39b0e1d6819b49b673ed55a775",
+      "sha256": "767b951b3b3c2f0a8bdeeb500bdedf44ab753ec4d79c35099696d2f2feca0c41"
+    },
+    {
+      "path": "scripts/workspace.py",
+      "change": "modified",
+      "baseSha256": "e969825a4f35f54195f309998a16597935d69fc072599d4a6f0f485774a6b8af",
+      "sha256": "dbb048dffb3c3f24c46e1602fdee78c318f20d955b718eee1d2ee097952b6bac"
+    },
+    {
+      "path": "SKILL.md",
+      "change": "modified",
+      "baseSha256": "b78e15311d8dfee4241a1b1db33fe9a5d990a62a48cb845d054aecc726dbf664",
+      "sha256": "efabf54316706a5393f0cdfae5f663e8ed437c76b1c493bcc78d074127b0069f"
+    },
+    {
+      "path": "stages/asset-design/SKILL.md",
+      "change": "modified",
+      "baseSha256": "7190f8290c121adb2d226792dc993df340baaa65fc6e2fa08c78e605728e9e98",
+      "sha256": "e1d53c31941f442debd2b01c832d4fa85631563999a2b682f09ebd7c5d63aa5c"
+    },
+    {
+      "path": "stages/episode-production/SKILL.md",
+      "change": "modified",
+      "baseSha256": "55e96e5509ff925fb453ff817b50dfa9e010bf08d49c7689c73c25e28a12f095",
+      "sha256": "896d8078db4e2f36b6ce38f1f09106e035d3b4849c33cd51f3ee91b3345c7f07"
+    },
+    {
+      "path": "stages/review-delivery/SKILL.md",
+      "change": "modified",
+      "baseSha256": "7f4762cd110571fccbd5e765299f95fb8ecb9af347581bd6121a38c088b96e7c",
+      "sha256": "0f877d9af13c954002cba4f2bd870b2609ab32a4f44bfe97cc46dc1624929adf"
+    },
+    {
+      "path": "stages/source-intake/SKILL.md",
+      "change": "modified",
+      "baseSha256": "54f19aa1302682702b3418927388de32d34c7992dec22b849b3323da1beb8b4b",
+      "sha256": "1a581774f06ca14342116b32cea0435c40f30ee1399c621ad5f9aad2fc17a6eb"
+    },
+    {
+      "path": "tests/desktop-sound-events.test.mjs",
+      "change": "modified",
+      "baseSha256": "c2b79a6db67faf194691de3080b59fb4eeae6d87d7cb1624ef5e09a38f945a48",
+      "sha256": "f485fd9d1f73bfb1b959a83f22cd9b2b2bb3503214c359682f7818d4501b61d1"
+    },
+    {
+      "path": "tests/season-assets.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "e8c70edad431e34310908fe411d765659fd155793a483ef634ad8083be16c83c"
+    },
+    {
+      "path": "tests/season-consumers.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "4d6b4e4aa05eb2b1a79fc6d076bec59e6f0439970cd54abba6e2d13e3b17aa73"
+    },
+    {
+      "path": "tests/season-handoff.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "1f95e4c3fc1a92e4f921d04629c46e43a016f91796b9d37dbf1c0be3ecff7e4e"
+    },
+    {
+      "path": "tests/season-scope.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "4bca099cea11fcca3415e1f994d7bac85691db1de86ec6bf52410b70b53f929d"
+    },
+    {
+      "path": "tests/source-lock.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "96f1ad16300607292d86b922f5e8b43d60be28f984720f9a1cc7f0341f5f18b3"
+    },
+    {
+      "path": "tests/test_inspect_editing.py",
+      "change": "modified",
+      "baseSha256": "cf80b797bbfa291ee45cae311381e64b1e9a0088d87b70fd32e846898a920b88",
+      "sha256": "51633959ecaaa9478ec957122443c073fa4e6f0f7c9d078dac81dfeb87d26c83"
+    },
+    {
+      "path": "tests/test_season_workspace.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "7cd7c3cca77af698104498db9e8d9df1d3139dbb1f65e80aa8705e4bce1e9184"
+    },
+    {
+      "path": "tests/test_stage3_task.py",
+      "change": "modified",
+      "baseSha256": "d5b2bd5af18972e185c84b7c3d689e3af3e539dd664bbe5f2d1c779c4bee0030",
+      "sha256": "c637382589c718babb435a65011558b96e7e16ad912f88a2f2ce64142dcdeaec"
+    },
+    {
+      "path": "VERSION",
+      "change": "modified",
+      "baseSha256": "bef74349019bc1dd048b614994a1acbad89d6597fe39a62c9c1d5d40a7e03fce",
+      "sha256": "f1d7a28176eb86f2a2d8fbfc1776dfa53effa3f23f0fd254c3a371afdea0b6f5"
+    },
+    {
+      "path": "使用说明.md",
+      "change": "modified",
+      "baseSha256": "fce790bd2be59eb9b3d0b3bc792fc184936a17937e309129b9ae2aa43b7afd38",
+      "sha256": "689eb76d3ef54398cc7971edacd570fb1888b8ce6b5b8a9359a001f3f8e656f3"
+    },
+    {
+      "path": "references/release-v1.1.4.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ff9cf371a93dd4490dd333709f2e305b47c93d5d4938fba0b207607a17ca0303"
+    },
+    {
+      "path": "references/visual-baseline.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "4c8f0e3f39936d94bd80e33f0c2709a7519df9b2ec203a1e256cc61c403bc033"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/visual-style.mjs",
+      "change": "modified",
+      "baseSha256": "6dbdc6841f5f44fb189da8319ebaaf0311a0b0f179312cd783720e773ec55b1b",
+      "sha256": "e2f4dd161afbb8f181445181846b184da4b0b69c45ae7caaecdb3232fa217752"
+    },
+    {
+      "path": "scripts/visual-baseline.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "72073dda70de1c1567933b3284df76d10d4b01856c0cf118b7c2cdeafda14985"
+    },
+    {
+      "path": "scripts/visual_baseline.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "74bfc35bea91ad026f93f98e178f5a4fa6181ae41d895b323290ffcb10ea9109"
+    },
+    {
+      "path": "tests/visual-baseline.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ec70e9f1bc58f97243f3d5ea61b64cc6e5600cf830adda3ac9bb2b967cea3c97"
+    }
+  ],
+  "hashPolicy": "localChanges excludes this manifest and SHA256SUMS; SHA256SUMS covers distributed files except itself, excluding Python caches.",
+  "maintenance": {
+    "date": "2026-10-26",
+    "baseInstalledVersion": "20261025-v1.1.3-readable-image-bindings",
+    "previousProvenanceVersion": "20261023-v1.1.1-production-parity",
+    "releaseNotes": "references/release-v1.1.4.md",
+    "scope": "Adopted visual baseline, exact role supply and per-clip export; no production migration.",
+    "upstreamInspected": {
+      "repository": "K1rsam/director-web",
+      "commit": "d491ab01be6713faa15c4463c1fa00c4d8d4400f"
+    },
+    "published": true,
+    "realModelProduction": false,
+    "videoQualityValidated": false
+  },
+  "maintenanceChanges": [
+    {
+      "path": "references/context-and-dispatch.md",
+      "change": "modified",
+      "baseSha256": "236f464b6d727b1a7677f8867789acf0456eb790828401d91400fbf479f2256b",
+      "sha256": "3e8f94b712a18f1f5bc33fbb5bdb927a18603d4db8af1dd9cb7eb2fd2974d8e0"
+    },
+    {
+      "path": "references/data-contract.md",
+      "change": "modified",
+      "baseSha256": "590058260b12293c68cf52582fb6f0df80e01d5db035c5c3212819e0b628e04f",
+      "sha256": "c16ebdf681d44baabebdee3f4872779b33f81cbaed0d17c86589858087550ac8"
+    },
+    {
+      "path": "references/lingmo-v7-contract.md",
+      "change": "modified",
+      "baseSha256": "3c2f8a1adb8d7535d954ef9fb156cff4dcf7887cf1853909cdbec689dbb0a7bc",
+      "sha256": "33e87725d4465747dabfed85fc461cba249667de7375f2b04de6bcdf9412f4e1"
+    },
+    {
+      "path": "references/release-v1.1.4.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ff9cf371a93dd4490dd333709f2e305b47c93d5d4938fba0b207607a17ca0303"
+    },
+    {
+      "path": "references/tools.md",
+      "change": "modified",
+      "baseSha256": "1d1192a220e3865535991a40059a34989d90bdc865fbe91190643d8bffdff182",
+      "sha256": "0ea481da6deca1704eefd78213593755e572600dc6c647ea663f3092cf9e1257"
+    },
+    {
+      "path": "references/validation-report.md",
+      "change": "modified",
+      "baseSha256": "434279f2c7bbea87fc3f1da0c8f99223240ea37166f8428bcdf7a36bb7c9cfa6",
+      "sha256": "23b2e1739ae119fa8542d2332a36a1632ed201bbdee3dcac9b49eb6a60360185"
+    },
+    {
+      "path": "references/visual-baseline.md",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "4c8f0e3f39936d94bd80e33f0c2709a7519df9b2ec203a1e256cc61c403bc033"
+    },
+    {
+      "path": "scripts/context_packet.py",
+      "change": "modified",
+      "baseSha256": "63801d690935ab5871d954e8207d62020a5d58ed1c5c0a0ded46f34b7410a555",
+      "sha256": "25b1e21bc2d9f95bffbc2dceb89d10ce07be001170769ed3515e3ccaa55a8b0c"
+    },
+    {
+      "path": "scripts/core/runtime/storyboard-v4/core/visual-style.mjs",
+      "change": "modified",
+      "baseSha256": "6dbdc6841f5f44fb189da8319ebaaf0311a0b0f179312cd783720e773ec55b1b",
+      "sha256": "e2f4dd161afbb8f181445181846b184da4b0b69c45ae7caaecdb3232fa217752"
+    },
+    {
+      "path": "scripts/lingmo-v7.mjs",
+      "change": "modified",
+      "baseSha256": "db889df83bc074729b318258dc5cf963bfb098a72a2aded63fd5f19c3aa35371",
+      "sha256": "7a03b1fafaef4c0e21e636a8b1fa689c0b50788fef336472e6fb540b4a61ab6f"
+    },
+    {
+      "path": "scripts/stage3-task.py",
+      "change": "modified",
+      "baseSha256": "4d5c4d038bf2de0dcdc6e616ffc8cdb418780d30d1e4d1a50c9e154aa990ec3b",
+      "sha256": "3556380b0884974fc02dd04c198f1d9373091aa4404ed085f923aa5b2894b90c"
+    },
+    {
+      "path": "scripts/storyboard.mjs",
+      "change": "modified",
+      "baseSha256": "92e90f51ca6f682d6f4bd584425dd6aeff4797f283f8a761850af9f9b12d2eee",
+      "sha256": "767b951b3b3c2f0a8bdeeb500bdedf44ab753ec4d79c35099696d2f2feca0c41"
+    },
+    {
+      "path": "scripts/visual-baseline.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "72073dda70de1c1567933b3284df76d10d4b01856c0cf118b7c2cdeafda14985"
+    },
+    {
+      "path": "scripts/visual_baseline.py",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "74bfc35bea91ad026f93f98e178f5a4fa6181ae41d895b323290ffcb10ea9109"
+    },
+    {
+      "path": "SKILL.md",
+      "change": "modified",
+      "baseSha256": "76e25f20968b66b40d6032e0ca890c2bfac472fb262030991a6b873558f42a75",
+      "sha256": "efabf54316706a5393f0cdfae5f663e8ed437c76b1c493bcc78d074127b0069f"
+    },
+    {
+      "path": "stages/asset-design/SKILL.md",
+      "change": "modified",
+      "baseSha256": "97e5ea7333cc29c091faa503e47f11415845c32628a7b6d169101235d779454d",
+      "sha256": "e1d53c31941f442debd2b01c832d4fa85631563999a2b682f09ebd7c5d63aa5c"
+    },
+    {
+      "path": "stages/episode-production/SKILL.md",
+      "change": "modified",
+      "baseSha256": "0632f0a845a4fc0f2963d55a9a2a77140c034a3e1aec9f2649ece26100977a86",
+      "sha256": "896d8078db4e2f36b6ce38f1f09106e035d3b4849c33cd51f3ee91b3345c7f07"
+    },
+    {
+      "path": "stages/review-delivery/SKILL.md",
+      "change": "modified",
+      "baseSha256": "1ec5fe07e633b1f8514df0c1738102397683dd9d9ba43218625125dd4e6a756e",
+      "sha256": "0f877d9af13c954002cba4f2bd870b2609ab32a4f44bfe97cc46dc1624929adf"
+    },
+    {
+      "path": "stages/source-intake/SKILL.md",
+      "change": "modified",
+      "baseSha256": "55738ab65c3df50d30d81530169ceaeff5659cba5296197cc478cea188a8c3ed",
+      "sha256": "1a581774f06ca14342116b32cea0435c40f30ee1399c621ad5f9aad2fc17a6eb"
+    },
+    {
+      "path": "tests/test_stage3_task.py",
+      "change": "modified",
+      "baseSha256": "207a560b3cf44b4f78e4cf68de38aa6e3848193c023c0b5ec4cc96bbf483c5e3",
+      "sha256": "c637382589c718babb435a65011558b96e7e16ad912f88a2f2ce64142dcdeaec"
+    },
+    {
+      "path": "tests/visual-baseline.test.mjs",
+      "change": "added",
+      "baseSha256": null,
+      "sha256": "ec70e9f1bc58f97243f3d5ea61b64cc6e5600cf830adda3ac9bb2b967cea3c97"
+    },
+    {
+      "path": "VERSION",
+      "change": "modified",
+      "baseSha256": "81608d6ece7756dc0b5b84c48a7e8ca9e660256e472a47815c1fa1fe570234f7",
+      "sha256": "f1d7a28176eb86f2a2d8fbfc1776dfa53effa3f23f0fd254c3a371afdea0b6f5"
+    },
+    {
+      "path": "使用说明.md",
+      "change": "modified",
+      "baseSha256": "bc36c56600fbf021df45dac2e9fa98c4fbf7354527681ca25a251aec58aa04ef",
+      "sha256": "689eb76d3ef54398cc7971edacd570fb1888b8ce6b5b8a9359a001f3f8e656f3"
+    }
+  ],
+  "publication": {
+    "date": "2026-10-26",
+    "repository": "K1rsam/series-storyboard-director",
+    "branch": "main",
+    "repositorySkillPath": "skills/desktop-storyboard-director",
+    "companionVersion": "20261026-v6.7.3-visual-baseline",
+    "baseRemoteCommit": "af718aefa9e620918c72557b7f5cabea3697f2d5",
+    "scope": "Complete desktop Skill; shared adopted visual baseline and image bindings; no desktop application migration"
+  }
+}

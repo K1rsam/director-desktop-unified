@@ -47,6 +47,9 @@ mod rules;
 pub(crate) use repair::revalidate_review_repair_response;
 #[path = "series_frame_render.rs"]
 mod frame_render;
+#[path = "series_visual_baseline.rs"]
+mod visual_baseline;
+pub(crate) use visual_baseline::validate_handoff as validate_visual_baseline_handoff;
 pub(crate) use frame_render::validate_projection as validate_frame_render_projection;
 #[path = "series_review_scope.rs"]
 mod review_scope;
@@ -105,6 +108,9 @@ fn delivery_supply_proof(delivery: &Value) -> &Value {
     }
 }
 fn visual_style(input: &Value) -> &str {
+    if visual_baseline::enabled(input) {
+        return s(&input["settings"]["visualBaseline"], "visualStyle");
+    }
     super::asset_design_contract::project_visual_style(&input["settings"])
 }
 fn direction(input: &Value) -> Value {
@@ -146,6 +152,21 @@ pub fn uses_profile(input: &Value) -> Result<bool, String> {
 }
 pub fn rule_snapshots() -> Result<Vec<RuleSnapshot>, String> {
     rules::snapshots()
+}
+/// Rule identity belongs to the frozen task, never the installed default.
+pub(crate) fn rule_version(input: &Value) -> Result<&str, String> {
+    match input["seriesSkillVersion"].as_str() {
+        Some(rules::VERSION) => Ok(rules::VERSION),
+        Some(rules::LEGACY_VERSION) => Ok(rules::LEGACY_VERSION),
+        _ => Err("SERIES_RULE_VERSION_UNSUPPORTED".into()),
+    }
+}
+pub(crate) fn rule_pack_hash(input: &Value) -> Result<String, String> {
+    rules::pack_hash_for(rule_version(input)?)
+}
+pub fn rule_snapshots_for(input: &Value) -> Result<Vec<RuleSnapshot>, String> {
+    validate_profile(input)?;
+    rules::snapshots_for(rule_version(input)?)
 }
 pub fn allocate_asset_identities(assets: &mut [Value]) -> Result<(), String> {
     export::allocate_asset_identities(assets)
@@ -293,6 +314,16 @@ pub(crate) fn export_delivery_package_with_inputs(
     package::write_with_inputs(input, deliveries, frozen_inputs, directory)
 }
 pub fn mark_input(input: &mut Value) -> Result<(), String> {
+    let mut marked = input.clone();
+    mark_input_version(&mut marked, rules::VERSION)?;
+    *input = marked;
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn mark_legacy_input(input: &mut Value) -> Result<(), String> {
+    mark_input_version(input, rules::LEGACY_VERSION)
+}
+fn mark_input_version(input: &mut Value, version: &str) -> Result<(), String> {
     if !input.is_object() {
         return Err("SERIES_INPUT_NOT_OBJECT".into());
     }
@@ -302,9 +333,17 @@ pub fn mark_input(input: &mut Value) -> Result<(), String> {
     {
         return Err("SERIES_CANNOT_REWRITE_FROZEN_PROFILE".into());
     }
+    // Either marker makes this a frozen input. A partial or corrupt identity
+    // must fail validation, not acquire today's version or fresh contracts.
+    if input.get("seriesSkillVersion").is_some()
+        || input.get("seriesRulePackSha256").is_some()
+    {
+        return validate_profile(input);
+    }
     input[PROFILE_FIELD] = json!(PROFILE);
-    input["seriesRulePackSha256"] = json!(rules::pack_hash()?);
-    input["seriesSkillVersion"] = json!(rules::VERSION);
+    input["seriesRulePackSha256"] = json!(rules::pack_hash_for(version)?);
+    input["seriesSkillVersion"] = json!(version);
+    visual_baseline::validate(input)?;
     input["seriesTransportVersion"] = json!(COMPACT_DESIGN_INPUT);
     input["seriesDialogueCoordinates"] = json!(ABSOLUTE_DIALOGUE_COORDINATES);
     input["seriesRuleMaterialization"] = json!(rules::CONTENT_ONCE);
@@ -316,11 +355,11 @@ pub fn mark_input(input: &mut Value) -> Result<(), String> {
 }
 fn validate_profile(input: &Value) -> Result<(), String> {
     if !uses_profile(input)?
-        || input["seriesRulePackSha256"] != rules::pack_hash()?
-        || input["seriesSkillVersion"] != rules::VERSION
+        || input["seriesRulePackSha256"] != rule_pack_hash(input)?
     {
         return Err("SERIES_FROZEN_RULES_MISMATCH".into());
     }
+    visual_baseline::validate(input)?;
     if input
         .get("seriesTransportVersion")
         .is_some_and(|v| !v.is_null() && v != COMPACT_DESIGN_INPUT)
@@ -452,6 +491,7 @@ fn packet(
     input: &Value,
     values: Vec<(&str, Value)>,
 ) -> Result<Value, String> {
+    visual_baseline::validate(input)?;
     let mut blobs = Map::new();
     let mut bindings = Vec::new();
     let mut kinds = HashSet::new();
@@ -469,6 +509,9 @@ fn packet(
             return Err(format!("SERIES_PACKET_MISSING:{required}"));
         }
     }
+    if visual_baseline::enabled(input) && !kinds.contains("visual-baseline") {
+        return Err("SERIES_PACKET_MISSING:visual-baseline".into());
+    }
     if matches!(role, "finisher" | "reviewer" | "repair") {
         for required in ["draft", "plan", "selection"] {
             if !kinds.contains(required) {
@@ -476,7 +519,7 @@ fn packet(
             }
         }
     }
-    let mut p = json!({"version":ROLE_PACKET,"workflowProfile":PROFILE,"role":role,"episodeId":episode,"sourceSha256":input["source"]["sha256"],"productionScope":input["productionScope"],"rulePackSha256":rules::pack_hash()?,"bindings":bindings,"blobs":blobs});
+    let mut p = json!({"version":ROLE_PACKET,"workflowProfile":PROFILE,"role":role,"episodeId":episode,"sourceSha256":input["source"]["sha256"],"productionScope":input["productionScope"],"rulePackSha256":rule_pack_hash(input)?,"bindings":bindings,"blobs":blobs});
     p["inputFingerprint"] = json!(hash(&p));
     Ok(p)
 }
@@ -527,7 +570,7 @@ fn request(
         context["seriesTransportVersion"] = json!(COMPACT_DESIGN_INPUT);
         context["designReadContract"] = json!("完整设计供料只保存一次：source.sourceRowsBinding 指向本包 designSourceRows（含本集完整源及有据跨集设计行），按 episodeId 区分。designTargets.asset 仅定位，完整身份/范围/已有完整设计必须按 id+variantId 从 assets 读取，不能以定位项代替完整供料。");
     }
-    context["seriesRulePackSha256"] = json!(rules::pack_hash()?);
+    context["seriesRulePackSha256"] = json!(rule_pack_hash(input)?);
     if let Some(version) = input.get(frame_render::PROFILE_FIELD) {
         context[frame_render::PROFILE_FIELD] = version.clone();
     }
@@ -538,7 +581,7 @@ fn request(
         reasoning: reasoning.into(),
         input: context,
         schema,
-        rule_snapshot: rules::role(role, fantasy_mode(input)? != "off")?,
+        rule_snapshot: rules::role_for(rule_version(input)?, role, fantasy_mode(input)? != "off")?,
     })
 }
 fn role_receipt(request: &TextRequest, raw: &Value) -> Result<Value, String> {
@@ -570,7 +613,11 @@ pub(crate) fn repair_rules_for(
     fantasy: bool,
 ) -> Result<Value, String> {
     validate_rule_materialization(input)?;
-    let original = repair_rules(origin_role, fantasy)?;
+    let version = rule_version(input)?;
+    let mut original = rules::role_for(version, "repair", fantasy)?;
+    if origin_role != "repair" {
+        original["originRules"] = rules::role_for(version, origin_role, fantasy)?;
+    }
     if input["seriesRuleMaterialization"] == rules::CONTENT_ONCE
         && original.get("originRules").is_some()
     {
@@ -614,7 +661,7 @@ fn validate_role_packet(
     if !allowed
         || req.input["episodeId"] != episode.id
         || p["episodeId"] != episode.id
-        || req.input["seriesRulePackSha256"] != rules::pack_hash()?
+        || req.input["seriesRulePackSha256"] != rule_pack_hash(input)?
     {
         return Err("SERIES_ROLE_STAGE_IDENTITY".into());
     }
@@ -646,7 +693,7 @@ fn validate_role_packet(
     let expected_rules = if req.stage == "seriesRepair" {
         repair_rules_for(input, role, fantasy_mode(input)? != "off")?
     } else {
-        rules::role(effective_role, fantasy_mode(input)? != "off")?
+        rules::role_for(rule_version(input)?, effective_role, fantasy_mode(input)? != "off")?
     };
     if req.rule_snapshot != expected_rules {
         return Err("SERIES_ROLE_RULE_CONTENT_MISMATCH".into());
@@ -709,7 +756,7 @@ fn validate_role_packet(
         }
     }
     for (kind, expected) in base_values(input, source, episode, &[], &Value::Null) {
-        if !matches!(kind, "source" | "direction" | "state") {
+        if !matches!(kind, "source" | "direction" | "state" | "visual-baseline") {
             continue;
         }
         let mut actual = packet_value(p, kind)?.clone();
@@ -777,7 +824,7 @@ fn base_values(
         .filter(|r| r.episode_id.as_deref() == Some(&episode.id) && r.kind == "body")
         .cloned()
         .collect();
-    vec![
+    let mut values = vec![
         (
             "source",
             json!({"episode":episode,"scenes":source.scenes.iter().filter(|s|s.episode_id==episode.id).collect::<Vec<_>>(),"sourceRows":source_view(&rows)}),
@@ -789,7 +836,11 @@ fn base_values(
         ),
         ("assets", json!(assets)),
         ("entry", entry.clone()),
-    ]
+    ];
+    if visual_baseline::enabled(input) {
+        values.push(("visual-baseline", input["settings"]["visualBaseline"].clone()));
+    }
+    values
 }
 fn candidate_schema(
     source: &LockedSource,
@@ -1323,7 +1374,8 @@ async fn episode(
     }
     let style = visual_style(input);
     let delivery = export::export(source, episode, &candidate["draft"], &cards, style)?;
-    let bundle = json!({"schemaVersion":"desktop-series-episode/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"episodeId":episode.id,"productionScope":input["productionScope"],"plan":candidate["plan"],"selection":candidate["selection"],"draft":candidate["draft"],"assets":cards,"entry":entry});
+    let mut bundle = json!({"schemaVersion":"desktop-series-episode/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"episodeId":episode.id,"productionScope":input["productionScope"],"plan":candidate["plan"],"selection":candidate["selection"],"draft":candidate["draft"],"assets":cards,"entry":entry});
+    visual_baseline::bind_bundle(&mut bundle, input);
     let review_receipt = receipts
         .iter()
         .rev()
@@ -1335,7 +1387,7 @@ async fn episode(
         .collect();
     let mut used = used;
     used.sort();
-    let adoption = json!({"version":"desktop-series-adoption/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"bundleSha256":hash(&bundle),"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"]),"rulePackSha256":rules::pack_hash()?,"roleReceipts":receipts,"review":{"candidateSha256":hash(&candidate),"requestSha256":review_receipt["requestSha256"],"resultSha256":review_receipt["rawSha256"],"status":"passed"},"steps":{"sync":{"usedAssetIds":used,"designsSha256":hash(&json!(cards))},"check":{"sourceSha256":source.sha256,"candidateSha256":hash(&candidate)},"export":{"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"])},"verify":{"parserVersion":crate::lingmo_parser::PARSER_VERSION,"status":"passed"}},"evidenceBoundary":"local contracts and independent model review; not platform import or media acceptance"});
+    let adoption = json!({"version":"desktop-series-adoption/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"bundleSha256":hash(&bundle),"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"]),"rulePackSha256":rule_pack_hash(input)?,"roleReceipts":receipts,"review":{"candidateSha256":hash(&candidate),"requestSha256":review_receipt["requestSha256"],"resultSha256":review_receipt["rawSha256"],"status":"passed"},"steps":{"sync":{"usedAssetIds":used,"designsSha256":hash(&json!(cards))},"check":{"sourceSha256":source.sha256,"candidateSha256":hash(&candidate)},"export":{"markdownSha256":delivery["markdownSha256"],"assetIndexSha256":hash(&delivery["assetIndex"])},"verify":{"parserVersion":crate::lingmo_parser::PARSER_VERSION,"status":"passed"}},"evidenceBoundary":"local contracts and independent model review; not platform import or media acceptance"});
     let mut adoption = adoption;
     if let Some(context) = controller { adoption[controller_review::FIELD] = context.clone(); }
     if !supplement_proof.is_null() {
@@ -1379,6 +1431,7 @@ pub(crate) fn validated_supplied_scope_assets(
 }
 pub fn validate_delivery(input: &Value, delivery: &Value) -> Result<(), String> {
     validate_profile(input)?;
+    visual_baseline::validate_delivery(input, delivery)?;
     let source = source(input)?;
     let episode = source
         .episodes
@@ -1397,7 +1450,7 @@ pub fn validate_delivery(input: &Value, delivery: &Value) -> Result<(), String> 
         || receipt["version"] != "desktop-series-adoption/v1"
         || receipt["sourceSha256"] != source.sha256
         || receipt["bundleSha256"] != hash(bundle)
-        || receipt["rulePackSha256"] != rules::pack_hash()?
+        || receipt["rulePackSha256"] != rule_pack_hash(input)?
         || receipt["markdownSha256"] != digest(s(delivery, "markdown"))
         || delivery["markdownSha256"] != receipt["markdownSha256"]
         || receipt["assetIndexSha256"] != hash(&delivery["assetIndex"])
@@ -1626,7 +1679,7 @@ pub async fn run(
                     .and_then(|v| v.last())
                     .cloned()
                     .unwrap_or(Value::Null);
-                let publication = json!({"schemaVersion":"complete-episode-delivery/v1","workflowProfile":PROFILE,"status":"running","scope":"episodes","sourceSha256":source.sha256,"episodeId":episode.id,"updatedEpisodeIds":[episode.id],"replacedUnitIds":[],"units":draft["units"],"plans":[{"episodeId":episode.id,"plan":delivery["bundle"]["plan"]}],"fantasyRealization":draft["fantasyRealization"],"revisionNotes":draft["revisionNotes"],"unresolved":[],"blocked":[],"seriesDeliveries":[delivery],"designAdoptions":delivery["designAdoptions"],"ruleSnapshots":rule_snapshots()?});
+                let publication = json!({"schemaVersion":"complete-episode-delivery/v1","workflowProfile":PROFILE,"status":"running","scope":"episodes","sourceSha256":source.sha256,"episodeId":episode.id,"updatedEpisodeIds":[episode.id],"replacedUnitIds":[],"units":draft["units"],"plans":[{"episodeId":episode.id,"plan":delivery["bundle"]["plan"]}],"fantasyRealization":draft["fantasyRealization"],"revisionNotes":draft["revisionNotes"],"unresolved":[],"blocked":[],"seriesDeliveries":[delivery],"designAdoptions":delivery["designAdoptions"],"ruleSnapshots":rule_snapshots_for(input)?});
                 validate_episode_delivery(input, &publication)?;
                 executor.publish_episode(&publication, input).await?;
                 units.extend(draft["units"].as_array().unwrap().iter().cloned());
@@ -1649,7 +1702,7 @@ pub async fn run(
     }
     let updated: Vec<_> = deliveries.iter().map(|d| d["episodeId"].clone()).collect();
     Ok(
-        json!({"schemaVersion":"storyboard-delivery/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"status":if blocked.is_empty(){"completed"}else{"partially_blocked"},"scope":"episodes","updatedEpisodeIds":updated,"replacedUnitIds":[],"units":units,"plans":plans,"waitingDecision":null,"waitingDecisions":[],"fantasyRealization":[],"revisionNotes":[],"unresolved":[],"blocked":blocked,"seriesDeliveries":deliveries,"designAdoptions":adoptions,"ruleSnapshots":rule_snapshots()?}),
+        json!({"schemaVersion":"storyboard-delivery/v1","workflowProfile":PROFILE,"sourceSha256":source.sha256,"status":if blocked.is_empty(){"completed"}else{"partially_blocked"},"scope":"episodes","updatedEpisodeIds":updated,"replacedUnitIds":[],"units":units,"plans":plans,"waitingDecision":null,"waitingDecisions":[],"fantasyRealization":[],"revisionNotes":[],"unresolved":[],"blocked":blocked,"seriesDeliveries":deliveries,"designAdoptions":adoptions,"ruleSnapshots":rule_snapshots_for(input)?}),
     )
 }
 // Keep the noun `episode` free for the source object at call sites.

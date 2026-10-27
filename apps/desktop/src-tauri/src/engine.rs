@@ -3369,7 +3369,7 @@ impl Engine {
         if stage == "storyboard.run" && pipeline::series::uses_profile(&input)? {
             input["storyboardMethod"] = json!("series-full-episode/v1");
         }
-        let rules = if pipeline::series::uses_profile(&input)? { json!(pipeline::series::rule_snapshots()?) } else if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
+        let rules = if pipeline::series::uses_profile(&input)? { json!(pipeline::series::rule_snapshots_for(&input)?) } else if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
         let guard = crate::workflow::guard_from_input(&input);
         store.ensure_workflow_storage()?;
         {
@@ -5210,7 +5210,7 @@ fn production_rules(stage: &str) -> Value {
 // resume its accepted steps; a new run uses the restored F2 → Q1 method.
 fn production_rules_for_snapshot(snapshot: &Value) -> Result<Value> {
     if pipeline::series::uses_profile(&snapshot["input"])? {
-        return Ok(json!(pipeline::series::rule_snapshots()?));
+        return Ok(json!(pipeline::series::rule_snapshots_for(&snapshot["input"])?));
     }
     if pipeline::stage3_pack::uses_profile(&snapshot["input"])? {
         let mut checked = json!({});
