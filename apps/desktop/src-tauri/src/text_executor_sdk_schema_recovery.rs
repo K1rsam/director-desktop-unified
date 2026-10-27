@@ -43,7 +43,7 @@ impl SavedTextExecutor {
         let saved_already=job["prepared"].get(FIELD).is_some();
         if !saved_already {
             if snapshot["executorIdentity"]["bridgeSha256"]!="48af55f1835bd6959ede5801fa8ff2ca9068b267b36ec9f751949efdc9481dc7" {return Ok(None);}
-            let receipt=self.store.root.join("sdk-worker").join(s(job,"id")).join("receipt.json");
+            let receipt=crate::text_sdk::worker_root(&self.store.root,&serde_json::from_value::<TextRequest>(job["snapshot"].clone()).map_err(|_|HELD)?)?.join(s(job,"id")).join("receipt.json");
             let m=std::fs::symlink_metadata(&receipt).map_err(|_|HELD)?;if !m.is_file()||m.is_symlink()||m.len()>4_194_304{return Err(HELD.into());}
             let record:Value=serde_json::from_slice(&std::fs::read(receipt).map_err(|_|HELD)?).map_err(|_|HELD)?;
             if record["error"]["code"]!="ENOENT" {return Ok(None);}
@@ -72,7 +72,7 @@ impl SavedTextExecutor {
             })?;first=true;saved
         };
         crate::text_sdk::verify_schema_recovery_bytes(&snapshot["executorIdentity"],&saved["effectiveIdentity"],&saved["resourceHashes"])?;
-        let config=crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?;let transport=self.sdk_transport(config,id);
+        let config=crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?.for_request(&self.store.root,request)?;let transport=self.sdk_transport(config,id);
         let observation=if first{transport.recover_schema_preparation(original,&saved["proof"],&saved["evidence"]).await}else{transport.reconcile(original).await};
         transport.close().await?;let observation=observation?;if observation.kind!=ObservationKind::Completed{return Err(HELD.into());}
         let file=self.store.root.join("text-runs").join(id).join("sdk-attempt.json");let mut attempt=FrozenAttempt::load(&file)?;attempt.observe(observation)?;

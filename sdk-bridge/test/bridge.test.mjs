@@ -473,6 +473,64 @@ test('stdio fixture uses actual official SDK and cleanly returns a transport obs
   await client.request(command('shutdown')); await client.exited;
 });
 
+test('three foundation lane workers overlap through the pinned SDK and preserve isolated receipts across restart', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'director-sdk-three-lanes-'));
+  const clients = [];
+  t.after(async () => { for (const c of clients) { c.child.kill(); await c.exited; } await fs.rm(root, { recursive: true, force: true }); });
+  // Hanging synthetic children make overlap deterministic; no real credentials
+  // or model service are opened. A same-directory worker remains exclusive.
+  const lanePaths = [0, 1, 2].map(i => path.join(root, 'sdk-worker-trials', 'a'.repeat(64), `lane-${i}`));
+  for (const lane of lanePaths) { await fs.mkdir(lane, { recursive: true }); clients.push(childClient(lane, 'hang')); }
+  const requests = clients.map((_, i) => executeCommand(`lane_${i}`));
+  const acks = await Promise.all(clients.map((c, i) => c.request(requests[i])));
+  assert.ok(acks.every(a => a.ok === true));
+  await Promise.all(clients.map(c => c.wait(m => m.type === 'sdk_event' && m.rawEvent?.type === 'thread.started')));
+  const invocations = await Promise.all(lanePaths.map(async (lane, i) => JSON.parse(await fs.readFile(path.join(lane, `lane_${i}`, 'fixture-invocation.json'), 'utf8'))));
+  assert.equal(new Set(invocations.map(v => v.pid)).size, 3);
+  for (let i = 0; i < 3; i++) {
+    const receipt = await clients[i].request(command('observe', `lane_${i}`));
+    assert.equal(receipt.ok, true);
+    assert.equal(receipt.result.attemptId, `lane_${i}`);
+    assert.equal(receipt.result.state, 'running');
+    const second = await clients[i].request(executeCommand(`duplicate_lane_${i}`));
+    assert.equal(second.error.code, 'WORKER_OCCUPIED');
+  }
+  const conflicting = new OfficialSdkBridge({ stateDirectory: lanePaths[0], offlineFixture: offlineFixture('happy') });
+  await assert.rejects(conflicting.initialize(), { code: 'WORKER_LOCKED' });
+  await Promise.all(clients.map(c => c.request(command('shutdown'))));
+  await Promise.all(clients.map(c => c.exited));
+  for (let i = 0; i < 3; i++) {
+    const reopened = new OfficialSdkBridge({ stateDirectory: lanePaths[i], offlineFixture: offlineFixture('happy') });
+    await reopened.initialize();
+    assert.equal(reopened.observe(`lane_${i}`).state, 'submission_unknown');
+    await assert.rejects(reopened.handle(executeCommand(`replacement_${i}`)), { code: 'WORKER_OCCUPIED' });
+    await reopened.disconnect();
+  }
+});
+
+test('three completed foundation lane receipts replay locally without a second SDK invocation', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'director-sdk-lane-results-'));
+  const lanes = [0, 1, 2].map(i => path.join(root, 'sdk-worker-trials', 'b'.repeat(64), `lane-${i}`));
+  const clients = [];
+  t.after(async () => { for (const c of clients) { c.child.kill(); await c.exited; } await fs.rm(root, { recursive: true, force: true }); });
+  for (const lane of lanes) { await fs.mkdir(lane, { recursive: true }); clients.push(childClient(lane, 'happy')); }
+  await Promise.all(clients.map((c, i) => c.request(executeCommand(`completed_lane_${i}`))));
+  const results = await Promise.all(clients.map(c => c.wait(m => m.type === 'observation')));
+  assert.ok(results.every(r => r.state === 'transport_completed' && r.rawResult.parsedJson.ok === true));
+  await Promise.all(clients.map(c => c.request(command('shutdown'))));
+  await Promise.all(clients.map(c => c.exited));
+  for (let i = 0; i < 3; i++) {
+    const capture = path.join(lanes[i], `completed_lane_${i}`, 'fixture-invocation.json');
+    const before = await fs.readFile(capture);
+    const restarted = new OfficialSdkBridge({ stateDirectory: lanes[i], offlineFixture: offlineFixture('happy') });
+    await restarted.initialize();
+    assert.equal(restarted.observe(`completed_lane_${i}`).state, 'transport_completed');
+    await assert.rejects(restarted.handle(executeCommand(`completed_lane_${i}`)), { code: 'ATTEMPT_EXISTS' });
+    assert.deepEqual(await fs.readFile(capture), before);
+    await restarted.disconnect();
+  }
+});
+
 test('cancel after runtime starts is bounded even when synthetic child ignores SIGTERM', async t => {
   const { bridge, events } = await fixture(t, 'ignore-abort', { limits: { cancelMs: 100 } });
   await bridge.handle(executeCommand());

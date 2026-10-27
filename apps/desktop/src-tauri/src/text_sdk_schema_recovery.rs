@@ -86,7 +86,7 @@ pub(crate) fn schema_recovery_record_bound(dir: &Path, record: &Value, effective
         && plan["compiledSchemaSha256"]==original["compiledSchemaSha256"])
 }
 pub(crate) fn schema_recovered_receipt_bound(root: &Path, attempt: &FrozenAttempt, saved: &Value) -> Result<()> {
-    historical_receipt(root,attempt)?;let dir=root.join("sdk-worker").join(&attempt.attempt_id);let record=read(&dir.join("receipt.json"))?;
+    historical_receipt(root,attempt)?;let dir=worker_root(root,&attempt.request)?.join(&attempt.attempt_id);let record=read(&dir.join("receipt.json"))?;
     if record["schemaPreparationRecovery"]!=json!({"proof":saved["proof"],"effectiveIdentity":saved["effectiveIdentity"]})
         || !schema_recovery_record_bound(&dir,&record,&saved["effectiveIdentity"])? {return Err(HELD.into());}Ok(())
 }
@@ -119,7 +119,7 @@ pub(crate) fn schema_preparation_evidence(root: &Path, attempt: &FrozenAttempt, 
     let historical=historical_receipt(root,attempt)?;
     if attempt.state!=AttemptState::SubmissionUnknown || attempt.last_sequence!=1 || attempt.thread_id.is_some()
         || attempt.turn_id.is_some() || attempt.raw_result.is_some() || attempt.runtime_identity["bridgeSha256"]!=SCHEMA_FAILED_BRIDGE_SHA {return Err(format!("{HELD} [attempt-state]"));}
-    let worker=root.join("sdk-worker");let dir=worker.join(&attempt.attempt_id);let runtime=dir.join("native-runtime");
+    let worker=worker_root(root,&attempt.request)?;let dir=worker.join(&attempt.attempt_id);let runtime=dir.join("native-runtime");
     let meta=std::fs::symlink_metadata(&worker).map_err(|_|HELD)?;
     if !meta.is_dir() || meta.is_symlink() || !absent(&worker.join("worker.lock")) || !absent(&worker.join("worker.lock.recovery")) {return Err(format!("{HELD} [worker-owner]"));}
     directory(&dir,&["receipt.json","native-runtime"])?;

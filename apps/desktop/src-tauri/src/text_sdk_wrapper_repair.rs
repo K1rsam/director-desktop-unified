@@ -60,8 +60,8 @@ fn failed_identity(identity:&Value)->bool {
 }
 pub(crate) fn wrapper_preparation_evidence(root:&Path, attempt:&FrozenAttempt, previous:&Value, events:&Value)->Result<Value> {
     historical_receipt(root,attempt)?;
-    let dir=root.join("sdk-worker").join(&attempt.attempt_id);let runtime=dir.join("native-runtime");
-    let worker=root.join("sdk-worker");
+    let dir=worker_root(root,&attempt.request)?.join(&attempt.attempt_id);let runtime=dir.join("native-runtime");
+    let worker=worker_root(root,&attempt.request)?;
     for p in [&worker,&dir] {let m=std::fs::symlink_metadata(p).map_err(|_|HELD)?;if !m.is_dir()||m.is_symlink(){return Err(HELD.into());}}
     for p in [worker.join("worker.lock.recovery"),dir.join("events.ndjson"),runtime.join("process-receipt.json"),dir.join("wrapper-preparation-repair.json"),dir.join("wrapper-preparation-original.json"),dir.join("native-runtime-wrapper-repair")] {if !absent(&p){return Err(HELD.into());}}
     let worker_lock=worker_lock_evidence(&worker)?;
@@ -126,7 +126,7 @@ pub(crate) fn wrapper_repair_record_bound(dir:&Path, record:&Value, effective:&V
             .iter().all(|key|old[key]==record[key]))
 }
 pub(crate) fn repaired_receipt_bound(root:&Path, attempt:&FrozenAttempt, saved:&Value)->Result<()> {
-    let dir=root.join("sdk-worker").join(&attempt.attempt_id);let record=read(&dir.join("receipt.json"))?;
+    let dir=worker_root(root,&attempt.request)?.join(&attempt.attempt_id);let record=read(&dir.join("receipt.json"))?;
     if record["wrapperPreparationRepair"]!=json!({"proof":saved["proof"],"effectiveIdentity":saved["effectiveIdentity"]})
         || !wrapper_repair_record_bound(&dir,&record,&saved["effectiveIdentity"])? {return Err(HELD.into());}Ok(())
 }

@@ -96,7 +96,7 @@ impl SavedTextExecutor {
             return self.sdk_repair_wrapper_preparation(request,snapshot,job,original,&saved).await.map(Some);
         }
         crate::text_sdk::verify_local_recovery_bytes(&snapshot["executorIdentity"],&saved["effectiveIdentity"],&saved["resourceHashes"])?;
-        let config=crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?;
+        let config=crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?.for_request(&self.store.root,request)?;
         let transport=self.sdk_transport(config,id);
         // A reserved intent never dispatches again, including a crash before
         // the RPC. It may only recover an already durable original result.
@@ -134,7 +134,7 @@ impl SavedTextExecutor {
             tx.commit().map_err(|e|e.to_string())?;first=true;saved
         };
         crate::text_sdk::verify_local_recovery_bytes(&snapshot["executorIdentity"],&saved["effectiveIdentity"],&saved["resourceHashes"])?;
-        let transport=self.sdk_transport(crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?,id);
+        let transport=self.sdk_transport(crate::text_sdk::Config::from_frozen_identity(&self.settings,&saved["effectiveIdentity"],&self.store.root)?.for_request(&self.store.root,request)?,id);
         let observed=if first{transport.recover_local_preparation(original,&saved["proof"]).await}else{transport.reconcile(original).await};
         transport.close().await?;let observed=observed?;if observed.kind!=ObservationKind::Completed{return Err(HELD.into());}
         let file=self.store.root.join("text-runs").join(id).join("sdk-attempt.json");let mut attempt=FrozenAttempt::load(&file)?;

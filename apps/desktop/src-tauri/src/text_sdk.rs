@@ -409,7 +409,38 @@ pub(crate) struct Config {
     identity: Value,
     input_frame_recovery:Option<crate::text_executor::VerifiedInputFrameRecovery>,
 }
+/// New foundation lanes have separate worker locks and journals. Historical
+/// requests without the frozen marker retain their exact original directory.
+pub(crate) fn worker_root(root:&Path,request:&crate::pipeline::TextRequest)->Result<PathBuf> {
+    let Some(marker)=request.input.get("foundationParallelTrial") else{return Ok(root.join("sdk-worker"))};
+    let hash=s(marker,"authorizationSha256");
+    let lane=marker["laneId"].as_u64().filter(|n|*n<=2).ok_or("SDK_PARALLEL_WORKER_SCOPE")?;
+    if marker["version"]!="foundation-three-lane-trial/v1" || marker["concurrency"]!=3
+        || hash.len()!=64 || !hash.bytes().all(|b|b.is_ascii_hexdigit())
+        || !matches!(request.stage.as_str(),"foundation:F2"|"foundation:Q1") {
+        return Err("SDK_PARALLEL_WORKER_SCOPE".into());
+    }
+    let base=root.join("sdk-worker-trials");let authorization=base.join(hash);let lane=authorization.join(format!("lane-{lane}"));
+    for path in [&base,&authorization,&lane] {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta)=>{
+                #[cfg(windows)]
+                let reparse={use std::os::windows::fs::MetadataExt;meta.file_attributes()&0x400!=0};
+                #[cfg(not(windows))]
+                let reparse=false;
+                if !meta.is_dir() || meta.file_type().is_symlink() || reparse{return Err("SDK_PARALLEL_WORKER_SCOPE".into());}
+            },
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>(),
+            Err(e)=>return Err(e.to_string()),
+        }
+    }
+    Ok(lane)
+}
 impl Config {
+    pub(crate) fn for_request(mut self,root:&Path,request:&crate::pipeline::TextRequest)->Result<Self> {
+        self.state=worker_root(root,request)?;
+        Ok(self)
+    }
     pub(crate) fn from_verified_input_frame_recovery(
         settings:&Value,root:&Path,permit:crate::text_executor::VerifiedInputFrameRecovery,
     )->Result<Self> {
@@ -419,6 +450,10 @@ impl Config {
     }
     fn verify_attempt_scope(&self,attempt:&FrozenAttempt)->Result<()> {
         if let Some(permit)=&self.input_frame_recovery {permit.verify_attempt(attempt)?;}
+        if let Some(marker)=attempt.request.input.get("foundationParallelTrial") {
+            let scope=self.state.parent().and_then(Path::parent).and_then(Path::parent).ok_or("SDK_PARALLEL_WORKER_SCOPE")?;
+            if worker_root(scope,&attempt.request)?!=self.state || marker["workflowId"]!=attempt.workflow_id {return Err("SDK_PARALLEL_WORKER_SCOPE".into());}
+        }
         Ok(())
     }
     pub(crate) fn from_frozen_identity(

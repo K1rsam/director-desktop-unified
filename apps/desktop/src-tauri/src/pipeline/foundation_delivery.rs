@@ -4,6 +4,9 @@ use super::*;
 use serde_json::Map;
 use std::collections::BTreeSet;
 
+#[path = "foundation_parallel.rs"]
+pub(crate) mod parallel;
+
 pub const METHOD_VERSION: &str = "foundation-delivery/v2";
 // Original defaults: project-foundation-contracts.ts, foundation-fragments.ts,
 // and project-foundation.ts. These are application UTF-16 budgets, not model tokens.
@@ -1258,6 +1261,7 @@ fn input_for(
         let guide = input["transportInstructions"].as_str().unwrap_or("").to_owned();
         input["transportInstructions"] = json!(format!("{guide} jointSpeakers是程序根据原文明确人物名单识别的共同说者：speaker完整保留原标签，speakers各text与range是分别登记的原文成员，不是一个新人物、群像资产或互为别名。按每个成员分别识别并沿用正式身份、适用形象及历史资料，不按连接标签创建或合并资产；共同的一句原话保持一次，不按成员人数复制。"));
     }
+    parallel::attach_input(stage, &mut input, context, foundation);
     if context["foundationModelInputProfile"] != super::foundation_wire::PROFILE {
         return input; // Frozen tasks and accepted cache retain their original wire.
     }
@@ -5555,6 +5559,9 @@ pub async fn run_foundation_delivery(
     model: &str,
     reasoning: &str,
 ) -> Result<FoundationProposal, String> {
+    if !context["foundationParallelTrial"].is_null() {
+        return parallel::run(source, context, executor, model, reasoning).await;
+    }
     let source = upgrade_source_dialogues(source)?;
     validate_source(&source)?;
     let (selected, mut foundation, resolved) = delivery_basis(&source, context)?;

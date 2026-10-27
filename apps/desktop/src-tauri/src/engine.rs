@@ -3494,6 +3494,10 @@ impl Engine {
             SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
                 .authorize_series_supply_correction(authorization)?;
         }
+        if let Some(authorization)=request.get("foundationParallelTrial") {
+            if s(request,"action")!="workflows.resume" {return Err("三路试用只能从原制作基础流程继续".into());}
+            crate::foundation_trial_store::authorize(&store,id,authorization)?;
+        }
         if let Some(authorization)=request.get("controllerReviewSupplement") {
             SavedTextExecutor{store:store.clone(),settings:snapshot["input"]["settings"].clone(),workflow_id:Some(id.to_owned())}
                 .authorize_series_controller_review(authorization)?;
@@ -3573,6 +3577,7 @@ impl Engine {
                     let source:pipeline::LockedSource=serde_json::from_value(input["source"].clone()).map_err(|e|e.to_string())?;
                     let mut context=json!({"foundation":input["foundation"],"assets":input["assets"],"selection":input["selection"],"foundationModelInputProfile":input["foundationModelInputProfile"],"foundationPhase":input["foundationPhase"],"confirmedDecisions":input["confirmedDecisions"],"projectId":input["projectId"],"sourceVersion":input["sourceVersion"],"foundationDecisionPolicy":input["foundationDecisionPolicy"],"automaticDecisions":input["automaticDecisions"],"userReviewRequirements":input["userReviewRequirements"],"settings":{"confirmedDirection":input["foundation"]["productionDirection"]}});
                     pipeline::asset_coverage::inherit(&mut context, &input)?;
+                    crate::foundation_trial_store::attach(&store,&run,&snapshot,&mut context)?;
                     let (mut proposal,applied)=if input["foundationPhase"]=="APPLY_DECISION" {
                         if snapshot["foundationMethod"]!=pipeline::foundation_delivery::METHOD_VERSION {return Err("制作选择采用流程版本无效，未重新提取F2".into())}
                         pipeline::foundation_delivery::run_foundation_choice_application(&source,&context,&exec,model,reasoning).await?

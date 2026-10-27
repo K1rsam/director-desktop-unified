@@ -5146,6 +5146,9 @@ pub(crate) fn spawn_cli_child(
 }
 #[async_trait::async_trait]
 impl TextExecutor for SavedTextExecutor {
+    async fn foundation_parallel_receipt_time(&self,input:&Value)->Result<String> {
+        crate::foundation_trial_store::receipt_time(&self.store,self.workflow_id.as_deref().ok_or("FOUNDATION_PARALLEL_RECEIPT_WORKFLOW")?,input)
+    }
     async fn series_supply_correction_context(&self, origin:&TextRequest, origin_raw:&Value)->Result<Option<Value>> {
         self.saved_series_supply_correction_context(origin,origin_raw)
     }
@@ -8192,6 +8195,7 @@ impl SavedTextExecutor {
 }
 
 fn validate_model_input_profile(request: &TextRequest) -> Result<()> {
+    foundation_parallel::validate_markers(request)?;
     let Some(profile) = request.input.get("modelInputProfile") else {
         return Ok(());
     };
@@ -8552,7 +8556,12 @@ fn restore_optional_fields(value: &mut Value, schema: &Value) {
     }
 }
 fn step_key(request: &TextRequest) -> String {
-    let key = base_step_key(request);
+    let mut key = base_step_key(request);
+    for field in ["foundationParallelTrial","foundationParallelRebase","foundationParallelFinal"] {
+        if let Some(marker)=request.input.get(field) {
+            key.push_str(&format!(":{field}:{}",crate::pipeline::digest(&marker.to_string())));
+        }
+    }
     if request.stage=="storyboardPlan" && request.input["planRepair"]["version"]=="rejected-plan-repair/v1" {
         return format!("{key}:plan-repair:{}",crate::pipeline::digest(&request.input["planRepair"].to_string()));
     }
@@ -11775,6 +11784,8 @@ mod visual_fact_recovery_tests {
 // SDK is a transport branch of this executor. Jobs, workflow checkpoints, raw
 // evidence, domain callbacks and the global four-slot semaphore remain shared.
 static SDK_DISPATCH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+#[path = "text_executor_foundation_parallel.rs"]
+mod foundation_parallel;
 const SDK_PRE_DISPATCH_POLICY: &str = "sdk-pre-dispatch-queued/v1";
 const SDK_PRE_DISPATCH_HELD: &str = "SDK_PRE_DISPATCH_HELD: 原排队节点缺少完整零派发和原流程绑定证明；保留原请求及文件，不重发或追认";
 
@@ -11782,7 +11793,7 @@ const SDK_PRE_DISPATCH_HELD: &str = "SDK_PRE_DISPATCH_HELD: 原排队节点缺�
 #[path = "text_executor_sdk_predispatch_tests.rs"]
 mod sdk_predispatch_tests;
 
-fn sdk_pre_dispatch_artifacts(root: &Path, job: &str) -> Result<Value> {
+fn sdk_pre_dispatch_artifacts(root: &Path, job: &str, request:&TextRequest) -> Result<Value> {
     if uuid::Uuid::parse_str(job).is_err() {return Err(SDK_PRE_DISPATCH_HELD.into());}
     fn metadata(path:&Path)->Result<Option<std::fs::Metadata>> {
         let meta=match std::fs::symlink_metadata(path) {
@@ -11798,10 +11809,11 @@ fn sdk_pre_dispatch_artifacts(root: &Path, job: &str) -> Result<Value> {
         Ok(Some(meta))
     }
     // Inspect shared roots without reading an unrelated control worker/lock.
-    for parent in [root.join("text-runs"),root.join("sdk-worker")] {
+    let worker=crate::text_sdk::worker_root(root,request)?;
+    for parent in [root.join("text-runs"),worker.clone()] {
         if metadata(&parent)?.is_some_and(|meta|!meta.is_dir()) {return Err(SDK_PRE_DISPATCH_HELD.into());}
     }
-    if metadata(&root.join("sdk-worker").join(job))?.is_some() {
+    if metadata(&worker.join(job))?.is_some() {
         return Err(SDK_PRE_DISPATCH_HELD.into());
     }
     let directory=root.join("text-runs").join(job);
@@ -11865,7 +11877,7 @@ impl SavedTextExecutor {
         let binding=self.sdk_pre_dispatch_binding(request,snapshot,c)?;
         let exact:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind='text' AND provider='codex_sdk' AND state='queued' AND snapshot=?2 AND prepared IS NULL AND receipt IS NULL AND result IS NULL AND task_id IS NULL AND error IS NULL) AND (SELECT COUNT(*) FROM jobs WHERE kind='text' AND provider='codex_sdk' AND snapshot=?2)=1 AND (SELECT COUNT(*) FROM workflow_steps WHERE text_job_id=?1)=1 AND EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?3 AND node_key=?4 AND stage=?5 AND request_hash=?6 AND state='queued' AND text_job_id=?1 AND result IS NULL AND error IS NULL) AND (SELECT COUNT(*) FROM events WHERE job_id=?1)=1 AND EXISTS(SELECT 1 FROM events WHERE job_id=?1 AND type='sdk_pre_dispatch_queued' AND data=?7)",params![job,snapshot.to_string(),self.workflow_id,step_key(request),request.stage,crate::pipeline::digest(&snapshot.to_string()),binding.to_string()],|r|r.get(0)).map_err(|e|e.to_string())?;
         if !exact{return Err(SDK_PRE_DISPATCH_HELD.into());}
-        Ok(json!({"binding":binding,"compiledArtifacts":sdk_pre_dispatch_artifacts(&self.store.root,job)?}))
+        Ok(json!({"binding":binding,"compiledArtifacts":sdk_pre_dispatch_artifacts(&self.store.root,job,request)?}))
     }
 
     /// This CAS is the dispatch boundary for both a fresh node and a strictly
@@ -11989,6 +12001,7 @@ impl SavedTextExecutor {
     /// bounded synchronous worklist; it must not recursively replay the chain.
     fn sdk_raw_local(&self, job: &Value, snapshot: &Value) -> Result<Value> {
         use crate::text_transport::{AttemptState, FrozenAttempt};
+        self.sdk_parallel_worker_bound(job,snapshot)?;
         self.sdk_local_recovery_bound(job)?;
         self.sdk_schema_recovery_bound(job)?;
         self.sdk_input_envelope_bound(job,snapshot)?;
@@ -12111,10 +12124,12 @@ impl SavedTextExecutor {
     }
     async fn sdk_execute(&self, request: &TextRequest, snapshot: &Value) -> Result<Value> {
         use crate::text_transport::{AttemptState, Backend, FrozenAttempt, TextTransport};
-        let _serial = SDK_DISPATCH
+        let parallel_slot=foundation_parallel::slot(request).await?;
+        let mut serial = Some(SDK_DISPATCH
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
-            .await;
+            .await);
+        let parallel_lease=self.foundation_parallel_lease(request,parallel_slot)?;
         self.sdk_parent_binding()?;
         self.sdk_request_policy(request)?;
         self.sdk_checkpoint_binding(request, snapshot)?;
@@ -12123,6 +12138,7 @@ impl SavedTextExecutor {
         self.sdk_checkpoint_binding(request, snapshot)?;
         let mut queued_preparation=None;
         if let Some(job) = self.sdk_find(snapshot)? {
+            self.sdk_parallel_worker_bound(&job,snapshot)?;
             if job["receipt"]["transportValidation"] == "schema_rejected" {
                 return Err("SDK_SCHEMA_REJECTED: 原请求被格式校验明确拒绝；当前没有可用的一次性格式修正，不自动重发".into());
             }
@@ -12172,7 +12188,7 @@ impl SavedTextExecutor {
             }
             let config = crate::text_sdk::Config::from_frozen_identity(
                 &self.settings, &snapshot["executorIdentity"], &self.store.root,
-            )?;
+            )?.for_request(&self.store.root,request)?;
             let transport = self.sdk_transport(config, s(&job, "id"));
             let observation = transport.reconcile(&original).await;
             transport.close().await?;
@@ -12200,7 +12216,7 @@ impl SavedTextExecutor {
             return self.sdk_receive(request, snapshot, s(&job, "id"), &attempt);
             }
         }
-        self.check_sdk_unresolved_hold()?;
+        self.check_sdk_parallel_hold(request,&parallel_lease)?;
         check_cli_unknown_hold(&self.store)?;
         let new_node_snapshot = if queued_preparation.is_some(){snapshot.clone()} else {self.sdk_new_node_snapshot(request, snapshot).await?};
         let snapshot = &new_node_snapshot;
@@ -12215,7 +12231,7 @@ impl SavedTextExecutor {
         }
         let config = crate::text_sdk::Config::from_frozen_identity(
             &self.settings, &snapshot["executorIdentity"], &self.store.root,
-        )?;
+        )?.for_request(&self.store.root,request)?;
         let mut compiled = compile_codex_input(request)?;
         let mut transport =
             crate::text_sdk::OfficialSdkTransport::new(config, Arc::new(|_, _| Ok(())));
@@ -12245,7 +12261,7 @@ impl SavedTextExecutor {
             .await
             .map_err(|e| e.to_string())?;
         children().check_open()?;
-        self.check_sdk_unresolved_hold()?;
+        self.check_sdk_parallel_hold(request,&parallel_lease)?;
         let handed_off = snapshot.get("sdkSupervisorHandoff").is_some();
         let resumed=queued_preparation.is_some();
         let bound_preparation=!handed_off&&self.workflow_id.is_some();
@@ -12286,6 +12302,12 @@ impl SavedTextExecutor {
             if existing!=compiled_value{return Err(SDK_PRE_DISPATCH_HELD.into());}
         } else {crate::store::atomic_json(&dir.join("sdk-compiled.json"),&compiled_value)?;}
         let mut prepared = json!({"sdkRequestHash":hash,"sdkAttemptId":job,"sdkDispatchStarted":true,"sdkOriginWorkflowId":self.workflow_id,"compiledPromptSha256":crate::pipeline::digest(&compiled.prompt),"compiledSchemaSha256":crate::pipeline::digest(&compiled.schema)});
+        if parallel_lease.is_some() {
+            prepared["sdkWorkerScope"]=json!({"version":"foundation-sdk-lane-worker/v1",
+                "authorizationSha256":request.input["foundationParallelTrial"]["authorizationSha256"],
+                "laneId":request.input["foundationParallelTrial"]["laneId"],
+                "workerRoot":crate::text_sdk::worker_root(&self.store.root,request)?});
+        }
         if let Some(envelope)=input_envelope {prepared["sdkInputEnvelope"]=envelope;}
         if handed_off {
             prepared["sdkSupervisorHandoff"] = snapshot["sdkSupervisorHandoff"].clone();
@@ -12311,7 +12333,11 @@ impl SavedTextExecutor {
         let frozen = attempt.clone();
         attempt.begin_dispatch(Backend::CodexSdk)?;
         attempt.persist(&dir.join("sdk-attempt.json"))?;
+        self.foundation_parallel_bind(&parallel_lease,&job)?;
         transport.set_observer(self.sdk_observer(&job));
+        // Only explicitly authorized lanes release the global dispatch lock.
+        // Their same-lane lease and three-slot permit live through completion.
+        if parallel_lease.is_some(){drop(serial.take());}
         let result = transport.execute(&frozen).await;
         if let Err(error) = transport.close().await {
             self.sdk_unknown(&job, request, &hash, &error)?;

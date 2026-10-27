@@ -72,7 +72,7 @@ impl SavedTextExecutor {
         let id=s(job,"id");let run=self.workflow_id.as_deref().ok_or(HELD)?;
         if uuid::Uuid::parse_str(id).is_err() || job["status"]!="submission_unknown" || job["error"]!="SDK_FRAME_LIMIT"
             || !job["receipt"].is_null() || !job["result"].is_null() || job["snapshot"]!=*snapshot
-            || original.attempt_id!=id || original.workflow_id!=run || !absent(&self.store.root.join("sdk-worker").join(id)) {return Err(HELD.into());}
+            || original.attempt_id!=id || original.workflow_id!=run || !absent(&crate::text_sdk::worker_root(&self.store.root,request)?.join(id)) {return Err(HELD.into());}
         self.sdk_parent_binding()?;self.sdk_checkpoint_binding(request,snapshot)?;self.sdk_schema_job_bound(job,snapshot)?;
         if !step(&self.store.conn()?,run,&step_key(request),id,&hash(snapshot))?{return Err(HELD.into());}
         let parent=self.store.job(run)?;let rows=events(&self.store.conn()?,id)?;
@@ -124,7 +124,7 @@ impl SavedTextExecutor {
     fn reserve_sdk_input_frame(&self,request:&TextRequest,snapshot:&Value,job:&Value,original:&FrozenAttempt,evidence:&Value)->Result<()> {
         use std::io::Write;
         let id=s(job,"id");let run=self.workflow_id.as_deref().ok_or(HELD)?;
-        if !absent(&self.store.root.join("sdk-worker/worker.lock")) || !absent(&self.store.root.join("sdk-worker/worker.lock.recovery")) {
+        if !absent(&crate::text_sdk::worker_root(&self.store.root,request)?.join("worker.lock")) || !absent(&crate::text_sdk::worker_root(&self.store.root,request)?.join("worker.lock.recovery")) {
             return Err("SDK_INPUT_FRAME_PROBE_STILL_OWNS_LOCK: 本地能力探测尚未释放工作目录；未预约或派发".into());
         }
         let mut c=self.store.conn()?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
@@ -149,7 +149,7 @@ impl SavedTextExecutor {
         let evidence=match &prior {Some(value)=>value.clone(),None=>self.sdk_frame_recovery_evidence(request,snapshot,job,original)?};
         let archived=if prior.is_some(){FrozenAttempt::load(&self.store.root.join("text-runs").join(id).join("sdk-input-frame-original.json"))?}else{original.clone()};
         let permit=VerifiedInputFrameRecovery{frozen:input_attempt(&archived)?};permit.verify_attempt(original)?;
-        let config=crate::text_sdk::Config::from_verified_input_frame_recovery(&self.settings,&self.store.root,permit)?;
+        let config=crate::text_sdk::Config::from_verified_input_frame_recovery(&self.settings,&self.store.root,permit)?.for_request(&self.store.root,request)?;
         let mut transport=crate::text_sdk::OfficialSdkTransport::new(config,Arc::new(|_,_|Ok(())));
         let observed=if prior.is_some() {
             transport.set_observer(self.sdk_observer(id));transport.reconcile(original).await

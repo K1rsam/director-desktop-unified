@@ -23,8 +23,8 @@ fn bounded(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|_| HELD.into())
 }
 pub(crate) fn recovered_receipt_bound(root: &Path, attempt: &FrozenAttempt, saved: &Value) -> Result<()> {
-    let dir=root.join("sdk-worker").join(&attempt.attempt_id);
-    for path in [root.join("sdk-worker"),dir.clone()] {
+    let dir=worker_root(root,&attempt.request)?.join(&attempt.attempt_id);
+    for path in [worker_root(root,&attempt.request)?,dir.clone()] {
         let meta=std::fs::symlink_metadata(path).map_err(|_|HELD)?;
         if !meta.is_dir() || meta.is_symlink(){return Err(HELD.into());}
     }
@@ -46,7 +46,7 @@ pub(crate) fn local_preparation_evidence(root: &Path, original: &FrozenAttempt, 
     if original.state != AttemptState::SubmissionUnknown || original.last_sequence > 1
         || original.thread_id.is_some() || original.turn_id.is_some() || original.raw_result.is_some()
         || original.runtime_identity["bridgeSha256"] != LOCAL_PATH_BRIDGE_SHA { return Err(HELD.into()); }
-    let worker = root.join("sdk-worker"); let dir = worker.join(&original.attempt_id);
+    let worker = worker_root(root,&original.request)?; let dir = worker.join(&original.attempt_id);
     for path in [&worker, &dir] {
         let meta = std::fs::symlink_metadata(path).map_err(|_| HELD)?;
         if !meta.is_dir() || meta.is_symlink() { return Err(HELD.into()); }

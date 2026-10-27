@@ -137,7 +137,7 @@ impl SavedTextExecutor {
         let Some(run)=self.workflow_id.as_deref() else{return Ok(None);};
         let Some(original)=self.sdk_find(snapshot)? else{return Ok(None);};
         if !["submission_unknown","rejected"].contains(&s(&original,"status")) || !original["result"].is_null(){return Ok(None);}
-        let file=self.store.root.join("sdk-worker").join(s(&original,"id")).join("receipt.json");
+        let file=crate::text_sdk::worker_root(&self.store.root,request)?.join(s(&original,"id")).join("receipt.json");
         let metadata=std::fs::symlink_metadata(&file).map_err(|_|HELD)?;
         if !metadata.is_file()||metadata.is_symlink()||metadata.len()>4_194_304{return Err(HELD.into());}
         let record:Value=serde_json::from_slice(&std::fs::read(file).map_err(|_|HELD)?).map_err(|_|HELD)?;
@@ -291,7 +291,8 @@ impl SavedTextExecutor {
     }
     pub(super) fn sdk_schema_current_account_allocation_bound(&self,snapshot:&Value)->Result<()> {
         if snapshot[CONTINUE]["version"]!=ACCOUNT_CONTINUATION {return Ok(());}
-        self.check_sdk_unresolved_hold()?;
+        let request:TextRequest=serde_json::from_value(snapshot.clone()).map_err(|_|HELD)?;
+        self.check_sdk_request_hold(&request)?;
         self.sdk_schema_continuation_bound(snapshot)?;
         // Preparation and dispatch check installed bytes. This allocation guard
         // rebinds only the local immutable proof; it adds no third account probe.
@@ -330,7 +331,7 @@ impl SavedTextExecutor {
         if occupied{return Err(HELD.into());}
         if domain(original)?!=self.request_domain_snapshot(request)? {return Err(HELD.into());}
         let anchor=self.sdk_schema_anchor_for(&job,Some(request))?;
-        self.check_sdk_unresolved_hold()?;
+        self.check_sdk_request_hold(request)?;
         // After verified completion (or exact bounded domain rejection), the
         // successor's frozen package is the runtime reference. Do not require
         // the mutable pre-upgrade source
@@ -489,10 +490,19 @@ mod tests {
         let mut request=TextRequest{stage:"seriesAuthor".into(),skill:"series-author".into(),model:"gpt-6.1-sol".into(),reasoning:"medium".into(),
             input:json!({"workflowProfile":crate::asset_graph::PROFILE,"sourceSha256":"synthetic-source","episodeId":"e1","executionRoleId":"e1/author/0","role":"author","task":"complete author","freshContext":true,"fantasyMode":"off","packet":{"sourceSha256":"synthetic-source","sourceRows":["原文不变"],"assets":[{"id":"a","full":"完整设计"}]}}),
             schema:json!({"type":"object","properties":{"assets":{"type":"array","items":{"type":"string"},"uniqueItems":true}}}),rule_snapshot:rules["originRules"].clone()};
-        let(temp,executor,request,original,next)=if pooled {
+        // Mirror the actual frozen rule identity rather than relying on the
+        // installed default when a rejected request later enters domain repair.
+        let mut parent_input=json!({"workflowProfile":crate::asset_graph::PROFILE,"source":{"sha256":"synthetic-source"}});
+        for (field,pack_field) in [("seriesSkillVersion","skillVersion"),("seriesRulePackSha256","packSha256")] {
+            request.input[field]=request.rule_snapshot["creativePack"][pack_field].clone();
+            parent_input[field]=request.input[field].clone();
+        }
+        assert_eq!(crate::pipeline::series::rule_pack_hash(&request.input).unwrap(),s(&request.rule_snapshot["creativePack"],"packSha256"));
+        if pooled {
             request.input["seriesRuleMaterialization"]=json!("series-rule-content-once/v1");
-            fixture_request_input(request,Some(json!({"workflowProfile":crate::asset_graph::PROFILE,"source":{"sha256":"synthetic-source"},"seriesRuleMaterialization":"series-rule-content-once/v1"})))
-        }else{fixture_request(request)};
+            parent_input["seriesRuleMaterialization"]=request.input["seriesRuleMaterialization"].clone();
+        }
+        let(temp,executor,request,original,next)=fixture_request_input(request,Some(parent_input));
         let job=executor.sdk_reserve_schema_successor_checked(&request,&original,&next,||Ok(())).unwrap();
         adopt_synthetic_successor(&executor,&request,&next,&job);
         reject_synthetic(&executor,&request,&next,&job,"SERIES_DIALOGUE_INTERVAL_OUTSIDE_SOURCE");

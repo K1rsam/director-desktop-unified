@@ -613,7 +613,43 @@ pub(crate) fn repair_rules_for(
     fantasy: bool,
 ) -> Result<Value, String> {
     validate_rule_materialization(input)?;
-    let version = rule_version(input)?;
+    // Frozen role packets already bind the complete rule pack, but earlier
+    // request projections omitted seriesSkillVersion. Resolve only that exact
+    // packet shape by both frozen hashes; never rewrite/re-key old requests or
+    // fall back to the installed default for an unknown/explicit version.
+    let version = if input.get("seriesSkillVersion").is_none()
+        && input["packet"]["version"] == ROLE_PACKET
+        && input["packet"]["rulePackSha256"] == input["seriesRulePackSha256"]
+    {
+        let packet = &input["packet"];
+        let mut fingerprint_input = packet.clone();
+        fingerprint_input.as_object_mut().ok_or("SERIES_PACKET_BINDINGS")?.remove("inputFingerprint");
+        if input["workflowProfile"] != PROFILE
+            || packet["workflowProfile"] != PROFILE
+            || ["role", "episodeId", "sourceSha256"].iter().any(|key|
+                input[*key].as_str().is_none_or(|s| s.is_empty()) || packet[*key] != input[*key])
+            || packet["inputFingerprint"] != hash(&fingerprint_input)
+            || !packet["bindings"].is_array() || !packet["blobs"].is_object()
+        {
+            return Err("SERIES_PACKET_BINDINGS".into());
+        }
+        for binding in packet["bindings"].as_array().unwrap() {
+            let key = s(binding, "blob");
+            if key.is_empty() || packet["blobs"].get(key).is_none_or(|body| hash(body) != key) {
+                return Err("SERIES_PACKET_BINDINGS".into());
+            }
+        }
+        let mut resolved = None;
+        for version in [rules::LEGACY_VERSION, rules::VERSION] {
+            if input["seriesRulePackSha256"] == rules::pack_hash_for(version)? {
+                resolved = Some(version);
+                break;
+            }
+        }
+        resolved.ok_or("SERIES_RULE_VERSION_UNSUPPORTED")?
+    } else {
+        rule_version(input)?
+    };
     let mut original = rules::role_for(version, "repair", fantasy)?;
     if origin_role != "repair" {
         original["originRules"] = rules::role_for(version, origin_role, fantasy)?;

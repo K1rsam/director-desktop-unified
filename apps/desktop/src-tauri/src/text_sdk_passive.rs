@@ -50,7 +50,7 @@ pub(crate) fn historical_receipt(root: &Path, original: &FrozenAttempt) -> Resul
         || !original.attempt_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return Err("SDK_PASSIVE_ATTEMPT_IDENTITY".into());
     }
-    let dir = root.join("sdk-worker").join(&original.attempt_id);
+    let dir = worker_root(root,&original.request)?.join(&original.attempt_id);
     let file = dir.join("receipt.json");
     let text = read(&file, 4_194_304, false)?;
     let record: Value = serde_json::from_str(&text).map_err(|_| "SDK_PASSIVE_RECEIPT_JSON")?;

@@ -76,6 +76,11 @@ pub struct TextRequest {
 #[async_trait]
 pub trait TextExecutor: Send + Sync {
     async fn execute(&self, request: TextRequest) -> Result<Value, String>;
+    /// Stable time of the saved original response, used only by new parallel Q1
+    /// checkpoints. Authorization or replay time is not a response timestamp.
+    async fn foundation_parallel_receipt_time(&self, _input: &Value) -> Result<String, String> {
+        Err("FOUNDATION_PARALLEL_RECEIPT_TIME_UNAVAILABLE".into())
+    }
     /// Recover only a proven stopped text transport. Default executors never retry.
     async fn prepare_transport_request(&self, request: TextRequest) -> Result<TextRequest, String> {
         Ok(request)

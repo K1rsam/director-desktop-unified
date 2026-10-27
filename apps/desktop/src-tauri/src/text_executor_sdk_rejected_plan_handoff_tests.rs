@@ -133,7 +133,7 @@ fn sdk_rejected_planner_handoff_readonly_firstep_copy_proves_exact_original_repa
     let origin=FrozenAttempt::load(&file).unwrap().request;let raw:Value=serde_json::from_slice(&std::fs::read(file.parent().unwrap().join("result.json")).unwrap()).unwrap();
     let repair=planner_repair_request(&source,&origin,&raw,&origin,&raw,"事件跨入另一个真实场景",1);
     let before=evidence(&executor);let original=executor.request_snapshot(&repair).unwrap();
-    no_node_or_attempt(&executor.store,&executor.store.conn().unwrap(),run,&step_key(&repair),&original).unwrap();
+    no_node_or_attempt(&executor,&executor.store.conn().unwrap(),run,&step_key(&repair),&original).unwrap();
     let (policy,prior)=executor.sdk_handoff_predecessor(&original,false).unwrap();
     assert_eq!(policy,REJECTED_PLAN_POLICY);assert_eq!(prior["jobId"],job);assert_eq!(prior.as_object().unwrap().len(),16);
     assert_eq!(evidence(&executor),before);assert_eq!(std::fs::read(&file).unwrap(),before_file);

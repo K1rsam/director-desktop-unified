@@ -105,7 +105,7 @@ pub(crate) fn schema_rejection_evidence(root: &Path, attempt: &FrozenAttempt, ev
     if !matches!(attempt.state, AttemptState::SubmissionUnknown | AttemptState::Rejected)
         || attempt.turn_id.is_some() || attempt.raw_result.is_some()
         || attempt.runtime_identity["permissionProfile"] != NATIVE_POLICY { return Err(HELD.into()); }
-    let worker = root.join("sdk-worker");
+    let worker = worker_root(root,&attempt.request)?;
     if !absent(&worker.join("worker.lock")) || !absent(&worker.join("worker.lock.recovery")) { return Err(HELD.into()); }
     let dir = worker.join(&attempt.attempt_id);
     let record_bytes = bytes(&dir.join("receipt.json"),4_194_304)?;

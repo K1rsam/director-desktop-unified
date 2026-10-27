@@ -220,12 +220,13 @@ fn first_node_absent(store: &Store, c: &rusqlite::Connection, run: &str) -> Resu
 }
 
 fn no_node_or_attempt(
-    store: &Store,
+    executor: &SavedTextExecutor,
     c: &rusqlite::Connection,
     run: &str,
     key: &str,
     snapshot: &Value,
 ) -> Result<()> {
+    let store=&executor.store;
     let occupied: bool = c
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_steps WHERE workflow_id=?1 AND node_key=?2)",
@@ -254,13 +255,8 @@ fn no_node_or_attempt(
             return Err(HELD.into());
         }
     }
-    let unresolved: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='text' AND provider='codex_sdk' AND state NOT IN ('completed','rejected') AND json_extract(prepared,'$.sdkDispatchStarted')=1)",
-        [], |r| r.get(0),
-    ).map_err(|e| e.to_string())?;
-    if unresolved {
-        return Err(HELD.into());
-    }
+    let request:TextRequest=serde_json::from_value(snapshot.clone()).map_err(|_|HELD)?;
+    executor.check_sdk_request_hold(&request)?;
     let root = store.root.join("text-runs");
     if root.exists() {
         for (index, entry) in std::fs::read_dir(root)
@@ -415,7 +411,7 @@ impl SavedTextExecutor {
             return Ok(original.clone());
         };
         no_node_or_attempt(
-            &self.store,
+            self,
             &self.store.conn()?,
             run,
             &step_key(request),
@@ -423,7 +419,7 @@ impl SavedTextExecutor {
         )?;
         self.sdk_parent_binding()?;
         self.sdk_request_policy(request)?;
-        self.check_sdk_unresolved_hold()?;
+        self.check_sdk_request_hold(request)?;
         let reference=self.sdk_current_account_reference()?;
         let mut runtime_settings=self.settings.clone();
         if let Some((previous,_))=&reference {runtime_settings["textSdkIdentity"]=previous.clone();}
@@ -488,7 +484,7 @@ impl Store {
         let tx = c
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        if proof["policy"]==ACCOUNT_POLICY { executor.check_sdk_unresolved_hold()?; }
+        if proof["policy"]==ACCOUNT_POLICY { executor.check_sdk_request_hold(request)?; }
         if !parent_bound(&tx, proof, original_settings)? {
             return Err(HELD.into());
         }
@@ -501,7 +497,7 @@ impl Store {
             if executor.sdk_local_recovery_bound(&prior)?.is_none()
                 && base_policy(&prior["snapshot"][FIELD]) != LOCAL_RECOVERY_POLICY { return Err(HELD.into()); }
         }
-        no_node_or_attempt(self, &tx, run, &key, snapshot)?;
+        no_node_or_attempt(&executor, &tx, run, &key, snapshot)?;
         if proof["policy"] == ACCOUNT_POLICY {
             let previous=executor.sdk_current_account_authorization_bound(snapshot,&proof["accountAuthorization"],base_policy(proof))?;
             crate::text_sdk::verify_current_account_handoff_bytes(&previous,&snapshot["executorIdentity"],&proof["resourceHashes"],false)?;

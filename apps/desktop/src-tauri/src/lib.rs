@@ -18,6 +18,7 @@ mod module22_discover;
 pub mod lingmo_media;
 pub mod media_probe;
 pub mod pipeline;
+pub(crate) mod foundation_trial_store;
 pub mod asset_graph;
 pub mod asset_composite;
 mod asset_identity_layout;

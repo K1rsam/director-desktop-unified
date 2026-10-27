@@ -15,6 +15,41 @@ fn current_fixture() -> (Value, Value) {
     (input, authored)
 }
 
+#[tokio::test]
+async fn sdk_frozen_role_repair_resolves_exact_pack_without_rewriting_requests() {
+    for (input, authored) in [fixture(), current_fixture()] {
+        let executor = Offline::new(authored);
+        let output = run(&input, &executor, "offline", "medium").await.unwrap();
+        assert_eq!(output["status"], "completed", "{}", output["blocked"]);
+        let calls = executor.requests.lock().unwrap();
+        let author = calls.iter().find(|r| r.stage == "seriesAuthor").unwrap();
+        assert!(author.input.get("seriesSkillVersion").is_none(), "old request shape must stay stable");
+        let before = serde_json::to_vec(author).unwrap();
+        assert_eq!(repair_rules_for(&author.input, "author", false).unwrap(), repair_rules_for(&input, "author", false).unwrap());
+        assert_eq!(serde_json::to_vec(author).unwrap(), before);
+        for (pointer, value) in [
+            ("/seriesRulePackSha256", json!("unknown")),
+            ("/packet/rulePackSha256", json!("unknown")),
+            ("/packet/version", json!("unknown")),
+            ("/packet/inputFingerprint", json!("unknown")),
+            ("/packet/role", json!("reviewer")),
+            ("/packet/sourceSha256", json!("other-source")),
+        ] {
+            let mut bad = author.input.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(repair_rules_for(&bad, "author", false).is_err(), "{pointer}");
+        }
+        let mut explicit_unknown = author.input.clone();
+        explicit_unknown["seriesSkillVersion"] = json!("future");
+        assert!(repair_rules_for(&explicit_unknown, "author", false).is_err());
+        explicit_unknown["seriesSkillVersion"] = Value::Null;
+        assert!(repair_rules_for(&explicit_unknown, "author", false).is_err());
+        let mut missing_top_level = input.clone();
+        missing_top_level.as_object_mut().unwrap().remove("seriesSkillVersion");
+        assert!(validate_profile(&missing_top_level).is_err(), "no default version for a top-level workflow");
+    }
+}
+
 #[test]
 fn baseline_requires_real_adoption_six_excerpts_exact_text_and_matching_ratio() {
     let (input, _) = current_fixture();

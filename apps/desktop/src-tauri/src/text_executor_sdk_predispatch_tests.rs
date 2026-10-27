@@ -84,7 +84,8 @@ fn sdk_pre_dispatch_all_db_dispatch_or_checkpoint_pollution_fails_closed(){
 #[test]
 fn sdk_pre_dispatch_attempt_partial_worker_or_unknown_file_blocks_preparation(){
     let temp=tempfile::tempdir().unwrap();
-    assert!(sdk_pre_dispatch_artifacts(temp.path(),"../outside").is_err());
+    let (_fixture,_executor,request,_snapshot)=fixture();
+    assert!(sdk_pre_dispatch_artifacts(temp.path(),"../outside",&request).is_err());
     for fault in ["attempt","attempt-partial","worker","result","unknown-partial"] {
         let (_temp,executor,request,snapshot)=fixture();let job=executor.sdk_allocate_pre_dispatch(&request,&snapshot).unwrap();
         let dir=executor.store.root.join("text-runs").join(&job);std::fs::create_dir_all(&dir).unwrap();

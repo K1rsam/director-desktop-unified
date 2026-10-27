@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { request } from './api';
 import { Badge, Button, messageOf, Modal } from './components';
 import { foundationCoverage } from './foundationCoverage';
+import { foundationSavedProgress } from './foundationProgress';
+import { foundationParallelResume } from './foundationTrial';
 import { record, records, words } from './stageProduction';
 import { executionSummary, selectWorkflowProgress, storyboardCompletion, storyboardNodeTitle, workflowNodeResolution } from './workflowProgressModel';
 import type { Job, Mutation, Workspace } from './types';
@@ -12,7 +14,7 @@ function foundationBatch(node: Record<string, unknown>) {
   const request = record(node.request), input = record(request.input || node.input), delivery = record(input.delivery || node.delivery);
   const value = words(request.stage) || words(node.stage);
   const phase = value === 'foundation:F2' ? 'F2' : value === 'foundation:Q1' ? 'Q1' : '';
-  return phase ? { phase, title: phase === 'F2' ? '资产整理' : '资料整编', delivery: delivery.method === 'foundation-delivery/v2' ? delivery : {}, scope: request.scope ?? node.scope ?? input.scope ?? delivery.scope } : null;
+  return phase ? { phase, title: phase === 'F2' ? '资产整理' : '整理核对', delivery: delivery.method === 'foundation-delivery/v2' ? delivery : {}, scope: request.scope ?? node.scope ?? input.scope ?? delivery.scope } : null;
 }
 function batchScope(value: unknown, workspace: Workspace): string {
   const ids = Array.isArray(value) ? [...new Set(value.filter((id): id is string => typeof id === 'string'))] : [];
@@ -36,20 +38,18 @@ function batchTitle(node: Record<string, unknown>, workspace: Workspace): string
   if (!batch) return words(node.title) || words(node.label);
   const delivery = batch.delivery, index = Number(delivery.batchIndex), count = Number(delivery.batchCount), fragment = record(delivery.fragment);
   const parts = [batch.title, batchScope(batch.scope, workspace)];
+  const input = record(record(node.request).input || node.input), parallel = record(input.parallelTrial);
+  if (parallel.version === 'foundation-three-lane-trial/v1') {
+    if (parallel.kind === 'rebase') parts.push('冲突修订');
+    else if (parallel.kind === 'final') parts.push('统一收口');
+    if (Number.isInteger(parallel.laneId) && Number(parallel.laneId) >= 0 && Number(parallel.laneId) < 3) parts.push(`通道 ${Number(parallel.laneId) + 1}`);
+  }
   if (Number.isInteger(index) && index >= 0) parts.push(`本批 ${index + 1}${Number.isInteger(count) && count > 0 ? `（当前规划 ${count} 批）` : ''}`);
   if (words(fragment.episodeId) && Number.isInteger(fragment.index) && Number(fragment.index) >= 0) {
     const fragments = Number(fragment.count);
     parts.push(`本集片段 ${Number(fragment.index) + 1}${Number.isInteger(fragments) && fragments > 0 ? `（当前规划 ${fragments} 段）` : ''}`);
   }
   return parts.join(' · ');
-}
-function foundationCompletion(nodes: Record<string, unknown>[]): string | null {
-  const batches = nodes.map(node => ({ node, batch: foundationBatch(node) })).filter(item => item.batch);
-  if (!batches.length) return null;
-  return (['F2', 'Q1'] as const).flatMap(phase => {
-    const scoped = batches.filter(item => item.batch?.phase === phase);
-    return scoped.length ? [`${scoped.filter(item => words(item.node.status) === 'accepted').length} 批${phase === 'F2' ? '资产整理' : '资料整编'}`] : [];
-  }).join(' · ');
 }
 function candidatesOf(value: unknown): Record<string, unknown>[] {
   const data = record(value), decision = record(data.waitingDecision);
@@ -68,13 +68,15 @@ export function WorkflowProgress({ workspace, stage, writable, mutate, onError }
   const [decision, setDecision] = useState<{ id: string; candidates: Record<string, unknown>[] } | null>(null), [selected, setSelected] = useState<string[]>([]), [loading, setLoading] = useState(false);
   const [clock, setClock] = useState(Date.now);
   const { progress, job, id, state, nodes, currentNodes, completed } = selectWorkflowProgress(workspace, stage);
+  const parallelContinuation = stage === 'foundation' ? foundationParallelResume(workspace, job) : null;
   const unknown = job?.submissionUnknown === true || job?.status === 'submission_unknown' || progress?.submissionUnknown === true;
   const ticking = currentNodes.some(node => words(node.status) === 'running');
   useEffect(() => { if (!ticking) return; setClock(Date.now()); const timer = window.setInterval(() => setClock(Date.now()), 1000); return () => window.clearInterval(timer); }, [id, ticking]);
   if (!job && !progress) return null;
   const coverage = foundationCoverage(workspace);
   const readFailed = !!workspace.readState?.error;
-  const batchesCompleted = stage === 'foundation' ? foundationCompletion(currentNodes) : storyboardCompletion(currentNodes);
+  const savedFoundation = foundationSavedProgress(workspace);
+  const batchesCompleted = stage === 'storyboard' ? storyboardCompletion(currentNodes) : null;
   const views = nodes.map((node, index) => { const resolution = workflowNodeResolution(node, nodes, id); return { node, resolution, title: (stage === 'foundation' ? batchTitle(node, workspace) : storyboardNodeTitle(node, workspace)) || `制作步骤 ${index + 1}`, summary: resolution ? '' : executionSummary(node, clock, readFailed) }; });
   const currentTitles = views.filter(view => !view.resolution && words(view.node.status) === 'running').map(view => view.title);
   const activeViews = views.filter(view => !view.resolution && ['running', 'queued', 'received'].includes(words(view.node.status)));
@@ -101,9 +103,11 @@ export function WorkflowProgress({ workspace, stage, writable, mutate, onError }
     if (next) setDecision(null);
   }
   return <section className="surface production-progress" aria-label="制作进度">
-    <div className="production-progress-heading"><div><strong>{stage === 'foundation' ? '制作基础进度' : '分镜文字进度'}</strong><span>{readFailed ? '上次记录：' : ''}{stage === 'foundation' ? coverage.summary + ' · ' : ''}{batchesCompleted ? `已完成 ${batchesCompleted}` : nodes.length > 0 ? `已核对 ${completed} 个步骤` : '正在读取制作步骤，已完成结果会保留。'}</span>{currentTitles.length > 0 && <span>{readFailed ? '上次执行范围：' : '当前：'}{currentTitles.join('、')}</span>}</div><Badge status={unknown ? 'submission_unknown' : stage === 'foundation' && state === 'completed' && !coverage.complete ? 'draft' : state}>{readFailed ? '上次状态：' : ''}{unknown ? '原提交待核对' : stage === 'foundation' && state === 'completed' ? coverage.complete ? '全剧已整理' : '本次范围完成 · 全剧未完成' : labels[state] || '制作状态待核对'}</Badge></div>
+    <div className="production-progress-heading"><div><strong>{stage === 'foundation' ? '制作基础进度' : '分镜文字进度'}</strong><span>{readFailed ? '上次记录：' : ''}{stage === 'foundation' ? savedFoundation.catalogue.summary : batchesCompleted ? `已完成 ${batchesCompleted}` : nodes.length > 0 ? `已核对 ${completed} 个步骤` : '正在读取制作步骤，已完成结果会保留。'}</span>{stage === 'foundation' && <span>{savedFoundation.review.summary} · {`最终采用 ${coverage.count} / ${coverage.total} 集`}</span>}{currentTitles.length > 0 && <span>{readFailed ? '上次执行范围：' : '当前：'}{currentTitles.join('、')}</span>}</div><Badge status={unknown ? 'submission_unknown' : stage === 'foundation' && state === 'completed' && !coverage.complete ? 'draft' : state}>{readFailed ? '上次状态：' : ''}{unknown ? '原提交待核对' : stage === 'foundation' && state === 'completed' ? coverage.complete ? '全剧已整理' : '本次范围完成 · 全剧未完成' : labels[state] || '制作状态待核对'}</Badge></div>
+    {stage === 'foundation' && savedFoundation.hasSaved && <p className="muted">已保存范围：{savedFoundation.recoveryLabel}。批次结果已留在原任务中，继续时按有效输入恢复；整理、核对与最终采用分别统计。</p>}
+    {stage === 'foundation' && savedFoundation.unboundBatches > 0 && <p className="muted">另有 {savedFoundation.unboundBatches} 批历史结果范围待核对，不计入当前剧本进度；原记录保留。</p>}
     {activeViews.length > 0 && <div className="production-step-list">{activeViews.map(({ node, title, summary }, index) => <div key={words(node.id) || index}><span>{title}</span><Badge status={words(node.status)}>{labels[words(node.status)] || '正在制作'}</Badge>{summary && <span className="muted">{summary}</span>}</div>)}</div>}
-    {nodes.length > 0 && <details className="details production-step-history"><summary>步骤与历史 · {nodes.length} 项记录{stage === 'storyboard' ? ` · 已发布 ${workspace.units.length} 个单元` : ''}</summary><div className="production-step-list">{views.map(({ node, title, summary, resolution }, index) => <div key={words(node.id) || index}><span>{title}</span><Badge status={resolution ? 'historical' : words(node.status)}>{readFailed ? '上次：' : ''}{resolution === 'author-scope-repair' ? '已修订 · 历史失败' : resolution === 'continuity-superseded' ? '历史分支 · 输入已变化' : resolution === 'text-transport-recovered' ? '已恢复 · 历史中断' : node.status === 'accepted' && (stage === 'storyboard' || foundationBatch(node)) ? '本批完成' : labels[words(node.status)] || '等待开始'}</Badge>{summary && <span className="muted">{summary}</span>}{resolution ? <details className="details"><summary>历史状态与原记录</summary><p className="muted">原状态：{labels[words(node.status)] || words(node.status)}。{resolution === 'author-scope-repair' ? '已由经过核验并采用的关联范围修订解决。' : resolution === 'text-transport-recovered' ? '原文本 CLI 已退出且未收到结果，经过有界恢复与正常校验后完成；原记录保留。' : '真实连续末态变化已触发新分支，后续对应步骤已核对；此记录不再属于当前范围。'}</p>{node.error != null && <p className="muted">原错误：{messageOf(node.error)}</p>}</details> : node.error != null && <p className="warning">{messageOf(node.error)}</p>}</div>)}</div></details>}
+    {nodes.length > 0 && <details className="details production-step-history"><summary>步骤与历史 · {nodes.length} 项记录{stage === 'storyboard' ? ` · 已发布 ${workspace.units.length} 个单元` : ''}</summary><div className="production-step-list">{views.map(({ node, title, summary, resolution }, index) => <div key={words(node.id) || index}><span>{title}</span><Badge status={resolution ? 'historical' : words(node.status)}>{readFailed ? '上次：' : ''}{resolution === 'author-scope-repair' ? '已修订 · 历史失败' : resolution === 'continuity-superseded' ? '历史分支 · 输入已变化' : resolution === 'text-transport-recovered' ? '已恢复 · 历史中断' : node.status === 'accepted' && foundationBatch(node) ? '本批已保存' : node.status === 'accepted' && stage === 'storyboard' ? '本批完成' : labels[words(node.status)] || '等待开始'}</Badge>{summary && <span className="muted">{summary}</span>}{resolution ? <details className="details"><summary>历史状态与原记录</summary><p className="muted">原状态：{labels[words(node.status)] || words(node.status)}。{resolution === 'author-scope-repair' ? '已由经过核验并采用的关联范围修订解决。' : resolution === 'text-transport-recovered' ? '原文本 CLI 已退出且未收到结果，经过有界恢复与正常校验后完成；原记录保留。' : '真实连续末态变化已触发新分支，后续对应步骤已核对；此记录不再属于当前范围。'}</p>{node.error != null && <p className="muted">原错误：{messageOf(node.error)}</p>}</details> : node.error != null && <p className="warning">{messageOf(node.error)}</p>}</div>)}</div></details>}
     {unknown && <p className="warning" role="status">先核对已收到的原结果；原提交仍未知时不会重新发送。历史记录与已完成内容保留。</p>}
-    {(continuing || unknown) ? (job?.error || blocked.length > 0) && <details className="details production-step-history"><summary>{unknown ? '原中断记录（保留原文）' : '上次中断记录 · 当前正在继续'}</summary>{interruption}</details> : interruption}<div className="actions">{['interrupted', 'failed', 'partially_blocked', 'blocked', 'waiting_decision', 'waitingDecision'].includes(state) && <Button executionAction="workflows.resume" icon="play" disabled={!writable || !id} onClick={() => void mutate('workflows.resume', { workflowId: id }, unknown ? '已请求核对原结果；原提交仍未知时不会重新发送。' : '已继续原流程，已核对步骤将按有效输入复用。')}>{unknown ? '核对原结果后继续' : '继续原流程'}</Button>}{stage === 'storyboard' && !!waiting && <Button icon="check" disabled={!writable || loading || unknown} onClick={() => void openDecision()}>选择创作机会</Button>}</div>{decision && <Modal title="本次创作机会" onClose={() => setDecision(null)}><p className="muted">仅采用你在本次计划中选定的机会。可以全部取消，保留原文自身的表达。</p><div className="production-decision-list">{decision.candidates.map((item, index) => { const candidateId = words(item.id); return <label key={candidateId || index}><input type="checkbox" disabled={!candidateId || !writable} checked={selected.includes(candidateId)} onChange={event => setSelected(current => event.target.checked ? [...new Set([...current, candidateId])] : current.filter(id => id !== candidateId))}/><div><strong>{words(item.title) || words(item.subject) || `创作机会 ${index + 1}`}</strong><p>{words(item.proposal) || words(item.description) || words(item.reason) || words(item.emotionPurpose)}</p></div></label>; })}</div><div className="form-actions"><Button onClick={() => setDecision(null)}>取消</Button><Button executionAction="storyboard.decision.resolve" variant="primary" disabled={!writable || unknown} onClick={() => void confirmDecision()}>保存选择并继续</Button></div></Modal>}</section>;
+    {(continuing || unknown) ? (job?.error || blocked.length > 0) && <details className="details production-step-history"><summary>{unknown ? '原中断记录（保留原文）' : '上次中断记录 · 当前正在继续'}</summary>{interruption}</details> : interruption}<div className="actions">{['interrupted', 'failed', 'partially_blocked', 'blocked', 'waiting_decision', 'waitingDecision'].includes(state) && <Button executionAction="workflows.resume" icon="play" disabled={!writable || !id} onClick={() => void mutate('workflows.resume', parallelContinuation || { workflowId: id }, unknown ? '已请求核对原结果；原提交仍未知时不会重新发送。' : '已继续原流程，已核对步骤将按有效输入复用。')}>{unknown ? '核对原结果后继续' : parallelContinuation ? '三路加速继续（试用）' : '继续原流程'}</Button>}{stage === 'storyboard' && !!waiting && <Button icon="check" disabled={!writable || loading || unknown} onClick={() => void openDecision()}>选择创作机会</Button>}</div>{decision && <Modal title="本次创作机会" onClose={() => setDecision(null)}><p className="muted">仅采用你在本次计划中选定的机会。可以全部取消，保留原文自身的表达。</p><div className="production-decision-list">{decision.candidates.map((item, index) => { const candidateId = words(item.id); return <label key={candidateId || index}><input type="checkbox" disabled={!candidateId || !writable} checked={selected.includes(candidateId)} onChange={event => setSelected(current => event.target.checked ? [...new Set([...current, candidateId])] : current.filter(id => id !== candidateId))}/><div><strong>{words(item.title) || words(item.subject) || `创作机会 ${index + 1}`}</strong><p>{words(item.proposal) || words(item.description) || words(item.reason) || words(item.emotionPurpose)}</p></div></label>; })}</div><div className="form-actions"><Button onClick={() => setDecision(null)}>取消</Button><Button executionAction="storyboard.decision.resolve" variant="primary" disabled={!writable || unknown} onClick={() => void confirmDecision()}>保存选择并继续</Button></div></Modal>}</section>;
 }
