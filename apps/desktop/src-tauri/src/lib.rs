@@ -44,6 +44,8 @@ mod series_lite_scene_projection;
 mod series_lite_execution;
 mod series_lite_desktop_supply;
 mod series_lite_desktop_supply_native;
+mod series_lite_review;
+mod series_lite_controller_store;
 mod series_lite_contract;
 pub mod portable;
 pub mod project_library;

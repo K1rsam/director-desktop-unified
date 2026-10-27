@@ -76,6 +76,16 @@
 - `compile-release-17` 成功，二进制 SHA256 `76d44ea6a58768d618e6d16ac33c2d46e5d2fb1de8d870560cd18092767b4dc6`；`lite-supply-17`：30/30 通过。含 28 项供料测试及 2 项真实 Desktop parser/adapter 包装器测试。第 28 集不能被内部序号改为第 1 集；保留 UTF16 与原场映射。旧完整设计需原发布、原作者/独审回执和当前版本一致，显式依赖闭包逐项核证；未知类型及证据不足返回局部 gap，不伪造 lite TEXT_ADOPTED。
 - 本批未进入安装候选 12，未调用真实模型、图片或视频。岗位持久账本、完整三岗调度、原生采用/第四阶段投影及真实内容验收仍在实施，不以这 49 项新增工程通过宣称最终发行通过。
 
+### 岗位持久账本及独审响应合同（尚未接 Engine 生产）
+
+- 新增 `series_lite_controller_store`：显式增量建表，旧库读取不写 DDL；派发前保存完整请求、精确基稿、外置岗位/上下文 pin、共同依赖及前岗候选。首版限定主创→整编→独审三槽，前岗原任务接受且候选持久保存后才可取得后岗上下文。独审原回包与候选共用源/设计/基准依赖，岗位独有证据留在 provenance，避免合法独审因输入摘要不同被拒。
+- 通过原 `VerifiedRawText`、jobs、workflow_steps 和接收事件核验后保存 Raw/Candidate/ReviewRaw；重入幂等，不覆盖已有成果。原文本文件摘要与成果封套摘要分别保存。未知提交仍返回原槽，不因换账户更换创作上下文。
+- 审查发现初版跨 workflow 扫描仅挡未决传输，仍允许 received/queued/rejected 等状态绕行。已收紧初始链：同源同集已存在其他 workflow 岗位时不再建立新初创槽，避免丢掉已返结果、双排队或重置拒绝预算。明确重新创作版本及有预算局部修订尚未接入此模块，不能把这个初始链当完整修订控制器。
+- 新增 `series_lite_review`：绑定完整候选原字节、实际源行/单元阅读范围、问题坐标与影响、旧问题保留或当前稿关闭依据，以及确实提供的上集末单元→本集首单元。不提供上集稿时保留边界待核；不会把单集报告 PASS 当整季交付。`declared_content_pass` 仅是报告结论，不是独立内容验收。
+- 计划上下文不同不等于 SDK/CLI 真实会话不同。账本明确保留 `actualContextIndependence=NOT_VERIFIED`、`contentReview=NOT_PROVEN`、`adoptionGranted=false`；真实会话排除、领域验证、正式采用与既有单元/第四阶段原子投影仍须在 controller/发布适配中落实。
+- `compile-release-18` / `lite-controller-review-18`：12/12 通过；二进制 SHA256 `76d877ff674c51ac4ef5608e87b9edaecb420f4a44ad687dc7de6b56e364cb5a`。补跨 workflow 各状态回归后，`compile-release-19` / `lite-controller-review-19`：13/13 通过，二进制 SHA256 `0b498895fe729a054ac37e8964ef17231f216b6b5e45f96fb1999605fbfabe20`。测试使用合成 CLI 原始证据和临时库，没有真实模型；包含原执行器精确读取/接受/拒绝、保存重读和幂等，而不是实际三岗内容创作验收。
+- 19:54 只读现场复核：原 workflow 仍为 83 集后容量失败，events 最大 ID 276；原客户端 PID 361108 仍占用当前 EXE，未自行关闭或替换。候选 12 SHA 再核一致。已有关闭客户端的请求仍待完成；真实 150 集/Q1/收口、三项身份未决、lite 新项目一集→十集、最终安装发行门均未完成。
+
 冻结包位于 `rules/series-lite/20261027-v0.1.2/`，来自指定提交 `6dea8d6c57dde38f04a4d71f05f4c039004dd4a9`。90 份文件逐项符合原 SHA256SUMS；原脚本仅开发期等价对照，普通用户运行依赖仍为 Rust。旁置 receipt 的 active=false，未替换已生效旧规则。
 
 已迁入 compose/patch/preflight、同版用途登记、registry/season 校验、精确时间、源锁、灵墨导出／独立反解／文件 hash、sync 消费回执。完整源正规化、创作门禁及实际三岗链仍在接续，不能将纯函数对照通过写成新项目验收。
