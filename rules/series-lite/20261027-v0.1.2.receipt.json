@@ -1,0 +1,11 @@
+{
+  "skill": "series-storyboard-director-lite",
+  "version": "0.1.2",
+  "repository": "K1rsam/series-storyboard-director",
+  "commit": "6dea8d6c57dde38f04a4d71f05f4c039004dd4a9",
+  "active": false,
+  "activationReason": "Rust adapter and real production acceptance incomplete",
+  "filesVerified": 90,
+  "checksumFileSha256": "4d6e37e88da4c9f6a01bb817993e93581957827a5ebda8acdd9327df149d6f56",
+  "runtimeDependency": "Rust only; frozen original scripts are development conformance references"
+}

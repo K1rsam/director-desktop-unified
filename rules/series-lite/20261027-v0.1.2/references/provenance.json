@@ -1,0 +1,33 @@
+{
+  "version": "series-lite-provenance-v1",
+  "skillVersion": "20261027-v0.1.2-usage-reuse",
+  "baseSkill": "series-storyboard-director",
+  "baseVersion": "20261027-v6.7.4-scope-first",
+  "scope": "independent distilled workflow trial; not an upgrade or migration of existing productions",
+  "runtime": "retains source, assets, scope, v7 export and recovery code from the base",
+  "modifiedInheritedScripts": [
+    "scripts/job_packet.py",
+    "scripts/assets.mjs"
+  ],
+  "newScripts": [
+    "scripts/lite_edit.py",
+    "scripts/packet_view.py",
+    "scripts/asset-uses.mjs"
+  ],
+  "validationBoundary": "format/runtime tests and isolated forward author trial do not establish creative equivalence or fee savings",
+  "earlyAssetMaintenance": {
+    "baseVersion": "20261027-v0.1.0-distilled",
+    "alignedContractVersion": "20261027-v6.7.5-early-assets",
+    "runtimeCodeChanged": false,
+    "releaseNotes": "references/release-v0.1.1.md"
+  },
+  "usageReuseMaintenance": {
+    "date": "2026-10-27",
+    "releaseNotes": "references/release-v0.1.2.md",
+    "scope": "Direct known-asset supply, version-bound usage annotations, minimal early handoff; unchanged adoption gates and frozen production runtime",
+    "productionModified": false,
+    "liveProductionValidated": false,
+    "validation": "62 director Node tests; 16 full and 16 lite episode-execution tests; 12 receiver Node tests passed. Isolated real-project registry test preserved 7 existing adopted receipts with the frozen verifier and all asset rows unchanged. No live production migration, model quality, media acceptance or measured fee saving asserted.",
+    "isolatedRealProjectValidated": true
+  }
+}

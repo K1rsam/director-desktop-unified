@@ -1,0 +1,253 @@
+{
+  "version": "series-storyboard-bundle-v1",
+  "testFixture": true,
+  "title": "合成闭门样例",
+  "scope": [
+    {
+      "number": 1,
+      "sceneIds": [
+        "1-1",
+        "1-2"
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "key": "值守者·面罩CH",
+      "name": "值守者·面罩",
+      "type": "CH",
+      "status": "面罩遮住口鼻",
+      "upstreamKind": "CHARACTER"
+    },
+    {
+      "key": "门厅SC",
+      "name": "门厅",
+      "type": "SC",
+      "status": "闭门",
+      "upstreamKind": "SCENE"
+    },
+    {
+      "key": "走廊SC",
+      "name": "走廊",
+      "type": "SC",
+      "status": "常态",
+      "upstreamKind": "SCENE"
+    },
+    {
+      "key": "铜钥匙PR",
+      "name": "铜钥匙",
+      "type": "PR",
+      "status": "右手持握",
+      "upstreamKind": "PROP"
+    }
+  ],
+  "unresolved": [],
+  "episodes": [
+    {
+      "number": 1,
+      "source": {
+        "key": "E01",
+        "title": "合成闭门样例",
+        "sourceRows": [
+          {
+            "id": "E01:R1",
+            "text": "△门厅内，值守者戴面罩，站在门左侧，右手握着铜钥匙。"
+          },
+          {
+            "id": "E01:R2",
+            "text": "值守者：门还没开，先别摘下面罩。"
+          },
+          {
+            "id": "E01:R3",
+            "text": "△空走廊，冷白灯亮着。"
+          },
+          {
+            "id": "E01:R4",
+            "text": "系统音：门锁正常。"
+          }
+        ],
+        "contextRows": []
+      },
+      "plan": {
+        "fantasyCandidates": []
+      },
+      "selection": {
+        "selectedIds": []
+      },
+      "settings": {
+        "visualStyle": "项目已定的冷色写实表现，材质与人物比例保持连续。",
+        "prohibitions": "无额外字幕、配乐、水印。",
+        "maxUnitSeconds": 30
+      },
+      "scenes": [
+        {
+          "id": "1-1",
+          "dayInterior": "夜 内",
+          "sourceRefs": [
+            "E01:R1",
+            "E01:R2"
+          ],
+          "bindings": [
+            "门厅SC",
+            "值守者·面罩CH",
+            "铜钥匙PR"
+          ]
+        },
+        {
+          "id": "1-2",
+          "dayInterior": "夜 内",
+          "sourceRefs": [
+            "E01:R3",
+            "E01:R4"
+          ],
+          "bindings": [
+            "走廊SC"
+          ]
+        }
+      ],
+      "draft": {
+        "schemaVersion": "performance-core-v4",
+        "unresolved": [],
+        "fantasyRealization": [],
+        "units": [
+          {
+            "id": "U1",
+            "title": "闭门前的等待",
+            "sceneId": "1-1",
+            "scene": "门厅",
+            "bindings": [
+              "门厅SC",
+              "值守者·面罩CH",
+              "铜钥匙PR"
+            ],
+            "participants": [
+              "值守者·面罩"
+            ],
+            "visualSubjects": [],
+            "props": [
+              "铜钥匙"
+            ],
+            "unitDirection": "面罩始终遮挡口鼻，以眼神和手部变化承载表演。",
+            "lighting": "冷白顶灯。",
+            "initialState": "值守者在门左侧，右手持钥匙，面罩遮住口鼻。",
+            "exitState": "钥匙留在右手，面罩仍覆盖口鼻。",
+            "intent": {
+              "subject": "值守者",
+              "change": "等待转为克制提醒",
+              "landing": "维持关闭与遮挡状态",
+              "retain": [
+                "信息传达"
+              ]
+            },
+            "shots": [
+              {
+                "id": "S1",
+                "duration": 2.5,
+                "camera": "固定中近景，保持门与人物的左右关系。",
+                "picture": "值守者保持门左侧站位，面罩遮住口鼻；眼神移向关闭的门。",
+                "lighting": "顶灯维持均匀受光。",
+                "sound": "通风机低鸣。",
+                "transition": "视线方向顺接。",
+                "sourceRefs": [
+                  "E01:R1",
+                  "E01:R2"
+                ],
+                "contextRefs": [],
+                "dialogueParts": [
+                  {
+                    "lineId": "E01:R2:D1",
+                    "text": "门还没开，",
+                    "voiceStart": 0.4,
+                    "voiceEnd": 2.3,
+                    "presentation": "画内",
+                    "delivery": "压低音量，字音清楚"
+                  }
+                ]
+              },
+              {
+                "id": "S2",
+                "duration": 3.5,
+                "camera": "固定中近景，保持门与人物的左右关系。",
+                "picture": "右手钥匙微动即停，面罩仍遮住口鼻，眼神收回。",
+                "lighting": "顶灯维持均匀受光。",
+                "sound": "通风机低鸣。",
+                "transition": "视线方向顺接。",
+                "sourceRefs": [
+                  "E01:R2"
+                ],
+                "contextRefs": [],
+                "dialogueParts": [
+                  {
+                    "lineId": "E01:R2:D1",
+                    "text": "先别摘下面罩。",
+                    "voiceStart": 0,
+                    "voiceEnd": 3.2,
+                    "presentation": "画内",
+                    "delivery": "压低音量，字音清楚"
+                  }
+                ]
+              }
+            ],
+            "voiceBindings": [
+              {
+                "lineId": "E01:R2:D1",
+                "assetKey": "值守者·面罩CH"
+              }
+            ]
+          },
+          {
+            "id": "U2",
+            "title": "走廊确认",
+            "sceneId": "1-2",
+            "scene": "走廊",
+            "bindings": [
+              "走廊SC"
+            ],
+            "participants": [],
+            "visualSubjects": [],
+            "props": [],
+            "unitDirection": "空走廊只呈现现实环境，系统声音不使说者入画。",
+            "lighting": "冷白顶灯。",
+            "initialState": "走廊无人。",
+            "exitState": "走廊仍无人。",
+            "intent": {
+              "subject": "系统声音",
+              "change": "等待转为克制提醒",
+              "landing": "维持关闭与遮挡状态",
+              "retain": [
+                "信息传达"
+              ]
+            },
+            "shots": [
+              {
+                "id": "S3",
+                "duration": 4,
+                "camera": "固定中近景，保持门与人物的左右关系。",
+                "picture": "空走廊顶灯稳定，画面没有系统声音的具象人物。",
+                "lighting": "顶灯维持均匀受光。",
+                "sound": "通风机低鸣。",
+                "transition": "视线方向顺接。",
+                "sourceRefs": [
+                  "E01:R3",
+                  "E01:R4"
+                ],
+                "contextRefs": [],
+                "dialogueParts": [
+                  {
+                    "lineId": "E01:R4:D2",
+                    "text": "门锁正常。",
+                    "voiceStart": 0.2,
+                    "voiceEnd": 2.8,
+                    "presentation": "系统音",
+                    "delivery": "中性播报"
+                  }
+                ]
+              }
+            ],
+            "voiceBindings": []
+          }
+        ]
+      }
+    }
+  ]
+}

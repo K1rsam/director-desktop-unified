@@ -1,0 +1,4 @@
+interface:
+  display_name: "全剧分镜总导演·蒸馏版"
+  short_description: "精简供料和调度，保留完整主创、整集整编与独立核查的灵墨分镜制作"
+  default_prompt: "使用 $series-storyboard-director-lite 制作这份剧本，先确认范围和方向，以精简流程交付完整灵墨分镜与资产资料。"
