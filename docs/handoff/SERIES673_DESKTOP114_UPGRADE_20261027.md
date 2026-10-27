@@ -42,9 +42,24 @@
 | `cargo test --lib visual_baseline_tests -- --nocapture` | 最终 4/4 通过，含各岗位传递、同版采用、局部返修、UNKNOWN、恢复不重发、拒绝混版导出 |
 | `cargo test --lib lingmo_package::tests -- --nocapture` | 8/8 通过，含完整导出再导入、保存重开、原源移走后可用、拒绝重算文件 hash 的基准漂移 |
 | `cargo test --lib pipeline::series::rules -- --nocapture` | 最终 6/6 通过，含旧 12 岗位组合黄金 SHA 与新规则适配 |
+| Git 暂存区字节核对 | 新包 281 个源文件及两份清单与冻结字节一致；新增 `rules/desktop/** -text -whitespace`，防止 Git 换行转换破坏来源摘要 |
+| Windows 隐藏客户端 | 最终 SHA 安装候选的启动/重开、完整 MD 导入/重开四轮全部通过；150 集、371 场、883 片段、5407 镜，原文未改，生成请求及任务为 0 |
 
 上述数字有范围重叠，不相加冒充独立测试总数。SDK 回放使用离线合成响应；未进行本轮真实模型质量验证。证据目录 `.local/series673-desktop114-20261027/`，不提交私人运行目录。
 
 所有合成测试、原生导入均不提交模型、图片或视频生成；本轮不开始新剧本生产。旧新规则的稿件不能伪装为一套共同创作依据混合导出；沿用原冻结恢复或分别导出，不自动重签旧稿。
 
 本轮仅验证工程合同及 Windows 包装运行。实际新剧本的创作质量、风格充分性、真实图片与视频效果不由这些测试证明。
+
+## 安装交付
+
+实现提交：`607ee508ca6d4e30b05cfc50d2597727e139185a`。验证后的安装文件与候选逐字节一致：
+
+- 当前版：`apps/desktop/.local/client/director-desktop-next.exe`，SHA-256 `a91fa1a327b0188032785787076f1d1308cddc6dc23e04025b2502a32953dd89`。
+- 上一版：`director-desktop-next-previous.exe`，SHA-256 `cfc13572f3e7befdbec51ba362c8f56244cd4e3ced1c4a146ded4d700c92f565`。
+- 已核对原桌面 `director-desktop.lnk` 仍指向同名当前版；安装目录仅保留这两个 EXE，已移除发布候选。SDK/OpenCLI 资源按 EXE 摘要隔离。
+- 首次发布因用户客户端仍运行而安全停止，未轮换；用户回复“已关闭”后发布成功。未强制终止用户客户端。
+
+无正文验收摘要见 `SERIES673_DESKTOP114_RECEIPT_20261027.json`。下一步由用户选择新剧本，在项目制作设置选择/确认完整视觉基准并保存，再开始实际文字生产与读稿；此次更新不替该轮创作质量验收。
+
+上层 `D:/EDY/Documents/CL` 的 AOCI 索引存在治理范围未对齐，不能作为本子仓完整当前认知证明；本轮修改与验收以绑定源码、冻结文件和实际测试为依据，不扩大到整个 CL 的索引重建。

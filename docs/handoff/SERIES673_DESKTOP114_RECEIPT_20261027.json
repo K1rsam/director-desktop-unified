@@ -1,0 +1,109 @@
+{
+  "version": "desktop-rule-upgrade-acceptance/v1",
+  "sourceCommit": "607ee508ca6d4e30b05cfc50d2597727e139185a",
+  "branch": "feat/series673-desktop114-20261027",
+  "seriesSkill": "20261026-v6.7.3-visual-baseline",
+  "desktopSkill": "20261026-v1.1.4-visual-baseline",
+  "assetSkill": "V1.1.2",
+  "currentExeSha256": "a91fa1a327b0188032785787076f1d1308cddc6dc23e04025b2502a32953dd89",
+  "previousExeSha256": "cfc13572f3e7befdbec51ba362c8f56244cd4e3ced1c4a146ded4d700c92f565",
+  "frontend": {
+    "passed": 342,
+    "failed": 0
+  },
+  "seriesFirstRun": {
+    "passed": 150,
+    "failedFixtures": 2,
+    "fixedEngineRetestPassed": 4
+  },
+  "targeted": {
+    "baseline": 4,
+    "package": 8,
+    "rules": 6
+  },
+  "native": {
+    "status": "PASSED_EXISTING_NATIVE_PROBE_SCOPE",
+    "counts": {
+      "assets": 518,
+      "episodes": 150,
+      "fragments": 883,
+      "mentionOccurrences": 4736,
+      "scenes": 371,
+      "shots": 5407
+    },
+    "sourceSha256": "c3796cedc5ac9d1a2db033deec7eb48eda9deff886273d00fa4fe5620b996636",
+    "receipts": [
+      {
+        "kind": "startup",
+        "round": "first",
+        "reportSha256": "8d6b50d233df2c003c99a8c5e7d181c6b1c3199b631925b655e99b635a549438"
+      },
+      {
+        "kind": "startup",
+        "round": "reopen",
+        "reportSha256": "70def0139651650d380fc171c7dde4efaece9c6acb2ca403f8e99744ae4565d9"
+      },
+      {
+        "kind": "lingmo",
+        "round": "first",
+        "reportSha256": "be1fa084aae822b85cd0c896511e920ba0b2614806783a0be74bfe335b7c09f8"
+      },
+      {
+        "kind": "lingmo",
+        "round": "reopen",
+        "reportSha256": "1d58c52158a9af409c58791468f08e3c751edc690036e51c78a10c7fa993b23e"
+      }
+    ]
+  },
+  "generationRequests": 0,
+  "scope": "engineering and Windows native verification; no new screenplay or media production",
+  "unverified": [
+    "real model quality",
+    "identity layout with actual inspected mother",
+    "reference N+M extension candidate",
+    "image composition quality",
+    "video generation"
+  ],
+  "logs": [
+    {
+      "name": "baseline-tests-final.log",
+      "sha256": "1d9fcd3c8c863e5bab80458bd9b4ed0e62b19afa81748fa2f3e31c592772f706"
+    },
+    {
+      "name": "baseline-tests.log",
+      "sha256": "356f5a0f9fc1bcaf57e08c50b2ecd38b0e1d9157e87cda64530126cbd3f08be3"
+    },
+    {
+      "name": "build-final.log",
+      "sha256": "1a97cc6125405069bbcf7f87a63521829f3973ee7b84d9d4d945d772b4e53354"
+    },
+    {
+      "name": "build.log",
+      "sha256": "636ccf50d86fb41bec461a2976f46db9a3a32739b900d88932d191a33a15e662"
+    },
+    {
+      "name": "frontend-tests.log",
+      "sha256": "fbdcc0fda35b085fedc6c65919f9923ffc1404d19c65eb78384ff2a78c66a84c"
+    },
+    {
+      "name": "native-final.log",
+      "sha256": "7e2772fa4e31926df81664584f0654ea8f995f871dce79373238cc5d45633aef"
+    },
+    {
+      "name": "package-tests.log",
+      "sha256": "6466f09b43f4cb029171b36f9290fb697cb0a3b7d544fdc89390fcce9baffbec"
+    },
+    {
+      "name": "publish-final.log",
+      "sha256": "4e3549bd89a8a1a8d6f4fe0bacf6b1ffab1fb00a7f69d18e04400f76520a7eae"
+    },
+    {
+      "name": "publish.log",
+      "sha256": "6969ae18b11ef05fed7353c6e025298736abd6b956173943437881c71586f84d"
+    },
+    {
+      "name": "rules-tests.log",
+      "sha256": "9dea15742a4c1212546328540e14597255a8e1fd82f379e45933ff17d7c662c9"
+    }
+  ]
+}
