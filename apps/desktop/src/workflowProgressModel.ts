@@ -53,10 +53,16 @@ function episodeOf(node: Node, workspace: Workspace) {
   const episodes = workspace.source?.episodes || [];
   if (explicit) return episodes.find(episode => episode.id === explicit);
   const stage = words(node.stage) || words(request.stage), key = words(node.id);
+  if (stage.startsWith('series-lite:')) {
+    const value = record(input.roleContext || requested.roleContext).episode;
+    const number = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+    const matching = Number.isSafeInteger(number) && number > 0 ? episodes.filter(episode => Number(episode.sourceNumber ?? episode.number) === number) : [];
+    if (matching.length === 1) return matching[0];
+  }
   return episodes.find(episode => episode.id && (key === `${stage}:${episode.id}` || key.startsWith(`${stage}:${episode.id}:`)));
 }
 export function storyboardNodeTitle(node: Node, workspace: Workspace): string {
-  const phase = words(node.stage), titles: Record<string, string> = { storyboardPlan: '情绪与事件规划', storyboardCreate: '单元主创', storyboardFinish: '关联范围整编' };
+  const phase = words(node.stage), titles: Record<string, string> = { storyboardPlan: '情绪与事件规划', storyboardCreate: '单元主创', storyboardFinish: '关联范围整编', litePrepare: '本集资料准备', 'series-lite:author': '整集主创', 'series-lite:finisher': '整集整编', 'series-lite:reviewer': '独立审稿' };
   const title = titles[phase] || words(node.title) || words(node.label);
   const episode = episodeOf(node, workspace), episodeTitle = episode?.title || (episode?.number ? `第${episode.number}集` : '');
   const key = words(node.id), marker = key.lastIndexOf(':batch:');
@@ -72,6 +78,10 @@ export function storyboardCompletion(nodes: Node[]): string | null {
     const scoped = nodes.filter(node => words(node.stage) === phase);
     return scoped.length ? [`${scoped.filter(accepted).length} 批${title}`] : [];
   });
+  for (const [phase, title] of [['litePrepare', '资料准备'], ['series-lite:author', '整集主创'], ['series-lite:finisher', '整集整编'], ['series-lite:reviewer', '独立审稿']]) {
+    const scoped = nodes.filter(node => words(node.stage) === phase);
+    if (scoped.length) result.push(`${scoped.filter(accepted).length} 项${title}`);
+  }
   return result.length ? result.join(' · ') : null;
 }
 export function secondsLabel(value: number): string {

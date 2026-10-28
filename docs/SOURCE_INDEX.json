@@ -1,5 +1,15 @@
 {
   "version": "source-lock/v1",
+  "currentLiteCandidate": {
+    "release": "20261028-v0.4.1-3d-fantasy",
+    "repository": "K1rsam/series-storyboard-director",
+    "commit": "f855227c8406b38093d03c777fe24a0b0b4f87dc",
+    "path": "rules/series-lite/20261028-v0.4.1",
+    "manifestSha256": "25e213960a03eddb59928108ed7e95f4743b674074736129deefe803b972c538",
+    "runtimeContract": "series-lite-runtime/v2",
+    "evidence": "docs/handoff/LITE041_DESKTOP_UPGRADE_20261028.md",
+    "historicalRequestsResigned": false
+  },
   "createdAt": "2026-10-06T17:57:00Z",
   "status": "engineering_implementation_authorized_creative_runtime_pending_evidence",
   "destination": {

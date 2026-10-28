@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { choose, request } from './api';
 import { Badge, Button, Empty, kindName, messageOf, Modal } from './components';
-import { productionDirection, records, sourceEpisodes, sourceEvidence, stageJobs, words } from './stageProduction';
+import { productionDirection, projectProductionBusy, records, sourceEpisodes, sourceEvidence, stageJobs, words } from './stageProduction';
+import { SERIES_LITE_WORKFLOW_PROFILE } from './workflowNavigation';
 import { foundationCoverage, foundationRunOptions } from './foundationCoverage';
 import { foundationSavedProgress } from './foundationProgress';
 import { foundationParallelResume } from './foundationTrial';
@@ -13,7 +14,7 @@ import type { SourceReadScope } from './SourceStructure';
 import type { Job, Mutation, Workspace } from './types';
 import './stage-production.css';
 
-type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; onError?: (error: string) => void; onNotice?: (notice: string) => void };
+type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; onError?: (error: string) => void; onNotice?: (notice: string) => void; onStoryboard?: () => void };
 type Tab = 'source' | 'direction' | 'assets' | 'issues';
 
 /** Summary-only hint. The guarded foundation.run entry verifies full source,
@@ -42,11 +43,26 @@ export function foundationStartContinuation(workspace: Workspace, episodeIds: st
   }
   return continuation;
 }
-export function Stage1Panel({ workspace, writable, mutate, onError, onNotice }: Props) {
+function originalFoundationScope(job: Job | null): string[] {
+  const snapshot = job?.snapshot as { input?: { selection?: { episodeIds?: unknown } }; selection?: { episodeIds?: unknown } } | undefined;
+  const ids = snapshot?.input?.selection?.episodeIds ?? snapshot?.selection?.episodeIds;
+  return Array.isArray(ids) && ids.every(id => typeof id === 'string') ? ids : [];
+}
+function pendingFoundation(workspace: Workspace): Job | null {
+  const full = foundationStartContinuation(workspace, foundationRunOptions(workspace).selection.episodeIds);
+  if (full) return full;
+  for (const job of stageJobs(workspace, 'foundation')) {
+    const found = foundationStartContinuation(workspace, originalFoundationScope(job));
+    if (found) return found;
+  }
+  return null;
+}
+export function Stage1Panel({ workspace, writable, mutate, onError, onNotice, onStoryboard }: Props) {
   const savedSource = workspace.source?.text || workspace.source?.content || '', episodes = sourceEpisodes(workspace), rows = workspace.source?.rows || [], foundation = workspace.foundation;
   const [episode, setEpisode] = useState('all'), [scene, setScene] = useState(''), [tab, setTab] = useState<Tab>('source');
   const [readingContext, setReadingContext] = useState(false);
   const startingRef = useRef(false), [starting, setStarting] = useState(false);
+  const [firstBatch, setFirstBatch] = useState('1');
   const analysisPendingRef = useRef(false), [analysisPending, setAnalysisPending] = useState(false);
   const [editingSource, setEditingSource] = useState(false), [sourceDraft, setSourceDraft] = useState(savedSource);
   const savedDirection = productionDirection(workspace), [directionDraft, setDirectionDraft] = useState(savedDirection), [directionDirty, setDirectionDirty] = useState(false);
@@ -61,10 +77,12 @@ export function Stage1Panel({ workspace, writable, mutate, onError, onNotice }: 
   const formatBusy = analysisPending || analysis.pending;
   const issues: Record<string, unknown>[] = [...(workspace.source?.diagnostics || []).map(issue => ({ ...issue, origin: '原文范围' })), ...records(foundation?.issues).filter(issue => (issue.details as Record<string, unknown> | undefined)?.kind !== 'APPLIED_INTERPRETATION').map(issue => ({ ...issue, origin: '制作基础' }))];
   const coverage = foundationCoverage(workspace);
-  const continuation = foundationStartContinuation(workspace, foundationRunOptions(workspace).selection.episodeIds), unknownContinuation = continuation?.submissionUnknown === true || continuation?.status === 'submission_unknown';
+  const continuation = pendingFoundation(workspace), unknownContinuation = continuation?.submissionUnknown === true || continuation?.status === 'submission_unknown';
   const parallelContinuation = foundationParallelResume(workspace, continuation);
   const currentContinuation = episode === 'all' ? null : foundationStartContinuation(workspace, foundationRunOptions(workspace, episode).selection.episodeIds), currentUnknown = currentContinuation?.submissionUnknown === true || currentContinuation?.status === 'submission_unknown';
-  const selection = episodes.filter(item => episode === 'all' || item.id === episode).map(item => item.id), creating = stageJobs(workspace, 'foundation').some(job => ['queued', 'running'].includes(job.status));
+  const selection = episodes.filter(item => episode === 'all' || item.id === episode).map(item => item.id), creating = projectProductionBusy(workspace);
+  const firstBatchIds = (firstBatch === 'all' ? episodes : episodes.slice(0, Number(firstBatch))).map(item => item.id);
+  const textUnknown = workspace.jobs.some(job => job.cliSubmissionUnknown === true || ['text', 'workflow'].includes(job.kind || '') && (job.submissionUnknown === true || job.status === 'submission_unknown'));
   const contextRows = sourceContextRows(workspace.source);
   const selectedRows = rows.filter(row => (episode === 'all' || row.episodeId === episode) && (!scene || row.sceneId === scene));
   const displayedSource = readingContext ? contextRows.map(row => row.text).join('') : episode === 'all' && !scene ? savedSource : selectedRows.map(row => row.text).join('');
@@ -79,7 +97,7 @@ export function Stage1Panel({ workspace, writable, mutate, onError, onNotice }: 
   async function saveSource(event: FormEvent) { event.preventDefault(); if (await mutate('source.import', { text: sourceDraft }, '完整原文已保存为新版本。')) setEditingSource(false); }
   async function saveDirection(event: FormEvent) { event.preventDefault(); if (!directionDraft.trim()) return; const next = await mutate('production.direction.save', { direction: directionDraft, expectedSourceVersion: directionVersion.source, expectedFoundationVersion: directionVersion.foundation }, '制作方向已确认保存，后续文字任务会读取此版本。'); if (next) setDirectionDirty(false); }
   async function run(explicitEpisodeId?: string) {
-    const options = foundationRunOptions(workspace, explicitEpisodeId), original = foundationStartContinuation(workspace, options.selection.episodeIds);
+    const options = !explicitEpisodeId && continuation ? { selection: { episodeIds: originalFoundationScope(continuation) } } : foundationRunOptions(workspace, explicitEpisodeId), original = foundationStartContinuation(workspace, options.selection.episodeIds);
     if (!writable || creating || startingRef.current || analysisPendingRef.current || analysis.pending || original?.submissionUnknown || original?.status === 'submission_unknown') return;
     if (manualBlockers.length) { onError?.(manualBlockers.map(issue => issue.message).join('；') + '。这些记录需要先确认，AI 集场识别不能替代处理。'); return; }
     if (!savedSource || !options.selection.episodeIds.length && !needsAnalysis) { onError?.('请先导入原文，并确认未识别的集场结构。'); return; }
@@ -87,7 +105,7 @@ export function Stage1Panel({ workspace, writable, mutate, onError, onNotice }: 
     // Keep the ordinary action name: the engine chooses an original workflow
     // only after validating its full source/scope, before preflight/reservation.
     try {
-      if (needsAnalysis) await mutate('source.analyze', { expectedSourceVersion: workspace.source?.version || 0, episodeIds: options.selection.episodeIds, continueFoundation: true }, '已启动后台格式识别；结构确认后自动整理制作基础，进度见任务记录。');
+      if (needsAnalysis) await mutate('source.analyze', { expectedSourceVersion: workspace.source?.version || 0, episodeIds: options.selection.episodeIds, continueFoundation: !!original }, original ? '已启动原任务的格式识别续接，原制作基础合同保留。' : '已启动原文格式识别，不自动整理全剧资产。');
       else {
         const trial = foundationParallelResume(workspace, original);
         if (trial) await mutate('workflows.resume', trial, '已请求三路加速继续；保留原批次，只处理尚未提交的范围。');
@@ -96,13 +114,34 @@ export function Stage1Panel({ workspace, writable, mutate, onError, onNotice }: 
     }
     finally { startingRef.current = false; setStarting(false); }
   }
+  async function startStoryboard() {
+    if (!writable || creating || startingRef.current || analysisPendingRef.current || analysis.pending || textUnknown) return;
+    if (manualBlockers.length) { onError?.(manualBlockers.map(issue => issue.message).join('；')); return; }
+    if (!savedSource) return;
+    startingRef.current = true; setStarting(true);
+    try {
+      if (needsAnalysis) {
+        await mutate('source.analyze', { expectedSourceVersion: workspace.source?.version || 0, episodeIds: firstBatchIds, continueFoundation: false }, '已启动原文格式识别；保留原文，不启动全剧资产整理。识别完成后即可确认首批创作范围。');
+        return;
+      }
+      if (!firstBatchIds.length) { onError?.('请先确认原文集场。'); return; }
+      if (!directionDraft.trim()) { setTab('direction'); onNotice?.('请确认制作方向，再开始首批分镜；无需整理全剧资产。'); return; }
+      if (directionDirty || !savedDirection.trim()) {
+        const next = await mutate('production.direction.save', { direction: directionDraft, expectedSourceVersion: directionVersion.source, expectedFoundationVersion: directionVersion.foundation }, '制作方向已确认。');
+        if (!next) return;
+        setDirectionDirty(false);
+      }
+      const next = await mutate('storyboard.run', { workflowProfile: SERIES_LITE_WORKFLOW_PROFILE, episodeIds: firstBatchIds, options: { selection: { episodeIds: firstBatchIds } } }, `已开始 ${firstBatchIds.length} 集分镜；本集所需资料按需补齐，图片另行制作。`);
+      if (next) onStoryboard?.();
+    } finally { startingRef.current = false; setStarting(false); }
+  }
   const savedFoundation = foundationSavedProgress(workspace);
   const evidenceRows = evidence ? sourceEvidence(workspace, evidence.refs) : [];
   return <div className="production-workbench stage-one-workbench">
-    <div className="stage-intro"><div><h2>确认原文与制作基础</h2><p>导入原文后，一键整理全剧制作基础与资产目录，自动衔接后续资产设计和分镜创作。</p></div><div className="actions"><Button icon="upload" disabled={!writable} onClick={() => void importSource()}>导入原文</Button><Button executionAction={needsAnalysis ? "source.analyze" : "foundation.run"} variant="primary" icon="spark" disabled={!writable || !savedSource || !coverage.total && !needsAnalysis || !!manualBlockers.length || creating || starting || formatBusy || unknownContinuation} onClick={() => void run()}>{analysis.unknown ? '核对原格式识别任务' : formatBusy || starting && needsAnalysis ? '正在识别原文格式' : unknownContinuation ? '保留原制作基础任务' : creating || starting ? '正在整理' : needsAnalysis ? '识别格式并整理' : parallelContinuation ? '三路加速继续（试用）' : continuation ? '继续原制作基础流程' : '整理全剧制作基础'}</Button></div></div>
+    <div className="stage-intro"><div><h2>{continuation ? '继续原制作基础' : '确认原文与制作方向'}</h2><p>{continuation ? '原任务按冻结范围继续，已保存批次、回包和恢复记录保留。' : '确认原文和方向后即可开始首批分镜；只补本集需要的资料，无需等待全剧资产整理。'}</p></div><div className="actions"><Button icon="upload" disabled={!writable} onClick={() => void importSource()}>导入原文</Button>{!continuation && <label className="production-range-label">首批范围<select aria-label="首批创作范围" value={firstBatch} onChange={event => setFirstBatch(event.target.value)}><option value="1">先制作第 1 集</option><option value="3">前 3 集</option><option value="10">前 10 集</option><option value="all">全部 {episodes.length} 集</option></select></label>}<Button executionAction={needsAnalysis ? 'source.analyze' : continuation ? 'foundation.run' : 'storyboard.run'} variant="primary" icon="spark" disabled={!writable || !savedSource || !coverage.total && !needsAnalysis || !!manualBlockers.length || creating || starting || formatBusy || unknownContinuation || !continuation && textUnknown} onClick={() => void (continuation ? run() : startStoryboard())}>{analysis.unknown ? '核对原格式识别任务' : formatBusy || starting && needsAnalysis ? '正在识别原文格式' : unknownContinuation ? '保留原制作基础任务' : !continuation && textUnknown ? '保留原任务，先核对' : creating || starting ? '本项目正在制作' : needsAnalysis ? '识别原文格式' : continuation ? parallelContinuation ? '三路加速继续（试用）' : '继续原制作基础流程' : `确认并开始${firstBatchIds.length === 1 ? '首集' : `${firstBatchIds.length} 集分镜`}`}</Button></div></div>
     <WorkflowProgress workspace={workspace} stage="foundation" writable={writable} mutate={mutate} onError={onError}/>
     {analysis.message && <p role="status" className="production-inline-warning">{analysis.message}</p>}
-    {needsAnalysis && !manualBlockers.length && !formatBusy && <p className="control-hint">将使用当前文字渠道识别未定片段的用途与集场，原文保持不变；成功后自动继续整理。无法确定的内容会保留待确认，不会强行归类。</p>}
+    {needsAnalysis && !manualBlockers.length && !formatBusy && <p className="control-hint">将使用当前文字渠道识别未定片段的用途与集场，原文保持不变；识别后确认创作范围。无法确定的内容保留待确认。</p>}
     {manualBlockers.length > 0 && <p className="production-inline-warning">请先确认：{manualBlockers.map(issue => issue.message).join('；')}。这些问题不能只靠集场格式识别解决。</p>}
     {parallelContinuation && <p className="control-hint">保留已保存批次，未提交范围最多三路同时整理；随后并行核对，最后统一合并。原请求、回包与恢复记录保留。</p>}
     {continuation && <p className="production-inline-warning">{unknownContinuation ? '原范围有未知提交，先核对原执行；不会新建或重发。' : '同范围制作基础尚未完成；将继续原流程，已核对步骤按原冻结输入复用。'}</p>}

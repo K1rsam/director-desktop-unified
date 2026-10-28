@@ -6,7 +6,7 @@ import { productionDirection, projectProductionBusy, records, sourceEpisodes, so
 import { WorkflowProgress } from './WorkflowProgress';
 import type { Job, Mutation, Unit, Workspace } from './types';
 import './stage-production.css';
-import { SERIES_WORKFLOW_PROFILE } from './workflowNavigation';
+import { SERIES_LITE_WORKFLOW_PROFILE } from './workflowNavigation';
 import { StoryboardRefinement } from './StoryboardRefinement';
 
 type Props = { workspace: Workspace; writable: boolean; mutate: Mutation; onError?: (error: string) => void; onNotice?: (notice: string) => void };
@@ -46,7 +46,7 @@ export function storyboardStartContinuation(workspace: Workspace, episodeIds: st
 
 type Version = { version: number; data: Unit; createdAt?: string };
 export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: Props) {
-  const episodes = sourceEpisodes(workspace), [episode, setEpisode] = useState('all'), [selectedId, setSelectedId] = useState(workspace.units[0]?.id || ''), [tab, setTab] = useState<Tab>('prompt');
+  const episodes = sourceEpisodes(workspace), [episode, setEpisode] = useState(() => workspace.units.length || workspace.jobs.some(job => job.kind === 'workflow' && job.entityId === 'storyboard.run') ? 'all' : episodes[0]?.id || 'all'), [selectedId, setSelectedId] = useState(workspace.units[0]?.id || ''), [tab, setTab] = useState<Tab>('prompt');
   const [full, setFull] = useState<Unit | null>(workspace.units[0] || null), [loading, setLoading] = useState(false), [detailError, setDetailError] = useState('');
   const [editing, setEditing] = useState<Unit | null>(null), [promptDraft, setPromptDraft] = useState(''), [titleDraft, setTitleDraft] = useState('');
   const [redo, setRedo] = useState<Unit | null>(null), [instruction, setInstruction] = useState('');
@@ -81,7 +81,7 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
     startingRef.current = true; setStarting(true);
     // Both new/continue intents use the guarded start entry. A summary alone
     // cannot select a historical workflow or bypass the backend source check.
-    try { await mutate('storyboard.run', { ...(!continuation ? { workflowProfile: SERIES_WORKFLOW_PROFILE } : {}), options: { selection: { episodeIds: selection } }, episodeIds: selection }, continuation ? '已继续原范围的分镜流程，原请求与已核对步骤将保留复用。' : '所选范围的分镜文字创作已启动。'); }
+    try { await mutate('storyboard.run', { ...(!continuation ? { workflowProfile: SERIES_LITE_WORKFLOW_PROFILE } : {}), options: { selection: { episodeIds: selection } }, episodeIds: selection }, continuation ? '已继续原范围的分镜流程，原请求与已核对步骤将保留复用。' : '所选范围的分镜文字创作已启动。'); }
     finally { startingRef.current = false; setStarting(false); }
   }
   async function exportDelivery() {
@@ -105,7 +105,7 @@ export function Stage3Panel({ workspace, writable, mutate, onError, onNotice }: 
   async function restore(version: Version) { if (!unit || version.data.id !== unit.id) { onError?.('版本记录与当前单元身份不一致。'); return; } const next = await mutate('units.version.restore', { unitId: unit.id, version: version.version, expectedVersion: unit.version }, '已恢复为新的当前版本，原版本和已提交任务保留。'); if (next) { setFull(null); setVersionPreview(null); setTab('prompt'); } }
   let offset = 0;
   return <div className="production-workbench stage-three-workbench">
-    <div className="stage-intro"><div><h2>创作完整分镜，交付同版资产资料</h2><p>完整设计、主创、整集整编和独立审稿自动衔接；图片在第三阶段制作。</p></div><div className="actions"><label className="production-range-label">创作范围<select aria-label="分镜创作范围" value={episode} onChange={event => { setEpisode(event.target.value); setTab('prompt'); }}><option value="all">全部已确认集数 · {episodes.length} 集</option><option value="empty">还没有分镜的集数 · {emptyEpisodes.length} 集</option>{episodes.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><Button executionAction="storyboard.run" variant="primary" icon="spark" disabled={!writable || !selection.length || !!blocking.length || creating || starting || unknownContinuation} onClick={() => void run()}>{creating ? '本项目正在制作' : starting ? '正在启动创作' : unknownContinuation ? '保留原分镜任务' : continuation ? '继续原分镜流程' : '一键创作分镜'}</Button><Button executionAction="storyboard.exportDelivery" icon="download" disabled={!writable || exporting || !selection.length || !visibleUnits.length} onClick={() => void exportDelivery()}>{exporting ? '正在导出…' : '导出分镜与接续资料'}</Button></div></div>
+    <div className="stage-intro"><div><h2>创作完整分镜，交付同版资产资料</h2><p>本集资料就绪即可主创，整集整编和独立审稿自动衔接；图片在第三阶段制作。</p></div><div className="actions"><label className="production-range-label">创作范围<select aria-label="分镜创作范围" value={episode} onChange={event => { setEpisode(event.target.value); setTab('prompt'); }}><option value="all">全部已确认集数 · {episodes.length} 集</option><option value="empty">还没有分镜的集数 · {emptyEpisodes.length} 集</option>{episodes.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><Button executionAction="storyboard.run" variant="primary" icon="spark" disabled={!writable || !selection.length || !!blocking.length || creating || starting || unknownContinuation} onClick={() => void run()}>{creating ? '本项目正在制作' : starting ? '正在启动创作' : unknownContinuation ? '保留原分镜任务' : continuation ? '继续原分镜流程' : '一键创作分镜'}</Button><Button executionAction="storyboard.exportDelivery" icon="download" disabled={!writable || exporting || !selection.length || !visibleUnits.length} onClick={() => void exportDelivery()}>{exporting ? '正在导出…' : '导出分镜与接续资料'}</Button></div></div>
     {(continuation || unknownContinuation) && !creating && <p className="muted" role="status">{unknownContinuation ? '本项目有原提交待核对，请先核对原结果；原提交仍未知时不会另建或重发。' : '同范围的分镜尚未完成。此按钮继续原流程，已核对的步骤将复用。'}</p>}
     {episode === 'empty' && <p className="muted" role="status">仅创作当前零单元的 {emptyEpisodes.length} 集；已有单元的集数仍需各自核对是否完整。</p>}
     <WorkflowProgress workspace={workspace} stage="storyboard" writable={writable} mutate={mutate} onError={onError}/>

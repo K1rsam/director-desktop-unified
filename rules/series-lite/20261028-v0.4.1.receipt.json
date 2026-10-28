@@ -12,7 +12,7 @@
   "activationScope": "new-explicit-desktop-lite-tasks/v1",
   "rustAdapterVersion": "series-lite-rust-adapter/v0.4.1-candidate.1",
   "runtimeContract": "series-lite-runtime/v2",
-  "acceptance": "candidate_engineering_pass_windows_install_pending_real_model_review_pending",
+  "acceptance": "candidate_engineering_and_windows_install_pass_real_model_review_pending",
   "standalonePackDispatchAllowed": false,
   "historicalRequestsResigned": false
 }

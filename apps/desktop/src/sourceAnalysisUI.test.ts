@@ -18,7 +18,7 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
     const { SourceStructure, sourceAnalysisState } = await server.ssrLoadModule('/src/SourceStructure.tsx');
     const policy = await server.ssrLoadModule('/src/executionPolicy.ts');
     const { previewWorkspace } = await server.ssrLoadModule('/src/preview.ts');
-    const live = () => policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'inactive', reasons: [], allowedActions: ['foundation.run', 'source.analyze', 'source.resolve', 'source.reparse'] });
+    const live = () => policy.installExecutionPolicy({ mode: 'standard_native', liveExecutionAllowed: true, stage3CreativePackStatus: 'verified_active', reasons: [], allowedActions: ['foundation.run', 'storyboard.run', 'production.direction.save', 'source.analyze', 'source.resolve', 'source.reparse'] });
     const fixture = (code = 'BOUNDARY_UNCONFIRMED', episodes = true) => {
       const workspace = structuredClone(previewWorkspace);
       workspace.jobs = []; workspace.assets = []; workspace.units = []; workspace.foundation = null; workspace.rules = [];
@@ -33,9 +33,9 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
       let finish: (value: unknown) => void = () => {};
       const element = createElement(Stage1Panel, { workspace, writable: true, onError: (message: string) => errors.push(message), mutate: (action: string, payload: any) => { calls.push({ action, payload }); return new Promise(resolve => { finish = resolve; }); } });
       try {
-        const start = button(view.render(element), '识别格式并整理'); assert.equal(start.props.disabled, false);
+        const start = button(view.render(element), '识别原文格式'); assert.equal(start.props.disabled, false);
         start.props.onClick(); start.props.onClick();
-        assert.deepEqual(calls, [{ action: 'source.analyze', payload: { expectedSourceVersion: 4, episodeIds: [], continueFoundation: true } }]);
+        assert.deepEqual(calls, [{ action: 'source.analyze', payload: { expectedSourceVersion: 4, episodeIds: [], continueFoundation: false } }]);
         let hosts = view.render(element);
         assert.equal(button(hosts, '正在识别原文格式').props.disabled, true);
         assert.equal(button(hosts, '格式识别处理中').props.disabled, true);
@@ -54,7 +54,7 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
         const navigation = view.render(element).find(host => host.type === 'button' && String(host.props.className).includes('production-nav-item') && content(host).startsWith('第二集'));
         assert.ok(navigation); navigation.props.onClick();
         button(view.render(element), '识别格式并整理当前集').props.onClick(); await settle();
-        assert.deepEqual(calls, [{ action: 'source.analyze', payload: { expectedSourceVersion: 4, episodeIds: ['e2'], continueFoundation: true } }]);
+        assert.deepEqual(calls, [{ action: 'source.analyze', payload: { expectedSourceVersion: 4, episodeIds: ['e2'], continueFoundation: false } }]);
       } finally { view.unmount(); }
     });
 
@@ -74,18 +74,19 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
       } finally { view.unmount(); }
     });
 
-    await t.test('unsupported speaker ambiguities remain manual and known structures use original foundation flow', async () => {
+    await t.test('unsupported speaker ambiguities remain manual and known structures proceed to direction without a catalogue run', async () => {
       live(); const workspace = fixture('DIALOGUE_MULTI_SPEAKER_UNCONFIRMED'), calls: any[] = [], view = hookRenderer();
       const element = createElement(Stage1Panel, { workspace, writable: true, mutate: async (action: string, payload: any) => { calls.push({ action, payload }); return workspace; } });
       try {
         let hosts = view.render(element);
-        assert.equal(button(hosts, '整理全剧制作基础').props.disabled, true);
+        assert.equal(button(hosts, '确认并开始首集').props.disabled, true);
         assert.ok(hosts.some(host => content(host).includes('这行有多个说者待确认')));
         assert.equal(calls.length, 0);
         workspace.source.diagnostics = [];
-        hosts = view.render(element); const start = button(hosts, '整理全剧制作基础'); assert.equal(start.props.disabled, false);
+        hosts = view.render(element); const start = button(hosts, '确认并开始首集'); assert.equal(start.props.disabled, false);
         start.props.onClick(); await settle();
-        assert.deepEqual(calls, [{ action: 'foundation.run', payload: { options: { selection: { episodeIds: ['e1', 'e2'] } } } }]);
+        assert.deepEqual(calls, []);
+        assert.ok(view.render(element).some(host => host.type === 'textarea' && host.props.className === 'production-direction-input'));
       } finally { view.unmount(); }
     });
 
@@ -100,7 +101,7 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
         workspace.jobs = [task(workspace, 'partially_blocked')];
         hosts = view.render(createElement(Stage1Panel, props));
         assert.ok(hosts.some(host => host.props.role === 'status' && content(host).includes('仍有部分结构待确认')));
-        assert.equal(button(hosts, '识别格式并整理').props.disabled, false);
+        assert.equal(button(hosts, '识别原文格式').props.disabled, false);
         const old = task(workspace, 'running'); old.snapshot.sourceVersion = 3;
         assert.equal(sourceAnalysisState(workspace.source, [old]).pending, false);
         const published = { ...workspace.source, version: 5 };
@@ -117,7 +118,7 @@ test('source analysis real handlers preserve text, selected scope, durable pendi
       const view = hookRenderer(), workspace = fixture();
       try {
         const hosts = view.render(createElement(Stage1Panel, { workspace, writable: true, mutate: async () => { throw new Error('offline'); } }));
-        for (const text of ['识别格式并整理', 'AI识别格式']) assert.equal(button(hosts, text).props.disabled, true);
+        for (const text of ['识别原文格式', 'AI识别格式']) assert.equal(button(hosts, text).props.disabled, true);
         assert.equal(button(hosts, '重新识别').props.disabled, false);
       } finally { view.unmount(); }
     });

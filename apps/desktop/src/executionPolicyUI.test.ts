@@ -53,6 +53,13 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
           blocked.add(button.action);
         }
       }
+      if (name === 'Stage1Panel') {
+        const start = actionButtons(html).find(button => button.action === 'storyboard.run');
+        assert.ok(start, 'the simplified first-stage entry starts lite storyboard writing');
+        assert.equal(start.disabled, true);
+        assert.ok(start.title.includes('离线准备模式'));
+        assert.doesNotMatch(html, /整理全剧制作基础<\/button>/, 'offline tests must not restore the removed full-catalogue default');
+      }
       if (name === 'AssetPanel') {
         assert.ok(html.includes('asset-library') && html.includes('asset-editor'), 'Stage3 library/editor split retained');
         const add = [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].find(([, , body]) => body.replace(/<[^>]+>/g, '') === '新增资产');
@@ -66,7 +73,7 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
         assert.ok(!html.includes('即梦 Canvas 账户与连接'), 'unused Canvas account is not mounted');
       }
     }
-    for (const action of ['foundation.run', 'images.design', 'images.run', 'storyboard.run', 'units.regenerate', 'videos.prepare', 'videos.submit', 'providers.refresh', 'readiness.check', 'textCli.login', 'dreamina.login', 'jobs.query', 'jobs.download', 'jobs.reconcile']) assert.ok(blocked.has(action), `${action} is represented and blocked`);
+    for (const action of ['images.design', 'images.run', 'storyboard.run', 'units.regenerate', 'videos.prepare', 'videos.submit', 'providers.refresh', 'readiness.check', 'textCli.login', 'dreamina.login', 'jobs.query', 'jobs.download', 'jobs.reconcile']) assert.ok(blocked.has(action), `${action} is represented and blocked`);
     const { TextExecutionSettings } = await server.ssrLoadModule('/src/TextExecutionSettings.tsx');
     const apiSettings = renderToStaticMarkup(createElement(TextExecutionSettings, { ...props, settings: { textProvider: 'api' }, update: () => {}, saveSettings: async () => true }));
     assert.doesNotMatch(apiSettings, /type="password"/);
@@ -83,6 +90,7 @@ test('rendered four-stage controls and real frontend API enforce the offline bou
     const banner = renderToStaticMarkup(createElement(ExecutionPolicyBanner));
     assert.ok(banner.includes('offline_prepare_only') && banner.includes('分镜创作暂不可生成'));
     const api = await server.ssrLoadModule('/src/api.ts');
+    await assert.rejects(api.request({ action: 'foundation.run', options: { selection: { episodeIds: ['synthetic-legacy-episode'] } } }), /离线准备模式/, 'legacy foundation execution remains blocked at the direct API boundary');
     for (const action of [...blocked, 'workflows.resume', 'foundation.choices.apply', 'storyboard.decision.resolve', 'future.execution']) {
       await assert.rejects(api.request({ action }), /离线准备模式/, action);
     }

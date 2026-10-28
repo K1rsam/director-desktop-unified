@@ -1,6 +1,7 @@
 import type { Page, Workspace } from './types.ts';
 
 export const SERIES_WORKFLOW_PROFILE = 'desktop-series672-assets112/v1';
+export const SERIES_LITE_WORKFLOW_PROFILE = 'desktop-series-lite/v1';
 export type ProductionPage = 'foundation' | 'storyboard' | 'images' | 'videos';
 export const PRODUCTION_PAGES: ProductionPage[] = ['foundation', 'storyboard', 'images', 'videos'];
 const pageKey = (id: string) => `director.project-page.v1:${id}`;

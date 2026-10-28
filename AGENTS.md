@@ -1,5 +1,12 @@
 # 新独立桌面项目实施约束
 
+## 2026-10-28 lite 0.4.1 接线
+
+- 新分镜入口采用 `desktop-series-lite/v1`，冻结 `series-storyboard-director-lite 20261028-v0.4.1-3d-fantasy`，来源提交 `f855227c8406b38093d03c777fe24a0b0b4f87dc`。本机可变 Skill 已到后续版本，不混入本轮。
+- 初创只交 plan/selection/draft，Rust 合入源与设置并反算程序索引；按本集实际设计取料，已有可信设计和明确场绑定不再派补料模型。缺图片不阻塞文字。
+- 新岗位使用 `series-lite-runtime/v2` 不可变槽与持久问题预算；原三槽及更早任务按原合同恢复。UNKNOWN 先对账，失格候选和原拒绝保留；两轮后局部挂起，其他集继续。
+- 工程、原生安装与实际模型/内容分别验收；当前证据和未决项以 `docs/handoff/LITE041_DESKTOP_UPGRADE_20261028.md` 为准。禁止视频，不操作用户前台。
+
 ## 2026-10-27 可恢复工作流重构
 
 - 当前新增实施范围以 `docs/handoff/RECOVERABLE_WORKFLOW_REFACTOR_20261027.md` 和用户确认计划为准：先完成原150集制作基础，再实施统一成果/修订/恢复合同与 lite 0.1.2 Rust 适配。

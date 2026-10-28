@@ -86,3 +86,40 @@ test('unknown submission keeps the original shutdown error only inside collapsed
     assert.equal(JSON.stringify(workspace), before); assert.equal(requests, 0);
   }
 });
+
+test('原流程恢复尊重同项目真实制作占用，释放后保留原ID和UNKNOWN对账语义', async () => {
+  for (const unknown of [false, true]) {
+    const workspace = view(unknown), calls: unknown[][] = [];
+    const mutate = async (...args: unknown[]) => { calls.push(args); return workspace; };
+    const render = () => {
+      const internals = (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+      const previous = internals.H;
+      internals.H = { useState(initial: any) { return [typeof initial === 'function' ? initial() : initial, () => {}]; }, useEffect() {} };
+      try { return WorkflowProgress({ workspace, stage: 'storyboard', writable: true, mutate }); }
+      finally { internals.H = previous; }
+    };
+    for (const active of [
+      { id: 'real-worker', kind: 'workflow', entityId: 'foundation.run', provider: 'local', status: 'running' },
+      { id: 'real-worker', kind: 'workflow', entityId: 'images.design:batch', provider: 'local', status: 'queued' },
+    ]) {
+      workspace.jobs.push(active);
+      const before = JSON.stringify(workspace), tree = render();
+      const resume = nodes(tree).find(node => node.props?.executionAction === 'workflows.resume');
+      assert.ok(resume); assert.equal(resume.props.disabled, true);
+      assert.equal(content(resume), '等待当前制作完成');
+      assert.match(content(tree), /已保存成果仍可阅读/);
+      resume.props.onClick(); await Promise.resolve();
+      assert.deepEqual(calls, [], 'even a stale or programmatic click does not dispatch against the occupied pipeline');
+      assert.equal(JSON.stringify(workspace), before);
+      workspace.jobs.pop();
+    }
+    workspace.jobs.push({ id: 'media-only', kind: 'image', entityId: 'asset', provider: 'dreamina', status: 'processing' });
+    const tree = render(), resume = nodes(tree).find(node => node.props?.executionAction === 'workflows.resume');
+    assert.ok(resume); assert.equal(resume.props.disabled, false, 'media polling does not own the text pipeline');
+    assert.equal(content(resume), unknown ? '核对原结果后继续' : '继续原流程');
+    resume.props.onClick(); await Promise.resolve();
+    assert.equal(calls.length, 1); assert.equal(calls[0][0], 'workflows.resume');
+    assert.deepEqual(calls[0][1], { workflowId: 'original' });
+    assert.equal(String(calls[0][2]).includes('原提交仍未知时不会重新发送'), unknown);
+  }
+});

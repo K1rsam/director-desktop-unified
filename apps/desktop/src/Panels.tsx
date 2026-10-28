@@ -31,7 +31,7 @@ function chromeSetup(value: unknown): ChromeSetup {
   return result;
 }
 
-export function FoundationPanel(props: Props) { return <Stage1Panel {...props}/>; }
+export function FoundationPanel(props: Props & { onStoryboard?: () => void }) { return <Stage1Panel {...props}/>; }
 
 export function TasksPanel({ workspace, writable, mutate, inspect }: Props & { inspect: (media: Media) => void }) {
   const [filter, setFilter] = useState('all'), [reconciling, setReconciling] = useState<Job | null>(null), [taskId, setTaskId] = useState('');

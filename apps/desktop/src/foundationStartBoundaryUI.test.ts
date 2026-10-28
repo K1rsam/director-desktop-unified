@@ -28,7 +28,8 @@ test('failed foundation scope offers original continuation while completed scope
     workspace.jobs = [{ ...job, status: 'completed' }, job];
     assert.equal(foundationStartContinuation(workspace, ['e1', 'e2']), null);
     const completed = renderToStaticMarkup(createElement(Stage1Panel, { workspace, writable: true, mutate: async () => { mutations++; return workspace; } }));
-    assert.match(completed, /整理全剧制作基础/);
+    assert.match(completed, /确认并开始首集/);
+    assert.doesNotMatch(completed, /整理全剧制作基础<\/button>/);
     assert.doesNotMatch(completed, /同范围制作基础尚未完成/);
     assert.equal(mutations, 0);
   } finally { await server.close(); }
