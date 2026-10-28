@@ -106,6 +106,10 @@ pub struct Delivery {
     pub gate_validator: String,
     pub validation: String,
 }
+/// Render one already verified projection with the exact same delivery writer.
+pub(crate) fn render_projected_unit(unit: &Value) -> Result<String> {
+    project::render_unit(unit)
+}
 pub fn export_lingmo_v7(bundle_raw: &[u8], gate: &mut impl BundleGate) -> Result<Delivery> {
     let ordered: Ordered =
         serde_json::from_slice(bundle_raw).map_err(|e| format!("BUNDLE_JSON: {e}"))?;

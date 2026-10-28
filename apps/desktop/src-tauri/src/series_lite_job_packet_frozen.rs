@@ -79,6 +79,7 @@ pub fn load_frozen(
     validate_request(
         &request,
         packet.get("compiler")?.get("version")?.string()? != LEGACY_COMPILER_VERSION,
+        packet.get("compiler")?.get("version")?.string()? == CURRENT_COMPILER_VERSION,
     )?;
     need(
         request.get("episode")? == episode && request.get("role")?.string()? == role,
@@ -92,17 +93,16 @@ pub fn load_frozen(
         .iter()
         .map(|item| bind(&root, item, &mut actual_blobs, None))
         .collect::<Result<Vec<_>>>()?;
-    let review = bind(
-        &root,
-        request.get("review")?,
-        &mut actual_blobs,
-        Some("review"),
-    )?;
+    let review = if let Some(item) = request.object()?.get("review") {
+        bind(&root, item, &mut actual_blobs, Some("review"))?
+    } else {
+        Json::Null
+    };
     for record in packet
         .get("bindings")?
         .array()?
         .iter()
-        .chain(std::iter::once(packet.get("review")?))
+        .chain((packet.get("review")? != &Json::Null).then_some(packet.get("review")?))
     {
         fields(
             record,
@@ -121,7 +121,9 @@ pub fn load_frozen(
         "JOB input binding changed",
     )?;
     need(packet.get("review")? == &review, "review record changed")?;
-    review_nonempty(actual_blobs[review.get("blob")?.string()?].get("value")?)?;
+    if review != Json::Null {
+        review_nonempty(actual_blobs[review.get("blob")?.string()?].get("value")?)?;
+    }
     validate_scope(packet.get("scope")?, episode)?;
     need(
         packet.get("scope")? == &scope(&root, episode, scope_gate)?,

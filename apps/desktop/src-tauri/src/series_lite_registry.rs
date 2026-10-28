@@ -197,6 +197,14 @@ pub fn registry_scope(registry: &Value, require_locked: bool) -> Result<Option<&
 /// Complete validateRegistry equivalent. It allows historical design dependencies;
 /// actual consumers must additionally call check_design_dependencies.
 pub fn validate_registry(registry: &Value, require_locked: bool) -> Result<()> {
+    validate_registry_impl(registry, require_locked, false)
+}
+/// Explicit 0.4.1 entry point. Historical 0.1.2 readers keep their original
+/// extra-field semantics through validate_registry and are never re-signed.
+pub(crate) fn validate_registry_current(registry: &Value, require_locked: bool) -> Result<()> {
+    validate_registry_impl(registry, require_locked, true)
+}
+fn validate_registry_impl(registry: &Value, require_locked: bool, current: bool) -> Result<()> {
     need(
         registry["version"] == "series-assets-v1"
             && text(&registry["id"])
@@ -275,6 +283,9 @@ pub fn validate_registry(registry: &Value, require_locked: bool) -> Result<()> {
             "ASSET_DESIGN",
             "invalid adopted design",
         )?;
+        if current {
+            crate::series_lite_image_design::validate_design_level(a)?;
+        }
         let names = arr(&a["aliases"], "ASSET_ALIASES")?;
         let mut seen = HashSet::new();
         need(
@@ -382,7 +393,11 @@ pub fn validate_registry(registry: &Value, require_locked: bool) -> Result<()> {
             )?;
         }
     }
-    crate::series_lite_asset_uses::validate_usage_annotations(registry)
+    crate::series_lite_asset_uses::validate_usage_annotations(registry)?;
+    if current {
+        crate::series_lite_image_design::validate_image_designs(registry)?;
+    }
+    Ok(())
 }
 fn visit_dependencies(
     id: &str,
@@ -564,6 +579,60 @@ pub struct NativeRegistryValidator;
 impl crate::series_lite_asset_uses::RegistryValidator for NativeRegistryValidator {
     fn validate(&mut self, registry: &Value, require_locked: bool) -> Result<()> {
         validate_registry(registry, require_locked)
+    }
+}
+/// Version-selected companion for new 0.4.1 registry transitions. Keeping the
+/// old adapter separate prevents a historical frozen call silently upgrading.
+pub(crate) struct NativeCurrentRegistryValidator;
+impl crate::series_lite_asset_uses::RegistryValidator for NativeCurrentRegistryValidator {
+    fn validate(&mut self, registry: &Value, require_locked: bool) -> Result<()> {
+        validate_registry_current(registry, require_locked)
+    }
+}
+
+#[cfg(test)]
+mod current_contract_tests {
+    use super::*;
+    fn registry() -> Value {
+        json!({"version":"series-assets-v1","id":"synthetic-versioned-registry","revision":1,"sourceHash":"a".repeat(64),
+            "assets":[{"id":"A0001","revision":1,"type":"CH","name":"甲","key":"甲CH","status":"常态","aliases":[],
+                "origin":{"kind":"source","sourceRefs":["E01:R1"],"basis":"合成原文"},"design":{"state":"TEXT_ADOPTED","text":"旧完整文字设计"}}],
+            "requests":[],"changes":[]})
+    }
+    #[test]
+    fn new_image_schema_is_opt_in_and_legacy_unmarked_rows_stay_readable() {
+        let mut value = registry();
+        validate_registry(&value, true).unwrap();
+        validate_registry_current(&value, true).unwrap();
+        value["assets"][0]["design"]["detailLevel"] = json!("historical-extra-field");
+        validate_registry(&value, true).unwrap();
+        assert!(validate_registry_current(&value, true)
+            .unwrap_err()
+            .starts_with("ASSET_DESIGN_LEVEL:"));
+        value["assets"][0]["design"]
+            .as_object_mut()
+            .unwrap()
+            .remove("detailLevel");
+        value["imageDesigns"] = json!({"historicalExtra":true});
+        validate_registry(&value, true).unwrap();
+        assert!(validate_registry_current(&value, true)
+            .unwrap_err()
+            .starts_with("ASSET_IMAGE_DESIGN:"));
+    }
+    #[test]
+    fn new_marked_storyboard_design_requires_full_body_without_becoming_art() {
+        let mut value = registry();
+        value["assets"][0]["design"]["detailLevel"] = json!("storyboard");
+        assert!(validate_registry_current(&value, true)
+            .unwrap_err()
+            .starts_with("ASSET_DESIGN_FULL:"));
+        value["assets"][0]["design"]["full"] = json!({"body":"完整身份和动作条件"});
+        validate_registry_current(&value, true).unwrap();
+        assert!(
+            crate::series_lite_image_design::resolve_image_design(&value, "A0001")
+                .unwrap_err()
+                .starts_with("ASSET_IMAGE_NOT_READY:")
+        );
     }
 }
 #[cfg(test)]

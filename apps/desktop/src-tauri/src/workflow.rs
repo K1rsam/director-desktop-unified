@@ -1901,6 +1901,9 @@ pub(crate) fn verify_series_receipts(c:&Connection,run:&str,output:&Value)->Resu
 }
 
 pub fn guard_from_input(input: &Value) -> Value {
+    if crate::pipeline::series_lite::uses_profile(input) {
+        return crate::series_lite_guard::from_input(input);
+    }
     let assets: BTreeMap<_, _> = input["assets"]
         .as_array()
         .into_iter()
@@ -1936,6 +1939,12 @@ impl Store {
         if snapshot["stage"] != "storyboard.run" || snapshot["runnerVersion"] != "desktop-runner/v1"
         {
             return Ok(());
+        }
+        if crate::pipeline::series_lite::uses_profile(&snapshot["input"]) {
+            if snapshot["guard"]["version"] != crate::series_lite_guard::VERSION {
+                return Err("LITE_GUARD_VERSION: 原新版任务缺少匹配的消费守卫，保留原快照".into());
+            }
+            return crate::pipeline::series_lite::refresh_guard(self, run, snapshot);
         }
         let mut connection = self.conn()?;
         let tx = connection
@@ -2011,6 +2020,12 @@ impl Store {
     }
 }
 pub fn verify_guard(tx: &Transaction<'_>, guard: &Value) -> Result<()> {
+    if guard["version"] == crate::series_lite_guard::VERSION {
+        return crate::series_lite_guard::verify(tx, guard);
+    }
+    if !guard["version"].is_null() {
+        return Err("WORKFLOW_GUARD_VERSION_UNSUPPORTED: 未知发布守卫版本，未覆盖当前成果".into());
+    }
     let source: i64 = tx
         .query_row("SELECT COALESCE(MAX(version),0) FROM sources", [], |r| {
             r.get(0)

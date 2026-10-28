@@ -1,0 +1,238 @@
+{
+  "version": "series-lite-provenance-v1",
+  "skillVersion": "20261028-v0.4.1-3d-fantasy",
+  "baseSkill": "series-storyboard-director",
+  "baseVersion": "20261027-v6.7.4-scope-first",
+  "scope": "independent distilled workflow trial; not an upgrade or migration of existing productions",
+  "runtime": "retains source, assets, scope, v7 export and recovery code from the base",
+  "modifiedInheritedScripts": [
+    "scripts/job_packet.py",
+    "scripts/assets.mjs",
+    "scripts/episode_execution.py",
+    "scripts/storyboard.mjs",
+    "scripts/core/runtime/storyboard-v4/core/visual-style.mjs"
+  ],
+  "newScripts": [
+    "scripts/lite_edit.py",
+    "scripts/packet_view.py",
+    "scripts/asset-uses.mjs",
+    "scripts/asset-image-design.mjs",
+    "scripts/generation-boundary.mjs",
+    "scripts/prepare_episode.py"
+  ],
+  "validationBoundary": "format/runtime tests and isolated forward author trial do not establish creative equivalence or fee savings",
+  "earlyAssetMaintenance": {
+    "baseVersion": "20261027-v0.1.0-distilled",
+    "alignedContractVersion": "20261027-v6.7.5-early-assets",
+    "runtimeCodeChanged": false,
+    "releaseNotes": "references/release-v0.1.1.md"
+  },
+  "usageReuseMaintenance": {
+    "date": "2026-10-27",
+    "releaseNotes": "references/release-v0.1.2.md",
+    "scope": "Direct known-asset supply, version-bound usage annotations, minimal early handoff; unchanged adoption gates and frozen production runtime",
+    "productionModified": false,
+    "liveProductionValidated": false,
+    "validation": "62 director Node tests; 16 full and 16 lite episode-execution tests; 12 receiver Node tests passed. Isolated real-project registry test preserved 7 existing adopted receipts with the frozen verifier and all asset rows unchanged. No live production migration, model quality, media acceptance or measured fee saving asserted.",
+    "isolatedRealProjectValidated": true
+  },
+  "qPairAssetMaintenance": {
+    "date": "2026-10-27",
+    "releaseNotes": "references/release-v0.1.3.md",
+    "scope": "Normal plus 3D Q in one comparison image; immediate-parent costume chain; per-unit image choice and current-image clothing authority",
+    "runtimeCodeChanged": false,
+    "productionModified": false,
+    "receiverModified": false,
+    "published": false,
+    "validationBoundary": "Text and existing runtime compatibility; no real media acceptance or measured savings asserted",
+    "validation": {
+      "nodeTestsPassed": 47,
+      "jobPacketTestsPassed": 22,
+      "compiledRolesVerified": [
+        "author",
+        "finisher",
+        "reviewer"
+      ],
+      "syntheticReferenceAndDependencyCases": 3,
+      "realMediaValidated": false
+    }
+  },
+  "creativeFlowMaintenance": {
+    "date": "2026-10-27",
+    "releaseNotes": "references/release-v0.1.4.md",
+    "activeAmplificationAndCoverage": true,
+    "existingThreeRolesOnly": true,
+    "runtimeCodeChanged": true,
+    "runtimeChange": "asset-only readable projection",
+    "productionModified": false,
+    "newModelABTested": false,
+    "realMediaValidated": false,
+    "published": false,
+    "validation": {
+      "pythonTestsPassed": 29,
+      "effectiveRolesChecked": [
+        "author",
+        "finisher",
+        "reviewer"
+      ],
+      "realAssetValuesPreserved": true,
+      "newModelABTested": false,
+      "tokenSavingsMeasured": false,
+      "realMediaValidated": false
+    }
+  },
+  "productionFlowMaintenance": {
+    "date": "2026-10-27",
+    "baseVersion": "20261027-v0.1.4-creative-flow",
+    "releaseNotes": "references/release-v0.2.0.md",
+    "runtimeCodeChanged": true,
+    "narrativeAndImageDesignSeparated": true,
+    "generationBoundary": "video-prompt-v1",
+    "productionModified": false,
+    "receiverModified": false,
+    "published": false,
+    "validation": {
+      "nodeTestsPassed": 298,
+      "combinedPythonTestsPassed": 103,
+      "isolatedRealProject": {
+        "sourceSnapshot": "shared/assets/v000708.json",
+        "sourceRegistryRevision": 708,
+        "assetId": "A0002",
+        "assetRevision": 2,
+        "realReceiptsKeptValid": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          51,
+          52
+        ],
+        "isolatedRegistryOnly": true,
+        "productionFilesWritten": false,
+        "allAssetRowsUnchanged": true,
+        "nodeDependencyFingerprintUnchanged": true,
+        "localVerificationSeconds": 3.815,
+        "method": "frozen real verifier with isolated current-registry cache substitution; original outputs and historical hashes still checked; new Node dependency fingerprint checked before/after",
+        "notClaimed": "not live migration; not new model AB, token, cost or media quality measurement"
+      },
+      "newModelABTested": false,
+      "tokenSavingsMeasured": false,
+      "realMediaValidated": false
+    }
+  },
+  "selectivePropsMaintenance": {
+    "date": "2026-10-27",
+    "baseVersion": "20261027-v0.2.0-production-flow",
+    "releaseNotes": "references/release-v0.2.1.md",
+    "runtimeCodeChanged": false,
+    "newRuntimeFields": false,
+    "productionModified": false,
+    "receiverModified": false,
+    "published": false,
+    "validation": {
+      "isolatedExportReadback": true,
+      "logicalWithoutImage": true,
+      "criticalPanelImageRetained": true,
+      "threeEffectiveRolesVerified": true,
+      "sixScenarioIndependentReview": true,
+      "realMediaValidated": false,
+      "tokenSavingsMeasured": false
+    }
+  },
+  "directStartMaintenance": {
+    "date": "2026-10-28",
+    "baseVersion": "20261027-v0.2.1-selective-props",
+    "scope": "one-call role preparation; optional state/entry/review; effective-context reuse; first-ready-batch intake",
+    "productionModified": false,
+    "published": false,
+    "newModelABTested": false,
+    "tokenSavingsMeasured": false,
+    "validation": {
+      "pythonTestsPassed": 180,
+      "skillQuickValidatePassed": true,
+      "localMarkdownLinksChecked": 68,
+      "missingLinks": 0,
+      "syntheticPrepareAndAdoptionPassed": true,
+      "originalSourceAndSelectedAssetRowsPreserved": true,
+      "noPreparatoryReportsRequired": true,
+      "newModelABTested": false,
+      "tokenSavingsMeasured": false
+    }
+  },
+  "integratedDraftMaintenance": {
+    "version": "20261028-v0.4.0-integrated-draft",
+    "scope": "joint complete draft, single event contract, derived duplicate indices, local finishing and independent review retained",
+    "historicalTrial": {
+      "project": "精神小妹也要开机甲",
+      "episodes": [
+        3,
+        11,
+        51
+      ],
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": "high",
+      "design": "historical adopted drafts versus one fresh isolated run per episode; not randomized simultaneous A/B",
+      "outcome": "mixed; EP3 emotional axis slightly favors new, EP11 slightly favors new, EP51 old emotional acting preferred and new needed local source-action repair",
+      "equalQualityProven": false,
+      "wholeProjectSavingsProven": false,
+      "mediaTested": false
+    },
+    "regressionsFixed": [
+      "CRLF source rows preserved in event coverage",
+      "derived seconds avoid artificial trailing precision",
+      "visual-domain schema ambiguity clarified"
+    ],
+    "validation": {
+      "pythonTestsPassed": 189,
+      "nodeTestsPassed": 82,
+      "quickValidatePassed": true,
+      "threeRealSourceLockedCandidatesCheckExportVerifyPassed": true,
+      "productionFilesModified": false
+    },
+    "boundary": "default production has only author, finisher and independent content review; double-draft comparison and history audit are experiment-only; not a new mandatory layer",
+    "published": false
+  },
+  "threeDimensionalFantasyMaintenance": {
+    "version": "20261028-v0.4.1-3d-fantasy",
+    "date": "2026-10-28",
+    "purpose": "strong embodied 3D fantasy; no automatic side-avatar or 2D inserts",
+    "sameWorkflow": true,
+    "addedRoles": 0,
+    "addedDefaultPasses": 0,
+    "addedSchemas": 0,
+    "threeRoleRuleReading": [
+      {
+        "skill": "series-storyboard-director-lite",
+        "role": "author",
+        "rules": 4,
+        "bytesBefore": 21485,
+        "bytesAfter": 21439,
+        "changeBytes": -46
+      },
+      {
+        "skill": "series-storyboard-director-lite",
+        "role": "finisher",
+        "rules": 4,
+        "bytesBefore": 21430,
+        "bytesAfter": 21384,
+        "changeBytes": -46
+      },
+      {
+        "skill": "series-storyboard-director-lite",
+        "role": "reviewer",
+        "rules": 4,
+        "bytesBefore": 21430,
+        "bytesAfter": 21384,
+        "changeBytes": -46
+      }
+    ],
+    "validation": {
+      "visualBaselineTestsPassed": 8,
+      "jobPacketTestsPassed": 24,
+      "quickValidatePassed": true
+    },
+    "boundary": "rules and default preset propagation only; no new model production or video test; earlier three-episode costs belong to v0.4.0, not this update",
+    "published": false
+  }
+}

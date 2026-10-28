@@ -14,6 +14,34 @@ fn embedded_release_matches_pinned_files_without_runtime_script_dependency() {
 }
 
 #[test]
+fn current_release_is_exact_published_041_and_never_replaces_historical_pack() {
+    let old = VerifiedPack::embedded().unwrap();
+    let current = VerifiedPack::current_embedded().unwrap();
+    let disk = VerifiedPack::load(&Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../rules/series-lite/20261028-v0.4.1")).unwrap();
+    assert_eq!(current.files, disk.files);
+    assert_eq!(current.files.len(), 106);
+    assert_eq!(current.release(), CURRENT_RELEASE);
+    assert_eq!(current.compiler_version(), "lingmo-lite-role-rules-v2");
+    assert_eq!(current.inspection()["contract"]["sourceCommit"], CURRENT_SOURCE_COMMIT);
+    assert_eq!(current.manifest_sha256(), hash(CURRENT_MANIFEST));
+    assert!(current.file_bytes("scripts/prepare_episode.py").is_ok());
+    assert!(old.file_bytes("scripts/prepare_episode.py").is_err());
+    assert_eq!(old.release(), RELEASE);
+    for role in ["author", "finisher", "reviewer"] {
+        let rules = current.inspection_role_rules(role, true).unwrap();
+        assert!(current.verify_existing(&json!({"seriesLiteContract":current.contract_identity()}), role, true, &rules).is_ok());
+        assert!(old.verify_existing(&json!({"seriesLiteContract":current.contract_identity()}), role, true, &rules).is_err());
+        assert!(current.verify_existing(&json!({"seriesLiteContract":old.contract_identity()}), role, true, &rules).is_err());
+    }
+    // A frozen file, compiler or active flag cannot grant a still-unaccepted route.
+    let mut drift = current.files.clone();
+    drift.get_mut("scripts/prepare_episode.py").unwrap().push(b' ');
+    assert!(VerifiedPack::verify_files(CURRENT_MANIFEST, drift).is_err());
+    assert!(current.require_new_production().is_err());
+}
+
+#[test]
 fn role_selection_includes_system_contract_and_full_shared_methods_once() {
     let p = pack();
     let methods = [

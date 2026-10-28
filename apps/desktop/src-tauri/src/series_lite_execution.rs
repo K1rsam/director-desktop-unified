@@ -151,6 +151,16 @@ fn verify_bound(
     episode: Option<i64>,
 ) -> Result<VerifiedReceipt> {
     let raw = job.read(path)?;
+    verify_raw_bound(job, raw, trusted, episode)
+}
+/// The caller supplies independently frozen intent bytes. Reading an unpinned
+/// on-disk receipt and computing its own hash is never a verification path.
+fn verify_raw_bound(
+    job: &Job,
+    raw: Vec<u8>,
+    trusted: &str,
+    episode: Option<i64>,
+) -> Result<VerifiedReceipt> {
     need(
         hex(trusted) && sha256(&raw) == trusted,
         "receipt external pin mismatch; retain for reconciliation",
@@ -307,6 +317,29 @@ pub fn run(
         &mut |_| Ok(()),
     )
 }
+/// Freeze the exact final receipt in the caller's durable SQL transaction
+/// before publishing the immutable filesystem receipt. The callback must commit
+/// the path, bytes and their SHA-256 (or validate an identical existing intent)
+/// before returning Ok. Callback failure leaves every mechanical output intact.
+/// Existing receipts still require the prior independent completed pin.
+pub fn run_with_commit_intent(
+    root: &Path,
+    manifest: &str,
+    output: &str,
+    pack: &VerifiedPack,
+    completed_receipt_pin: Option<&str>,
+    before_receipt: &mut dyn FnMut(&str, &[u8]) -> Result<()>,
+) -> Result<ExecutionResult> {
+    run_controlled(
+        root,
+        manifest,
+        output,
+        pack,
+        completed_receipt_pin,
+        &mut |_| Ok(()),
+        before_receipt,
+    )
+}
 fn run_inner(
     root: &Path,
     manifest: &str,
@@ -314,6 +347,17 @@ fn run_inner(
     pack: &VerifiedPack,
     pin: Option<&str>,
     hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<ExecutionResult> {
+    run_controlled(root, manifest, output, pack, pin, hook, &mut |_, _| Ok(()))
+}
+fn run_controlled(
+    root: &Path,
+    manifest: &str,
+    output: &str,
+    pack: &VerifiedPack,
+    pin: Option<&str>,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+    before_receipt: &mut dyn FnMut(&str, &[u8]) -> Result<()>,
 ) -> Result<ExecutionResult> {
     let job = Job::new(root)?;
     let run = job.path(output)?;
@@ -415,7 +459,9 @@ fn run_inner(
             .collect::<Result<Vec<_>>>()?,
     );
     protected.push(s(&bound.request, "registry")?);
-    protected.push(s(bound.packet.get("review")?, "path")?);
+    if *bound.packet.get("review")? != Json::Null {
+        protected.push(s(bound.packet.get("review")?, "path")?);
+    }
     protected.push(s(bound.packet.get("requestOrigin")?, "path")?);
     for path in protected {
         need(
@@ -580,24 +626,55 @@ fn run_inner(
         current.fingerprint == bound.fingerprint && current.signature == bound.signature,
         "inputs changed during execution; no receipt written",
     )?;
-    // Recheck all output pins immediately before committing the receipt too.
+    let raw = receipt_bytes(&job, manifest, &bound, &state)?;
+    before_receipt(&rel_receipt, &raw)?;
+    // The SQL callback must not change a frozen input or output. Recheck after
+    // it commits and before publication, even when recovery supplies an intent.
+    let current = inputs(&job, manifest, Some(pack), None)?;
+    need(
+        current.fingerprint == bound.fingerprint
+            && current.signature == bound.signature
+            && receipt_bytes(&job, manifest, &current, &state)? == raw,
+        "inputs/outputs changed after receipt intent; no receipt written",
+    )?;
+    job.atomic_new(&receipt_path, &raw)?;
+    Ok(ExecutionResult {
+        reused: false,
+        receipt_path: rel_receipt,
+        receipt_file_sha256: sha256(&raw),
+        steps_run: performed,
+        preview_path: s(&state, "preview")?.into(),
+        content_review: "NOT_PROVEN",
+    })
+}
+
+fn receipt_bytes(job: &Job, manifest: &str, bound: &BoundInputs, state: &Json) -> Result<Vec<u8>> {
     let steps = state.get("steps")?.object()?;
+    need(
+        steps.len() == 4
+            && ["sync", "check", "export", "verify"]
+                .iter()
+                .all(|name| steps.contains_key(*name)),
+        "receipt intent requires all four committed mechanical steps",
+    )?;
     let mut outputs = vec![];
     for group in steps.values() {
+        need(!group.array()?.is_empty(), "empty mechanical step evidence")?;
         for record in group.array()? {
             job.record_matches(record)?;
             outputs.push(record.clone());
         }
     }
+    job.record_matches(&bound.registry.snapshot)?;
     let mut receipt = object([
         ("version", text(RECEIPT)),
         ("episode", bound.request.get("episode")?.clone()),
         ("manifest", text(manifest)),
         ("bundle", job.record(s(&bound.request, "bundle")?)?),
-        ("executionFingerprint", text(bound.fingerprint)),
-        ("inputs", bound.signature),
+        ("executionFingerprint", text(bound.fingerprint.clone())),
+        ("inputs", bound.signature.clone()),
         ("steps", Json::Array(steps.keys().map(text).collect())),
-        ("registrySnapshot", bound.registry.snapshot),
+        ("registrySnapshot", bound.registry.snapshot.clone()),
         ("outputs", Json::Array(outputs)),
         ("preview", state.get("preview")?.clone()),
         ("contentReview", text("NOT_PROVEN")),
@@ -606,13 +683,87 @@ fn run_inner(
     put(&mut receipt, "receiptSha256", text(hash))?;
     let mut raw = canonical(&receipt);
     raw.push(b'\n');
-    job.atomic_new(&receipt_path, &raw)?;
+    Ok(raw)
+}
+
+/// Complete only an independently frozen pre-publication SQL intent. No new
+/// mechanical stage, export attempt, model request or receipt authority is
+/// allocated. Historical runtime pins come from that trusted intent, not from
+/// the current adapter or an unverified receipt found on disk.
+pub fn reconcile_commit_intent(
+    root: &Path,
+    manifest: &str,
+    output: &str,
+    trusted_intent_bytes: &[u8],
+    trusted_intent_sha256: &str,
+) -> Result<ExecutionResult> {
+    let job = Job::new(root)?;
+    let run = job.path(output)?;
+    need(run.is_dir(), "receipt intent output missing; no recreation")?;
+    let _workspace_lock = job.lock(&job.root.join(".state.lock"))?;
+    let _run_lock = job.lock(&run.join(".state.lock"))?;
+    let receipt_path = run.join("adoption.json");
+    let relative = job.relative(&receipt_path)?;
+    let verified = verify_raw_bound(
+        &job,
+        trusted_intent_bytes.to_vec(),
+        trusted_intent_sha256,
+        None,
+    )?;
+    let intended = parse(&verified.bytes)?;
+    need(
+        s(&intended, "manifest")? == manifest,
+        "receipt intent belongs to another request",
+    )?;
+    let bound = inputs(&job, manifest, None, Some(intended.get("inputs")?))?;
+    let state = job.json(&job.relative(&run.join("execution.json"))?)?;
+    fields(
+        &state,
+        &["version", "executionFingerprint", "steps", "attempt"],
+        &["preview"],
+    )?;
+    need(
+        s(&state, "version")? == REQUEST
+            && s(&state, "executionFingerprint")? == bound.fingerprint
+            && state
+                .get("attempt")?
+                .integer()
+                .is_some_and(|n| n >= 0 && n < i64::MAX as i128)
+            && state.get("preview")? == intended.get("preview")?,
+        "receipt intent and committed execution journal differ",
+    )?;
+    need(
+        job.path(s(&state, "preview")?)?.starts_with(&run),
+        "intent preview outside execution run",
+    )?;
+    for group in state.get("steps")?.object()?.values() {
+        for record in group.array()? {
+            need(
+                job.path(s(record, "path")?)?.starts_with(&run),
+                "intent output outside execution run",
+            )?;
+        }
+    }
+    // Reconstruct from current exact input values and the original output pins.
+    // A different whitespace/field/step/preview result is not this SQL intent.
+    need(
+        receipt_bytes(&job, manifest, &bound, &state)? == trusted_intent_bytes,
+        "receipt intent cannot be reconstructed exactly from saved inputs/outputs",
+    )?;
+    if receipt_path.exists() {
+        need(
+            job.read(&relative)? == trusted_intent_bytes,
+            "existing receipt differs; never overwrite",
+        )?;
+    } else {
+        job.atomic_new(&receipt_path, trusted_intent_bytes)?;
+    }
     Ok(ExecutionResult {
-        reused: false,
-        receipt_path: rel_receipt,
-        receipt_file_sha256: sha256(&raw),
-        steps_run: performed,
-        preview_path: s(&state, "preview")?.into(),
+        reused: true,
+        receipt_path: relative,
+        receipt_file_sha256: trusted_intent_sha256.into(),
+        steps_run: vec![],
+        preview_path: verified.preview_path,
         content_review: "NOT_PROVEN",
     })
 }

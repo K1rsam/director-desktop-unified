@@ -336,3 +336,226 @@ fn immutable_receipt_publication_cannot_overwrite_existing_bytes() {
     assert!(job.atomic_new(&output, b"replacement").is_err());
     assert_eq!(fs::read(output).unwrap(), b"complete-first");
 }
+
+fn saved_intent(dir: &Path, pack: &VerifiedPack) -> (String, Vec<u8>) {
+    let mut saved = None;
+    let result = run_with_commit_intent(
+        dir,
+        "execution-request.json",
+        "out",
+        pack,
+        None,
+        &mut |path, bytes| {
+            saved = Some((path.to_owned(), bytes.to_vec()));
+            Err(err(
+                "synthetic crash after durable SQL intent, before FS receipt",
+            ))
+        },
+    );
+    assert!(result.unwrap_err().contains("synthetic crash"));
+    let saved = saved.unwrap();
+    assert!(!dir.join(&saved.0).exists());
+    saved
+}
+
+#[test]
+fn receipt_commit_intent_closes_both_sql_filesystem_crash_windows_without_rerunning_steps() {
+    let dir = fixture();
+    let pack = VerifiedPack::embedded().unwrap();
+    let (path, intended) = saved_intent(dir.path(), &pack);
+    // This hash represents the caller's durable SQL intent captured in the
+    // pre-publication callback, never the untrusted on-disk adoption.json.
+    let frozen_pin = sha256(&intended);
+    let protected = [
+        "out/execution.json",
+        "out/consumption.json",
+        "out/sync.json",
+        "out/check.json",
+        "out/export.json",
+        "out/verify.json",
+        "out/export-0/preview.md",
+        "out/export-0/preview.md.assets.json",
+    ]
+    .into_iter()
+    .map(|p| (p, fs::read(dir.path().join(p)).unwrap()))
+    .collect::<Vec<_>>();
+    assert!(run(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &pack,
+        Some(&frozen_pin)
+    )
+    .unwrap_err()
+    .contains("missing"));
+    let repaired = reconcile_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &intended,
+        &frozen_pin,
+    )
+    .unwrap();
+    assert!(repaired.reused);
+    assert!(repaired.steps_run.is_empty());
+    assert_eq!(repaired.content_review, "NOT_PROVEN");
+    assert_eq!(repaired.receipt_path, path);
+    assert_eq!(fs::read(dir.path().join(&path)).unwrap(), intended);
+    for (path, bytes) in protected {
+        assert_eq!(
+            fs::read(dir.path().join(path)).unwrap(),
+            bytes,
+            "{path}: no re-export/recheck journal rewrite"
+        );
+    }
+    verify_receipt(dir.path(), &path, &frozen_pin, Some(1)).unwrap();
+    let again = reconcile_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &intended,
+        &frozen_pin,
+    )
+    .unwrap();
+    assert!(again.reused);
+    assert!(again.steps_run.is_empty());
+    // A crash after the receipt was published is also idempotent because the
+    // callback already committed this pin before the filesystem operation.
+    let mut called = false;
+    let resumed = run_with_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &pack,
+        Some(&frozen_pin),
+        &mut |_, _| {
+            called = true;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(resumed.reused);
+    assert!(!called);
+}
+
+#[test]
+fn receipt_intent_reconciliation_rejects_changed_input_output_journal_or_untrusted_bytes() {
+    for drift in ["input", "output", "journal", "missing_journal", "intent"] {
+        let dir = fixture();
+        let pack = VerifiedPack::embedded().unwrap();
+        let (path, mut intended) = saved_intent(dir.path(), &pack);
+        let pin = sha256(&intended);
+        match drift {
+            "input" => fs::write(
+                dir.path().join("direction.txt"),
+                b"changed frozen direction",
+            )
+            .unwrap(),
+            "output" => fs::write(
+                dir.path().join("out/export-0/preview.md"),
+                b"changed delivery",
+            )
+            .unwrap(),
+            "journal" => {
+                let file = dir.path().join("out/execution.json");
+                let mut state: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                state["steps"].as_object_mut().unwrap().remove("verify");
+                fs::write(file, serde_json::to_vec(&state).unwrap()).unwrap();
+            }
+            "missing_journal" => fs::remove_file(dir.path().join("out/execution.json")).unwrap(),
+            "intent" => intended.push(b' '),
+            _ => unreachable!(),
+        }
+        assert!(
+            reconcile_commit_intent(dir.path(), "execution-request.json", "out", &intended, &pin)
+                .is_err(),
+            "{drift}"
+        );
+        assert!(
+            !dir.path().join(path).exists(),
+            "{drift}: no recreated authority"
+        );
+    }
+}
+
+#[test]
+fn receipt_commit_callback_cannot_hide_input_drift_or_self_adopt_an_unpinned_existing_receipt() {
+    let dir = fixture();
+    let pack = VerifiedPack::embedded().unwrap();
+    let mut saved = None;
+    let result = run_with_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &pack,
+        None,
+        &mut |_, bytes| {
+            saved = Some(bytes.to_vec());
+            fs::write(
+                dir.path().join("direction.txt"),
+                b"drift during SQL callback",
+            )
+            .unwrap();
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(saved.is_some());
+    assert!(!dir.path().join("out/adoption.json").exists());
+    let dir = fixture();
+    let result = run(dir.path(), "execution-request.json", "out", &pack, None).unwrap();
+    let original = fs::read(dir.path().join(&result.receipt_path)).unwrap();
+    let mut callback_called = false;
+    let error = run_with_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "out",
+        &pack,
+        None,
+        &mut |_, _| {
+            callback_called = true;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("external pin"));
+    assert!(!callback_called);
+    assert_eq!(
+        fs::read(dir.path().join(result.receipt_path)).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn receipt_intent_never_overwrites_a_conflicting_receipt_or_accepts_a_different_run() {
+    let dir = fixture();
+    let pack = VerifiedPack::embedded().unwrap();
+    let (path, intended) = saved_intent(dir.path(), &pack);
+    let pin = sha256(&intended);
+    fs::write(
+        dir.path().join(&path),
+        b"independently existing receipt bytes",
+    )
+    .unwrap();
+    assert!(
+        reconcile_commit_intent(dir.path(), "execution-request.json", "out", &intended, &pin)
+            .unwrap_err()
+            .contains("never overwrite")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(path)).unwrap(),
+        b"independently existing receipt bytes"
+    );
+    assert!(
+        reconcile_commit_intent(dir.path(), "different-request.json", "out", &intended, &pin)
+            .is_err()
+    );
+    assert!(reconcile_commit_intent(
+        dir.path(),
+        "execution-request.json",
+        "different-run",
+        &intended,
+        &pin
+    )
+    .is_err());
+}

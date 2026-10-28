@@ -1,0 +1,18 @@
+{
+  "version": "series-lite-desktop-freeze/v1",
+  "skill": "series-storyboard-director-lite",
+  "release": "20261028-v0.4.1-3d-fantasy",
+  "sourceRepository": "K1rsam/series-storyboard-director",
+  "sourceCommit": "f855227c8406b38093d03c777fe24a0b0b4f87dc",
+  "sourcePath": "skills/series-storyboard-director-lite",
+  "manifestSha256": "25e213960a03eddb59928108ed7e95f4743b674074736129deefe803b972c538",
+  "verifiedFiles": 106,
+  "localMutableSourceUsed": false,
+  "active": true,
+  "activationScope": "new-explicit-desktop-lite-tasks/v1",
+  "rustAdapterVersion": "series-lite-rust-adapter/v0.4.1-candidate.1",
+  "runtimeContract": "series-lite-runtime/v2",
+  "acceptance": "candidate_engineering_pass_windows_install_pending_real_model_review_pending",
+  "standalonePackDispatchAllowed": false,
+  "historicalRequestsResigned": false
+}

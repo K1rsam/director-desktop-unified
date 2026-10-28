@@ -21,6 +21,16 @@ const MANIFEST: &[u8] =
     include_bytes!("../../../../rules/series-lite/20261027-v0.1.2/SHA256SUMS.txt");
 #[path = "series_lite_contract_embedded.rs"]
 mod embedded;
+#[path = "series_lite_contract_041_embedded.rs"]
+mod embedded_041;
+
+pub const CURRENT_RELEASE: &str = "20261028-v0.4.1-3d-fantasy";
+pub const CURRENT_SOURCE_COMMIT: &str = "f855227c8406b38093d03c777fe24a0b0b4f87dc";
+pub const CURRENT_ADAPTER_VERSION: &str = "series-lite-rust-adapter/v0.4.1-candidate.1";
+pub const CURRENT_MANIFEST_SHA256: &str =
+    "25e213960a03eddb59928108ed7e95f4743b674074736129deefe803b972c538";
+const CURRENT_MANIFEST: &[u8] =
+    include_bytes!("../../../../rules/series-lite/20261028-v0.4.1/SHA256SUMS.txt");
 
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -29,7 +39,8 @@ fn error(detail: &str) -> String {
     format!("SERIES_LITE_CONTRACT: {detail}")
 }
 fn manifest(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
-    if hash(bytes) != MANIFEST_SHA256 {
+    let current = hash(bytes) == CURRENT_MANIFEST_SHA256;
+    if !current && hash(bytes) != MANIFEST_SHA256 {
         return Err(error("冻结清单字节已漂移"));
     }
     let mut rows = BTreeMap::new();
@@ -50,7 +61,7 @@ fn manifest(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
             return Err(error("清单含重复或越界路径"));
         }
     }
-    if rows.len() != FILE_COUNT {
+    if rows.len() != if current { 106 } else { FILE_COUNT } {
         return Err(error("冻结清单文件数量不符"));
     }
     Ok(rows)
@@ -69,6 +80,7 @@ fn identity() -> Value {
 /// rules underneath a compiled packet. No public unchecked constructor exists.
 pub struct VerifiedPack {
     files: BTreeMap<String, Vec<u8>>,
+    current: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,6 +94,39 @@ impl VerifiedPack {
     /// mutable global Skill directory, Python or Node is required to read them.
     pub fn embedded() -> Result<Self> {
         Self::verify_files(MANIFEST, embedded::files())
+    }
+    /// Explicit selection for NEW work. Historical callers retain embedded().
+    pub fn current_embedded() -> Result<Self> {
+        Self::verify_files(CURRENT_MANIFEST, embedded_041::files())
+    }
+    pub fn is_current(&self) -> bool { self.current }
+    pub fn release(&self) -> &'static str {
+        if self.current { CURRENT_RELEASE } else { RELEASE }
+    }
+    pub fn manifest_sha256(&self) -> &'static str {
+        if self.current { CURRENT_MANIFEST_SHA256 } else { MANIFEST_SHA256 }
+    }
+    pub fn compiler_version(&self) -> &'static str {
+        if self.current { "lingmo-lite-role-rules-v2" } else { "lingmo-lite-role-rules-v1" }
+    }
+    pub fn file_bytes(&self, path: &str) -> Result<&[u8]> {
+        self.files.get(path).map(Vec::as_slice).ok_or_else(|| error("冻结规则文件缺失"))
+    }
+    pub fn contract_identity(&self) -> Value {
+        let mut result = identity();
+        if self.current {
+            result["creativeVersion"] = json!("0.4.1");
+            result["releaseVersion"] = json!(CURRENT_RELEASE);
+            result["sourceCommit"] = json!(CURRENT_SOURCE_COMMIT);
+            result["checksumFileSha256"] = json!(CURRENT_MANIFEST_SHA256);
+            result["rustAdapterVersion"] = json!(CURRENT_ADAPTER_VERSION);
+            result["active"] = json!(true);
+            result["activationScope"] = json!("new-explicit-desktop-lite-tasks/v1");
+            result["productionAcceptance"] = json!("candidate-real-model-review-pending");
+            result["dataContracts"]["generationBoundary"] = json!("video-prompt-v1");
+            result["dataContracts"]["imageQueue"] = json!("series-image-queue-v2");
+        }
+        result
     }
     /// Load every file from the pinned release manifest. This checks provenance
     /// only; successful loading never grants model dispatch or adoption authority.
@@ -110,6 +155,7 @@ impl VerifiedPack {
     }
     fn verify_files(checksums: &[u8], files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
         let entries = manifest(checksums)?;
+        let current = hash(checksums) == CURRENT_MANIFEST_SHA256;
         if files.len() != entries.len() {
             return Err(error("规则集合缺失或包含未知文件"));
         }
@@ -122,14 +168,22 @@ impl VerifiedPack {
             .get("VERSION")
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .map(str::trim)
-            != Some(RELEASE)
+            != Some(if current { CURRENT_RELEASE } else { RELEASE })
         {
             return Err(error("创作版本与冻结版本不符"));
         }
-        Ok(Self { files })
+        Ok(Self { files, current })
     }
     pub fn inspection(&self) -> Value {
-        json!({"contract":identity(),"filesVerified":self.files.len(),"active":false,
+        if self.current {
+            return json!({"contract":self.contract_identity(),"filesVerified":self.files.len(),"active":true,
+                "implementedCapabilities":["pinned_release_byte_validation","complete_role_rule_bytes","episode_local_prepare","derived_creative_compose","expected_value_patch","three_role_saved_controller","bounded_revisions","native_execution_and_adoption"],
+                "productionCompatibility":"desktop_candidate_real_model_acceptance_pending","modelDispatchAllowed":true,
+                "activationScope":"new-explicit-desktop-lite-tasks/v1","standalonePackDispatchAllowed":false,
+                "threeRoleRuntimeAccepted":false,"historicalResigningAllowed":false,"runtimeScriptExecutionRequired":false,
+                "boundary":"已接候选运行器；工程与安装证据不能替代新剧本真实生成、独审与用户验收"});
+        }
+        json!({"contract":self.contract_identity(),"filesVerified":self.files.len(),"active":false,
             "implementedCapabilities":["pinned_release_byte_validation","complete_role_rule_bytes","frozen_rule_identity_check"],
             "productionCompatibility":"not_accepted","modelDispatchAllowed":false,
             "fullRustGateAccepted":false,"threeRoleRuntimeAccepted":false,"historicalResigningAllowed":false,
@@ -261,7 +315,7 @@ impl VerifiedPack {
         let Some(saved) = snapshot.get("seriesLiteContract") else {
             return Ok(ExistingContract::LegacyUnchanged);
         };
-        if saved != &identity() {
+        if saved != &self.contract_identity() {
             return Err(error(
                 "未知或漂移的创作/数据/适配器合同；保留原任务，不重签",
             ));

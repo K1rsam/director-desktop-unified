@@ -370,6 +370,79 @@ pub fn compose_bytes(
     Ok(finish(base_raw, &base, &result))
 }
 
+#[path = "series_lite_derive_plan.rs"]
+mod derive_plan;
+
+/// Explicit v0.4.1 assembly mode. Historical compose_bytes remains unchanged;
+/// deriving indices never proves prior capacity planning or content quality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedEditResult {
+    pub edit: EditResult,
+    pub derived_bookkeeping: bool,
+    pub bookkeeping_basis: &'static str,
+}
+
+pub fn compose_derived_bytes(
+    base_raw: &[u8],
+    expected_sha256: &str,
+    response_raw: &[u8],
+) -> Result<DerivedEditResult> {
+    let edit = compose_bytes(base_raw, expected_sha256, response_raw)?;
+    let base = load_base(base_raw, expected_sha256)?;
+    let mut result = parse(&edit.bytes)?;
+    let derived_bookkeeping = derive_plan::derive(&mut result)?;
+    Ok(DerivedEditResult {
+        edit: if derived_bookkeeping {
+            finish(base_raw, &base, &result)
+        } else {
+            edit
+        },
+        derived_bookkeeping,
+        bookkeeping_basis: "retrospective completed-draft indices; not prior capacity planning",
+    })
+}
+
+/// Explicit new-route finishing mode. The caller must bind this mode to its
+/// frozen 0.4.1 controller contract. Before applying any patch, prove that both
+/// existing program-owned indices equal an exact retrospective derivation of
+/// the base draft. Historical/explicit authored plans use patch_bytes instead.
+/// Source/settings/assets remain protected by the unchanged patch contract.
+pub fn patch_derived_bytes(base_raw: &[u8], patch_raw: &[u8]) -> Result<DerivedEditResult> {
+    let edit = patch_bytes(base_raw, patch_raw)?;
+    let base = parse(base_raw)?;
+    let original_plan = base.get("episodes")?.array()?[0].get("plan")?;
+    for key in ["workPackages", "provisionalUnits"] {
+        original_plan.get(key)?.array()?;
+    }
+    let mut recalculated = base.clone();
+    derive_plan::clear_indices(&mut recalculated)?;
+    derive_plan::derive(&mut recalculated)?;
+    let expected_plan = recalculated.get("episodes")?.array()?[0].get("plan")?;
+    need(
+        ["workPackages", "provisionalUnits"].iter().all(|key|
+            canonical(original_plan.get(key).expect("checked index"))
+                == canonical(expected_plan.get(key).expect("derived index"))),
+        "derive-plan: base indices are not the program-derived indices of this draft",
+    )?;
+    let request = parse(patch_raw)?;
+    for operation in request.get("operations")?.array()? {
+        let path = tokens(operation.get("path")?.string()?)?;
+        need(
+            !(path.len() >= 4 && path[2] == "plan"
+                && ["workPackages", "provisionalUnits"].contains(&path[3].as_str())),
+            "derive-plan: program-owned indices cannot be patched directly",
+        )?;
+    }
+    let mut result = parse(&edit.bytes)?;
+    derive_plan::clear_indices(&mut result)?;
+    derive_plan::derive(&mut result)?;
+    Ok(DerivedEditResult {
+        edit: finish(base_raw, &base, &result),
+        derived_bookkeeping: true,
+        bookkeeping_basis: "verified program-owned base indices; refreshed retrospective completed-draft indices; not prior capacity planning",
+    })
+}
+
 fn tokens(path: &str) -> Result<Vec<String>> {
     need(path.starts_with('/'), "path must be a JSON Pointer")?;
     let mut out = Vec::new();

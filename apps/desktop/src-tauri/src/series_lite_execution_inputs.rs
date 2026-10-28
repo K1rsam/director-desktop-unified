@@ -208,6 +208,14 @@ pub(super) fn inputs(
     )?;
     let bundle = job.read(s(&request, "bundle")?)?;
     let b = parse(&bundle)?;
+    if pack.is_some_and(VerifiedPack::is_current) && historical.is_none() {
+        need(
+            b.object()?
+                .get("generationBoundaryVersion")
+                .is_some_and(|v| v.string().ok() == Some("video-prompt-v1")),
+            "new lite execution requires video-prompt-v1; historical source unchanged",
+        )?;
+    }
     need(
         s(&b, "exportProfile")? == "lingmo-v7" && b.get("episodes")?.array()?.len() == 1,
         "execution requires one complete Lingmo v7 episode",
@@ -253,7 +261,7 @@ pub(super) fn inputs(
     }
     let runtime = match historical {
         Some(old) => old.get("runtime")?.clone(),
-        None => runtime::current()?,
+        None => runtime::current(pack.ok_or_else(|| err("verified pack required"))?)?,
     };
     for (key, hash) in runtime.object()? {
         need(
@@ -269,7 +277,12 @@ pub(super) fn inputs(
     }
     let registry = registry(job, s(&request, "registry")?)?;
     if historical.is_none() {
-        crate::series_lite_registry::validate_registry(&value(&registry.value)?, false)?;
+        let current = value(&registry.value)?;
+        if pack.is_some_and(VerifiedPack::is_current) {
+            crate::series_lite_registry::validate_registry_current(&current, false)?;
+        } else {
+            crate::series_lite_registry::validate_registry(&current, false)?;
+        }
     }
     let asset_fingerprint = sha256(&canonical(&relevant(&registry.value, &b)?));
     let signature = object([

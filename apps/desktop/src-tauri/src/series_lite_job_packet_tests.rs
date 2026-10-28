@@ -125,6 +125,86 @@ fn series_lite_job_packet_matches_44_frozen_python_oracles() {
 }
 
 #[test]
+fn series_lite_job_packet_041_matches_52_python_oracles_and_complete_reading_views() {
+    let oracle: Value =
+        serde_json::from_str(include_str!("series_lite_job_packet_041_golden.json")).unwrap();
+    let pack = VerifiedPack::current_embedded().unwrap();
+    assert_eq!(
+        oracle["sourceHashes"]["job_packet.py"],
+        sha256(pack.file_bytes("scripts/job_packet.py").unwrap())
+    );
+    for case in oracle["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let dir = fixture(case);
+        let result = build(
+            dir.path(),
+            "request.json",
+            "packets/one.json",
+            case["maxBytes"].as_u64().unwrap() as usize,
+            &pack,
+            &RejectUnverifiedWorkspace,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["ok"].as_bool().unwrap(),
+            "{name}: {result:?}"
+        );
+        if let Ok(result) = result {
+            assert_eq!(
+                result.bytes,
+                case["encoded"].as_str().unwrap().as_bytes(),
+                "complete packet bytes: {name}"
+            );
+            assert_eq!(result.sha256, case["sha256"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                result.input_fingerprint,
+                case["inputFingerprint"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                render_reading_view(&result.bytes).unwrap(),
+                case["reading"].as_str().unwrap().as_bytes(),
+                "complete reading view: {name}"
+            );
+            assert_eq!(
+                verify(
+                    dir.path(),
+                    "packets/one.json",
+                    &pack,
+                    &RejectUnverifiedWorkspace
+                )
+                .unwrap()
+                .bytes,
+                result.bytes
+            );
+            assert_eq!(
+                load_frozen(
+                    dir.path(),
+                    "packets/one.json",
+                    &result.sha256,
+                    &RejectUnverifiedWorkspace
+                )
+                .unwrap()
+                .bytes,
+                result.bytes
+            );
+            assert!(
+                verify(
+                    dir.path(),
+                    "packets/one.json",
+                    &VerifiedPack::embedded().unwrap(),
+                    &RejectUnverifiedWorkspace
+                )
+                .is_err(),
+                "old compiler must not re-sign new packet"
+            );
+        } else {
+            assert!(!dir.path().join("packets/one.json").exists(), "{name}");
+        }
+    }
+}
+
+#[test]
 fn series_lite_job_packet_rules_and_full_bodies_are_lossless() {
     let dir = base_fixture();
     mutate_request(dir.path(), |r| {

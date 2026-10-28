@@ -309,6 +309,16 @@ impl Store {
         }
         let source = self.source()?;
         let deliveries = self.series_deliveries()?;
+        // New lite design provenance owns its actual preparation receipt. A
+        // version label cannot impersonate an adopted old series design.
+        {
+            let connection=self.conn()?;
+            for asset in assets.iter().filter(|a|ids.contains(&a["id"])) {
+                if crate::series_lite_desktop_prepare::has_design_origin(&connection, asset)? {
+                    crate::series_lite_desktop_prepare::verify_current_design(&connection,asset,s(&source,"sha256"))?;
+                }
+            }
+        }
         let foundation = self.foundation()?;
         let units = self.values("units")?;
         let mut related_ids = ids.clone();

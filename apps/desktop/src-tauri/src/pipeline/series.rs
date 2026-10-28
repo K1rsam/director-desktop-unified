@@ -146,6 +146,7 @@ pub fn uses_profile(input: &Value) -> Result<bool, String> {
     match input.get(PROFILE_FIELD) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::String(v)) if v == PROFILE => Ok(true),
+        Some(Value::String(v)) if v == "desktop-series-lite/v1" => Ok(false),
         Some(Value::String(v)) if v.starts_with("desktop-series") => {
             Err("SERIES_WORKFLOW_PROFILE_UNKNOWN".into())
         }

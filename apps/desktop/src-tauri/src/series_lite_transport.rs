@@ -4,17 +4,13 @@
 //! precision-sensitive packet JSON is never converted to Value and reserialized.
 use crate::series_lite_contract::VerifiedPack;
 use crate::series_lite_edit::{canonical, fields, parse, sha256, Json};
-use crate::series_lite_job_packet::{CompiledPacket, COMPILER_VERSION, PACKET_VERSION};
+use crate::series_lite_job_packet::{CompiledPacket, PACKET_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROFILE: &str = "series-lite-packet-utf8/v1";
 pub const MODEL_RULE: &str = "packetUtf8是本岗位完整冻结JSON文档的UTF-8原文字符串，按其中task、bindings、rules和blobs阅读；不另行概括规则或丢弃完整设计。所有引用及精确数字以原字符串为准。carrier只运输供料，不代表独审通过、正式采用或生成授权。输出仍服从本岗位另外冻结的响应schema，不回传载体或包。";
-const VERSION_BYTES: &[u8] =
-    include_bytes!("../../../../rules/series-lite/20261027-v0.1.2/VERSION");
-const COMPILER_BYTES: &[u8] =
-    include_bytes!("../../../../rules/series-lite/20261027-v0.1.2/scripts/job_packet.py");
 const INPUT_KEYS: &[&str] = &[
     "episode",
     "role",
@@ -283,9 +279,13 @@ fn check_structure(raw: &[u8]) -> Result<Checked> {
     let mut used = BTreeSet::new();
     let bindings = packet.get("bindings")?.array()?;
     let mut kinds = BTreeSet::new();
+    let review = packet.get("review")?;
+    let current = packet.get("compiler")?.get("version")?.string()? == "lingmo-lite-role-rules-v2";
+    // v2 explicitly permits no preparatory review. Old v1 retains its contract.
+    need(current || *review != Json::Null, "legacy packet requires original review")?;
     for record in bindings
         .iter()
-        .chain(std::iter::once(packet.get("review")?))
+        .chain(((*review != Json::Null).then_some(review)).into_iter())
     {
         fields(
             record,
@@ -304,14 +304,8 @@ fn check_structure(raw: &[u8]) -> Result<Checked> {
         used.insert(key.to_owned());
         kinds.insert(record.get("kind")?.string()?);
     }
-    let mut required = vec![
-        "source",
-        "direction",
-        "state",
-        "assets",
-        "entry",
-        "visual-baseline",
-    ];
+    let mut required = vec!["source", "direction", "assets", "visual-baseline"];
+    if !current { required.extend(["state", "entry"]); }
     if role != Role::Author {
         required.extend(["draft", "plan", "selection"])
     }
@@ -412,15 +406,17 @@ fn check_current_rules(packet: &Json, role: Role, pack: &VerifiedPack) -> Result
             "actual rule bytes differ from pinned pack",
         )?;
     }
+    let version_bytes = pack.file_bytes("VERSION")?;
+    let compiler_bytes = pack.file_bytes("scripts/job_packet.py")?;
     need(
         packet.get("skill")?.get("version")?.string()?
-            == std::str::from_utf8(VERSION_BYTES).unwrap().trim()
-            && packet.get("skill")?.get("sha256")?.string()? == sha256(VERSION_BYTES),
+            == std::str::from_utf8(version_bytes).map_err(|_| "invalid pack version")?.trim()
+            && packet.get("skill")?.get("sha256")?.string()? == sha256(version_bytes),
         "skill version identity mismatch",
     )?;
     need(
-        packet.get("compiler")?.get("version")?.string()? == COMPILER_VERSION
-            && packet.get("compiler")?.get("sha256")?.string()? == sha256(COMPILER_BYTES),
+        packet.get("compiler")?.get("version")?.string()? == pack.compiler_version()
+            && packet.get("compiler")?.get("sha256")?.string()? == sha256(compiler_bytes),
         "compiler identity mismatch",
     )
 }

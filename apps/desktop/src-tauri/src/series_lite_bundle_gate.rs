@@ -24,6 +24,8 @@ pub use source::normalize_legacy_source;
 #[path = "series_lite_bundle_gate_check.rs"]
 mod check;
 pub use check::NativeLegacyBundleGate;
+#[path = "series_lite_generation_boundary.rs"]
+mod generation_boundary;
 #[cfg(test)]
 #[path = "series_lite_bundle_gate_tests.rs"]
 mod tests;

@@ -43,6 +43,7 @@ pub struct NativeLegacyBundleGate<'a> {
 impl BundleGate for NativeLegacyBundleGate<'_> {
     fn check(&mut self, raw: &[u8]) -> Result<GateEvidence> {
         let bundle: Value = serde_json::from_slice(raw).map_err(|e| format!("BUNDLE_JSON: {e}"))?;
+        super::generation_boundary::check(&bundle)?;
         need(
             bundle["version"] == "series-storyboard-bundle-v1",
             "BUNDLE_VERSION",

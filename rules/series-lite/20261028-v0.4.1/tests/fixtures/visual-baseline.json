@@ -1,0 +1,16 @@
+{
+  "version": "series-visual-baseline-v1",
+  "id": "synthetic-cool-realism",
+  "revision": 1,
+  "status": "adopted",
+  "visualStyle": "自然比例电影写实，人物轮廓和年龄稳定。自然三维受光与柔和明暗过渡。布料哑光、金属局部反射，皮肤避免塑料泛亮。冷色走廊保留中间调，侧窗主光与接触阴影连贯。画幅16:9。仅在明确采用的镜头内进入局部图解，结束回接现实画风。",
+  "coverage": {
+    "form": "自然比例电影写实，人物轮廓和年龄稳定",
+    "rendering": "自然三维受光与柔和明暗过渡",
+    "materials": "布料哑光、金属局部反射，皮肤避免塑料泛亮",
+    "colorLighting": "冷色走廊保留中间调，侧窗主光与接触阴影连贯",
+    "aspectRatio": "画幅16:9",
+    "localExceptions": "仅在明确采用的镜头内进入局部图解，结束回接现实画风"
+  },
+  "adoptionBasis": "合成测试采用方向，非真实用户作品。"
+}

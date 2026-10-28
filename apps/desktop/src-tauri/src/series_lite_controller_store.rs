@@ -159,7 +159,7 @@ fn parent(c: &Connection, run: &str, source: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-fn frozen_valid(v: &FrozenRole) -> Result<()> {
+pub(crate) fn frozen_valid(v: &FrozenRole) -> Result<()> {
     if v.version != VERSION
         || v.workflow_id.trim().is_empty()
         || !hex(&v.source_sha256)
@@ -236,7 +236,7 @@ fn load_result(c: &Connection, id: &str) -> Result<Option<RoleResult>> {
 fn node_key(frozen: &FrozenRole) -> String {
     format!("{}:{}",frozen.request.stage,digest(&json!({"episode":frozen.context.episode,"iteration":frozen.context.iteration_id,"context":frozen.context.context_id}).to_string()))
 }
-fn bound_job(
+pub(crate) fn bound_job(
     c: &Connection,
     frozen: &FrozenRole,
     expected: Option<&RoleResult>,

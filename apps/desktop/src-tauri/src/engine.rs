@@ -1337,7 +1337,12 @@ impl Engine {
             }
             "images.exportPrompts" => return store.export_image_prompts(&request),
             "images.exportCurrent" => return store.export_current_images(&request),
-            "storyboard.exportDelivery" => return store.export_series_delivery(&request),
+            "storyboard.exportDelivery" => {
+                if let Some(result) = pipeline::series_lite::export_delivery(&store, &request)? {
+                    return Ok(result);
+                }
+                return store.export_series_delivery(&request);
+            },
             "images.registerReference" => return store.register_image_reference(&request),
             "assets.identityLayout.save" => {store.save_identity_layout(&request)?;},
             "assets.get" => return store.get("assets", s(&request, "assetId")),
@@ -2799,6 +2804,10 @@ impl Engine {
         for uid in ids {
             let key = uid.as_str().unwrap();
             let result: Result<Value> = (|| {
+                let unit = store.get("units", key)?;
+                // A lite status flag is not adoption evidence. Check the bound
+                // delivery before reuse/preparation; isolate failures per unit.
+                pipeline::series_lite::verify_unit_for_media(store, &unit)?;
                 if submit {
                     let summary = jobs
                         .iter()
@@ -2872,7 +2881,6 @@ impl Engine {
                     }
                     return Err("已有原任务或准备包，请恢复原任务或处理未知提交后再生成".into());
                 }
-                let unit = store.get("units", key)?;
                 let mut snapshot = binding::bind(store, &unit, &provider, model)?;
                 snapshot["frozenSettings"]=settings.clone();
                 snapshot["providerConfig"]=serde_json::to_value(self.config_with_settings(store,&provider,&settings)?.0).map_err(|e|e.to_string())?;
@@ -3315,7 +3323,7 @@ impl Engine {
             let key = if stage == "foundation.run" { "foundation-start" } else { "storyboard-start" };
             Some(self.acquire_keys(vec![format!("{key}:{}", s(&store.project()?, "id"))])?)
         } else { None };
-        let planning=if matches!(stage,"storyboard.run"|"storyboard.refine"){self.global_planning_capabilities(&store)?}else{None};
+        let planning=if matches!(stage,"storyboard.run"|"storyboard.refine") && request["workflowProfile"]!=pipeline::series_lite::PROFILE {self.global_planning_capabilities(&store)?}else{None};
         let mut input = if stage == "storyboard.refine" { refinement_input_with_capabilities(&store, &request,planning.as_ref())? } else { production_input_for_new_workflow_with_capabilities(&store, &request,planning.as_ref())? };
         if stage == "storyboard.refine" { pipeline::asset_use_binding::freeze_new(&mut input)?; }
         if stage == "foundation.run" {
@@ -3354,7 +3362,9 @@ impl Engine {
             input=production_input_for_new_workflow_with_capabilities(&store,&request,planning.as_ref())?;
             if prepare_series_continuation(&store,&mut input)? {return Ok(());}
         }
-        if matches!(stage, "storyboard.run" | "storyboard.refine") && !pipeline::series::uses_profile(&input)? {
+        if matches!(stage, "storyboard.run" | "storyboard.refine")
+            && !pipeline::series_lite::uses_profile(&input)
+            && !pipeline::series::uses_profile(&input)? {
             pipeline::freeze_scene_input_profile(&mut input)?;
             pipeline::storyboard_sound_events::freeze_new(&mut input)?;
             pipeline::asset_coverage::freeze_new(&mut input)?;
@@ -3384,10 +3394,12 @@ impl Engine {
                 }
             }
         }
-        if stage == "storyboard.run" && pipeline::series::uses_profile(&input)? {
+        if stage == "storyboard.run" && pipeline::series_lite::uses_profile(&input) {
+            input["storyboardMethod"] = json!("series-lite-full-episode/v1");
+        } else if stage == "storyboard.run" && pipeline::series::uses_profile(&input)? {
             input["storyboardMethod"] = json!("series-full-episode/v1");
         }
-        let rules = if pipeline::series::uses_profile(&input)? { json!(pipeline::series::rule_snapshots_for(&input)?) } else if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
+        let rules = if pipeline::series_lite::uses_profile(&input) { json!(pipeline::series_lite::rule_snapshots_for(&input)?) } else if pipeline::series::uses_profile(&input)? { json!(pipeline::series::rule_snapshots_for(&input)?) } else if pipeline::stage3_pack::uses_profile(&input)? { json!(pipeline::stage3_pack::rule_snapshots()?) } else { production_rules(stage) };
         let guard = crate::workflow::guard_from_input(&input);
         store.ensure_workflow_storage()?;
         {
@@ -3616,6 +3628,10 @@ impl Engine {
                     store.publish_foundation_with_source(&guard,output,assets,Some(&run),revised)
                 }else if stage=="storyboard.refine" {
                     pipeline::run_storyboard_refinement(&input,&exec,model,reasoning).await
+                }else if stage=="storyboard.run" && pipeline::series_lite::uses_profile(&input) {
+                    // Lite publishes each adopted episode itself. Sending it
+                    // through the legacy aggregate writer would publish twice.
+                    pipeline::series_lite::run(&store,&run,&input,&exec,model,reasoning).await
                 }else{
                     let history={
                         let connection=store.conn()?;
@@ -5242,6 +5258,9 @@ fn production_rules(stage: &str) -> Value {
 // A previously started run keeps its actual rules and requests. It may finish or
 // resume its accepted steps; a new run uses the restored F2 → Q1 method.
 fn production_rules_for_snapshot(snapshot: &Value) -> Result<Value> {
+    if pipeline::series_lite::uses_profile(&snapshot["input"]) {
+        return Ok(json!(pipeline::series_lite::rule_snapshots_for(&snapshot["input"])?));
+    }
     if pipeline::series::uses_profile(&snapshot["input"])? {
         return Ok(json!(pipeline::series::rule_snapshots_for(&snapshot["input"])?));
     }
@@ -6129,6 +6148,29 @@ fn production_input_for_new_workflow(store: &Store, request: &Value) -> Result<V
     production_input_for_new_workflow_with_capabilities(store,request,None)
 }
 fn production_input_for_new_workflow_with_capabilities(store: &Store, request: &Value,capabilities:Option<&Value>) -> Result<Value> {
+    if request["workflowProfile"] == pipeline::series_lite::PROFILE {
+        if s(request,"action") != "storyboard.run" {
+            return Err("LITE_NEW_WORKFLOW_ACTION: 新版规则只用于明确启动的整集分镜创作".into());
+        }
+        if request["unitIds"].as_array().is_some_and(|ids|!ids.is_empty()) {
+            return Err("LITE_WHOLE_EPISODE_REQUIRED: 单元重做不能改用整集新版合同，原成果保持不变".into());
+        }
+        // Do not run the old F2/full-catalogue and production-audit projection.
+        // The lite scheduler acquires only this episode's real design inputs.
+        // Lite's text contract does not require an installed/logged-in video
+        // provider or its expiring catalogue. Stage 4 keeps real media preflight.
+        let mut input=storyboard_input_inner_with_capabilities(store,request,false,None)?;
+        let max=input["settings"]["maxUnitSeconds"].as_u64().unwrap_or(30);
+        if ![15,30].contains(&max) {return Err("LITE_MAX_UNIT_SECONDS_INVALID: 项目单元上限须为15或30秒".into());}
+        input["capabilities"]=json!({"profileId":"series-lite/storyboard-planning/v1","planningOnly":true,"maxDuration":max,"requiresLivePreflightAtStage4":true});
+        input["productionScope"]=json!({"version":"desktop-production-scope/v1","status":"locked","sourceSha256":input["source"]["sha256"],"episodeIds":input["source"]["episodes"].as_array().into_iter().flatten().map(|e|e["id"].clone()).collect::<Vec<_>>(),"basis":"locked-desktop-source-scope;selection-is-execution-subset"});
+        if s(&input["settings"],"confirmedDirection").trim().is_empty()
+            && !s(&input["foundation"],"productionDirection").trim().is_empty() {
+            input["settings"]["confirmedDirection"]=input["foundation"]["productionDirection"].clone();
+        }
+        pipeline::series_lite::mark_input(&mut input)?;
+        return Ok(input);
+    }
     if request["unitIds"].as_array().is_some_and(|ids|!ids.is_empty()) {
         for id in request["unitIds"].as_array().unwrap() {
             if store.get("units",id.as_str().unwrap_or(""))?["timingProfile"]=="lingmo-v7-nanoseconds/v1" {return Err("新版单元必须通过绑定整集采用稿的精修入口，未调用旧版规则".into());}
@@ -6470,6 +6512,22 @@ mod local_video_prepare_tests {
             let r = self.request();
             std::thread::spawn(move || engine.dispatch(r))
         }
+    }
+    #[test]
+    fn lite_adoption_problem_blocks_only_its_unit_before_video_preparation() {
+        let f = Fixture::new(3);
+        let mut unit=f.store.get("units",&f.ids[1]).unwrap();
+        // A self-declared flag is not a bound, adopted lite delivery.
+        unit["seriesLite"]=json!({"finalDeliveryReady":true});
+        f.store.save_unit(unit).unwrap();
+        let result=f.engine.dispatch(f.request()).unwrap();
+        let report=&result["videoQueueReport"];
+        assert_eq!(report["queuedCount"],2);
+        assert_eq!(report["blockedCount"],1);
+        assert_eq!(report["blocked"][0]["unitId"],f.ids[1]);
+        assert!(s(&report["blocked"][0],"reason").contains("LITE_MEDIA_ADOPTED_EPISODE_MISSING"));
+        assert!(!f.store.jobs().unwrap().iter().any(|j|j["entityId"]==f.ids[1]));
+        f.channels.assert_no_cloud_call();
     }
     #[test]
     fn verified_cache_prepares_57_while_image_channel_is_held_reusing_37_without_submission() {
@@ -7288,6 +7346,9 @@ mod refinement_cas_tests;
 #[cfg(test)]
 #[path = "engine_series_start_tests.rs"]
 mod series_start_tests;
+#[cfg(test)]
+#[path = "engine_lite041_routing_tests.rs"]
+mod lite041_routing_tests;
 #[cfg(test)]
 #[path = "engine_cli_unknown_tests.rs"]
 mod cli_unknown_tests;
